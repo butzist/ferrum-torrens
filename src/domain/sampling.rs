@@ -8,14 +8,25 @@ use serde::Deserialize;
 const MIN_TEMPERATURE: f32 = 1e-6;
 const DEFAULT_MAX_TOKENS: u32 = 1024;
 
+/// `#[serde(default)]` on a field takes the field *type's* `Default`, not the
+/// struct's, so every non-zero default needs its own function: top_k is -1
+/// (disabled) and top_p is 1.0 (no filtering), not 0.
+fn default_top_k() -> i64 {
+    -1
+}
+
+fn default_top_p() -> f32 {
+    1.0
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SamplingParams {
     #[serde(default)]
     pub temperature: f32,
-    #[serde(default)]
+    #[serde(default = "default_top_k")]
     pub top_k: i64,
-    #[serde(default)]
+    #[serde(default = "default_top_p")]
     pub top_p: f32,
     #[serde(default)]
     pub ignore_eos: bool,
@@ -29,8 +40,8 @@ impl Default for SamplingParams {
     fn default() -> Self {
         Self {
             temperature: 0.0,
-            top_k: -1,
-            top_p: 1.0,
+            top_k: default_top_k(),
+            top_p: default_top_p(),
             ignore_eos: false,
             max_tokens: DEFAULT_MAX_TOKENS,
             stop_strs: Vec::new(),
@@ -303,5 +314,34 @@ mod tests {
         for _ in 0..64 {
             assert_eq!(sample(&logits, &p, &mut a), sample(&logits, &p, &mut b));
         }
+    }
+
+    #[test]
+    fn serde_defaults_match_the_default_impl() {
+        let from_json: SamplingParams = serde_json::from_str("{}").unwrap();
+        assert_eq!(from_json, SamplingParams::default(), "an empty object is the default");
+        assert_eq!(from_json.top_k, -1, "top_k defaults to disabled, not 0");
+        assert_eq!(from_json.top_p, 1.0, "top_p defaults to no filtering");
+        assert!(from_json.is_greedy(), "an empty object samples greedily");
+    }
+
+    #[test]
+    fn serde_reads_the_fields_it_is_given() {
+        let p: SamplingParams = serde_json::from_str(
+            r#"{"temperature": 0.7, "top_k": 40, "top_p": 0.95, "ignore_eos": true, "max_tokens": 8, "stop_strs": ["END"]}"#,
+        )
+        .unwrap();
+        assert_eq!(p.temperature, 0.7);
+        assert_eq!(p.top_k, 40);
+        assert_eq!(p.top_p, 0.95);
+        assert!(p.ignore_eos);
+        assert_eq!(p.max_tokens, 8);
+        assert_eq!(p.stop_strs, vec!["END".to_string()]);
+        assert!(!p.is_greedy());
+    }
+
+    #[test]
+    fn serde_rejects_unknown_fields() {
+        assert!(serde_json::from_str::<SamplingParams>(r#"{"nucleus": 0.9}"#).is_err());
     }
 }
