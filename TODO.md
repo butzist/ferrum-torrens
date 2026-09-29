@@ -1,10 +1,14 @@
 # FerrumTorrens -- FreeToken MVP port to Rust: TODO
 
-Status: planning, part 3. Model verified and readable at
-`/nix/store/mpwkgysbh8dyxz8jlrwkhzcsp01v6my3-qwen3.6-35b-a3b-nvfp4` (HF shards,
-config + hf_quant_config confirmed; kv_cache_quant_algo=FP8). Flake provides
-python312/uv and binds `/nix/store` ro. Todo before M1 crate work: reload the
-flake, create the FreeToken venv, run the one-time FTW conversion.
+Status: M1 in progress -- conversion DONE. FTW index parser + mmap reader landed
+(strict TDD, clippy/fmt clean); the FTW dir's `config.json` dispatches the
+registry (`architectures[0]`); `models/qwen3_6` text tower maps config -> params,
+bakes Gemma norms (+1 at load), and ships a full **CPU fp32 reference forward**
+(embeddings, partial-rope GQA attention with output gate, GatedDeltaNet recurrence,
+NVFP4 MoE + shared expert, lm_head). A gated test runs it against the real
+checkpoint: finite + deterministic logits, plausible top-1 (decision 12).
+Remaining M1: engine config TOML + scheduler + sampling + tokenizer + axum
+`/v1/completions` on the reference path.
 
 Goal: a **minimal, fast, single-GPU** Rust serving engine for **one model** --
 `Qwen3.6-35B-A3B-NVFP4` (MoE + hybrid GatedDeltaNet/attention) -- using FreeToken's
@@ -94,7 +98,7 @@ ferrum-torrens/
         weights.rs              #   tensor-name scheme -> (layer, expert, part)
         forward.rs              #   GDN + partial-rope GQA + router + block math
     application/                # use-cases orchestrating domain ports
-      registry.rs               # arch label from FTW meta -> ModelFactory
+      registry.rs               # FTW dir config.json architectures[0] -> ModelFactory
       engine.rs                 # load weights, schedule_next_batch, run_forward
       generation.rs             # step advancement, completion, abort draining
       run_experts.rs            # generic MoE block: router output + cache -> grouped GEMM
@@ -122,7 +126,8 @@ Model boundary contract:
   `ensure -> stream misses -> grouped GEMM -> weighted sum`. A different MoE
   model therefore reuses the whole cache/streaming path unchanged.
 - The FTW reader is generic; `models/<arch>/weights.rs` teaches it the tensor
-  names. Registry keys on the arch label in the FTW index `meta`.
+  names. Registry keys on the FTW dir's copied `config.json` (`architectures[0]`;
+  the FTW index meta carries no arch label).
 
 ## 4. Config file (TOML) -- draft schema
 
@@ -175,8 +180,8 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 - [ ] P0 note: running the converter requires building FreeToken once (torch + flashinfer + nvcc deps, see `FreeToken/README.md`). If that is undesirable on the target machine, a standalone converter (safetensors -> FTW) is a P2 fallback; it does not change the Rust side because FTW is the input format either way.
 
 ### Weights / model load
-- [ ] P0 `ftw.rs`: parse `freetoken_weight.json` (schema: `format="freetoken_weight"`, `version=1`, `align=4096`, `shards[]` with `file/global_off/nbytes`, `tensors[]` with `name/kind/dtype/shape/global_off/nbytes`).
-- [ ] P0 mmap all `freetoken-NNNNN.ftw` shards; resolve per-tensor `global_off -> (shard, offset)`.
+- [x] P0 `ftw.rs`: parse `freetoken_weight.json` (schema: `format="freetoken_weight"`, `version=1`, `align=4096`, `shards[]` with `file/global_off/nbytes`, `tensors[]` with `name/kind/dtype/shape/global_off/nbytes`).
+- [x] P0 mmap all `freetoken-NNNNN.ftw` shards; resolve per-tensor `global_off -> (shard, offset)` (`MmapFtwReader`: memmap2, `WeightsReader` port, `pieces()` split).
 - [ ] P0 load & cast dense weights to GPU: embeddings, all tensor projections + norms + router (bf16), lm_head. Gemma norms: bake `w+1.0` at load.
 - [ ] P0 GDN fp32 params (`A_log`, `dt_bias`) kept fp32; biased/linear projections per checkpoint quant.
 - [ ] P0 expert host banks from per-layer FTW entries (`gate_up_packed#L`, `gate_up_scale#L`, `gate_up_global#L`, `down_*#L`) read serially into pinned host buffers; keep a GPU-resident `[L*E]` set for the fp16 global alphas.
@@ -287,14 +292,28 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 10. **Checkpoint access** -- the FTW input lives in the Nix store (added via
     `nix store add-path ... --name qwen3.6-35b-a3b-nvfp4`). The devshell jail binds
     `/nix/store` read-only so agents can mmap it; the converted `.ftw` output is
-    written into `$FLAKE_ROOT`.
+    written into the git-ignored `.model-cache/` dir inside `$FLAKE_ROOT`.
+    The FreeToken venv is installed (`FreeToken/.venv`, torch 2.11.0+cu130
+    wheel). The one-time conversion must run with CUDA device access (the agent
+    sandbox gets `cuInit=CUDA_ERROR_NO_DEVICE`); exact command in AGENTS.md.
 11. **Model-agnostic engine** -- the engine, caches, streaming, FTW loader,
     tokenizer and server are model-independent (`TODO.md` section 3). The only
-    arch-specific surface is `src/models/<arch>/` + a registry entry keyed on the
-    FTW `meta` arch label. The MoE offload cache and prefill/decode streaming are
+    arch-specific surface is `src/models/<arch>/` + a registry entry keyed on
+    the arch from the FTW dir's copied `config.json` (`architectures[0]`). The MoE offload cache and prefill/decode streaming are
     core engine obligations for every supported model ("moe caching and streaming
     is a must"); slot dtype is a `QuantFormat` enum (Nvfp4 first, Fp8/Bf16 later)
     so new archs reuse the cache unchanged.
+12. **M1 reference forward** -- because the sandbox has no GPU runtime, M1 runs the
+    **CPU fp32 reference forward** as the model implementation behind the `Model`
+    trait: it is both the M1 correctness path and the golden oracle the M3 CUDA
+    kernels are validated against (ALGORITHM.md 2.3.1). It recomputes the whole
+    sequence every step (no KV/radix/offload cache in M1), reads experts straight
+    from the mmap'd banks, and panics-with-context on weight errors. The GPU load,
+    CUDA nodes, CUDA graphs and the offload cache remain M3/M4 items as scheduled;
+    the engine-facing `Model` boundary is unchanged when GPU forward lands.
+    Verified by `tests/ftw_real_forward.rs` (gated): forward on the converted
+    checkpoint is finite, deterministic, and yields a plausible argmax; exact
+    logits vs FreeToken is a host-side harness step.
 
 ### Config defaults for the RTX 5060 / 8 GB target
 

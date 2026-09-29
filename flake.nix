@@ -67,35 +67,25 @@
 
         # CUDA device paths for jail access (unfree, requires allowUnfree).
         #
-        # These must be listed explicitly: `noescape` passes the string through
-        # unquoted, so a glob like /dev/nvidia* would be expanded by the shell
-        # into one token per device and bwrap would treat every token past the
-        # second as the start of the command, swallowing the remaining options
-        # (including --unshare-uts).
-        #
-        # CUDA needs the control device, the per-GPU nodes and the UVM driver.
-        # /dev/nvidia-modeset is display-only and /dev/nvidia-caps/* is MIG-only,
-        # so neither is bound. try-readwrite skips nodes absent on this host.
-        cudaDevices = with combinators;
-          map try-readwrite (
-            [
-              "/dev/nvidiactl"
-              "/dev/nvidia-uvm"
-              "/dev/nvidia-uvm-tools"
-            ]
-            ++ map (i: "/dev/nvidia${toString i}") (pkgs.lib.range 0 7)
-          );
-
-        cudaDevicePaths = with combinators;
-          [
-            # Driver libraries, config and render nodes are only ever read, so
-            # bind them read-only and skip them when absent. Opening a device node
-            # is governed by its mode bits, not by the mount being writable.
-            (try-readonly "/run/opengl-driver")
-            (try-readonly "/etc/nvidia")
-            (try-readonly "/dev/dri")
-          ]
-          ++ cudaDevices;
+        # Mirror the working reference config: bind the driver libraries plus
+        # the sysfs device tree read-only (libcuda enumerates the GPU through
+        # /sys/devices and /sys/class/drm; without them cuInit sees no device
+        # even when the nodes are mounted) and the device/shm nodes write.
+        # try-* skips paths absent on this host. noescape passes the string
+        # through unquoted so bwrap does not split or glob it.
+        cudaDevicePaths = with combinators; [
+          (try-readonly (noescape "/proc/driver/nvidia"))
+          (try-readonly (noescape "/sys/class/drm"))
+          (try-readonly (noescape "/sys/devices"))
+          (try-readonly "/etc/nvidia")
+          (try-readwrite "/dev/nvidia0")
+          (try-readwrite "/dev/nvidia1")
+          (try-readwrite "/dev/nvidiactl")
+          (try-readwrite "/dev/nvidia-uvm")
+          (try-readwrite "/dev/nvidia-uvm-tools")
+          (try-readwrite "/dev/nvidia-modeset")
+          (try-readwrite "/dev/nvidia-caps")
+        ];
 
         jailOptions = with combinators;
           jlib.commonJailOptions
@@ -103,6 +93,9 @@
             (readwrite (noescape "\"$FLAKE_ROOT\""))
             (readonly "/nix/store")
           ]
+          # jail.nix `gpu`: ro-binds the PCI GPU dirs in /sys/devices, mounts
+          # /sys/dev/char + /run/opengl-driver(-32) and --dev-binds /dev/dri.
+          ++ [combinators.gpu]
           ++ cudaDevicePaths;
 
         jailedOpencode = jlib.makeJailedOpencode {

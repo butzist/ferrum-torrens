@@ -86,9 +86,16 @@ Instructions for AI coding agents working in this repository.
   `nix store add-path <dir> --name qwen3.6-35b-a3b-nvfp4`; the jail binds
   `/nix/store` read-only, so agents can mmap the converted `.ftw` output turned
   out into `$FLAKE_ROOT` by the conversion step.
-- Python venv (flake provides python312 + uv):
-  `cd FreeToken && uv venv && uv pip install -e ".[accel]"` then
-  `.venv/bin/ft checkpoint --model <hf_dir> --out <ftw> --moe-backend offload`.
+- Python venv (flake provides python312 + uv), already installed:
+  `cd FreeToken && uv venv --python 3.12 && FREETOKEN_ALLOW_CUDA_MISMATCH=1 uv pip install -e ".[accel]"`.
+  When running `ft`/python with the venv, torch needs the driver and libstdc++
+  on the library path:
+  `LD_LIBRARY_PATH="/run/opengl-driver/lib:$(dirname "$(gcc -print-file-name=libstdc++.so.6)")"`.
+- One-time HF -> FTW conversion (needs CUDA device access; the agent sandbox
+  cannot open the GPU -- cuInit=CUDA_ERROR_NO_DEVICE -- so run in a devshell):
+  `LD_LIBRARY_PATH="/run/opengl-driver/lib:$(dirname "$(gcc -print-file-name=libstdc++.so.6)")" \
+   FreeToken/.venv/bin/ft checkpoint --model /nix/store/mpwkgysbh8dyxz8jlrwkhzcsp01v6my3-qwen3.6-35b-a3b-nvfp4 \
+   --out .model-cache/Qwen3.6-35B-A3B-NVFP4.ftw --moe-backend offload --shard-gib 8`
 - Verify with: `cargo fmt --check`, `cargo clippy --all-targets`,
   `cargo test`.
 
