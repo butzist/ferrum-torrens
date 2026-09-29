@@ -12,7 +12,10 @@ strict typing + defaults, model-agnostic validation (52 lib tests). Tokenizer
 landed: `domain/tokenizer.rs` port + `infrastructure/tokenizers_hf.rs` (HF
 `tokenizers` crate, byte-level BPE, `add_special_tokens=false`); gated tests
 against the checkpoint's `tokenizer.json` confirm eos `248044`/`248046` and
-lossless prompt round-trip (58 lib tests).
+lossless prompt round-trip (58 lib tests). `domain/sampling.rs` landed
+(FreeToken-mirror `SamplingParams`, greedy argmax fast-path with lowest-id
+tie-break, stable softmax/top_k/top_p/renorm/deterministic splitmix64 draw;
+68 lib tests).
 Remaining M1: scheduler + sampling + engine loop + axum
 `/v1/completions` on the reference path.
 
@@ -236,8 +239,11 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 - [ ] P0 abort: mark aborted; free resources only after in-flight forward drained (idempotent via table_idx==-1).
 
 ### Sampling
-- [ ] P0 greedy fast-path (no softmax kernel when all rows greedy); mixed-batch greedy mask overwrite with deterministic argmax.
-- [ ] P0 `SamplingParams{temperature, top_k, top_p, ignore_eos, max_tokens, stop_strs}`.
+- [x] P0 greedy fast-path (argmax shortcut, lowest-id tie-break; mixed-batch mask
+  falls out of per-row domain sampling).
+- [x] P0 domain `SamplingParams{temperature, top_k, top_p, ignore_eos, max_tokens=1024, stop_strs}` +
+  stable softmax(logits/temp), top_k then top_p (flashinfer cumsum, inclusive),
+  renormalize, deterministic splitmix64 draw. CUDA kernel parity later.
 
 ### Server (axum recommended)
 - [ ] P0 `POST /v1/chat/completions` stream + non-stream (n=1), reasoning-free.
