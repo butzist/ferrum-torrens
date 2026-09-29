@@ -1,0 +1,11 @@
+[package]
+name = "ferrum-torrens"
+version = "0.1.0"
+edition = "2024"
+description = "A Rust project built with the FerrumTorrens dev shell"
+
+[[bin]]
+name = "ferrum-torrens"
+path = "src/main.rs"
+
+[dependencies]
