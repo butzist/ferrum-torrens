@@ -45,6 +45,8 @@
           ];
         };
 
+        # Python is used only for the one-time HF -> FTW conversion via FreeToken's
+        # `ft checkpoint` (see AGENTS.md); the runtime itself is Rust-only.
         basePackages = [
           rustNightly
           pkgs.stdenv.cc
@@ -58,8 +60,9 @@
           pkgs.gawk
           pkgs.diffutils
           pkgs.just
-          pkgs.deno
           pkgs.cudatoolkit
+          pkgs.python312
+          pkgs.uv
         ];
 
         # CUDA device paths for jail access (unfree, requires allowUnfree).
@@ -98,6 +101,7 @@
           jlib.commonJailOptions
           ++ [
             (readwrite (noescape "\"$FLAKE_ROOT\""))
+            (readonly "/nix/store")
           ]
           ++ cudaDevicePaths;
 
