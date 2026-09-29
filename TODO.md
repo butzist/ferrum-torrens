@@ -19,9 +19,15 @@ tie-break, stable softmax/top_k/top_p/renorm/deterministic splitmix64 draw;
 machine, bit-identical to FreeToken's CPU oracle), `kvcache.rs` (page free-list,
 per-req page table with sentinel dummy rows, radix prefix tree with split /
 whole-leaf LRU / ref-counted locks, GDN state free-list), `scheduler.rs`
-(Req/Batch, prefill-priority batching, stop rules). 96 lib tests.
-Remaining M1: application engine loop + axum `/v1/completions` on the
-reference path.
+(Req/Batch, prefill-priority batching, stop rules). The engine loop landed:
+`application/engine.rs` (config -> FTW -> registry model + tokenizer + eos list
+-> `Engine`, batched `run_forward` over whole sequences, `page_size` and
+`cache_size >= num_experts` floors) and `application/generation.rs` (uid-keyed
+token/text store, scheduler-driven step loop, length/EOS/stop-string rules with
+EOS winning over length, `max_tokens` clamped by engine limits and context
+room). 119 lib tests; the gated real-checkpoint load test passes (eos
+`[248046, 248044]`, `Hello` round-trips through the HF tokenizer).
+Remaining M1: axum `/v1/completions` on the reference path.
 
 Goal: a **minimal, fast, single-GPU** Rust serving engine for **one model** --
 `Qwen3.6-35B-A3B-NVFP4` (MoE + hybrid GatedDeltaNet/attention) -- using FreeToken's
@@ -223,7 +229,7 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 - [x] P0 `ensure_experts` (LRU): rewrite routed ids -> slot ids in place; emit miss list; LRU victim = argmin(usage) with same-step owner protection (an expert used earlier in this step may not be evicted).
 - [ ] P0 `copy_missing`: fused copy of all banks' missed rows on the compute stream (serial per step).
 - [ ] P0 prefill: `materialize_layer` per-layer full stream; `prefill_overlap` two-buffer (copy stream + ready/release events, layer+1 prefetch) guarded by `cache_size >= 2*E`.
-- [ ] P0 `cache_size_slots` explicit from config; floor `>= num_experts`.
+- [x] P0 `cache_size_slots` explicit from config; floor `>= num_experts`. (floor enforced in `application::engine::load_engine`)
 - [ ] P0 prefill double-buffer and decode path must not clobber each other (begin_prefill fence).
 
 ### KV cache + radix
@@ -238,7 +244,7 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 - [x] P0 in-process tokenize/detokenize.
 - [x] P0 strict prefill-priority `schedule_next_batch()`; chunked prefill budget `max_prefill_length`; no decode starvation guard in v0 (mirror FreeToken, note as known issue). (simple M1 form in `domain/scheduler.rs`)
 - [x] P0 decode batch sorted by uid (deterministic).
-- [ ] P0 per-step `run_forward`: build positions/mapping/out_loc -> model forward -> sample -> scatter token_pool -> `complete_one()` advancement -> D2H next-token for stop/detokenize.
+- [x] P0 per-step `run_forward`: build positions/answers -> model forward -> sample -> `complete_one()` advancement -> next-token for stop/detokenize. (M1 reference form in `application/engine.rs` + `application/generation.rs`; `token_pool` scatter and `out_loc` land with the paged KV pool)
 - [x] P0 stop handling: max_tokens, eos (`248044`), stop-strings (decode last N tokens); EOS/stop wins over length.
 - [ ] P0 abort: mark aborted; free resources only after in-flight forward drained (idempotent via table_idx==-1).
 
