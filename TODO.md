@@ -6,8 +6,10 @@ registry (`architectures[0]`); `models/qwen3_6` text tower maps config -> params
 bakes Gemma norms (+1 at load), and ships a full **CPU fp32 reference forward**
 (embeddings, partial-rope GQA attention with output gate, GatedDeltaNet recurrence,
 NVFP4 MoE + shared expert, lm_head). A gated test runs it against the real
-checkpoint: finite + deterministic logits, plausible top-1 (decision 12).
-Remaining M1: engine config TOML + scheduler + sampling + tokenizer + axum
+checkpoint: finite + deterministic logits, plausible top-1 (decision 12). Engine
+`src/config.rs` (TOML, TODO.md section 4 schema) landed with serde/toml,
+strict typing + defaults, model-agnostic validation (52 lib tests).
+Remaining M1: scheduler + sampling + tokenizer + engine loop + axum
 `/v1/completions` on the reference path.
 
 Goal: a **minimal, fast, single-GPU** Rust serving engine for **one model** --
