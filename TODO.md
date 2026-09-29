@@ -15,9 +15,13 @@ against the checkpoint's `tokenizer.json` confirm eos `248044`/`248046` and
 lossless prompt round-trip (58 lib tests). `domain/sampling.rs` landed
 (FreeToken-mirror `SamplingParams`, greedy argmax fast-path with lowest-id
 tie-break, stable softmax/top_k/top_p/renorm/deterministic splitmix64 draw;
-68 lib tests).
-Remaining M1: scheduler + sampling + engine loop + axum
-`/v1/completions` on the reference path.
+68 lib tests). Domain cache + scheduler landed: `expert_cache.rs` (LRU slot
+machine, bit-identical to FreeToken's CPU oracle), `kvcache.rs` (page free-list,
+per-req page table with sentinel dummy rows, radix prefix tree with split /
+whole-leaf LRU / ref-counted locks, GDN state free-list), `scheduler.rs`
+(Req/Batch, prefill-priority batching, stop rules). 96 lib tests.
+Remaining M1: application engine loop + axum `/v1/completions` on the
+reference path.
 
 Goal: a **minimal, fast, single-GPU** Rust serving engine for **one model** --
 `Qwen3.6-35B-A3B-NVFP4` (MoE + hybrid GatedDeltaNet/attention) -- using FreeToken's
@@ -215,8 +219,8 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 - [ ] P1 [opt] reuse FlashInfer C API (paged prefill/decode) instead of custom attention kernels (see decisions).
 
 ### MoE offload cache
-- [ ] P0 flat id space `layer*num_experts + expert`; tables `slot_for_id[L*E]` (-1 free), `id_of_slot[C]`, `usage[C]` step clock.
-- [ ] P0 `ensure_experts` (LRU): rewrite routed ids -> slot ids in place; emit miss list; LRU victim = argmin(usage) with same-step owner protection (an expert used earlier in this step may not be evicted).
+- [x] P0 flat id space `layer*num_experts + expert`; tables `slot_for_id[L*E]` (-1 free), `id_of_slot[C]`, `usage[C]` step clock. (`domain/expert_cache.rs`)
+- [x] P0 `ensure_experts` (LRU): rewrite routed ids -> slot ids in place; emit miss list; LRU victim = argmin(usage) with same-step owner protection (an expert used earlier in this step may not be evicted).
 - [ ] P0 `copy_missing`: fused copy of all banks' missed rows on the compute stream (serial per step).
 - [ ] P0 prefill: `materialize_layer` per-layer full stream; `prefill_overlap` two-buffer (copy stream + ready/release events, layer+1 prefetch) guarded by `cache_size >= 2*E`.
 - [ ] P0 `cache_size_slots` explicit from config; floor `>= num_experts`.
@@ -224,18 +228,18 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 
 ### KV cache + radix
 - [ ] P0 MHA paged pool `[2, num_full_layers, num_pages, page_size, kv_heads, head_dim]` with global-layer->dense-index remap (only 10 full layers get slabs).
-- [ ] P0 page free-list (`free_slots` holds page bases) + per-req page table holding **token locations** + dummy row pointing at a sentinel page.
-- [ ] P0 radix prefix tree: walk by first-page-key, `std::mismatch`-comparison align-down to page, node split, insert, LRU evict (unlocked leaf only), ref-counted handles.
+- [x] P0 page free-list (`free_slots` holds page bases) + per-req page table holding **token locations** + dummy row pointing at a sentinel page. (`domain/kvcache.rs`)
+- [x] P0 radix prefix tree: walk by first-page-key, `std::mismatch`-comparison align-down to page, node split, insert, LRU evict (unlocked leaf only), ref-counted handles. (`domain/kvcache.rs`, page_size=1)
 - [ ] P0 prefill flow: `match_req` -> lock -> allocate_paged -> compute/store kv -> `cache_req` commit (unfinished rows re-point at canonical tree pages).
-- [ ] P0 GDN linear-state pool: conv-state `[Lg, slots, conv_dim, ker-1]` + recurrent `[Lg, slots, vh, dk, dv]` fp32; ping-pong live slots; restore before decode reuse.
+- [x] P0 GDN linear-state pool: free-slot bookkeeping (conv-state + recurrent fp32 rows are infra tensors); ping-pong live slots and restore land with the hybrid path.
 - [ ] [opt] hybrid_radix full feature: donate GDN snapshot at chunk boundary (x64 alignment), dual (full+mamba) refcounts, dual eviction (tombstones). Without it, fall back to radix-KV-only + always-cold GDN state.
 
 ### Scheduler
 - [x] P0 in-process tokenize/detokenize.
-- [ ] P0 strict prefill-priority `schedule_next_batch()`; chunked prefill budget `max_prefill_length`; no decode starvation guard in v0 (mirror FreeToken, note as known issue).
-- [ ] P0 decode batch sorted by uid (deterministic).
+- [x] P0 strict prefill-priority `schedule_next_batch()`; chunked prefill budget `max_prefill_length`; no decode starvation guard in v0 (mirror FreeToken, note as known issue). (simple M1 form in `domain/scheduler.rs`)
+- [x] P0 decode batch sorted by uid (deterministic).
 - [ ] P0 per-step `run_forward`: build positions/mapping/out_loc -> model forward -> sample -> scatter token_pool -> `complete_one()` advancement -> D2H next-token for stop/detokenize.
-- [ ] P0 stop handling: max_tokens, eos (`248044`), stop-strings (decode last N tokens); EOS/stop wins over length.
+- [x] P0 stop handling: max_tokens, eos (`248044`), stop-strings (decode last N tokens); EOS/stop wins over length.
 - [ ] P0 abort: mark aborted; free resources only after in-flight forward drained (idempotent via table_idx==-1).
 
 ### Sampling
