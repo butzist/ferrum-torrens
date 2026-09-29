@@ -2,3 +2,4 @@
 // CUDA and HTTP types; never imported by the domain core.
 
 pub mod ftw;
+pub mod tokenizers_hf;

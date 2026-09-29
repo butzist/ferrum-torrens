@@ -8,8 +8,12 @@ bakes Gemma norms (+1 at load), and ships a full **CPU fp32 reference forward**
 NVFP4 MoE + shared expert, lm_head). A gated test runs it against the real
 checkpoint: finite + deterministic logits, plausible top-1 (decision 12). Engine
 `src/config.rs` (TOML, TODO.md section 4 schema) landed with serde/toml,
-strict typing + defaults, model-agnostic validation (52 lib tests).
-Remaining M1: scheduler + sampling + tokenizer + engine loop + axum
+strict typing + defaults, model-agnostic validation (52 lib tests). Tokenizer
+landed: `domain/tokenizer.rs` port + `infrastructure/tokenizers_hf.rs` (HF
+`tokenizers` crate, byte-level BPE, `add_special_tokens=false`); gated tests
+against the checkpoint's `tokenizer.json` confirm eos `248044`/`248046` and
+lossless prompt round-trip (58 lib tests).
+Remaining M1: scheduler + sampling + engine loop + axum
 `/v1/completions` on the reference path.
 
 Goal: a **minimal, fast, single-GPU** Rust serving engine for **one model** --
@@ -224,7 +228,7 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 - [ ] [opt] hybrid_radix full feature: donate GDN snapshot at chunk boundary (x64 alignment), dual (full+mamba) refcounts, dual eviction (tombstones). Without it, fall back to radix-KV-only + always-cold GDN state.
 
 ### Scheduler
-- [ ] P0 in-process tokenize/detokenize.
+- [x] P0 in-process tokenize/detokenize.
 - [ ] P0 strict prefill-priority `schedule_next_batch()`; chunked prefill budget `max_prefill_length`; no decode starvation guard in v0 (mirror FreeToken, note as known issue).
 - [ ] P0 decode batch sorted by uid (deterministic).
 - [ ] P0 per-step `run_forward`: build positions/mapping/out_loc -> model forward -> sample -> scatter token_pool -> `complete_one()` advancement -> D2H next-token for stop/detokenize.
