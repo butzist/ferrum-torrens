@@ -106,6 +106,51 @@ pub fn probe_cuda() -> CudaProbe {
     }
 }
 
+/// The device a test or a load should use: whatever `Auto` resolves to on this
+/// host. Device-agnostic so one test body runs in the sandbox and in a devshell.
+#[cfg(feature = "cuda")]
+pub fn auto_device() -> Device {
+    resolve_device(DeviceRequest::Auto, 0, probe_cuda()).expect("auto never fails")
+}
+
+/// A row-major `data` as an f32 tensor of `shape` on `device`.
+///
+/// Every dense weight in the checkpoint is stored in a narrow dtype that libtorch
+/// cannot matmul, so they are widened once at load and handed over as plain f32
+/// here. `shape` is row-major, matching how the FTW index stores shapes.
+#[cfg(feature = "cuda")]
+pub fn f32_tensor(data: &[f32], shape: &[i64], device: Device) -> tch::Tensor {
+    tch::Tensor::from_slice(data)
+        .reshape(shape)
+        .to(device.to_tch())
+}
+
+/// A row-major `data` as a bfloat16 tensor of `shape` on `device`.
+///
+/// This is the storage dtype for the widened weights: it is what the checkpoint
+/// itself uses for most tensors, it halves the resident bytes against the 8 GB
+/// target, and libtorch accumulates f32 through a bf16 matmul anyway.
+///
+/// The round trip goes through an f32 tensor rather than a blob over the raw
+/// bytes, so the result owns its data instead of borrowing a slice that the
+/// caller has to keep alive.
+#[cfg(feature = "cuda")]
+pub fn bf16_tensor(data: &[f32], shape: &[i64], device: Device) -> tch::Tensor {
+    f32_tensor(data, shape, device).to_kind(tch::Kind::BFloat16)
+}
+
+/// Copy a tensor's elements back to the host as f32. The forward's only crossing
+/// point back into the domain, which is why the `Model` trait can stay
+/// device-agnostic.
+#[cfg(feature = "cuda")]
+pub fn to_f32_vec(t: &tch::Tensor) -> Vec<f32> {
+    let flat = t.to_kind(tch::Kind::Float).contiguous().flatten(0, -1);
+    let n = flat.numel();
+    let mut out = vec![0.0f32; n];
+    flat.copy_data(&mut out, n);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,5 +267,74 @@ mod tests {
         let c = a.matmul(&b);
         assert_eq!(c.size(), vec![2, 4]);
         assert!(c.sum(tch::Kind::Double).double_value(&[]) == 24.0);
+    }
+
+    #[cfg(feature = "cuda")]
+    fn here() -> Device {
+        auto_device()
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn f32_tensor_round_trips_a_known_buffer() {
+        let d = here();
+        let data: Vec<f32> = (0..6).map(|i| i as f32 * 0.5).collect();
+        let t = f32_tensor(&data, &[2, 3], d);
+        assert_eq!(t.size(), vec![2, 3]);
+        assert_eq!(to_f32_vec(&t), data);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn f32_tensor_handles_a_rank_one_shape() {
+        let d = here();
+        let t = f32_tensor(&[1.0, 2.0, 3.0], &[3], d);
+        assert_eq!(t.dim(), 1);
+        assert_eq!(to_f32_vec(&t), vec![1.0, 2.0, 3.0]);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn bf16_tensor_keeps_bf16_precision() {
+        // bf16 holds 8 mantissa bits, so these must be exact while the gap below
+        // them is below the format's resolution. The check pins the storage
+        // precision rather than libtorch's arithmetic.
+        let exact = [1.0f32, 0.5, 2.0, -1.0, 0.0];
+        let t = bf16_tensor(&exact, &[5], here());
+        assert_eq!(t.kind(), tch::Kind::BFloat16);
+        assert_eq!(to_f32_vec(&t), exact.to_vec());
+
+        let lossy = [1.0f32 / 3.0, 0.1];
+        let back = to_f32_vec(&bf16_tensor(&lossy, &[2], here()));
+        for (got, want) in back.iter().zip(lossy.iter()) {
+            assert!(
+                (got - want).abs() < 1e-2,
+                "{got} is not within bf16 resolution of {want}"
+            );
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_tensor_survives_a_device_move() {
+        // On a CPU host this is the identity, on a GPU host a real copy. Both
+        // must give the same values, which is what makes the load path
+        // device-agnostic.
+        let data: Vec<f32> = (0..8).map(|i| i as f32).collect();
+        let on_host = f32_tensor(&data, &[2, 4], Device::Cpu);
+        let on_device = on_host.to(here().to_tch());
+        assert_eq!(to_f32_vec(&on_device), data);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn matmul_accumulates_the_row_major_layout_we_uploaded() {
+        // A 2x3 times 3x2, checked exactly, so a transposed or column-major
+        // upload would fail here rather than as a subtly wrong completion.
+        let d = here();
+        let a = f32_tensor(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], d);
+        let b = f32_tensor(&[7.0, 8.0, 9.0, 10.0, 11.0, 12.0], &[3, 2], d);
+        let c = a.matmul(&b);
+        assert_eq!(to_f32_vec(&c), vec![58.0, 64.0, 139.0, 154.0]);
     }
 }
