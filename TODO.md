@@ -1,33 +1,16 @@
 # FerrumTorrens -- FreeToken MVP port to Rust: TODO
 
-Status: M1 in progress -- conversion DONE. FTW index parser + mmap reader landed
-(strict TDD, clippy/fmt clean); the FTW dir's `config.json` dispatches the
-registry (`architectures[0]`); `models/qwen3_6` text tower maps config -> params,
-bakes Gemma norms (+1 at load), and ships a full **CPU fp32 reference forward**
-(embeddings, partial-rope GQA attention with output gate, GatedDeltaNet recurrence,
-NVFP4 MoE + shared expert, lm_head). A gated test runs it against the real
-checkpoint: finite + deterministic logits, plausible top-1 (decision 12). Engine
-`src/config.rs` (TOML, TODO.md section 4 schema) landed with serde/toml,
-strict typing + defaults, model-agnostic validation (52 lib tests). Tokenizer
-landed: `domain/tokenizer.rs` port + `infrastructure/tokenizers_hf.rs` (HF
-`tokenizers` crate, byte-level BPE, `add_special_tokens=false`); gated tests
-against the checkpoint's `tokenizer.json` confirm eos `248044`/`248046` and
-lossless prompt round-trip (58 lib tests). `domain/sampling.rs` landed
-(FreeToken-mirror `SamplingParams`, greedy argmax fast-path with lowest-id
-tie-break, stable softmax/top_k/top_p/renorm/deterministic splitmix64 draw;
-68 lib tests). Domain cache + scheduler landed: `expert_cache.rs` (LRU slot
-machine, bit-identical to FreeToken's CPU oracle), `kvcache.rs` (page free-list,
-per-req page table with sentinel dummy rows, radix prefix tree with split /
-whole-leaf LRU / ref-counted locks, GDN state free-list), `scheduler.rs`
-(Req/Batch, prefill-priority batching, stop rules). The engine loop landed:
-`application/engine.rs` (config -> FTW -> registry model + tokenizer + eos list
--> `Engine`, batched `run_forward` over whole sequences, `page_size` and
-`cache_size >= num_experts` floors) and `application/generation.rs` (uid-keyed
-token/text store, scheduler-driven step loop, length/EOS/stop-string rules with
-EOS winning over length, `max_tokens` clamped by engine limits and context
-room). 119 lib tests; the gated real-checkpoint load test passes (eos
-`[248046, 248044]`, `Hello` round-trips through the HF tokenizer).
-Remaining M1: axum `/v1/completions` on the reference path.
+Status: M1 in progress -- conversion DONE. The server is up: config -> FTW ->
+model + tokenizer -> engine loop -> axum `/v1/completions`, `/v1/models`,
+`/health` (134 lib tests, gated real-checkpoint load + prediction tests).
+**Blocked on correctness**: the CPU reference forward does not match the live
+FreeToken GPU oracle ("The capital of France is" -> `"dg"` vs `" Paris"`); see
+decision 13. Cost of the reference path is ~127 s per forward (decision 14).
+Earlier work: FTW index parser + mmap reader, registry dispatch, CPU fp32
+reference forward (embeddings, partial-rope GQA attention with output gate,
+GatedDeltaNet recurrence, NVFP4 MoE + shared expert, lm_head), `src/config.rs`
+(TOML schema, strict typing + defaults), tokenizer port + HF adapter,
+`sampling.rs`, `expert_cache.rs`, `kvcache.rs`, `scheduler.rs`.
 
 Goal: a **minimal, fast, single-GPU** Rust serving engine for **one model** --
 `Qwen3.6-35B-A3B-NVFP4` (MoE + hybrid GatedDeltaNet/attention) -- using FreeToken's
@@ -242,6 +225,9 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 
 ### Scheduler
 - [x] P0 in-process tokenize/detokenize.
+- [x] P0 `POST /v1/completions` (non-stream, n=1, `cmpl-{uid}` ids, usage block, `spawn_blocking` for the forward), `GET /v1/models`, `GET /health`. (`infrastructure/http.rs`, `main.rs`)
+- [ ] P0 SSE framing `data: {json}\n\n` + `data: [DONE]`; `chatcmpl-{uid}` ids; usage block.
+- [ ] P0 streaming (`stream: true`) returns 501 for now; `presence_penalty`/`frequency_penalty`/`best_of`/`user` still 400 (`deny_unknown_fields`).
 - [x] P0 strict prefill-priority `schedule_next_batch()`; chunked prefill budget `max_prefill_length`; no decode starvation guard in v0 (mirror FreeToken, note as known issue). (simple M1 form in `domain/scheduler.rs`)
 - [x] P0 decode batch sorted by uid (deterministic).
 - [x] P0 per-step `run_forward`: build positions/answers -> model forward -> sample -> `complete_one()` advancement -> next-token for stop/detokenize. (M1 reference form in `application/engine.rs` + `application/generation.rs`; `token_pool` scatter and `out_loc` land with the paged KV pool)
@@ -336,6 +322,22 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
     Verified by `tests/ftw_real_forward.rs` (gated): forward on the converted
     checkpoint is finite, deterministic, and yields a plausible argmax; exact
     logits vs FreeToken is a host-side harness step.
+13. **BLOCKER: the reference forward does not match FreeToken (2026-09-30)** --
+    A live FreeToken 0.1.3 GPU server on `127.0.0.1:1919` is the oracle. For
+    `"The capital of France is"` greedy it returns `" Paris, a"` (first token id
+    **11751**); our reference forward returns id 33974 (`"dg"`). Finite,
+    deterministic and in-vocab are not correctness. Suspects, in order: NVFP4
+    expert dequant / gate_up packing, GDN recurrence details (conv kernel, gate
+    `dt_bias`/`A_log` fp32, state layout), partial-rope dimension split, the
+    attention output gate, or lm_head/embedding mapping. `tests/engine_real_generate.rs`
+    (gated) pins the oracle value so the fix is measurable; the FreeToken server is
+    the comparison loop (~2 min per probe on the CPU reference).
+14. **Reference forward cost** -- scalar, single-threaded, no BLAS: one forward
+    over a 5-token prompt measured **126.7 s** (release, 16-core Ryzen 7 8745HX),
+    so a 12-token completion re-feeds the prefix and takes ~1 h. It is a
+    correctness oracle, not a serving path. Multi-threading the reductions
+    (`rayon`, fixed chunk order for reproducibility) is the cheap win for the
+    debugging loop; the GPU path (decision 2) is the real fix.
 
 ### Config defaults for the RTX 5060 / 8 GB target
 
