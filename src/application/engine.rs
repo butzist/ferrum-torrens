@@ -372,12 +372,16 @@ pub(crate) mod fake {
     }
 
     /// Whitespace tokenizer: one id per byte, plus FAKE_EOS as `<eos>`.
+    /// `<before-eos>` is the reserved prompt that tokenizes to the id one below
+    /// FAKE_EOS, so a counter run samples FAKE_EOS as its very next token.
     pub struct FakeTokenizer;
 
     impl Tokenizer for FakeTokenizer {
         fn encode(&self, text: &str) -> Result<Vec<u32>, TokenizerError> {
-            if text == "<eos>" {
-                return Ok(vec![FAKE_EOS]);
+            match text {
+                "<eos>" => return Ok(vec![FAKE_EOS]),
+                "<before-eos>" => return Ok(vec![FAKE_EOS - 1]),
+                _ => {}
             }
             Ok(text.bytes().map(|b| b as u32).collect())
         }

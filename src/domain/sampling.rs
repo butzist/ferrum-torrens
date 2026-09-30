@@ -319,7 +319,11 @@ mod tests {
     #[test]
     fn serde_defaults_match_the_default_impl() {
         let from_json: SamplingParams = serde_json::from_str("{}").unwrap();
-        assert_eq!(from_json, SamplingParams::default(), "an empty object is the default");
+        assert_eq!(
+            from_json,
+            SamplingParams::default(),
+            "an empty object is the default"
+        );
         assert_eq!(from_json.top_k, -1, "top_k defaults to disabled, not 0");
         assert_eq!(from_json.top_p, 1.0, "top_p defaults to no filtering");
         assert!(from_json.is_greedy(), "an empty object samples greedily");

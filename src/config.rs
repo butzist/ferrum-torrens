@@ -178,6 +178,16 @@ impl FromStr for Config {
 }
 
 impl Config {
+    /// The name the server advertises. Validation always fills it in (from
+    /// `serve.served_model_name`, else the model path's file stem), so a parsed
+    /// config always has one.
+    pub fn served_model_name(&self) -> &str {
+        self.serve
+            .served_model_name
+            .as_deref()
+            .expect("validated config has a served_model_name")
+    }
+
     fn validate(&mut self) -> Result<(), ConfigError> {
         let err = |m: &str| ConfigError::Invalid(m.to_string());
         let serve = &mut self.serve;
@@ -385,6 +395,11 @@ path = "/tmp/Qwen.ftw"
         .unwrap();
         assert_eq!(c.serve.port, DEFAULT_PORT);
         assert_eq!(c.serve.served_model_name.as_deref(), Some("Qwen"));
+        assert_eq!(
+            c.served_model_name(),
+            "Qwen",
+            "the accessor reads the derived name"
+        );
         assert_eq!(c.model.max_seq_len, DEFAULT_MAX_SEQ_LEN);
         assert_eq!(c.model.page_size, 1);
         assert_eq!(c.moe.cache_size_slots, DEFAULT_CACHE_SIZE_SLOTS);
