@@ -40,46 +40,77 @@ pub fn e4m3_with_row_scale(packed: &[u8], rows: usize, cols: usize, scale: &[f32
     out
 }
 
-/// NVFP4 block-scaled weights to f32, row-major `[rows, cols]`.
+/// NVFP4 block-scaled weights to f32, row-major `[rows, cols]`, **without** the
+/// per-row f16 global.
 ///
 /// Layout, as written by the converter and read by FreeToken's Triton kernels:
 /// * `packed[rows, cols/2]` u8, **low nibble = even k**, high nibble = odd k.
 /// * `scale[rows, cols/16]` e4m3fn, one per block of 16 along k.
-/// * `global[rows]` f16, applied once per output row, *after* the block scale,
-///   never folded into it (folding underflows).
 ///
 /// An empty `global` means no per-row scale, which is how a `weight_scale`-only
 /// tensor is expressed.
 pub fn nvfp4(packed: &[u8], rows: usize, cols: usize, scale: &[u8], global: &[u8]) -> Vec<f32> {
-    let mut out = vec![0.0f32; rows * cols];
-    let has_global = global.len() >= rows * 2;
-    for r in 0..rows {
-        let g = if has_global {
-            f16_to_f32(u16::from_le_bytes([global[2 * r], global[2 * r + 1]]))
-        } else {
-            1.0
-        };
-        let pbase = r * (cols / 2);
-        let sbase = r * (cols / 16);
-        for k in 0..cols {
-            out[r * cols + k] = fp4_nibble(packed[pbase + k / 2], k % 2 == 1)
-                * e4m3fn_to_f32(scale[sbase + k / 16])
-                * g;
+    let mut out = nvfp4_block(packed, rows, cols, scale);
+    let globals = nvfp4_globals(global, rows);
+    if !globals.is_empty() {
+        for r in 0..rows {
+            let g = globals[r];
+            for k in 0..cols {
+                out[r * cols + k] *= g;
+            }
         }
     }
     out
 }
 
-/// NVFP4 for one expert slab: `packed`/`scale`/`global` are already sliced to that
-/// expert's rows, so this is a plain `nvfp4` with no per-expert offsets.
-pub fn nvfp4_expert(
-    packed: &[u8],
-    scale: &[u8],
-    global: &[u8],
-    rows: usize,
-    cols: usize,
-) -> Vec<f32> {
-    nvfp4(packed, rows, cols, scale, global)
+/// NVFP4 with the block scale folded in but the per-row f16 global left out.
+///
+/// This split is what makes bf16 storage lossless: `fp4 * e4m3` needs at most
+/// four mantissa bits, well inside bf16's seven, so the widened value is
+/// represented exactly. The f16 global has ten mantissa bits and would not be,
+/// so it is returned separately by `nvfp4_globals` and applied as a per-output-row
+/// factor *after* the matmul -- which is also what the reference's packed gemm
+/// does, and what its Triton kernel does.
+pub fn nvfp4_block(packed: &[u8], rows: usize, cols: usize, scale: &[u8]) -> Vec<f32> {
+    let mut out = vec![0.0f32; rows * cols];
+    for r in 0..rows {
+        let pbase = r * (cols / 2);
+        let sbase = r * (cols / 16);
+        for k in 0..cols {
+            out[r * cols + k] = fp4_nibble(packed[pbase + k / 2], k % 2 == 1)
+                * e4m3fn_to_f32(scale[sbase + k / 16]);
+        }
+    }
+    out
+}
+
+/// The per-row f16 globals of an NVFP4 tensor, or empty when the tensor has
+/// none. Always apply after the matmul, never fold into the block scale
+/// (folding underflows).
+pub fn nvfp4_globals(global: &[u8], rows: usize) -> Vec<f32> {
+    if global.len() < rows * 2 {
+        return Vec::new();
+    }
+    (0..rows)
+        .map(|r| f16_to_f32(u16::from_le_bytes([global[2 * r], global[2 * r + 1]])))
+        .collect()
+}
+
+/// NVFP4 for one expert slab: `packed`/`scale` are already sliced to that
+/// expert's rows, so this is a plain `nvfp4_block` with no per-expert offsets.
+pub fn nvfp4_expert(packed: &[u8], scale: &[u8], rows: usize, cols: usize) -> Vec<f32> {
+    nvfp4_block(packed, rows, cols, scale)
+}
+
+/// Raw e4m3fn values, no row scale. Split out for the same reason as
+/// `nvfp4_block`: an e4m3 value needs three mantissa bits, so bf16 holds it
+/// exactly and the f32 row scale can be applied after the matmul.
+pub fn e4m3_values(packed: &[u8], rows: usize, cols: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; rows * cols];
+    for (i, &b) in packed.iter().take(rows * cols).enumerate() {
+        out[i] = e4m3fn_to_f32(b);
+    }
+    out
 }
 
 /// Bake the Gemma `1 + w` norm convention. The checkpoint stores the bare `w`;
@@ -220,9 +251,67 @@ mod tests {
     fn expert_slab_is_a_plain_nvfp4() {
         let packed = vec![0x21u8; 8];
         let scale = vec![e4m3(1.0)];
-        let out = nvfp4_expert(&packed, &scale, &[], 1, 16);
+        let out = nvfp4_expert(&packed, &scale, 1, 16);
         assert_eq!(out[0], 0.5);
         assert_eq!(out[1], 1.0);
+    }
+
+    #[test]
+    fn the_split_block_and_global_form_recompose_exactly() {
+        // This split is what makes bf16 storage lossless, so it has to
+        // recompose bit for bit.
+        let (rows, cols) = (8, 64);
+        let packed: Vec<u8> = (0..rows * cols / 2).map(|i| (i * 37 % 251) as u8).collect();
+        let scale: Vec<u8> = (0..rows * cols / 16)
+            .map(|i| e4m3(0.5 + (i % 8) as f32 * 0.25))
+            .collect();
+        let global: Vec<u8> = (0..rows)
+            .flat_map(|r| f16(0.5 + (r % 4) as f32 * 0.5))
+            .collect();
+
+        let whole = nvfp4(&packed, rows, cols, &scale, &global);
+        let blocks = nvfp4_block(&packed, rows, cols, &scale);
+        let globals = nvfp4_globals(&global, rows);
+        assert_eq!(globals.len(), rows);
+        for r in 0..rows {
+            for k in 0..cols {
+                let recomposed = blocks[r * cols + k] * globals[r];
+                assert_eq!(recomposed, whole[r * cols + k], "row {r} col {k}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_block_product_is_exactly_representable_in_bf16() {
+        // The whole reason the global is split out: fp4 x e4m3 must survive a
+        // bf16 round trip with no error, or bf16 storage would quietly lose
+        // weight precision.
+        let (rows, cols) = (4, 32);
+        let packed: Vec<u8> = (0..rows * cols / 2).map(|i| (i * 11 % 256) as u8).collect();
+        let scale: Vec<u8> = (0..rows * cols / 16)
+            .map(|i| e4m3(0.5 + (i % 8) as f32 * 0.25))
+            .collect();
+        let blocks = nvfp4_block(&packed, rows, cols, &scale);
+        for (i, &v) in blocks.iter().enumerate() {
+            let round = bf16_to_f32((v.to_bits() >> 16) as u16);
+            assert_eq!(round, v, "block value {i} ({v}) loses precision in bf16");
+        }
+    }
+
+    #[test]
+    fn raw_e4m3_values_survive_bf16_exactly() {
+        // Same argument for the FP8 path: every e4m3fn code must be exact in bf16
+        // so the row scale can be applied after the matmul.
+        let values = e4m3_values(&[0x38, 0x3c, 0xb8, 0x01, 0x7e, 0x00], 2, 3);
+        assert_eq!(values[0], 1.0);
+        assert_eq!(values[1], 1.5);
+        assert_eq!(values[2], -1.0);
+        assert_eq!(values[3], 2.0f32.powi(-9));
+        assert_eq!(values[4], 448.0);
+        assert_eq!(values[5], 0.0);
+        for &v in &values {
+            assert_eq!(bf16_to_f32((v.to_bits() >> 16) as u16), v, "{v}");
+        }
     }
 
     #[test]

@@ -45,7 +45,7 @@ fn softplus(x: f32) -> f32 {
 
 /// Row-wise rms_norm(x) * w over `row_len`-element rows; the (1 + w) Gemma bake
 /// already happened at load time. `x` may hold many rows sharing one weight.
-fn rms_norm(x: &[f32], w: &[f32], eps: f32, row_len: usize) -> Vec<f32> {
+pub(crate) fn rms_norm(x: &[f32], w: &[f32], eps: f32, row_len: usize) -> Vec<f32> {
     debug_assert_eq!(x.len() % row_len, 0);
     debug_assert_eq!(w.len(), row_len);
     let inv_rowlen = 1.0 / row_len as f32;
@@ -137,7 +137,14 @@ fn fp8_weight(ctx: &Ctx, name: &str) -> Result<(Vec<u8>, Vec<f32>)> {
     Ok((w.to_vec(), scale))
 }
 
-fn fp8_gemm(x: &[f32], w: &[u8], scale: &[f32], t: usize, rows: usize, cols: usize) -> Vec<f32> {
+pub(crate) fn fp8_gemm(
+    x: &[f32],
+    w: &[u8],
+    scale: &[f32],
+    t: usize,
+    rows: usize,
+    cols: usize,
+) -> Vec<f32> {
     let mut y = vec![0.0f32; t * rows];
     for (tt, xr) in x.chunks_exact(cols).enumerate() {
         for r in 0..rows {
@@ -152,7 +159,7 @@ fn fp8_gemm(x: &[f32], w: &[u8], scale: &[f32], t: usize, rows: usize, cols: usi
     y
 }
 
-fn bf16_gemm(x: &[f32], w: &[u8], t: usize, rows: usize, cols: usize) -> Vec<f32> {
+pub(crate) fn bf16_gemm(x: &[f32], w: &[u8], t: usize, rows: usize, cols: usize) -> Vec<f32> {
     let mut y = vec![0.0f32; t * rows];
     for (tt, xr) in x.chunks_exact(cols).enumerate() {
         for r in 0..rows {
@@ -210,7 +217,7 @@ pub fn nvfp4_gemv(
     y
 }
 
-fn nvfp4_gemm(
+pub(crate) fn nvfp4_gemm(
     x: &[f32],
     packed: &[u8],
     scale: &[u8],
@@ -278,7 +285,7 @@ pub fn apply_partial_rope(
     }
 }
 
-fn expand_heads(x: &[f32], t: usize, heads: usize, rep: usize, dim: usize) -> Vec<f32> {
+pub(crate) fn expand_heads(x: &[f32], t: usize, heads: usize, rep: usize, dim: usize) -> Vec<f32> {
     let mut out = Vec::with_capacity(t * heads * rep * dim);
     for i in 0..t {
         for h in 0..heads {
@@ -291,7 +298,13 @@ fn expand_heads(x: &[f32], t: usize, heads: usize, rep: usize, dim: usize) -> Ve
 }
 
 /// Causal depthwise conv1d, kernel K, left-pad K-1, then silu. `w` [c, K].
-fn causal_conv1d_silu(conv: &[f32], w: &[f32], t: usize, c: usize, k: usize) -> Vec<f32> {
+pub(crate) fn causal_conv1d_silu(
+    conv: &[f32],
+    w: &[f32],
+    t: usize,
+    c: usize,
+    k: usize,
+) -> Vec<f32> {
     let mut out = vec![0.0f32; t * c];
     for tt in 0..t {
         for ch in 0..c {
@@ -310,7 +323,7 @@ fn causal_conv1d_silu(conv: &[f32], w: &[f32], t: usize, c: usize, k: usize) -> 
 /// Reference GatedDeltaNet recurrence with fp32 state, ported from
 /// `gdn_reference.py`'s recurrent formulation.
 #[allow(clippy::too_many_arguments)]
-fn gdn_recurrence(
+pub(crate) fn gdn_recurrence(
     t: usize,
     hv: usize,
     dk: usize,
@@ -371,7 +384,7 @@ fn gdn_recurrence(
 
 /// Naive causal attention over one sequence; `at_flags` are not needed for a
 /// text-only reference (always dense) but keep the naive loop exact.
-fn causal_attention(
+pub(crate) fn causal_attention(
     q: &[f32],
     k: &[f32],
     v: &[f32],
@@ -678,7 +691,7 @@ fn moe_block(ctx: &Ctx, x_post: &[f32], layer: usize, t: usize) -> Result<Vec<f3
     Ok(routed)
 }
 
-fn softmax_rows(logits: &mut [f32], _n: usize, e: usize) {
+pub(crate) fn softmax_rows(logits: &mut [f32], _n: usize, e: usize) {
     for row in logits.chunks_exact_mut(e) {
         let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let mut sum = 0.0f32;
@@ -693,7 +706,7 @@ fn softmax_rows(logits: &mut [f32], _n: usize, e: usize) {
     }
 }
 
-fn topk_renorm(p: &[f32], n: usize, e: usize, k: usize) -> (Vec<usize>, Vec<f32>) {
+pub(crate) fn topk_renorm(p: &[f32], n: usize, e: usize, k: usize) -> (Vec<usize>, Vec<f32>) {
     let mut ids = vec![0usize; n * k];
     let mut w = vec![0.0f32; n * k];
     for r in 0..n {

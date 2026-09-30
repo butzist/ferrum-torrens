@@ -4,6 +4,8 @@
 
 pub mod config;
 pub mod forward;
+#[cfg(feature = "cuda")]
+pub mod forward_torch;
 pub mod weights;
 
 use crate::domain::model::{ForwardInput, LayerProbe, Model, ModelParams};
