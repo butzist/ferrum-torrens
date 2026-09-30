@@ -1,5 +1,6 @@
 // Pure domain core: data types and ports. No CUDA, no IO, no adapter imports.
 
+pub mod dequant;
 pub mod expert_cache;
 pub mod kvcache;
 pub mod model;
