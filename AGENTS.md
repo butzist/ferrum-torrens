@@ -26,8 +26,9 @@ Instructions for AI coding agents working in this repository.
 
 - Clean architecture, hexagonal, domain-driven. `TODO.md` section 3 groups code
   into a pure domain core (no CUDA, no IO), an application layer of use-cases
-  (scheduler, generation, `run_experts`), and infrastructure adapters (CUDA
-  runtime, FTW/mmap reader, axum server) that implement domain ports.
+  (scheduler, generation, `run_experts`), and infrastructure adapters (libtorch
+  compute runtime, the Triton kernel adapter, FTW/mmap reader, axum server) that
+  implement domain ports.
 - Ports are Rust traits defined in the domain core. Adapters depend on the core;
   the core never imports an adapter. Keep infra types (device tensors, mmap
   handles, HTTP types) out of the domain.
@@ -74,14 +75,26 @@ Instructions for AI coding agents working in this repository.
   comments. ASCII only (no em-dash, no arrows).
 - Keep everything GPU-only single-process in-process. This repo has no JS
   runtime (node/bun/deno were intentionally removed from the flake).
-- Rust is the only language in production code. Python exists solely for the
-  one-time HF -> FTW conversion via FreeToken's `ft` CLI (see below).
+- Rust is the production language. Python is used for the one-time HF -> FTW
+  conversion via FreeToken's `ft` CLI (see below) and, at runtime, for the fused
+  Triton kernels. Triton is a Python-embedded GPU kernel DSL; libtorch has no
+  CUDA NVFP4 GEMM (neither does upstream FreeToken, which is why it hand-writes
+  this kernel in Triton), so the one custom kernel stays Python/Triton for now.
+  A hand-written cudarc version is deferred, not ruled out. Keep Triton kernels
+  confined to the kernel adapter; the domain core stays pure Rust.
 
 ## Reference and tooling
 
 - `FreeToken/` is the reference implementation. It is READ-ONLY. Never edit it.
 - GPU runtime facts and target defaults live in `TODO.md` section 7
   (RTX 5060 Mobile 8 GB VRAM, sm_120) and `ALGORITHM.md` section 0.
+- **The sandbox has no GPU** (`cuInit=CUDA_ERROR_NO_DEVICE`) but the compute
+  runtime auto-detects that and falls back to CPU, so
+  `cargo test --features cuda` runs the libtorch forward and the correctness
+  gate on libtorch's CPU backend and needs no devshell. `model.device = "cuda"`
+  forces the GPU and is the only setting that needs a devshell; the GPU-only
+  pieces (CUDA-graph capture, the Triton NVFP4 kernel) are asked for explicitly
+  rather than discovered by a red test. See `TODO.md` decision 21.
 - The FTW checkpoint is served from the Nix store: add it with
   `nix store add-path <dir> --name qwen3.6-35b-a3b-nvfp4`; the jail binds
   `/nix/store` read-only, so agents can mmap the converted `.ftw` output turned
@@ -96,8 +109,14 @@ Instructions for AI coding agents working in this repository.
   `LD_LIBRARY_PATH="/run/opengl-driver/lib:$(dirname "$(gcc -print-file-name=libstdc++.so.6)")" \
    FreeToken/.venv/bin/ft checkpoint --model /nix/store/mpwkgysbh8dyxz8jlrwkhzcsp01v6my3-qwen3.6-35b-a3b-nvfp4 \
    --out .model-cache/Qwen3.6-35B-A3B-NVFP4.ftw --moe-backend offload --shard-gib 8`
-- Verify with: `cargo fmt --check`, `cargo clippy --all-targets`,
-  `cargo test`.
+- Verify with: `cargo fmt --check`, `cargo clippy --all-targets`, `cargo test`.
+  These are the CPU-only path and must stay green with no libtorch. The libtorch
+  adapter is behind the non-default `cuda` feature, so additionally run
+  `cargo clippy --all-targets --features cuda` inside the devshell (the flake
+  exports `LIBTORCH`, `LIBTORCH_INCLUDE`, `LIBTORCH_LIB`, `CXX`; see
+  `TODO.md` decision 19 -- they must be libtorch **roots**). The gated
+  oracle tests (`tests/engine_real_generate.rs`) need a GPU, so the agent sandbox
+  cannot run them; hand them to a devshell run.
 
 ## Commits
 

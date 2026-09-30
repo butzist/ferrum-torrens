@@ -1,16 +1,25 @@
 # FerrumTorrens -- FreeToken MVP port to Rust: TODO
 
-Status: M1 in progress -- conversion DONE. The server is up: config -> FTW ->
-model + tokenizer -> engine loop -> axum `/v1/completions`, `/v1/models`,
-`/health` (134 lib tests, gated real-checkpoint load + prediction tests).
-**Blocked on correctness**: the CPU reference forward does not match the live
-FreeToken GPU oracle ("The capital of France is" -> `"dg"` vs `" Paris"`); see
-decision 13. Cost of the reference path is ~127 s per forward (decision 14).
+Status: M1b in progress -- **switching the forward from the hand-written scalar
+CPU kernel to libtorch (`tch`) to get the first *correct* completion.** Why now:
+the scalar forward is numerically wrong and cannot be debugged into agreement
+(decision 13), costs ~127 s per forward (decision 14), and reading 18 GB of
+experts per forward is not a serving path. libtorch removes all three at once.
+Done so far: the `cuda` cargo feature + libtorch-in-the-flake wiring (decision
+2, 18, 19 -- verified `cargo build --features cuda` links against
+`libtorch-2.9.0` cu130), **auto-detected device selection with CPU as a real
+target (decision 21), so the torch forward and the correctness gate are testable
+in the agent sandbox on libtorch's CPU backend**; the FreeToken oracle value
+pinned in `tests/engine_real_generate.rs` (id 11751 = " Paris"), the
+shared-expert gate fixed to `sigmoid` (decision 16), and a logit-lens
+diagnostic (`Model::probe_layers`) that bisects a forward by depth. Next: the
+`TorchModel` adapter, then the first oracle-matching completion on CPU.
 Earlier work: FTW index parser + mmap reader, registry dispatch, CPU fp32
 reference forward (embeddings, partial-rope GQA attention with output gate,
 GatedDeltaNet recurrence, NVFP4 MoE + shared expert, lm_head), `src/config.rs`
 (TOML schema, strict typing + defaults), tokenizer port + HF adapter,
-`sampling.rs`, `expert_cache.rs`, `kvcache.rs`, `scheduler.rs`.
+`sampling.rs`, `expert_cache.rs`, `kvcache.rs`, `scheduler.rs`,
+`/v1/completions` + `/v1/models` + `/health` (152 lib tests, both builds green).
 
 Goal: a **minimal, fast, single-GPU** Rust serving engine for **one model** --
 `Qwen3.6-35B-A3B-NVFP4` (MoE + hybrid GatedDeltaNet/attention) -- using FreeToken's
@@ -50,7 +59,9 @@ with `--text-model-only`). Known-good bf16/Fp8 siblings: `Qwen/Qwen3.6-35B-A3B`,
 - Text-only. Never build vision towers; reject image inputs.
 - Single GPU, single process, in-process tokenizer (no ZMQ/tokenizer worker split).
 - Explicit sizing in a config file. **No `memory_ratio`**, no auto cache-budget planner.
-- All CUDA kernels compiled at build time (`build.rs` + `nvcc`), loaded as cached cubin at startup. **No Triton/python runtime, no JIT compilation at startup.**
+- All dense compute via libtorch (`tch`); the NVFP4 expert GEMV is the one
+  hand-written Triton kernel (decision 2). No build-time `nvcc`/fatbin step, no
+  cubin loading, no runtime JIT.
 - Prefill: chunked (default budget 8192), strict prefill-priority scheduling.
 - Decode: batched, CUDA-graph captured per batch size up to `max_running_req`, one model step per token.
 - Sampling: temperature / top_k / top_p / greedy (argmax) only. EOS + stop-strings + max-tokens.
@@ -80,11 +91,9 @@ forks the engine.
 
 ```
 ferrum-torrens/
-  Cargo.toml
-  build.rs                      # invokes nvcc over csrc/ kernels -> libferrum_kernels.a
-  sources/csrc/...              # CUDA C++ kernels (+ cbindgen C headers)
+  Cargo.toml                      # `cuda` feature gates the libtorch adapter
   src/
-    main.rs                     # CLI: serve, convert (delegates to python), params
+    main.rs                     # CLI: serve, params
     config.rs                   # TOML config -> typed structs (see §4); no model fields
     domain/                     # DDD core: no CUDA, no IO; ports are traits
       model.rs                  # MODEL trait + ModelParams (num_layers/experts/H/I...)
@@ -98,7 +107,8 @@ ferrum-torrens/
       qwen3_6/                  # Qwen3_5Moe text tower:
         config.rs               #   parse checkpoint text_config
         weights.rs              #   tensor-name scheme -> (layer, expert, part)
-        forward.rs              #   GDN + partial-rope GQA + router + block math
+        forward.rs              #   scalar CPU reference: the golden oracle (decision 12)
+        forward_torch.rs        #   libtorch forward: the serving path (feature = "cuda")
     application/                # use-cases orchestrating domain ports
       registry.rs               # FTW dir config.json architectures[0] -> ModelFactory
       engine.rs                 # load weights, schedule_next_batch, run_forward
@@ -107,16 +117,20 @@ ferrum-torrens/
     infrastructure/             # adapters implement the domain ports
       ftw.rs                    # FreeTokenWeight index parser + mmap reader (generic)
       banks.rs                  # per-layer expert host banks (pinned; QuantFormat-driven)
-      resident.rs               # dense weights -> GPU tensors
-      gpu.rs                    # cudarc wrapper: device, stream, event, tensors
-      kernels/mod.rs            # FFI to libferrum_kernels (generic ops + model kernel fns)
-      moe_offload.rs            # grouped NVFP4 MoE GEMM launcher + cache driver
+      torch.rs                  # libtorch compute runtime: device, tensors, streams, graphs
+      triton.rs                 # python/Triton NVFP4 expert GEMV adapter (the one kernel)
       kvcache_dev.rs            # mha_pool + radix on device tensors
-      server.rs                 # axum routes, SSE, chat template, generation
+      http.rs                   # axum routes, SSE, chat template, generation
       tokenizers_hf.rs          # HF `tokenizers` crate + minijinja chat template
   scripts/
     convert_hf_to_ftw.py        # one-time wrapper over FreeToken `ft checkpoint`
 ```
+
+Superseded by decision 2 (libtorch): the `build.rs` + `sources/csrc/` nvcc
+fatbin step, `infrastructure/gpu.rs` (cudarc wrapper) and
+`infrastructure/kernels/mod.rs` (FFI to a hand-built `libferrum_kernels`).
+`torch.rs` + `triton.rs` take their place. `moe_offload.rs` is folded into
+`triton.rs` + `run_experts.rs`.
 
 Model boundary contract:
 - `ModelParams` (from FTW `meta` + checkpoint config) is what the engine uses to
@@ -142,7 +156,8 @@ served_model_name = "Qwen3.6-35B-A3B-NVFP4"
 
 [model]
 path = "/mnt/models/Qwen3.6-35B-A3B-NVFP4.ftw"   # FTW dir (converted, one-time)
-gpu = 0                                          # cuda device / OG nvidia-smi index
+device = "auto"                               # auto | cpu | cuda
+gpu = 0                                       # cuda device / OG nvidia-smi index
 max_seq_len = 65536                              # explicit, no memory_ratio
 max_prefill_length = 8192                        # chunked-prefill token budget
 max_running_requests = 4
@@ -191,21 +206,66 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 - [ ] P1 load dense weights via the 4096-aligned O_DIRECT-friendly path (preadv) to cut startup, or rely on mmap page-in; decide.
 
 ### GPU runtime
-- [ ] P0 cudarc device init, compute stream + events.
-- [ ] P0 pinned staging buffers for batch metadata (positions / input_mapping / out_loc / token_pool / page_table sentinel dummy row).
-- [ ] P0 CUDA-graph capture for decode batch sizes `{1,2,4, max_running}` (shared mempool, dummy-req padding, logits `[bs, vocab]` inside graph).
-- [ ] P0 no-inference-during-capture warmup pattern (mirror `engine/graph.py`).
+- [x] P0 libtorch available to the build: `cuda` cargo feature (off by default so
+  the CPU-only unit suite never needs libtorch), `pkgs.libtorch-bin.override
+  {cudaSupport = true;}` (2.9.0, cu130) in the devshell, `LIBTORCH` /
+  `LIBTORCH_INCLUDE` / `LIBTORCH_LIB` as **roots** (decision 19). Verified:
+  `cargo build --features cuda` compiles and links.
+- [x] P0 `infrastructure/torch.rs`: `Device`/`DeviceRequest`/`CudaProbe`, the
+  pure `resolve_device` policy (unit-tested, no GPU needed), the `cfg(cuda)`
+  `probe_cuda`, and the `Display` used in the startup line. Verified: probe
+  reports `available=false, count=0` in the sandbox and libtorch's CPU backend
+  runs a matmul there (decision 21).
+- [x] P0 `model.device` config field (`auto`|`cpu`|`cuda`, default `auto`) with
+  `deny_unknown_fields` validation; `Engine` carries the resolved device and
+  `main.rs` prints it at startup so the operator sees what was picked.
+  (decision 21)
+- [ ] P0 dense weight upload: bf16 as-is, e4m3 FP8 dequantized to bf16 on the host
+  at load (libtorch has no e4m3 `mm`), NVFP4 `lm_head` dequantized to bf16 for
+  M1b. Gemma `1+w` baked at load. Skip the 333 `visual.*` tensors.
+- [ ] P0 `models/qwen3_6/forward_torch.rs`: the full tower in libtorch ops --
+  embed, add+rmsnorm, partial rope, GQA attention (`scaled_dot_product_attention`
+  with a GQA-expanded K/V, `is_causal`, then the sigmoid output gate), GDN
+  (conv1d + fp32 delta-rule recurrence), router softmax+topk+renorm, shared
+  expert, `run_experts` via the NVFP4 kernel, final norm, `lm_head`.
+- [ ] P0 `models/qwen3_6` picks its `Model` impl by feature: `cuda` -> torch,
+  otherwise the scalar reference (kept as the oracle, decision 12).
+- [ ] P0 first correct completion: `"The capital of France is"` greedy ->
+  `" Paris"` (id **11751**), gated in `tests/engine_real_generate.rs`; the gate
+  must pass, not merely be finite.
+- [ ] P0 `--features cuda` only affects the forward impl, not the engine call
+  shape: `Model::forward(&ForwardInput) -> Vec<f32>` and `Engine::run_forward`
+  stay unchanged (no KV cache, no graph, no offload yet).
 
-### Kernels (CUDA C++, built at build time, multi-arch fatbins)
-- [ ] P0 fused add+rmsnorm (Gemma `1+w`).
-- [ ] P0 silu / silu-and-mul / sigmoid / softplus / topk-softmax router.
-- [ ] P0 NVFP4 grouped MoE GEMM, decode (marlin-style nibble) and prefill (interleaved lo/hi) variants; e2m1 LUT {0,0.5,1,1.5,2,3,4,6,-...}, e4m3 block-scale decode, fp16 per-row global, weighted sum of topk partials.
-- [ ] P0 paged GQA attention prefill (flash-attention-2 style) + paged decode, page_size=1, NHD, `pos_encoding_mode=none`.
-- [ ] P0 partial-rope kernel (first 64 of 256 dims).
-- [ ] P0 GDN: causal depthwise conv1d (kernel 4), fused gated-delta-rule **chunked prefill** kernel and **single-token decode** update (fp32 recurrent state `[v_heads,dk,dv]`), GatedRMSNorm.
-- [ ] P0 sampling kernels: argmax (greedy), top_k/top_p filter + renormalize for non-greedy rows.
-- [ ] P1 fused MoE copy kernel for offload misses (pinned -> slot rows, 16-byte aligned, one fused multi-bank launch).
-- [ ] P1 [opt] reuse FlashInfer C API (paged prefill/decode) instead of custom attention kernels (see decisions).
+### Kernels (Triton via the python adapter; the NVFP4 expert GEMV only)
+- [ ] P0 **the one hand-written kernel**: NVFP4 grouped expert GEMM, decode
+  (marlin-style nibble) and prefill (interleaved lo/hi) variants; e2m1 LUT
+  {0,0.5,1,1.5,2,3,4,6,-...}, e4m3 block-scale decode, fp16 per-row global
+  applied once after the K reduction, weighted sum of topk partials.
+  M1b may start with a **torch-native** dequantize-to-bf16 + `bmm` stand-in to get
+  correctness first, then swap the kernel in behind the same port.
+- [x] P0 everything else libtorch already provides: silu/sigmoid/softplus/softmax/
+  topk (router), rmsnorm (+Gemma `1+w`), partial rope, paged GQA attention
+  (FlashInfer, `fi` semantics), GDN chunked prefill + single-token decode
+  (ALGORITHM.md 2.3.1), argmax/top_k/top_p sampling. No CUDA C++ to write.
+- [ ] P1 CUDA-graph capture for decode batch sizes `{1,2,4, max_running}` (shared
+  mempool, dummy-req padding, logits `[bs, vocab]` inside graph) via tch, plus the
+  no-inference-during-capture warmup pattern (mirror `engine/graph.py`).
+- [ ] P1 pinned staging buffers for batch metadata (positions / input_mapping /
+  out_loc / token_pool / page_table sentinel dummy row).
+
+### Superseded by libtorch (decision 2) -- do not implement
+- [ ] ~~fused add+rmsnorm~~ (libtorch: `add` + `rms_norm`).
+- [ ] ~~sigmoid / silu-and-mul / topk-softmax router kernel~~ (libtorch ops).
+- [ ] ~~paged GQA attention prefill+decode kernel~~ (FlashInfer via libtorch, so
+  the "[opt] reuse the FlashInfer C API" idea is simply what we do).
+- [ ] ~~partial-rope kernel~~ (`Tensor` slicing + `cos`/`sin`).
+- [ ] ~~GDN conv1d / delta-rule / GatedRMSNorm kernels~~ (torch ops; the fast
+  chunked form is ALGORITHM.md 2.3.1).
+- [ ] ~~sampling kernels~~ (`argmax`, `topk`, `cumsum` for top_p).
+- [ ] ~~`build.rs` + `csrc/` nvcc fatbins, cudarc wrapper, cubin cache~~.
+- [ ] ~~fused MoE copy kernel for offload misses~~ (one `index_select` + `copy_`
+  per miss batch from a pinned host buffer).
 
 ### MoE offload cache
 - [x] P0 flat id space `layer*num_experts + expert`; tables `slot_for_id[L*E]` (-1 free), `id_of_slot[C]`, `usage[C]` step clock. (`domain/expert_cache.rs`)
@@ -250,17 +310,33 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 - [ ] [opt] `/v1/responses` (needed only for Codex).
 
 ### Hygiene
-- [ ] P0 `cargo clippy`, `cargo fmt`, unit tests for ftw index parsing, radix, LRU, config parse, and a reference `gdn_reference.rs` used in correctness tests vs CUDA kernels.
-- [ ] P0 correctness gate: greedy logits match FreeToken output within tolerance on a short prompt (harness script).
+- [ ] P0 `cargo clippy`, `cargo fmt`, unit tests for ftw index parsing, radix, LRU, config parse, and a reference `gdn_reference.rs` used in correctness tests vs the libtorch/flash-attention GDN path.
+- [x] P0 **correctness gate**: greedy next token matches the FreeToken oracle on a
+  short prompt, pinned as an exact id in the gated
+  `tests/engine_real_generate.rs` (`"The capital of France is"` -> **11751**,
+  `" Paris"`). The gate asserts the id, so it fails until the port is actually
+  right. Also pinned: `tests/ftw_real_forward.rs` (finite, deterministic,
+  plausible argmax) for the scalar oracle.
 - [ ] P1 smoke: llama.cpp-style single-request throughput; token/s vs paper (77-83 tok/s on RTX 5090) as a target, not a benchmark suite.
 
 ## 6. Milestones
 
-- **M1 vertical slice**: FTW load -> one greedy non-stream `/v1/completions` correct end-to-end (naive attention, reference-GDN, dense MoE or cache_size=all).
+- **M1a vertical slice (shape, not numbers)** -- DONE: FTW load -> greedy
+  non-stream `/v1/completions` returns a finite in-vocab token, via the scalar
+  CPU reference. Wrong numbers, ~127 s/step (decisions 13, 14).
+- **M1b correct completion (CURRENT)** -- port the forward to libtorch and make
+  `"The capital of France is"` -> `" Paris"` (id 11751) come out of the real
+  server. The scalar reference stays as the oracle it was meant to be
+  (decision 12); correctness is proven against the FreeToken GPU oracle, not
+  against our own CPU path.
 - **M2 API**: sampling params, chat template + `/v1/chat/completions`, SSE.
-- **M3 performance**: NVFP4 fused MoE kernels, paged attention kernels, CUDA-graph decode, correct fast GDN.
-- **M4 offload**: LRU slot cache + fused copy + prefill double buffer; radix prefix cache; batch concurrency.
-- **M5**: optional APIs (Anthropic/Responses), hybrid_radix GDN reuse, startup load tuning.
+- **M3 performance**: the NVFP4 expert Triton kernel (replacing the torch
+  dequantize+bmm stand-in), paged KV + radix, fast chunked GDN, CUDA-graph
+  decode, prefill/decode split so decode stops re-feeding the prefix.
+- **M4 offload**: LRU slot cache + fused copy + prefill double buffer; radix
+  prefix cache wired to the running server; batch concurrency.
+- **M5**: optional APIs (Anthropic/Responses), hybrid_radix GDN reuse, startup
+  load tuning.
 
 ## 7. Decisions (confirmed)
 
@@ -271,18 +347,29 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
    non-expert weights ~2.5-3 GB; expert cache at 256-512 slots; KV is cheap
    (~20 KB/token, full-attention layers only). If more VRAM later, only config
    numbers change.
-2. **Kernel backend** -- **no libTorch**. cudarc (CUDA driver/context) + cuBLAS for
-   dense GEMM + our own CUDA kernels in `csrc/`, compiled by `build.rs` with
-   **multi-arch fatbins** (e.g. `sm_90`, `sm_120`; cubin picked at startup from
-   `compute_capability`). No runtime JIT. FlashInfer (which `fi` links) has no Rust
-   wrapper and covers only full-attention paged kernels; treat it as an optional later
-   swap, not a dependency.
+2. **Kernel backend** -- **libtorch via the `tch` crate**, plus **one hand-written
+   Triton kernel** for the NVFP4 expert GEMV. SUPERSEDES the earlier "no libTorch,
+   cudarc + multi-arch fatbins" plan; see decision 15 for the evidence.
+   Rationale: (a) the plan's stated reason for avoiding libtorch was that it
+   lacks the NVFP4 kernel we need, and that is false -- libtorch has no CUDA fp4
+   GEMM either, which is exactly why upstream FreeToken hand-writes it in Triton
+   too, so that kernel is hand-written under either backend and libtorch does not
+   make it harder; (b) libtorch supplies paged attention (FlashInfer, which
+   FreeToken itself uses via its `fi` extra), CUDA graph capture for decode,
+   tokenizer and dense ops, none of which we would otherwise write; (c) our
+   hand-written scalar forward is currently numerically wrong (decision 13) and
+   libtorch deletes that class of bug outright. Cost accepted: ~2.5 GB
+   libtorch+CUDA install, Linux-only, and Python at runtime for Triton.
+   `pkgs.libtorch-bin` (2.9.0, cu13, includes `sm_120`) from the flake; a
+   hand-written cudarc/ptxas backend stays a documented later option.
 3. **Server framework / API** -- **axum**, OpenAI-compatible only
    (`/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/health`).
 4. **Tokenizer** -- **HF `tokenizers` crate** (byte-level BPE) + **minijinja** chat
    templates, in-process; no python at runtime.
-5. **GDN kernels M1** -- **reference-faithful recurrence first** (golden oracle);
-   the fast chunked kernels are specified in ALGORITHM.md 2.3.1 and scheduled for M3.
+5. **GDN recurrence** -- implement the **reference-faithful recurrence first** and
+   keep it forever: it is the oracle the libtorch/flash-attention GDN paths are
+   validated against (ALGORITHM.md 2.3.1 is the fast chunked form, and it lands
+   in M3, not before correctness is proven).
 6. **hybrid_radix depth** -- MVP does radix-KV-only with cold per-request GDN states.
    Cross-request GDN-state donation (tombstones, dual eviction) is P2.
 7. **Host expert-bank load** -- `preadv` into pinned host buffers, serial per layer.
@@ -311,33 +398,128 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
     core engine obligations for every supported model ("moe caching and streaming
     is a must"); slot dtype is a `QuantFormat` enum (Nvfp4 first, Fp8/Bf16 later)
     so new archs reuse the cache unchanged.
-12. **M1 reference forward** -- because the sandbox has no GPU runtime, M1 runs the
-    **CPU fp32 reference forward** as the model implementation behind the `Model`
-    trait: it is both the M1 correctness path and the golden oracle the M3 CUDA
-    kernels are validated against (ALGORITHM.md 2.3.1). It recomputes the whole
-    sequence every step (no KV/radix/offload cache in M1), reads experts straight
-    from the mmap'd banks, and panics-with-context on weight errors. The GPU load,
-    CUDA nodes, CUDA graphs and the offload cache remain M3/M4 items as scheduled;
-    the engine-facing `Model` boundary is unchanged when GPU forward lands.
-    Verified by `tests/ftw_real_forward.rs` (gated): forward on the converted
-    checkpoint is finite, deterministic, and yields a plausible argmax; exact
-    logits vs FreeToken is a host-side harness step.
-13. **BLOCKER: the reference forward does not match FreeToken (2026-09-30)** --
-    A live FreeToken 0.1.3 GPU server on `127.0.0.1:1919` is the oracle. For
-    `"The capital of France is"` greedy it returns `" Paris, a"` (first token id
-    **11751**); our reference forward returns id 33974 (`"dg"`). Finite,
-    deterministic and in-vocab are not correctness. Suspects, in order: NVFP4
-    expert dequant / gate_up packing, GDN recurrence details (conv kernel, gate
-    `dt_bias`/`A_log` fp32, state layout), partial-rope dimension split, the
-    attention output gate, or lm_head/embedding mapping. `tests/engine_real_generate.rs`
-    (gated) pins the oracle value so the fix is measurable; the FreeToken server is
-    the comparison loop (~2 min per probe on the CPU reference).
+12. **The scalar forward is an oracle, not a serving path** -- the M1 work built a
+    **CPU fp32 reference forward** (`models/qwen3_6/forward.rs`) behind the `Model`
+    trait: reference-faithful, no caches, recomputing the whole sequence every
+    step, experts read straight from the mmap'd banks, panicking with context on
+    weight errors. It is **kept** as the golden oracle that the libtorch forward
+    is validated against (ALGORITHM.md 2.3.1 is the other oracle), and as the
+    implementation used when the `cuda` feature is off. It is *not* the path we
+    ship and never will be (decision 14). `tests/ftw_real_forward.rs` (gated)
+    keeps it honest: finite, deterministic, plausible argmax.
+13. **RESOLVED-BY-ABANDONMENT: the scalar forward does not match FreeToken
+    (2026-09-30)** -- a live FreeToken 0.1.3 GPU server on `127.0.0.1:1919` is the
+    oracle. For `"The capital of France is"` greedy it returns `" Paris, a"`
+    (first token id **11751**); the scalar forward returns id 33974 (`"dg"`).
+    Finite, deterministic and in-vocab are not correctness. Ruled out so far:
+    the shared-expert gate is `sigmoid`, not `silu` (decision 16, fixed). Still
+    open as a *list* -- NVFP4 expert dequant / `gate_up` concat, GDN recurrence
+    details (conv kernel, fp32 `dt_bias`/`A_log`, state layout), the partial-rope
+    split, the attention output gate interleave, lm_head/embedding mapping.
+    **Debugging is suspended, not abandoned**: at ~127 s per forward and 18 GB of
+    expert reads per forward, bisecting a scalar kernel this way is not viable
+    (decision 14), so the port to libtorch (decision 2) is the fix -- most of the
+    suspect list above is precisely the class of bug `scaled_dot_product_attention`
+    and libtorch's own rope/norm/GDN ops cannot have. `Model::probe_layers` (the
+    logit-lens diagnostic) stays as the bisect tool for whatever the torch path
+    does not resolve. `tests/engine_real_generate.rs` (gated) pins id 11751 so
+    "correct" is a pass/fail, not a vibe.
 14. **Reference forward cost** -- scalar, single-threaded, no BLAS: one forward
     over a 5-token prompt measured **126.7 s** (release, 16-core Ryzen 7 8745HX),
-    so a 12-token completion re-feeds the prefix and takes ~1 h. It is a
-    correctness oracle, not a serving path. Multi-threading the reductions
-    (`rayon`, fixed chunk order for reproducibility) is the cheap win for the
-    debugging loop; the GPU path (decision 2) is the real fix.
+    so a 12-token completion re-feeds the prefix and takes ~1 h, and each forward
+    reads all 18 GB of routed experts regardless of routing (`ctx.bank` pulls six
+    whole-layer slabs per layer, `forward.rs:633-638`). It is a correctness
+    oracle, not a serving path; that cost is the main reason M1b exists. The
+    GPU path (decision 2) is the fix -- not multi-threading the CPU reductions.
+15. **Upstream NVFP4 semantics (verified in `FreeToken/`, 2026-09-30)** -- NVFP4 is
+    a *storage* format, not FP4 tensor-core compute, and no NVFP4 tensor-core
+    path exists for `sm_120` in anything. Confirmed exact semantics:
+    * `packed[slot, n, k//2]` u8, **low nibble = even k**, high nibble = odd k
+      (`kernel/triton/nvfp4_fused_moe.py:9`).
+    * `scale[slot, n, k//16]` e4m3, `global[slot, n]` fp16, per **output row**;
+      the global scale is applied **once after** the whole K reduction, not folded
+      into the fp8 block scale (folding underflows).
+    * Decode (M=1) GEMV is an fp32 FMA reduction, `tl.sum(a[:, None] * b, axis=0)`
+      -- **no tensor cores at all**; prefill (M>1) uses `tl.dot` on dequantized
+      bf16. `BLOCK_N=16`, `BLOCK_KW=16`, warps 4, fixed (offline-tuned) config
+      because decode is CUDA-graph captured.
+    * "marlin-style" in `_decode_nvfp4_marlin_kernel` means **wide int32 loads +
+      deferred K reduction**, *not* FP4 MMA. It reaches ~87% of the RTX 5090
+      HBM read-bandwidth ceiling; the residual gap is FP4 dequant ALU and would
+      need sm_80-99 marlin or CUDA>=13 flashinfer b12x, i.e. not `sm_120`.
+    * Consequence for our kernel spec: the TODO entry "NVFP4 grouped MoE GEMM,
+      decode (marlin-style nibble)" is a **bandwidth-bound LUT-gather + fp32
+      FMA GEMV**, not an FP4 tensor-core kernel. Perf target is HBM bandwidth
+      (one expert read once, wide loads, graph capture), not FLOPS.
+    * `gate_up` is **concat**: gate is `[:d]`, up is `[d:]`
+      (`kernel/triton/activation.py:91`), so `[gate; up]` per expert is correct.
+16. **Shared-expert gate is `sigmoid`, not `silu`** -- `FreeToken/.../moe.py:51,80`
+    applies `sigmoid(shared_expert_gate(x)) * shared_expert(x)`. Found by diffing
+    upstream against our forward; fixed in `src/models/qwen3_6/forward.rs`.
+17. **candle-core rejected as the compute backend** -- audited
+    `candle-core`/`candle-nn`/`candle-transformers` at HEAD: no NVFP4 (`DType::F4`
+    is MX4 microscaling, zero matches for `nvfp4`/`e2m1`), no gated-delta-net
+    (`lfm2.rs` has short-conv + attention; `granitemoehybrid.rs` has Mamba, not
+    GDN), and **no public CUDA-graph capture API** on `Device` (the capture
+    machinery exists only internally), which decode needs. It remains a
+    reasonable CPU-side accelerator, but it is not a libtorch substitute.
+    Worth reusing: `candle-transformers/src/models/qwen3_moe.rs:128-150` as a
+    clean softmax -> topk -> renormalize routing reference.
+18. **Packaging** -- `pkgs.libtorch-bin.override {cudaSupport = true;}` (2.9.0,
+    cu13, ships `sm_120`) added to the flake's `basePackages`. Scoped per
+    derivation rather than `config.cudaSupport = true` globally so
+    `pkgs.cudatoolkit` (used by the FTW conversion) keeps its resolution. Host
+    driver is 595.104.02, above CUDA 13's 580 floor. The CUDA binary cache
+    (`cuda-maintainers.cachix.org`) is wired via `nixConfig` so the libtorch CUDA
+    build and its `cudaPackages_13` runtime libs substitute instead of building.
+19. **`LIBTORCH*` must be libtorch *roots*, and `LIBTORCH_USE_PYTORCH` must stay
+    unset** (verified by building, 2026-09-30). `torch-sys/build.rs:248-252`
+    appends `include`, `include/torch/csrc/api/include` and `lib` to these
+    itself, so pointing them at the already-suffixed dirs fails with
+    `fatal error: torch/csrc/autograd/engine.h: No such file or directory` --
+    that was the first state of the wiring. Correct values:
+    `LIBTORCH = ${libtorchCuda}` (required, or the script bails asking for a
+    manual install because `download-libtorch` is off),
+    `LIBTORCH_INCLUDE = ${libtorchCuda.dev}`, `LIBTORCH_LIB = ${libtorchCuda}`.
+    nixpkgs splits headers into `.dev` and shared objects into the main output,
+    which is why a single `LIBTORCH` root cannot serve both -- hence all three.
+    Do **not** set `LIBTORCH_USE_PYTORCH=1`: it makes the script query the pip
+    torch in `FreeToken/.venv` (2.11.0), a different version, and to use
+    `cpp_extension` for its include paths. Also: the nix package ships no
+    `build-version` file, so the script's version check is a no-op; `tch 0.22`
+    hard-fails on anything but 2.9.0, so the flake pins it.
+20. **`cuda` is a cargo feature, not a build-time fact** -- `tch` is `optional` and
+    gated behind `default = []` + `cuda = ["dep:tch"]`, with
+    `default-features = false` so nothing is downloaded. `cargo test` (the CPU
+    unit suite) therefore never needs libtorch and stays fast/portable; the
+    torch adapter is `#[cfg(feature = "cuda")]` and the registry falls back to the
+    scalar oracle when the feature is off. The `AGENTS.md` verify line becomes
+    `cargo fmt --check && cargo clippy --all-targets && cargo test` for the CPU
+    path and additionally `cargo clippy --all-targets --features cuda` inside the
+    devshell.
+21. **Device is auto-detected, CPU is a real target** (verified 2026-09-30) --
+    `model.device = "auto" | "cpu" | "cuda"` (default `auto`) with `model.gpu` as
+    the index. `infrastructure::torch` splits the policy
+    (`resolve_device(request, gpu, probe) -> Result<Device, DeviceError>`, pure
+    and unit-tested, no GPU needed) from the host probe (`probe_cuda()`,
+    `cfg(cuda)`); `application::engine::resolve_compute_device` joins them.
+    Deliberate asymmetry, so a typo is never silently papered over:
+    * `auto` + **zero** devices -> CPU. This is the agent-sandbox case, and it
+      means one config runs unchanged on the workstation and in the sandbox.
+    * `auto` + devices present but `gpu` out of range -> **error** (operator typo).
+    * `cpu` -> always CPU, GPU ignored.
+    * `cuda` -> error if unavailable, so a GPU-less run is never mistaken for a
+      GPU run.
+    * Build without the `cuda` feature: `auto` and `cpu` -> CPU (a default config
+      must start in every build), `cuda` -> error (there is no compute runtime to
+      honour it).
+    Consequence for testing: **the torch forward is exercised on CPU by
+    `cargo test --features cuda`, in the agent sandbox, with no GPU** -- libtorch's
+    CPU backend is complete enough (it has BLAS; it is ~1000x faster than the
+    scalar reference) that the M1b correctness gate can run automatically. Only
+    the GPU-only parts (CUDA-graph capture, the Triton NVFP4 kernel, on-device
+    expert streaming) need a devshell run, and those are asked for explicitly
+    rather than discovered by a red test.
 
 ### Config defaults for the RTX 5060 / 8 GB target
 
