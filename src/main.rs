@@ -27,8 +27,9 @@ async fn run() -> Result<(), String> {
     let engine = Arc::new(load_engine(&config).map_err(|e| e.to_string())?);
     let params = engine.params();
     eprintln!(
-        "loaded {} ({} layers, {} experts, vocab {}, eos {:?})",
+        "loaded {} on {} ({} layers, {} experts, vocab {}, eos {:?})",
         config.served_model_name(),
+        engine.device(),
         params.num_layers,
         params.num_experts,
         params.vocab_size,

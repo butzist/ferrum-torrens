@@ -4,3 +4,4 @@
 pub mod ftw;
 pub mod http;
 pub mod tokenizers_hf;
+pub mod torch;

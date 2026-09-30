@@ -55,6 +55,19 @@ pub enum CachePolicy {
     Lru,
 }
 
+/// Which compute device the runtime should run on. `Auto` takes the GPU when the
+/// host has one and silently falls back to CPU when it does not, so the same
+/// config runs on a workstation and in a GPU-less sandbox; `Cuda` is the
+/// operator asserting that a GPU must be there, and fails to start without one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ComputeDevice {
+    #[default]
+    Auto,
+    Cpu,
+    Cuda,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Serve {
@@ -80,6 +93,8 @@ impl Default for Serve {
 #[serde(deny_unknown_fields)]
 pub struct Model {
     pub path: String,
+    #[serde(default)]
+    pub device: ComputeDevice,
     #[serde(default)]
     pub gpu: u32,
     #[serde(default = "default_max_seq_len")]
@@ -514,6 +529,31 @@ num_tokens = 1024
             Config::from_str("[model]\npath=\"/tmp/Qwen.ftw\"\n[moe]\nstrategy = \"fused\"")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn device_defaults_to_auto() {
+        let c = Config::from_str("[model]\npath=\"/tmp/Qwen.ftw\"").unwrap();
+        assert_eq!(c.model.device, ComputeDevice::Auto);
+        assert_eq!(c.model.gpu, 0);
+    }
+
+    #[test]
+    fn device_parses_cpu_cuda_and_auto() {
+        for (text, want) in [
+            ("\"auto\"", ComputeDevice::Auto),
+            ("\"cpu\"", ComputeDevice::Cpu),
+            ("\"cuda\"", ComputeDevice::Cuda),
+        ] {
+            let c = Config::from_str(&format!("[model]\npath=\"/tmp/Qwen.ftw\"\ndevice = {text}"))
+                .unwrap();
+            assert_eq!(c.model.device, want, "device = {text}");
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_device() {
+        assert!(Config::from_str("[model]\npath=\"/tmp/Qwen.ftw\"\ndevice = \"tpu\"").is_err());
     }
 
     #[test]

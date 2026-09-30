@@ -8,6 +8,14 @@ description = "Minimal single-GPU MoE serving engine (FreeToken port)"
 name = "ferrum-torrens"
 path = "src/main.rs"
 
+[features]
+default = []
+# GPU compute backend. Off by default because tch's build script needs
+# libtorch at build time, which would break the CPU-only unit suite; enable
+# inside the devshell, where the flake supplies LIBTORCH_INCLUDE/LIBTORCH_LIB.
+# default-features = false drops `download-libtorch` so nothing is fetched.
+cuda = ["dep:tch"]
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -17,6 +25,7 @@ toml = "0.8"
 tokenizers = "0.21"
 axum = "0.8"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }
+tch = { version = "0.22", default-features = false, optional = true }
 
 [dev-dependencies]
 mockall = "0.13"

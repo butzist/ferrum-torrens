@@ -1,6 +1,5 @@
 {
   description = "FerrumTorrens";
-
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     flake-parts.url = "github:hercules-ci/flake-parts";
@@ -45,8 +44,17 @@
           ];
         };
 
-        # Python is used only for the one-time HF -> FTW conversion via FreeToken's
-        # `ft checkpoint` (see AGENTS.md); the runtime itself is Rust-only.
+        # libtorch, CUDA build. nixpkgs ships the official binary distribution as
+        # `libtorch-bin`, which statically links the CUDA toolkit (cu13); its
+        # cudaSupport argument selects the CUDA variant over the CPU one. Scoped
+        # to this one derivation instead of setting config.cudaSupport globally so
+        # the rest of the package set (notably pkgs.cudatoolkit, used by the FTW
+        # conversion) keeps its existing resolution.
+        libtorchCuda = pkgs.libtorch-bin.override {cudaSupport = true;};
+
+        # Rust is the production language. Python is used for the one-time
+        # HF -> FTW conversion via FreeToken's `ft checkpoint` and, at runtime, for
+        # the fused Triton kernels (see AGENTS.md).
         basePackages = [
           rustNightly
           pkgs.stdenv.cc
@@ -63,6 +71,7 @@
           pkgs.cudatoolkit
           pkgs.python312
           pkgs.uv
+          libtorchCuda
         ];
 
         # CUDA device paths for jail access (unfree, requires allowUnfree).
@@ -114,7 +123,23 @@
 
           inputsFrom = [config.flake-root.devShell];
 
-          LD_LIBRARY_PATH = "${pkgs.cudatoolkit}/lib";
+          LD_LIBRARY_PATH = "${pkgs.cudatoolkit}/lib:${libtorchCuda}/lib";
+
+          # tch build-script configuration: link the nix-provided libtorch instead
+          # of downloading one (hence default-features = false in Cargo.toml).
+          # nixpkgs splits the distribution across two outputs, and torch-sys
+          # appends "/include" and "/lib" to these itself, so all three point at
+          # *roots*, not at the include/lib dirs:
+          #   LIBTORCH         -> required, or the build script bails asking for a
+          #                       manual install because download-libtorch is off.
+          #   LIBTORCH_INCLUDE -> the .dev output (headers).
+          #   LIBTORCH_LIB     -> the main output (shared objects).
+          # Do NOT set LIBTORCH_USE_PYTORCH: that makes the build script query the
+          # pip torch in FreeToken/.venv, which is a different version.
+          LIBTORCH = "${libtorchCuda}";
+          LIBTORCH_INCLUDE = "${libtorchCuda.dev}";
+          LIBTORCH_LIB = "${libtorchCuda}";
+          CXX = "${pkgs.stdenv.cc.cc}/bin/c++";
 
           shellHook = ''
             export RUSTFLAGS="-C link-arg=-mold -C default-lib-fmt=rustls"

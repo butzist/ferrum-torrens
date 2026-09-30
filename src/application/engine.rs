@@ -10,6 +10,7 @@ use std::sync::Arc;
 use crate::domain::model::{ForwardInput, LayerProbe, Model, ModelParams};
 use crate::domain::sampling::{Rng, SamplingParams, sample};
 use crate::domain::tokenizer::{Tokenizer, TokenizerError};
+use crate::infrastructure::torch::{CudaProbe, Device, DeviceRequest};
 
 #[derive(Debug, Clone, Copy)]
 pub struct EngineLimits {
@@ -46,6 +47,7 @@ pub struct Engine {
     tokenizer: Arc<dyn Tokenizer>,
     eos_ids: Vec<u32>,
     limits: EngineLimits,
+    device: Device,
 }
 
 /// An id or the list of ids, the shape `generation_config.json` uses for
@@ -116,6 +118,60 @@ pub enum LoadError {
     PageSize(usize),
     #[error("moe cache_size_slots {slots} is under the model's {experts} experts")]
     CacheTooSmall { slots: usize, experts: usize },
+    #[error(transparent)]
+    Device(#[from] crate::infrastructure::torch::DeviceError),
+}
+
+/// The device request, as the config spells it.
+fn device_request(config: &crate::config::Config) -> DeviceRequest {
+    match config.model.device {
+        crate::config::ComputeDevice::Auto => DeviceRequest::Auto,
+        crate::config::ComputeDevice::Cpu => DeviceRequest::Cpu,
+        crate::config::ComputeDevice::Cuda => DeviceRequest::Cuda,
+    }
+}
+
+/// Resolve `model.device` + `model.gpu` against what the host has. Split from the
+/// probe so the policy is testable on a machine with no GPU.
+pub fn resolve_compute_device_with(
+    config: &crate::config::Config,
+    probe: CudaProbe,
+) -> Result<Device, LoadError> {
+    Ok(crate::infrastructure::torch::resolve_device(
+        device_request(config),
+        config.model.gpu as usize,
+        probe,
+    )?)
+}
+
+/// Resolve against the real host. A build without the `cuda` feature has no
+/// libtorch at all, so the only device it can serve is the CPU: `auto` and
+/// `cpu` both land there (a default config must start in every build), while an
+/// explicit `cuda` is an error rather than a silent CPU run the operator did not
+/// ask for.
+pub fn resolve_compute_device(config: &crate::config::Config) -> Result<Device, LoadError> {
+    if matches!(config.model.device, crate::config::ComputeDevice::Cpu) {
+        return Ok(Device::Cpu);
+    }
+    #[cfg(feature = "cuda")]
+    let probe = crate::infrastructure::torch::probe_cuda();
+    #[cfg(not(feature = "cuda"))]
+    let probe = match config.model.device {
+        crate::config::ComputeDevice::Cuda => {
+            return Err(LoadError::Device(
+                crate::infrastructure::torch::DeviceError::CudaRequestedUnavailable,
+            ));
+        }
+        _ => CudaProbe {
+            available: false,
+            device_count: 0,
+        },
+    };
+    Ok(crate::infrastructure::torch::resolve_device(
+        device_request(config),
+        config.model.gpu as usize,
+        probe,
+    )?)
 }
 
 /// The engine limits config implies, rejecting what M1 cannot honor. The
@@ -171,12 +227,14 @@ pub fn load_engine(config: &crate::config::Config) -> Result<Engine, LoadError> 
         &tokenizer_path.to_string_lossy(),
     )?;
     let eos_ids = eos_ids_from_ftw_dir(dir)?;
+    let device = resolve_compute_device(config)?;
 
     Ok(Engine::new(
         std::sync::Arc::from(model),
         std::sync::Arc::new(tokenizer),
         eos_ids,
         limits,
+        device,
     ))
 }
 
@@ -186,6 +244,7 @@ impl Engine {
         tokenizer: Arc<dyn Tokenizer>,
         eos_ids: Vec<u32>,
         limits: EngineLimits,
+        device: Device,
     ) -> Self {
         assert!(limits.max_seq_len > 0);
         assert!(limits.max_output_tokens > 0);
@@ -196,6 +255,7 @@ impl Engine {
             tokenizer,
             eos_ids,
             limits,
+            device,
         }
     }
 
@@ -217,6 +277,12 @@ impl Engine {
 
     pub fn eos_ids(&self) -> &[u32] {
         &self.eos_ids
+    }
+
+    /// The compute device the model runs on, as resolved from `model.device` at
+    /// load. Reported at startup so an operator can see which one was picked.
+    pub fn device(&self) -> Device {
+        self.device
     }
 
     pub fn encode(&self, text: &str) -> Result<Vec<u32>, EngineError> {
@@ -404,6 +470,7 @@ pub(crate) mod fake {
                 Arc::new(FakeTokenizer),
                 vec![FAKE_EOS],
                 limits,
+                Device::Cpu,
             ),
             rec,
         )
@@ -423,6 +490,12 @@ pub(crate) mod fake {
 mod tests {
     use super::fake::*;
     use super::*;
+    use crate::infrastructure::torch::DeviceError;
+
+    const NO_CUDA: CudaProbe = CudaProbe {
+        available: false,
+        device_count: 0,
+    };
 
     fn rows<'a>(params: &'a SamplingParams) -> Vec<BatchRow<'a>> {
         vec![BatchRow {
@@ -571,5 +644,97 @@ mod tests {
         std::fs::write(dir.join("config.json"), r#"{"model_type": "qwen3_moe"}"#).unwrap();
         assert!(matches!(eos_ids_from_ftw_dir(&dir), Err(LoadError::NoEos)));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn device_config(device: &str, gpu: u32) -> crate::config::Config {
+        format!("[model]\npath = \"/nonexistent\"\ndevice = \"{device}\"\ngpu = {gpu}\n")
+            .parse()
+            .unwrap()
+    }
+
+    #[test]
+    fn auto_device_falls_back_to_cpu_without_a_gpu() {
+        // This is the agent-sandbox case: the same config that runs on the
+        // workstation must not need editing to run with no CUDA device visible.
+        let d = resolve_compute_device_with(&device_config("auto", 0), NO_CUDA).unwrap();
+        assert_eq!(d, Device::Cpu);
+    }
+
+    #[test]
+    fn auto_device_takes_the_gpu_when_there_is_one() {
+        let one = CudaProbe {
+            available: true,
+            device_count: 1,
+        };
+        let two = CudaProbe {
+            available: true,
+            device_count: 2,
+        };
+        assert_eq!(
+            resolve_compute_device_with(&device_config("auto", 0), one).unwrap(),
+            Device::Cuda(0)
+        );
+        assert_eq!(
+            resolve_compute_device_with(&device_config("auto", 1), two).unwrap(),
+            Device::Cuda(1)
+        );
+    }
+
+    #[test]
+    fn explicit_cuda_without_a_gpu_is_a_load_error() {
+        assert!(matches!(
+            resolve_compute_device_with(&device_config("cuda", 0), NO_CUDA),
+            Err(LoadError::Device(DeviceError::CudaRequestedUnavailable))
+        ));
+    }
+
+    #[test]
+    fn explicit_cpu_wins_over_an_available_gpu() {
+        let one = CudaProbe {
+            available: true,
+            device_count: 1,
+        };
+        assert_eq!(
+            resolve_compute_device_with(&device_config("cpu", 0), one).unwrap(),
+            Device::Cpu
+        );
+    }
+
+    #[test]
+    fn a_gpu_index_past_the_last_device_is_a_load_error() {
+        let one = CudaProbe {
+            available: true,
+            device_count: 1,
+        };
+        assert!(matches!(
+            resolve_compute_device_with(&device_config("auto", 4), one),
+            Err(LoadError::Device(DeviceError::CudaIndexOutOfRange {
+                gpu: 4,
+                ..
+            }))
+        ));
+    }
+
+    /// Without the `cuda` feature there is no libtorch, so the only device such
+    /// a build can serve is the CPU. A default config still has to start, but an
+    /// explicit `cuda` must fail rather than quietly run somewhere the operator
+    /// did not choose.
+    #[test]
+    #[cfg(not(feature = "cuda"))]
+    fn without_the_cuda_feature_only_cpu_is_loadable() {
+        for d in ["auto", "cpu"] {
+            assert_eq!(
+                resolve_compute_device(&device_config(d, 0)).unwrap(),
+                Device::Cpu,
+                "device = {d} must fall back to the only device this build has"
+            );
+        }
+        assert!(
+            matches!(
+                resolve_compute_device(&device_config("cuda", 0)),
+                Err(LoadError::Device(DeviceError::CudaRequestedUnavailable))
+            ),
+            "device = \"cuda\" must be rejected in a build without libtorch"
+        );
     }
 }
