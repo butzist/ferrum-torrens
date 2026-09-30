@@ -66,6 +66,42 @@ fn one_token_prediction_matches_the_oracle() {
     );
 }
 
+/// Bisect the forward with a logit lens: print what the final norm + lm_head
+/// make of the residual stream after every `EVERY`-th layer. A healthy model
+/// sharpens into sensible tokens with depth; the first layer where the reading
+/// degenerates (flat entropy, or a nonsense top token) is the first suspect.
+/// Separate from the oracle gate because it is a diagnostic, not a pass/fail.
+#[test]
+#[ignore = "requires converted checkpoint in .model-cache"]
+fn logit_lens_locates_the_first_bad_layer() {
+    const EVERY: usize = 1;
+    let engine = load_engine(&config(1)).unwrap();
+    let ids = engine.encode(PROMPT).unwrap();
+    let input = ferrum_torrens::domain::model::ForwardInput {
+        positions: (0..ids.len() as u32).collect(),
+        input_ids: ids,
+        answers: vec![],
+    };
+    let start = Instant::now();
+    let (_logits, lenses) = engine.probe_layers(&input, EVERY);
+    eprintln!(
+        "lens over {} layers in {:.1}s",
+        engine.params().num_layers,
+        start.elapsed().as_secs_f64()
+    );
+    eprintln!(
+        "{:>5} {:>8} {:>9} {:>8} {:>9}",
+        "layer", "top", "logit", "entropy", "norm"
+    );
+    for l in &lenses {
+        let text = engine.decode(&[l.top]).unwrap_or_default();
+        eprintln!(
+            "{:>5} {:>8} {:>9.2} {:>8.3} {:>9.1}  {:?}",
+            l.layer, l.top, l.logit, l.entropy, l.norm, text
+        );
+    }
+}
+
 /// Per-step cost against prefix length, so the fixed per-forward cost (weight
 /// streaming plus per-layer expert dequant) separates from the marginal cost of
 /// one more token. The reference path re-feeds the whole sequence every step,

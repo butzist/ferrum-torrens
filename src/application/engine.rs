@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use crate::domain::model::{Model, ModelParams};
+use crate::domain::model::{ForwardInput, LayerProbe, Model, ModelParams};
 use crate::domain::sampling::{Rng, SamplingParams, sample};
 use crate::domain::tokenizer::{Tokenizer, TokenizerError};
 
@@ -235,6 +235,11 @@ impl Engine {
 
     pub fn decode(&self, ids: &[u32]) -> Result<String, EngineError> {
         Ok(self.tokenizer.decode(ids)?)
+    }
+
+    /// Diagnostic: logit-lens probes every `every`-th layer. Not a serving path.
+    pub fn probe_layers(&self, input: &ForwardInput, every: usize) -> (Vec<f32>, Vec<LayerProbe>) {
+        self.model.probe_layers(input, every)
     }
 
     /// One batched forward: the rows are concatenated (the model splits them

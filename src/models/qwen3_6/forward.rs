@@ -32,6 +32,12 @@ fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
 
+/// Shared-expert gate. FreeToken uses plain sigmoid here, not silu; see the test.
+#[inline]
+fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
 #[inline]
 fn softplus(x: f32) -> f32 {
     if x > 20.0 { x } else { (1.0 + x.exp()).ln() }
@@ -619,7 +625,7 @@ fn moe_block(ctx: &Ctx, x_post: &[f32], layer: usize, t: usize) -> Result<Vec<f3
     let mut routed = vec![0.0f32; t * h];
     for tt in 0..t {
         for d in 0..h {
-            routed[tt * h + d] = se[tt * h + d] * silu(gate_out[tt]);
+            routed[tt * h + d] = se[tt * h + d] * sigmoid(gate_out[tt]);
         }
     }
 
@@ -712,7 +718,12 @@ fn topk_renorm(p: &[f32], n: usize, e: usize, k: usize) -> (Vec<usize>, Vec<f32>
 }
 
 /// One contiguous sequence through the whole tower.
-fn run_sequence(ctx: &Ctx, tokens: &[u32], positions: &[u32]) -> Result<Vec<f32>> {
+fn run_sequence(
+    ctx: &Ctx,
+    tokens: &[u32],
+    positions: &[u32],
+    mut lens: Option<&mut Vec<Lens>>,
+) -> Result<Vec<f32>> {
     let p = ctx.params;
     let t = tokens.len();
     let h = p.hidden_size;
@@ -730,6 +741,11 @@ fn run_sequence(ctx: &Ctx, tokens: &[u32], positions: &[u32]) -> Result<Vec<f32>
     }
 
     let mut residual: Option<Vec<f32>> = None;
+
+    if lens.is_some() {
+        let zero = vec![0.0f32; t * h];
+        probe_lens(ctx, usize::MAX, &x, &zero, t, lens.as_deref_mut())?;
+    }
 
     for layer in 0..p.num_layers {
         // input norm: h1 = rms(x + res) * w; carry (x + res) forward.
@@ -767,6 +783,17 @@ fn run_sequence(ctx: &Ctx, tokens: &[u32], positions: &[u32]) -> Result<Vec<f32>
 
         x = moe_block(ctx, &h2, layer, t)?;
         residual = Some(sum2);
+
+        if lens.is_some() {
+            probe_lens(
+                ctx,
+                layer,
+                &x,
+                residual.as_ref().unwrap(),
+                t,
+                lens.as_deref_mut(),
+            )?;
+        }
     }
 
     // final norm then lm_head over the last token
@@ -790,6 +817,58 @@ fn run_sequence(ctx: &Ctx, tokens: &[u32], positions: &[u32]) -> Result<Vec<f32>
     Ok(nvfp4_gemv(last, lw, lscale, lglobal, p.vocab_size, h))
 }
 
+/// One logit-lens reading of the residual stream at `layer` depth.
+fn probe_lens(
+    ctx: &Ctx,
+    layer: usize,
+    x: &[f32],
+    residual: &[f32],
+    t: usize,
+    out: Option<&mut Vec<Lens>>,
+) -> Result<()> {
+    let Some(out) = out else { return Ok(()) };
+    let p = ctx.params;
+    let h = p.hidden_size;
+    let mut stream = vec![0.0f32; t * h];
+    for i in 0..stream.len() {
+        stream[i] = x[i] + residual[i];
+    }
+    let last = &stream[(t - 1) * h..t * h];
+    let norm = last.iter().map(|v| v * v).sum::<f32>().sqrt();
+    let model_norm = normed(ctx.dense("model.norm.weight")?, h, "model.norm.weight");
+    let xf = rms_norm(last, &model_norm, p.rms_norm_eps, h);
+    let logits = nvfp4_gemv(
+        &xf,
+        ctx.dense("lm_head.weight")?,
+        ctx.dense("lm_head.weight_scale")?,
+        ctx.dense("lm_head.weight_global")?,
+        p.vocab_size,
+        h,
+    );
+    let mut top = 0usize;
+    let mut top_logit = f32::NEG_INFINITY;
+    for (i, &v) in logits.iter().enumerate() {
+        if v > top_logit {
+            top_logit = v;
+            top = i;
+        }
+    }
+    let mx = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut acc = 0.0f64;
+    for &v in &logits {
+        acc += ((v - mx) as f64).exp();
+    }
+    let entropy = acc.ln() as f32 - mx;
+    out.push(Lens {
+        layer,
+        top: top as u32,
+        logit: top_logit,
+        norm,
+        entropy,
+    });
+    Ok(())
+}
+
 fn normed(raw: &[u8], h: usize, name: &str) -> Vec<f32> {
     let w = decode_bf16(raw, h);
     if is_baked_gemma_norm(name) {
@@ -802,6 +881,22 @@ fn normed(raw: &[u8], h: usize, name: &str) -> Vec<f32> {
 /// Reference forward for a batch of contiguous sequences. Returns the final-token
 /// logits per sequence, concatenated (M1 answers are the last token of each
 /// sequence).
+/// Logit-lens reading of the residual stream after a layer: what the final norm
+/// and lm_head make of the stream so far. A healthy model sharpens into sensible
+/// tokens as depth increases; the first layer whose reading degenerates is the
+/// first suspect. Purely diagnostic, used to bisect the forward against the
+/// FreeToken oracle.
+#[derive(Debug, Clone, Copy)]
+pub struct Lens {
+    pub layer: usize,
+    pub top: u32,
+    pub logit: f32,
+    /// L2 norm of the last-token residual stream at that depth.
+    pub norm: f32,
+    /// Softmax spread over the full vocab; ln(vocab) would be maximally flat.
+    pub entropy: f32,
+}
+
 pub fn forward_reference(
     params: &ModelParams,
     dense: &DenseWeights,
@@ -824,11 +919,38 @@ pub fn forward_reference(
                 &ctx,
                 &input.input_ids[s..i],
                 &input.positions[s..i],
+                None,
             )?);
             s = i;
         }
     }
     Ok(out)
+}
+
+/// Same forward, but every `every`-th layer also reports a `Lens`. `every = 0`
+/// disables probing and costs nothing.
+pub fn logit_lens(
+    params: &ModelParams,
+    dense: &DenseWeights,
+    index: &FtwIndex,
+    reader: &dyn WeightsReader,
+    input: &ForwardInput,
+    every: usize,
+) -> Result<(Vec<f32>, Vec<Lens>)> {
+    let ctx = Ctx {
+        params,
+        dense,
+        index,
+        reader,
+    };
+    let mut lenses = Vec::new();
+    let logits = run_sequence(
+        &ctx,
+        &input.input_ids,
+        &input.positions,
+        if every == 0 { None } else { Some(&mut lenses) },
+    )?;
+    Ok((logits, lenses))
 }
 
 #[cfg(test)]
@@ -881,6 +1003,16 @@ mod tests {
         let qinv = 1.0 / (1.0f32 + 1e-6).sqrt();
         assert!((out[0] - (1.0 * scale * qinv)).abs() < 1e-5, "{:?}", out);
         assert!((out[1] - (1.5 * scale * qinv)).abs() < 1e-5, "{:?}", out);
+    }
+
+    #[test]
+    fn shared_expert_gate_is_sigmoid() {
+        // FreeToken moe.py:51,80: sigmoid(gate) * shared_expert(x), not silu.
+        // silu(2.0) = 1.7616 would leak a value above 1 into the residual
+        // stream, which the oracle shows never happens.
+        assert!((sigmoid(2.0) - 0.880_797_1).abs() < 1e-6);
+        assert!((sigmoid(0.0) - 0.5).abs() < 1e-6);
+        assert!((sigmoid(-2.0) - 0.119_202_92).abs() < 1e-6);
     }
 
     #[test]

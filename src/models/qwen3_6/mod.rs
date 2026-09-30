@@ -6,7 +6,7 @@ pub mod config;
 pub mod forward;
 pub mod weights;
 
-use crate::domain::model::{ForwardInput, Model, ModelParams};
+use crate::domain::model::{ForwardInput, LayerProbe, Model, ModelParams};
 use crate::domain::weights::WeightsReader;
 use crate::infrastructure::ftw::FtwIndex;
 use serde_json::Value;
@@ -77,5 +77,30 @@ impl Model for Qwen3_6 {
             input,
         )
         .unwrap_or_else(|e| panic!("reference forward failed: {e}"))
+    }
+
+    fn probe_layers(&self, input: &ForwardInput, every: usize) -> (Vec<f32>, Vec<LayerProbe>) {
+        let (logits, lenses) = forward::logit_lens(
+            &self.params,
+            &self.dense,
+            &self.index,
+            self.reader.as_ref(),
+            input,
+            every,
+        )
+        .unwrap_or_else(|e| panic!("reference probe failed: {e}"));
+        (
+            logits,
+            lenses
+                .into_iter()
+                .map(|l| LayerProbe {
+                    layer: l.layer,
+                    top: l.top,
+                    logit: l.logit,
+                    norm: l.norm,
+                    entropy: l.entropy,
+                })
+                .collect(),
+        )
     }
 }

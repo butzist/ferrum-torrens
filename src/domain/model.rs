@@ -101,6 +101,21 @@ pub struct ForwardInput {
     pub answers: Vec<usize>,
 }
 
+/// One logit-lens reading of the residual stream at a given depth: what the
+/// final norm and the lm_head make of the stream so far. Diagnostic only, used
+/// to bisect a forward against a reference implementation. Arch-agnostic
+/// because it needs nothing but the residual stream and the head.
+#[derive(Debug, Clone, Copy)]
+pub struct LayerProbe {
+    pub layer: usize,
+    pub top: u32,
+    pub logit: f32,
+    /// L2 norm of the probed token's residual stream.
+    pub norm: f32,
+    /// Softmax spread over the full vocab; a flat reading is a dead stream.
+    pub entropy: f32,
+}
+
 /// The engine-facing contract every architecture implements. M1 ships the CPU
 /// reference forward (the golden oracle); M3 adds GPU implementations behind the
 /// same handle.
@@ -110,6 +125,14 @@ pub trait Model: Send + Sync {
     /// Full forward pass over `input`. Returns streaming logits for the rows
     /// named in `input.answers`, row-major `[answers.len(), vocab_size]` f32.
     fn forward(&self, input: &ForwardInput) -> Vec<f32>;
+
+    /// Logit-lens probes every `every`-th layer, alongside the normal logits.
+    /// `every == 0` disables probing. The default just runs the forward, so an
+    /// architecture that has not implemented probing still behaves correctly.
+    fn probe_layers(&self, input: &ForwardInput, every: usize) -> (Vec<f32>, Vec<LayerProbe>) {
+        let _ = every;
+        (self.forward(input), Vec::new())
+    }
 }
 
 #[cfg(test)]
