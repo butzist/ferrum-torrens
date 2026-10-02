@@ -13,6 +13,13 @@ pub enum MoEError {
     Bad(String),
     #[error("moe: slot {slot} out of range (capacity {capacity})")]
     SlotOutOfRange { slot: usize, capacity: usize },
+    /// The checkpoint has no such expert-bank entry.
+    #[error("moe: no expert bank entry {entry}")]
+    Missing { entry: String },
+    /// The bytes behind an entry could not be read; `why` is the reader port's
+    /// own message, kept verbatim so the shard/file detail survives.
+    #[error("moe: read {entry}: {why}")]
+    Read { entry: String, why: String },
 }
 
 /// Which half of an expert the two GEMMs read.

@@ -288,8 +288,13 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
     (route flattening, shape rules, cache sizing, slab-size and slot-range
     rejection) and the `[kernel]` config tests pass on the CPU-only box; the
     interpreter itself is exercised by those tests.
+  - [x] the checkpoint slab source (2026-10-02, `src/infrastructure/banks.rs`):
+    `FtwBanks` implements `ExpertSlabSource` over the mmap reader, one
+    `read_range` per field out of `"{gate_up,down}_{packed,scale,global}#L{l:05}"`
+    (bank tensors are `[experts, ...]` row-major, so expert `e` is one window),
+    with the per-expert byte counts checked against the entry shapes and
+    `MoEError::{Missing, Read}` added for actionable errors. 6 unit tests.
   - [ ] the gated GPU test, plus `application/run_experts.rs` and the
-    `infrastructure/banks.rs` `ExpertSlabSource` that feed it, and the
     `moe_block` swap in `models/qwen3_6/forward_torch.rs`.
 - [x] P0 everything else libtorch already provides: silu/sigmoid/softplus/softmax/
   topk (router), rmsnorm (+Gemma `1+w`), partial rope, paged GQA attention
