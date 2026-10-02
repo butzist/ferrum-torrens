@@ -2,6 +2,7 @@
 
 pub mod dequant;
 pub mod expert_cache;
+pub mod expert_kernel;
 pub mod kvcache;
 pub mod model;
 pub mod numerics;
