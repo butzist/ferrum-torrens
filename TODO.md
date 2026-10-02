@@ -1,22 +1,24 @@
 # FerrumTorrens -- FreeToken MVP port to Rust: TODO
 
-Status: M1b in progress -- libtorch forward cross-checks pass (188/188); scalar
-oracle NVFP4 global-scale fix applied. The gated oracle still disagrees (id 5049
-vs 11751) and runs under the memory cap from decision 22. Next: the `TorchModel`
-adapter and its full tower, then the first oracle-matching completion on CPU.
+Status: M1b DONE -- the libtorch tower matches the FreeToken oracle: gated
+`one_token_prediction_matches_the_oracle` emits id 11751 (" Paris") for
+`"The capital of France is"` in ~46 s under the 26 GiB cap (decision 22), and
+the gated scalar/libtorch cross-check agrees to 1.7e-6 of the logit scale on the
+same prompt (both pick 11751). All four gated real-checkpoint tests pass
+(oracle, logit lens, per-step cost, scalar reference). M2 (API) is next.
 Why now:
-the scalar forward is numerically wrong and cannot be debugged into agreement
-(decision 13), costs ~127 s per forward (decision 14), and reading 18 GB of
-experts per forward is not a serving path. libtorch removes all three at once.
+the scalar forward cost ~127 s per forward and read 18 GB of experts per
+forward (decisions 13, 14), and it was numerically wrong; libtorch removes both.
 Done so far: the `cuda` cargo feature + libtorch-in-the-flake wiring (decision
 2, 18, 19 -- verified `cargo build --features cuda` links against
 `libtorch-2.9.0` cu130), **auto-detected device selection with CPU as a real
 target (decision 21), so the torch forward and the correctness gate are testable
 in the agent sandbox on libtorch's CPU backend**; the FreeToken oracle value
 pinned in `tests/engine_real_generate.rs` (id 11751 = " Paris"), the
-shared-expert gate fixed to `sigmoid` (decision 16), and a logit-lens
-diagnostic (`Model::probe_layers`) that bisects a forward by depth. Next: the
-`TorchModel` adapter, then the first oracle-matching completion on CPU.
+shared-expert gate fixed to `sigmoid` (decision 16), a logit-lens diagnostic
+(`Model::probe_layers`) that bisects a forward by depth, the `TorchModel` adapter
+plus the full libtorch tower with windowed weight widening, and the gated
+scalar/libtorch cross-check. Next: M2 (the HTTP API).
 Earlier work: FTW index parser + mmap reader, registry dispatch, CPU fp32
 reference forward (embeddings, partial-rope GQA attention with output gate,
 GatedDeltaNet recurrence, NVFP4 MoE + shared expert, lm_head), `src/config.rs`
@@ -223,20 +225,26 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
   `deny_unknown_fields` validation; `Engine` carries the resolved device and
   `main.rs` prints it at startup so the operator sees what was picked.
   (decision 21)
-- [ ] P0 dense weight upload: bf16 as-is, e4m3 FP8 dequantized to bf16 on the host
-  at load (libtorch has no e4m3 `mm`), NVFP4 `lm_head` dequantized to bf16 for
-  M1b. Gemma `1+w` baked at load. Skip the 333 `visual.*` tensors.
-- [ ] P0 `models/qwen3_6/forward_torch.rs`: the full tower in libtorch ops --
-  embed, add+rmsnorm, partial rope, GQA attention (`scaled_dot_product_attention`
-  with a GQA-expanded K/V, `is_causal`, then the sigmoid output gate), GDN
-  (conv1d + fp32 delta-rule recurrence), router softmax+topk+renorm, shared
-  expert, `run_experts` via the NVFP4 kernel, final norm, `lm_head`.
-- [ ] P0 `models/qwen3_6` picks its `Model` impl by feature: `cuda` -> torch,
-  otherwise the scalar reference (kept as the oracle, decision 12).
-- [ ] P0 first correct completion: `"The capital of France is"` greedy ->
+- [x] P0 dense weight upload: bf16 as-is, e4m3 FP8 dequantized to bf16 on the host
+  (libtorch has no e4m3 `mm`), NVFP4 `lm_head` dequantized to bf16, in **row
+  windows widened on demand** (`Loader::widen`, `LM_HEAD_BLOCK` 8192) instead of
+  one resident copy -- that is what keeps the 20.3 GiB checkpoint inside the
+  cap. The Gemma `1+w` bake is **already in the FTW** (decision 23), so readers
+  must not fold it again. Skips the 333 `visual.*` tensors.
+- [x] P0 `models/qwen3_6/forward_torch.rs`: the full tower in libtorch ops --
+  embed, add+rmsnorm, partial rope, GQA attention (causal scores in fp32 with the
+  sigmoid per-head output gate), GDN (depthwise conv1d + fp32 delta-rule
+  recurrence), router softmax+topk+renorm, shared expert, `run_experts` on the
+  torch-native NVFP4 dequantize+matmul stand-in, final norm, `lm_head`.
+  The Triton NVFP4 expert kernel and FlashInfer paged attention are M3 swaps
+  behind the same ports.
+- [x] P0 `models/qwen3_6` picks its `Model` impl by feature: `cuda` -> torch,
+  otherwise the scalar reference (kept as the cross-check oracle, decision 12).
+- [x] P0 first correct completion: `"The capital of France is"` greedy ->
   `" Paris"` (id **11751**), gated in `tests/engine_real_generate.rs`; the gate
-  must pass, not merely be finite.
-- [ ] P0 `--features cuda` only affects the forward impl, not the engine call
+  must pass, not merely be finite. GREEN: `generated ids [11751]` in 46.3 s
+  (libtorch CPU backend, 26 GiB cap).
+- [x] P0 `--features cuda` only affects the forward impl, not the engine call
   shape: `Model::forward(&ForwardInput) -> Vec<f32>` and `Engine::run_forward`
   stay unchanged (no KV cache, no graph, no offload yet).
 
@@ -327,12 +335,13 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 - **M1a vertical slice (shape, not numbers)** -- DONE: FTW load -> greedy
   non-stream `/v1/completions` returns a finite in-vocab token, via the scalar
   CPU reference. Wrong numbers, ~127 s/step (decisions 13, 14).
-- **M1b correct completion (CURRENT)** -- port the forward to libtorch and make
-  `"The capital of France is"` -> `" Paris"` (id 11751) come out of the real
-  server. The scalar reference stays as the oracle it was meant to be
-  (decision 12); correctness is proven against the FreeToken GPU oracle, not
-  against our own CPU path.
-- **M2 API**: sampling params, chat template + `/v1/chat/completions`, SSE.
+- **M1b correct completion** -- DONE (2026-10-02): the libtorch tower emits
+  id 11751 (" Paris") for `"The capital of France is"` on the real FTW
+  checkpoint, and the scalar reference agrees with it to 1.7e-6 of the logit
+  scale (it used to be 605875260 off). Correctness is proven against the
+  FreeToken GPU oracle plus the two-implementation cross-check, not against our
+  own CPU path alone.
+- **M2 API (CURRENT)**: sampling params, chat template + `/v1/chat/completions`, SSE.
 - **M3 performance**: the NVFP4 expert Triton kernel (replacing the torch
   dequantize+bmm stand-in), paged KV + radix, fast chunked GDN, CUDA-graph
   decode, prefill/decode split so decode stops re-feeding the prefix.
@@ -535,6 +544,23 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
     `RLIMIT_AS` counts the mapping too, so the cap can never be lower than the
     checkpoint size plus libtorch -- a cap that fails `mmap` immediately is the
     symptom of setting it too low.
+
+23. **The FTW holds post-loader weights** (2026-10-02) -- `ft checkpoint` streams
+    `load_weight(...)`, i.e. the family's `iter_weights`, so the FTW is written
+    *after* FreeToken's weight reader ran. Consequences our readers must respect,
+    each of which was an M1b bug that the two paths shared:
+    - the Gemma-style norms (`model.norm`, `input_layernorm`,
+      `post_attention_layernorm`, `self_attn.{q,k}_norm`) already carry the
+      `(1 + w)` fold. Do **not** bake again; `linear_attn.norm` is the one norm
+      FreeToken leaves alone, so it is used exactly as stored;
+    - NVFP4 per-row globals are **float16**, i.e. 2 bytes per row, while FP8
+      `weight_scale` rows are float32 (4 bytes). A windowed reader must use the
+      element size of the sibling it slices, or every window past the first reads
+      the wrong rows;
+    - a fused projection row (`qkv_proj`, `in_proj_qkvz`, `in_proj_ba`) is split
+      **per token**: `t` rows of `out` features, so the halves are column blocks
+      strided by `out`, not contiguous slices at `t * block`. Nibble order inside
+      NVFP4 stays low-nibble-first (two consecutive values per byte).
 
 ### Config defaults for the RTX 5060 / 8 GB target
 

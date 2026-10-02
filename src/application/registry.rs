@@ -5,6 +5,7 @@
 use crate::domain::model::Model;
 use crate::domain::weights::WeightsReader;
 use crate::infrastructure::ftw::FtwIndex;
+use crate::infrastructure::torch::Device;
 use crate::models::qwen3_6::Qwen3_6;
 use serde_json::Value;
 use std::sync::Arc;
@@ -32,7 +33,53 @@ pub fn arch_of(config_json: &Value) -> Result<&str, RegistryError> {
 /// Build a `Model` for the arch declared in `config_json` (parsed from the FTW
 /// dir's `config.json`), boxing the arch-specific implementation behind the
 /// engine-facing trait.
+///
+/// The `cuda` cargo feature picks the forward: with it the arch runs on libtorch
+/// (on `device`, CPU included, decision 21), without it the scalar reference is
+/// the only implementation there is. The engine cannot tell the difference --
+/// both are `Box<dyn Model>` behind the same trait.
+#[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
 pub fn build(
+    config_json: &Value,
+    index: Arc<FtwIndex>,
+    reader: Arc<dyn WeightsReader>,
+    device: Device,
+) -> Result<Box<dyn Model>, RegistryError> {
+    match arch_of(config_json)? {
+        "Qwen3_5MoeForConditionalGeneration" | "Qwen3_5MoeForCausalLM" => {
+            let tc = config_json
+                .get("text_config")
+                .ok_or(RegistryError::NoArch)?;
+            #[cfg(feature = "cuda")]
+            {
+                // The libtorch path widens and uploads every weight itself, so
+                // it takes the parsed params plus the reader rather than the
+                // scalar path's pre-loaded dense store.
+                let params = crate::models::qwen3_6::config::parse_text_config(tc)
+                    .map_err(|e| RegistryError::Build(e.to_string()))?;
+                Ok(Box::new(
+                    crate::models::qwen3_6::forward_torch::TorchQwen3_6::load(
+                        params, device, index, reader,
+                    )
+                    .map_err(|e| RegistryError::Build(e.to_string()))?,
+                ))
+            }
+            #[cfg(not(feature = "cuda"))]
+            Ok(Box::new(
+                Qwen3_6::from_text_config(tc, index, reader)
+                    .map_err(|e| RegistryError::Build(e.to_string()))?,
+            ))
+        }
+        other => Err(RegistryError::Unsupported(other.to_string())),
+    }
+}
+
+/// Always the scalar reference forward, whatever the `cuda` feature says.
+///
+/// The reference is kept as the oracle the libtorch forward is validated
+/// against (decision 12), so its own gated test has to keep reaching it even in
+/// a build where `build` hands back the torch forward.
+pub fn build_scalar(
     config_json: &Value,
     index: Arc<FtwIndex>,
     reader: Arc<dyn WeightsReader>,
@@ -93,7 +140,11 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let m = build(&v, Arc::new(empty_index()), Arc::new(MockReader)).unwrap();
+        // `build_scalar`, not `build`: with the `cuda` feature `build` hands
+        // back the libtorch forward, which needs the real weights at load and so
+        // cannot be built against an empty index. The params assertion is about
+        // dispatch on the arch label, which both paths share.
+        let m = build_scalar(&v, Arc::new(empty_index()), Arc::new(MockReader)).unwrap();
         assert_eq!(m.params().num_layers, 4);
         assert_eq!(m.params().num_full_attention_layers(), 2);
     }
@@ -102,7 +153,12 @@ mod tests {
     fn unknown_arch_errors() {
         let v: Value = serde_json::from_str(r#"{"architectures": ["Qwen3.5-VL"]}"#).unwrap();
         assert!(matches!(
-            build(&v, Arc::new(empty_index()), Arc::new(MockReader)),
+            build(
+                &v,
+                Arc::new(empty_index()),
+                Arc::new(MockReader),
+                Device::Cpu
+            ),
             Err(RegistryError::Unsupported(_))
         ));
     }

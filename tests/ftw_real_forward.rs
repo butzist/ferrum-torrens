@@ -5,7 +5,7 @@
 // (needs .model-cache/Qwen3.6-35B-A3B-NVFP4.ftw). The true oracle comparison
 // (greedy tokens equal to FreeToken on the host GPU) is a manual harness step.
 
-use ferrum_torrens::application::registry::build;
+use ferrum_torrens::application::registry::build_scalar;
 use ferrum_torrens::domain::model::ForwardInput;
 use ferrum_torrens::infrastructure::ftw::{FtwIndex, MmapFtwReader};
 
@@ -20,7 +20,7 @@ fn model() -> Box<dyn ferrum_torrens::domain::model::Model> {
     let config: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(format!("{dir}/config.json")).unwrap())
             .unwrap();
-    build(
+    build_scalar(
         &config,
         std::sync::Arc::new(ix),
         std::sync::Arc::new(reader),

@@ -205,8 +205,13 @@ pub fn load_engine(config: &crate::config::Config) -> Result<Engine, LoadError> 
         .map_err(|e| LoadError::Io(format!("{}/config.json: {e}", dir.display())))?;
     let config_json: serde_json::Value = serde_json::from_str(&config_json_text)
         .map_err(|e| LoadError::Io(format!("{}/config.json: {e}", dir.display())))?;
-    let model =
-        crate::application::registry::build(&config_json, std::sync::Arc::new(index), reader)?;
+    let device = resolve_compute_device(config)?;
+    let model = crate::application::registry::build(
+        &config_json,
+        std::sync::Arc::new(index),
+        reader,
+        device,
+    )?;
     let params = model.params().clone();
 
     if config.model.max_seq_len > params.max_position_embeddings {
@@ -227,7 +232,6 @@ pub fn load_engine(config: &crate::config::Config) -> Result<Engine, LoadError> 
         &tokenizer_path.to_string_lossy(),
     )?;
     let eos_ids = eos_ids_from_ftw_dir(dir)?;
-    let device = resolve_compute_device(config)?;
 
     Ok(Engine::new(
         std::sync::Arc::from(model),

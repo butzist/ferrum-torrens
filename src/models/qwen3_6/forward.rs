@@ -11,7 +11,7 @@ use crate::domain::weights::TensorKind;
 use crate::domain::weights::WeightsReader;
 use crate::infrastructure::ftw::FtwIndex;
 
-use super::weights::{DenseWeights, is_baked_gemma_norm};
+use super::weights::DenseWeights;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ForwardError {
@@ -297,7 +297,9 @@ pub(crate) fn expand_heads(x: &[f32], t: usize, heads: usize, rep: usize, dim: u
     out
 }
 
-/// Causal depthwise conv1d, kernel K, left-pad K-1, then silu. `w` [c, K].
+/// Causal depthwise conv1d, kernel K, then silu. `w` is [c, K] and the reference
+/// is `Conv1d(padding=K - 1)` truncated back to `t`: `out[t] = sum_j w[j] *
+/// x[t + j - (k - 1)]`, anything before the sequence read as zero.
 pub(crate) fn causal_conv1d_silu(
     conv: &[f32],
     w: &[f32],
@@ -310,8 +312,12 @@ pub(crate) fn causal_conv1d_silu(
         for ch in 0..c {
             let mut acc = 0.0f32;
             for j in 0..k {
-                let src = tt + (k - 1) - j;
-                let val = if src < t { conv[src * c + ch] } else { 0.0 };
+                let src = (tt + j + 1) as isize - k as isize;
+                let val = if src >= 0 {
+                    conv[src as usize * c + ch]
+                } else {
+                    0.0
+                };
                 acc += val * w[ch * k + j];
             }
             out[tt * c + ch] = silu(acc);
@@ -454,49 +460,45 @@ fn full_attention(
         &format!("model.layers.{layer}.self_attn.o_proj.weight"),
     )?;
 
-    let qkv = fp8_gemm(x, &qkv_w, &qkv_s, t, qdim + 2 * kv_dim, p.hidden_size);
+    let qkv_dim = qdim + 2 * kv_dim;
+    let qkv = fp8_gemm(x, &qkv_w, &qkv_s, t, qkv_dim, p.hidden_size);
+    // The gemm row is `[q | gate | k | v]`, so every split is per token, not
+    // per fused row: token `tt`'s block starts at `tt * qkv_dim`.
     let mut q = vec![0.0f32; t * qh * hd];
     let mut gate = vec![0.0f32; t * qh * hd];
-    for i in 0..t * qh {
-        let src = &qkv[i * hd * 2..(i + 1) * hd * 2];
-        for d in 0..hd {
-            q[i * hd + d] = src[d];
-            gate[i * hd + d] = src[hd + d];
+    let mut k_flat = vec![0.0f32; t * kvh * hd];
+    let mut v_flat = vec![0.0f32; t * kvh * hd];
+    for tt in 0..t {
+        let row = &qkv[tt * qkv_dim..(tt + 1) * qkv_dim];
+        for h in 0..qh {
+            let src = &row[h * hd * 2..(h + 1) * hd * 2];
+            let dst = (tt * qh + h) * hd;
+            q[dst..dst + hd].copy_from_slice(&src[..hd]);
+            gate[dst..dst + hd].copy_from_slice(&src[hd..]);
+        }
+        for h in 0..kvh {
+            let dst = (tt * kvh + h) * hd;
+            k_flat[dst..dst + hd].copy_from_slice(&row[qdim + h * hd..qdim + (h + 1) * hd]);
+            v_flat[dst..dst + hd].copy_from_slice(&row[qdim + kv_dim + h * hd..][..hd]);
         }
     }
-    let kv_start = t * qdim;
-    let k_flat: &[f32] = &qkv[kv_start..kv_start + t * kv_dim];
-    let v_flat: &[f32] = &qkv[kv_start + t * kv_dim..];
 
     // per-head q/k rms norms (Gemma, baked +1)
-    let qn = decode_bf16(
-        ctx.dense(&format!("model.layers.{layer}.self_attn.q_norm.weight"))?,
-        hd,
-    );
-    let kn = decode_bf16(
-        ctx.dense(&format!("model.layers.{layer}.self_attn.k_norm.weight"))?,
-        hd,
-    );
-    let qn = if is_baked_gemma_norm(&format!("model.layers.{layer}.self_attn.q_norm.weight")) {
-        qn.iter().map(|&w| w + 1.0).collect::<Vec<_>>()
-    } else {
-        qn
-    };
-    let kn = if is_baked_gemma_norm(&format!("model.layers.{layer}.self_attn.k_norm.weight")) {
-        kn.iter().map(|&w| w + 1.0).collect::<Vec<_>>()
-    } else {
-        kn
-    };
+    let qn_raw = ctx.dense(&format!("model.layers.{layer}.self_attn.q_norm.weight"))?;
+    let kn_raw = ctx.dense(&format!("model.layers.{layer}.self_attn.k_norm.weight"))?;
+    let qn = normed(qn_raw, hd);
+    let kn = normed(kn_raw, hd);
     let mut q_f = rms_norm(&q, &qn, p.rms_norm_eps, hd);
-    let mut k_n = rms_norm(k_flat, &kn, p.rms_norm_eps, hd);
+    let mut k_n = rms_norm(&k_flat, &kn, p.rms_norm_eps, hd);
 
     apply_partial_rope(&mut q_f, t, qh, hd, p.rotary_dim, p.rope_theta, positions);
     apply_partial_rope(&mut k_n, t, kvh, hd, p.rotary_dim, p.rope_theta, positions);
 
-    let attn = causal_attention(&q_f, &k_n, v_flat, t, qh, kvh, hd);
+    let attn = causal_attention(&q_f, &k_n, &v_flat, t, qh, kvh, hd);
     let mut gated = vec![0.0f32; t * qh * hd];
     for i in 0..attn.len() {
-        gated[i] = attn[i] * silu(gate[i]);
+        // FreeToken attention.py:_combine: attn * sigmoid(gate), not silu.
+        gated[i] = attn[i] * sigmoid(gate[i]);
     }
     Ok(fp8_gemm(&gated, &o_w, &o_s, t, p.hidden_size, qh * hd))
 }
@@ -521,9 +523,17 @@ fn linear_attention(ctx: &Ctx, x: &[f32], layer: usize, t: usize) -> Result<Vec<
         &format!("model.layers.{layer}.linear_attn.out_proj.weight"),
     )?;
 
-    let qkvz = fp8_gemm(x, &qkvz_w, &qkvz_s, t, conv_dim + value_dim, p.hidden_size);
-    let z: Vec<f32> = qkvz[t * conv_dim..].to_vec();
-    let conv_in: Vec<f32> = qkvz[..t * conv_dim].to_vec();
+    let qkvz_dim = conv_dim + value_dim;
+    let qkvz = fp8_gemm(x, &qkvz_w, &qkvz_s, t, qkvz_dim, p.hidden_size);
+    // `[q | k | v | z]` per token, strided by the fused row, not sliced at
+    // `t * conv_dim`: the halves are columns of every token, not whole rows.
+    let mut z = vec![0.0f32; t * value_dim];
+    let mut conv_in = vec![0.0f32; t * conv_dim];
+    for tt in 0..t {
+        let row = &qkvz[tt * qkvz_dim..(tt + 1) * qkvz_dim];
+        conv_in[tt * conv_dim..(tt + 1) * conv_dim].copy_from_slice(&row[..conv_dim]);
+        z[tt * value_dim..(tt + 1) * value_dim].copy_from_slice(&row[conv_dim..]);
+    }
 
     let ba = bf16_gemm(
         x,
@@ -534,17 +544,32 @@ fn linear_attention(ctx: &Ctx, x: &[f32], layer: usize, t: usize) -> Result<Vec<
         2 * vb,
         p.hidden_size,
     );
-    let b: Vec<f32> = ba[..t * vb].to_vec();
-    let a: Vec<f32> = ba[t * vb..].to_vec();
+    let mut b = vec![0.0f32; t * vb];
+    let mut a = vec![0.0f32; t * vb];
+    for tt in 0..t {
+        let row = &ba[tt * 2 * vb..(tt + 1) * 2 * vb];
+        b[tt * vb..(tt + 1) * vb].copy_from_slice(&row[..vb]);
+        a[tt * vb..(tt + 1) * vb].copy_from_slice(&row[vb..]);
+    }
 
     let conv_w = decode_bf16(
         ctx.dense(&format!("model.layers.{layer}.linear_attn.conv1d.weight"))?,
         conv_dim * p.linear_conv_kernel_dim,
     );
+    trace_vec("gdn.qkvz", layer, &qkvz);
     let mixed = causal_conv1d_silu(&conv_in, &conv_w, t, conv_dim, p.linear_conv_kernel_dim);
-    let qf: Vec<f32> = mixed[..t * key_dim].to_vec();
-    let kf: Vec<f32> = mixed[t * key_dim..t * 2 * key_dim].to_vec();
-    let vf: Vec<f32> = mixed[t * 2 * key_dim..].to_vec();
+    trace_vec("gdn.conv", layer, &mixed);
+    // The conv keeps the fused `[q | k | v]` channel layout, so the three
+    // parts are per-token column blocks, strided by `conv_dim`.
+    let mut qf = vec![0.0f32; t * key_dim];
+    let mut kf = vec![0.0f32; t * key_dim];
+    let mut vf = vec![0.0f32; t * value_dim];
+    for tt in 0..t {
+        let row = &mixed[tt * conv_dim..(tt + 1) * conv_dim];
+        qf[tt * key_dim..(tt + 1) * key_dim].copy_from_slice(&row[..key_dim]);
+        kf[tt * key_dim..(tt + 1) * key_dim].copy_from_slice(&row[key_dim..2 * key_dim]);
+        vf[tt * value_dim..(tt + 1) * value_dim].copy_from_slice(&row[2 * key_dim..]);
+    }
 
     let rep = vb / kb;
     let q = expand_heads(&qf, t, kb, rep, dk);
@@ -564,10 +589,13 @@ fn linear_attention(ctx: &Ctx, x: &[f32], layer: usize, t: usize) -> Result<Vec<
     for i in 0..t * vb {
         let h = i % vb;
         g[i] = -(a_log[h].exp()) * softplus(a[i] + dt_bias[h]);
+        // FreeToken gdn.py:_gate_params: beta = b.sigmoid().
         beta[i] = 1.0 / (1.0 + (-b[i]).exp());
     }
 
+    trace_vec("gdn.g", layer, &g);
     let core = gdn_recurrence(t, vb, dk, dv, &q, &k, &v, &g, &beta);
+    trace_vec("gdn.core", layer, &core);
 
     // GatedRMSNorm: rms(core) * (norm.weight) * silu(z) -- no +1 bake.
     let norm_w = decode_bf16(
@@ -575,11 +603,15 @@ fn linear_attention(ctx: &Ctx, x: &[f32], layer: usize, t: usize) -> Result<Vec<
         dv,
     );
     let core_n = rms_norm(&core, &norm_w, p.rms_norm_eps, dv);
+    trace_vec("gdn.norm", layer, &core_n);
     let mut out = vec![0.0f32; t * vb * dv];
     for i in 0..t * vb * dv {
         out[i] = core_n[i] * silu(z[i]);
     }
-    Ok(fp8_gemm(&out, &o_w, &o_s, t, p.hidden_size, value_dim))
+    trace_vec("gdn.pre", layer, &out);
+    let o = fp8_gemm(&out, &o_w, &o_s, t, p.hidden_size, value_dim);
+    trace_vec("gdn.out", layer, &o);
+    Ok(o)
 }
 
 fn shared_expert(ctx: &Ctx, x: &[f32], layer: usize, t: usize) -> Result<Vec<f32>> {
@@ -731,6 +763,30 @@ pub(crate) fn topk_renorm(p: &[f32], n: usize, e: usize, k: usize) -> (Vec<usize
 }
 
 /// One contiguous sequence through the whole tower.
+/// Stage-level l2/absmax trace, gated on `FT_TRACE=1`. The scalar reference and
+/// the libtorch path print the same lines so a real-checkpoint run can diff them
+/// layer by layer and localise the first divergence.
+pub(crate) fn trace(stage: &str, layer: usize, l2: f64, amax: f64) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("FT_TRACE").is_ok_and(|v| v == "1")) {
+        return;
+    }
+    eprintln!("TRACE {layer} {stage} l2={l2:.6} amax={amax:.6}");
+}
+
+pub(crate) fn trace_vec(stage: &str, layer: usize, v: &[f32]) {
+    if !std::env::var("FT_TRACE").is_ok_and(|x| x == "1") {
+        return;
+    }
+    let l2 = v
+        .iter()
+        .map(|x| (*x as f64) * (*x as f64))
+        .sum::<f64>()
+        .sqrt();
+    let amax = v.iter().fold(0.0f32, |m, x| m.max(x.abs())) as f64;
+    trace(stage, layer, l2, amax);
+}
+
 fn run_sequence(
     ctx: &Ctx,
     tokens: &[u32],
@@ -760,6 +816,8 @@ fn run_sequence(
         probe_lens(ctx, usize::MAX, &x, &zero, t, lens.as_deref_mut())?;
     }
 
+    trace_vec("embed", usize::MAX, &x);
+
     for layer in 0..p.num_layers {
         // input norm: h1 = rms(x + res) * w; carry (x + res) forward.
         let xsum = match residual.take() {
@@ -773,8 +831,10 @@ fn run_sequence(
             }
         };
         let in_name = format!("model.layers.{layer}.input_layernorm.weight");
-        let in_w = normed(ctx.dense(&in_name)?, h, &in_name);
+        let in_w = normed(ctx.dense(&in_name)?, h);
         let h1 = rms_norm(&xsum, &in_w, p.rms_norm_eps, h);
+        trace_vec("xsum", layer, &xsum);
+        trace_vec("h1", layer, &h1);
 
         let attn_out = match p.layer_types[layer] {
             crate::domain::model::LayerType::FullAttention => {
@@ -785,16 +845,21 @@ fn run_sequence(
             }
         };
 
+        trace_vec("attn", layer, &attn_out);
+
         // post norm over (attn_out + residual)
         let mut sum2 = vec![0.0f32; t * h];
         for i in 0..sum2.len() {
             sum2[i] = attn_out[i] + xsum[i];
         }
         let post_name = format!("model.layers.{layer}.post_attention_layernorm.weight");
-        let post_w = normed(ctx.dense(&post_name)?, h, &post_name);
+        let post_w = normed(ctx.dense(&post_name)?, h);
         let h2 = rms_norm(&sum2, &post_w, p.rms_norm_eps, h);
 
+        trace_vec("sum2", layer, &sum2);
+        trace_vec("h2", layer, &h2);
         x = moe_block(ctx, &h2, layer, t)?;
+        trace_vec("moe", layer, &x);
         residual = Some(sum2);
 
         if lens.is_some() {
@@ -810,7 +875,7 @@ fn run_sequence(
     }
 
     // final norm then lm_head over the last token
-    let model_norm = normed(ctx.dense("model.norm.weight")?, h, "model.norm.weight");
+    let model_norm = normed(ctx.dense("model.norm.weight")?, h);
     let sumf = {
         let r = residual.take().ok_or_else(|| {
             ForwardError::Bad("no residual for final norm", "run_sequence".into())
@@ -822,6 +887,7 @@ fn run_sequence(
         s
     };
     let xf = rms_norm(&sumf, &model_norm, p.rms_norm_eps, h);
+    trace_vec("final", usize::MAX, &xf);
     let last = &xf[(t - 1) * h..t * h];
 
     let lw = ctx.dense("lm_head.weight")?;
@@ -848,7 +914,7 @@ fn probe_lens(
     }
     let last = &stream[(t - 1) * h..t * h];
     let norm = last.iter().map(|v| v * v).sum::<f32>().sqrt();
-    let model_norm = normed(ctx.dense("model.norm.weight")?, h, "model.norm.weight");
+    let model_norm = normed(ctx.dense("model.norm.weight")?, h);
     let xf = rms_norm(last, &model_norm, p.rms_norm_eps, h);
     let logits = nvfp4_gemv(
         &xf,
@@ -882,13 +948,8 @@ fn probe_lens(
     Ok(())
 }
 
-fn normed(raw: &[u8], h: usize, name: &str) -> Vec<f32> {
-    let w = decode_bf16(raw, h);
-    if is_baked_gemma_norm(name) {
-        w.iter().map(|&v| v + 1.0).collect()
-    } else {
-        w
-    }
+fn normed(raw: &[u8], h: usize) -> Vec<f32> {
+    decode_bf16(raw, h)
 }
 
 /// Reference forward for a batch of contiguous sequences. Returns the final-token

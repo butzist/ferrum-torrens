@@ -58,7 +58,12 @@ impl DenseWeights {
     }
 }
 
-/// Gemma-style norms bake (1 + w) at load; the GDN output norm keeps w.
+/// The Gemma-style norms FreeToken's weight reader folds `(1 + w)` into. The
+/// FTW is written from `load_weight`, i.e. *after* that fold, so its stored
+/// weights already carry the bake and readers must not add it again. Only the
+/// GDN gated norm (`linear_attn.norm`) stays un-folded, in the checkpoint and
+/// here alike; this predicate marks the already-baked names for tests and
+/// diagnostics.
 pub fn is_baked_gemma_norm(name: &str) -> bool {
     name == "model.norm.weight"
         || name.ends_with(".input_layernorm.weight")
