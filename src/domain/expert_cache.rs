@@ -119,6 +119,23 @@ impl ExpertCache {
         plan
     }
 
+    /// Drop every expert of `layer` back to "not resident". The GPU slot cache
+    /// holds one layer's working set at a time (256 experts x ~2.6 MB fits once
+    /// on 8 GB, not forty times), so switching layers has to invalidate the
+    /// layer's slots or the adapter would read another layer's bytes.
+    pub fn forget_layer(&mut self, layer: usize) {
+        assert!(layer < self.num_layers);
+        let id_base = layer * self.num_experts;
+        for e in 0..self.num_experts {
+            let slot = self.slot_for_id[id_base + e];
+            if slot >= 0 {
+                self.id_of_slot[slot as usize] = -1;
+                self.usage[slot as usize] = 0;
+                self.slot_for_id[id_base + e] = -1;
+            }
+        }
+    }
+
     /// argmin (usage, slot): least-recently-used slot wins, ties by lower slot.
     fn pick_victim(&self) -> usize {
         let mut victim = 0usize;
@@ -137,6 +154,49 @@ impl ExpertCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forget_layer_invalidates_only_that_layer() {
+        let mut c = ExpertCache::new(2, 4, 4);
+        c.ensure_experts(0, &[0, 1]);
+        c.ensure_experts(1, &[0, 1]);
+        assert!(c.slot_of(0, 0) >= 0 && c.slot_of(1, 0) >= 0);
+
+        c.forget_layer(0);
+        assert_eq!(c.slot_of(0, 0), -1);
+        assert_eq!(c.slot_of(0, 1), -1);
+        assert!(c.slot_of(1, 0) >= 0, "layer 1 keeps its slots");
+        assert_eq!(
+            c.id_of_slot
+                .iter()
+                .filter(|&&id| (0..4).contains(&id))
+                .count(),
+            0
+        );
+        assert_eq!(
+            c.id_of_slot
+                .iter()
+                .filter(|&&id| (4..8).contains(&id))
+                .count(),
+            2
+        );
+
+        // Coming back to layer 0 must re-miss everything.
+        let p = c.ensure_experts(0, &[0, 1]);
+        assert_eq!(p.misses, vec![0, 1]);
+        assert!(p.rewrites.iter().all(|&s| s >= 0));
+    }
+
+    #[test]
+    fn forget_layer_is_idempotent_and_frees_slots_for_the_next_layer() {
+        let mut c = ExpertCache::new(2, 3, 3);
+        c.ensure_experts(0, &[0, 1, 2]);
+        c.forget_layer(0);
+        c.forget_layer(0);
+        let p = c.ensure_experts(1, &[0, 1, 2]);
+        assert_eq!(p.misses, vec![0, 1, 2], "the freed slots are reusable");
+        assert_eq!(p.write_slots, vec![0, 1, 2]);
+    }
 
     #[test]
     fn fills_free_slots_first_lowest_slot() {

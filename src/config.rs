@@ -18,6 +18,7 @@ pub const DEFAULT_NUM_TOKENS: usize = 131072;
 pub const DEFAULT_TEMPERATURE: f32 = 0.0;
 pub const DEFAULT_TOP_K: i64 = -1;
 pub const DEFAULT_TOP_P: f32 = 1.0;
+pub const DEFAULT_PYTHON_PATH: &str = "python";
 pub const MIN_CACHE_SIZE_SLOTS: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
@@ -140,6 +141,35 @@ impl Default for Moe {
     }
 }
 
+/// Where the Triton kernel module lives. `triton = false` keeps the libtorch
+/// NVFP4 path (the stand-in), so a deployment can start without python at all.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Kernel {
+    #[serde(default)]
+    pub triton: bool,
+    #[serde(default = "default_python_path")]
+    pub python_path: String,
+    /// Extra `sys.path` entries holding `torch`/`triton`; the embedded
+    /// interpreter is the one pyo3 linked, which is not the venv's.
+    #[serde(default)]
+    pub site_packages: Vec<String>,
+}
+
+impl Default for Kernel {
+    fn default() -> Self {
+        Self {
+            triton: false,
+            python_path: DEFAULT_PYTHON_PATH.to_string(),
+            site_packages: Vec::new(),
+        }
+    }
+}
+
+fn default_python_path() -> String {
+    DEFAULT_PYTHON_PATH.to_string()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Kv {
@@ -180,6 +210,8 @@ pub struct Config {
     pub kv: Kv,
     #[serde(default)]
     pub sampling: Sampling,
+    #[serde(default)]
+    pub kernel: Kernel,
 }
 
 impl FromStr for Config {
@@ -368,6 +400,11 @@ num_pages = 131072
 temperature = 0.0
 top_k = -1
 top_p = 1.0
+
+[kernel]
+triton = true
+python_path = "python"
+site_packages = ["/nix/store/...-python3-3.12.14/lib/python3.12/site-packages"]
 "#;
 
     #[test]
@@ -398,6 +435,9 @@ top_p = 1.0
         assert_eq!(c.sampling.temperature, 0.0);
         assert_eq!(c.sampling.top_k, -1);
         assert_eq!(c.sampling.top_p, 1.0);
+        assert!(c.kernel.triton, "the example turns the kernel on");
+        assert_eq!(c.kernel.python_path, DEFAULT_PYTHON_PATH);
+        assert_eq!(c.kernel.site_packages.len(), 1);
     }
 
     #[test]
@@ -423,6 +463,29 @@ path = "/tmp/Qwen.ftw"
         assert_eq!(c.sampling.temperature, 0.0);
         assert_eq!(c.sampling.top_k, -1);
         assert_eq!(c.sampling.top_p, 1.0);
+        assert!(!c.kernel.triton, "the stand-in path is the default");
+        assert_eq!(c.kernel.python_path, DEFAULT_PYTHON_PATH);
+        assert!(c.kernel.site_packages.is_empty());
+    }
+
+    #[test]
+    fn kernel_section_points_at_the_python_kernel() {
+        let c = Config::from_str(
+            r#"[model]
+path = "/tmp/Qwen.ftw"
+[kernel]
+triton = true
+python_path = "/opt/ferrum/python"
+site_packages = ["/opt/venv/lib/python3.12/site-packages"]
+"#,
+        )
+        .unwrap();
+        assert!(c.kernel.triton);
+        assert_eq!(c.kernel.python_path, "/opt/ferrum/python");
+        assert_eq!(
+            c.kernel.site_packages,
+            vec!["/opt/venv/lib/python3.12/site-packages"]
+        );
     }
 
     #[test]

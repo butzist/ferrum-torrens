@@ -1,6 +1,14 @@
 # FerrumTorrens -- FreeToken MVP port to Rust: TODO
 
-Status: M1b DONE -- the libtorch tower matches the FreeToken oracle: gated
+Status: M2 (API) current, M3 kernel work started out of order -- the NVFP4
+grouped-MoE Triton kernel and its pyo3 adapter both exist and are green on the
+CPU-only box (decisions 24-28): `domain::expert_kernel` (ports + scalar oracle),
+`python/ferrum_kernel/nvfp4_moe.py` (PTX-clean for sm_120) and
+`infrastructure/triton.rs` (feature `triton`: device slot cache, `ExpertSlotStore`,
+`ExpertGemm`). What is missing is the gated GPU numerical run, the
+`infrastructure/banks.rs` slab source, `application/run_experts.rs`, and the
+`moe_block` swap. Last finished: M1b -- the
+libtorch tower matches the FreeToken oracle: gated
 `one_token_prediction_matches_the_oracle` emits id 11751 (" Paris") for
 `"The capital of France is"` in ~46 s under the 26 GiB cap (decision 22), and
 the gated scalar/libtorch cross-check agrees to 1.7e-6 of the logit scale on the
@@ -129,6 +137,11 @@ ferrum-torrens/
       tokenizers_hf.rs          # HF `tokenizers` crate + minijinja chat template
   scripts/
     convert_hf_to_ftw.py        # one-time wrapper over FreeToken `ft checkpoint`
+  python/
+    ferrum_kernel/               # the one hand-written GPU kernel (decision 24)
+      nvfp4_moe.py              #   grouped MoE GEMV + silu-mul + top-k reduce
+      selftest.py               #   torch reference + GPU numerical gate
+      compile_check.py          #   PTX compile check, no GPU needed
 ```
 
 Superseded by decision 2 (libtorch): the `build.rs` + `sources/csrc/` nvcc
@@ -249,12 +262,35 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
   stay unchanged (no KV cache, no graph, no offload yet).
 
 ### Kernels (Triton via the python adapter; the NVFP4 expert GEMV only)
-- [ ] P0 **the one hand-written kernel**: NVFP4 grouped expert GEMM, decode
-  (marlin-style nibble) and prefill (interleaved lo/hi) variants; e2m1 LUT
-  {0,0.5,1,1.5,2,3,4,6,-...}, e4m3 block-scale decode, fp16 per-row global
-  applied once after the K reduction, weighted sum of topk partials.
-  M1b may start with a **torch-native** dequantize-to-bf16 + `bmm` stand-in to get
-  correctness first, then swap the kernel in behind the same port.
+- [x] P0 **the one hand-written kernel**, part 1 (2026-10-02): the kernels
+  themselves plus the port they implement. e2m1 LUT
+  {0,0.5,1,1.5,2,3,4,6,-...}, e4m3 block scale, fp16 per-row global applied once
+  after the K reduction, routed weights on the second GEMM, dense `top_k` reduce.
+  One route-indexed GEMV serves decode and prefill alike (decision 24), so the
+  decode/prefill kernel pair collapsed into one kernel.
+  (`python/ferrum_kernel/nvfp4_moe.py`, `domain/expert_kernel.rs`: ports
+  `ExpertGemm`/`ExpertSlotStore`/`ExpertSlabSource` + the `grouped_moe_reference`
+  oracle the GPU gate compares against, 9 unit tests.)
+- [ ] P0 **the one hand-written kernel**, part 2: `infrastructure/triton.rs`
+  (pyo3, device slot cache, `ExpertGemm` over the python `grouped_moe`) plus the
+  gated GPU test (kernel vs `grouped_moe_reference` on a real expert slab, then
+  the oracle token through the full tower). The marlin-style int32 wide-load
+  decode and the `tl.dot` prefill tile stay later perf swaps behind the same
+  `grouped_moe` entry point (decision 24).
+  - [x] the adapter itself (2026-10-02, `src/infrastructure/triton.rs`, feature
+    `triton`): `TritonRuntime` puts `kernel.python_path` plus
+    `kernel.site_packages` on `sys.path`, imports the module, resolves
+    `cuda:N` and refuses to run without native e4m3; `TritonMoE` allocates the
+    `[slots, rows, cols/2]` banks on the device, stages one slab per expert
+    through `torch.frombuffer` + `copy_` (`load_slab`, byte-size checked),
+    implements `ExpertSlotStore` over an `ExpertSlabSource`, and `ExpertGemm for
+    Mutex<TritonMoE>` flattens the routes and calls `grouped_moe`. 5 unit tests
+    (route flattening, shape rules, cache sizing, slab-size and slot-range
+    rejection) and the `[kernel]` config tests pass on the CPU-only box; the
+    interpreter itself is exercised by those tests.
+  - [ ] the gated GPU test, plus `application/run_experts.rs` and the
+    `infrastructure/banks.rs` `ExpertSlabSource` that feed it, and the
+    `moe_block` swap in `models/qwen3_6/forward_torch.rs`.
 - [x] P0 everything else libtorch already provides: silu/sigmoid/softplus/softmax/
   topk (router), rmsnorm (+Gemma `1+w`), partial rope, paged GQA attention
   (FlashInfer, `fi` semantics), GDN chunked prefill + single-token decode
@@ -281,7 +317,7 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 ### MoE offload cache
 - [x] P0 flat id space `layer*num_experts + expert`; tables `slot_for_id[L*E]` (-1 free), `id_of_slot[C]`, `usage[C]` step clock. (`domain/expert_cache.rs`)
 - [x] P0 `ensure_experts` (LRU): rewrite routed ids -> slot ids in place; emit miss list; LRU victim = argmin(usage) with same-step owner protection (an expert used earlier in this step may not be evicted).
-- [ ] P0 `copy_missing`: fused copy of all banks' missed rows on the compute stream (serial per step).
+- [ ] P0 `copy_missing`: fused copy of all banks' missed rows on the compute stream (serial per step). Moves up next: the Triton adapter needs a device slot cache to read from (M3 kernel part 2, decision 24).
 - [ ] P0 prefill: `materialize_layer` per-layer full stream; `prefill_overlap` two-buffer (copy stream + ready/release events, layer+1 prefetch) guarded by `cache_size >= 2*E`.
 - [x] P0 `cache_size_slots` explicit from config; floor `>= num_experts`. (floor enforced in `application::engine::load_engine`)
 - [ ] P0 prefill double-buffer and decode path must not clobber each other (begin_prefill fence).
@@ -342,9 +378,12 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
   FreeToken GPU oracle plus the two-implementation cross-check, not against our
   own CPU path alone.
 - **M2 API (CURRENT)**: sampling params, chat template + `/v1/chat/completions`, SSE.
-- **M3 performance**: the NVFP4 expert Triton kernel (replacing the torch
-  dequantize+bmm stand-in), paged KV + radix, fast chunked GDN, CUDA-graph
-  decode, prefill/decode split so decode stops re-feeding the prefix.
+- **M3 performance**: the NVFP4 expert Triton kernel (kernels + port DONE, the
+  `triton.rs` adapter and the GPU gate pending -- decisions 24-26), paged KV +
+  radix, fast chunked GDN, CUDA-graph decode, prefill/decode split so decode
+  stops re-feeding the prefix. Note the kernel work pulls the device slot cache
+  (M4's `copy_missing`) forward: the adapter cannot run without somewhere to
+  stage an expert, so `copy_missing` lands with the adapter, not after it.
 - **M4 offload**: LRU slot cache + fused copy + prefill double buffer; radix
   prefix cache wired to the running server; batch concurrency.
 - **M5**: optional APIs (Anthropic/Responses), hybrid_radix GDN reuse, startup
@@ -561,6 +600,62 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
       **per token**: `t` rows of `out` features, so the halves are column blocks
       strided by `out`, not contiguous slices at `t * block`. Nibble order inside
       NVFP4 stays low-nibble-first (two consecutive values per byte).
+24. **The Triton kernel takes flat route lists, not top-k matrices** (2026-10-02)
+    -- `python/ferrum_kernel/nvfp4_moe.py` indexes the activation row, the slot
+    and the routed weight per *route* (`route_token[r]`, `route_slot[r]`,
+    `route_weight[r]`, dense over `tokens * top_k`, `-1` = not resident). That is
+    exactly the domain's `MoEGroup`, so no token sort or expert-metadata kernel
+    is needed on the Rust side, and a missing slot is branch-free (read slot 0,
+    zero the accumulator) which keeps the `top_k` reduce dense. A non-resident
+    route therefore costs one wasted pass over slot 0, not a separate code path.
+    Upstream's `_prefill_nvfp4_moe_kernel` instead wants
+    `sorted_token_ids` + per-block slot ids; the route-list shape replaces that
+    whole stage. Consequence: decode and prefill are the *same* launch (one
+    program per `(route, N block)`), so the port needs one GEMV, not the
+    decode/prefill kernel pair decision 2 assumed. The `tl.dot` prefill tile and
+    the marlin-style int32 wide-load decode are later perf swaps behind the same
+    `grouped_moe` entry point, not correctness work.
+25. **The kernel adapter speaks host slices; python owns the device buffers**
+    (2026-10-02) -- `domain::expert_kernel::{ExpertGemm, ExpertSlotStore,
+    ExpertSlabSource}` are host-slice ports, deliberately: the domain may not
+    hold device tensors (AGENTS.md), and the only heavy thing is the expert
+    weights, which live in the adapter's slot cache. So the adapter (a) holds
+    the `[slots, rows, cols/2]` NVFP4 banks on the device, (b) stages `x`
+    (4 KB/token) and reads `out` back per layer, and (c) never shares a pointer
+    with libtorch. That costs two tiny copies per layer and buys immunity to two
+    libtorch builds' C++ ABI disagreeing inside one process, which is what
+    sharing a `Tensor` pointer with python's torch would require. `pyo3` embeds
+    the interpreter (decision 2's "Python at runtime for Triton").
+26. **The kernels are checked without a GPU** (2026-10-02) -- `python/
+    ferrum_kernel/compile_check.py` lowers all three kernels to PTX for sm_120
+    with an explicit `GPUTarget`, a stubbed `cubin` stage and a mocked
+    `ptxas --version`, so kernel typos, constexpr arity and type errors fail on
+    the CPU-only box. `selftest.py --device cuda` is the numerical gate against
+    the torch reference and needs a devshell. Triton's interpreter mode was
+    rejected as a CPU numerical gate: in triton 3.6 `TRITON_INTERPRET=1` binds
+    scalar `int` args as 0-d tensors, so `range(0, K // 2, BLOCK)` raises
+    `TypeError: only 0-dimensional arrays can be converted to Python scalars`.
+    Both scripts need the venv on the library path:
+    `LD_LIBRARY_PATH="/run/opengl-driver/lib:$(dirname "$(gcc -print-file-name=libstdc++.so.6)"):<zlib>/lib" \
+     PYTHONPATH=python FreeToken/.venv/bin/python -m ferrum_kernel.compile_check`.
+27. **The device slot cache holds ONE layer, and forgetting is explicit** (2026-10-02)
+    -- `moe_cache_size_slots = 256` experts is ~0.43 GB, but that is 256 experts
+    of ONE layer: 40 layers x 256 experts is 17 GB, which does not fit an 8 GB
+    card. So `TritonMoE` allocates its banks for one layer and reallocates on a
+    layer switch, which makes every expert miss again. The layer's slots live in
+    the domain `ExpertCache`, so the adapter reports the switch
+    (`TritonMoE::take_dropped_layer`) and the caller replays it into
+    `ExpertCache::forget_layer(layer)` -- which must happen BEFORE
+    `ensure_experts` computes the plan for the new layer, or the plan sees the
+    stale residency and never asks for a copy. Consequence, recorded so it is
+    not rediscovered: a decode step over 40 layers re-stages the experts it
+    touches once per layer switch, which is the cost of fitting in VRAM at all.
+28. **`pyo3` is behind the non-default `triton` feature** (2026-10-02) -- like
+    `cuda`, it must not be in the default CPU-only build: `auto-initialize`
+    links the build-time interpreter (the Nix python), and `kernel.python_path`
+    / `kernel.site_packages` exist because the venv's torch is imported into
+    THAT interpreter, not the other way round. `kernel.triton = false` is the
+    default so the port and the scalar oracle stay runnable without python.
 
 ### Config defaults for the RTX 5060 / 8 GB target
 
