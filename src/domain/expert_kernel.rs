@@ -44,7 +44,9 @@ pub trait ExpertSlabSource: Send + Sync {
     fn slab(&self, layer: usize, expert: u32, part: Part) -> Result<Slab, MoEError>;
 }
 
-/// The slot cache's write side: stage one expert's bytes into `slot`.
+/// The slot cache's write side: stage one expert's bytes into `slot`. `&self`,
+/// not `&mut self`: one device cache serves every step, so the adapter takes the
+/// lock itself and callers hold a shared handle.
 #[cfg_attr(test, mockall::automock)]
 pub trait ExpertSlotStore: Send + Sync {
     /// Declare the layer that is about to be staged. Returns the layer whose
@@ -52,8 +54,8 @@ pub trait ExpertSlotStore: Send + Sync {
     /// forget that layer BEFORE `ExpertCache::ensure_experts` plans the new
     /// one -- otherwise the plan sees stale residency and never copies
     /// (decision 27). Idempotent per layer.
-    fn begin_layer(&mut self, layer: usize) -> Result<Option<usize>, MoEError>;
-    fn load(&mut self, layer: usize, expert: u32, slot: usize) -> Result<(), MoEError>;
+    fn begin_layer(&self, layer: usize) -> Result<Option<usize>, MoEError>;
+    fn load(&self, layer: usize, expert: u32, slot: usize) -> Result<(), MoEError>;
     fn slots(&self) -> usize;
 }
 

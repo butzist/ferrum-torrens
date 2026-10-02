@@ -270,6 +270,37 @@ impl TritonMoE {
         self.dropped_layer.take()
     }
 
+    /// Switch the device banks to `layer`, reporting the layer whose bytes were
+    /// dropped (decision 27). The caller replays that into
+    /// `ExpertCache::forget_layer` before planning, so the slots it still
+    /// believes in are gone exactly when the plan is computed.
+    pub fn begin_layer(&mut self, layer: usize) -> Result<Option<usize>, MoEError> {
+        if self.layer == Some(layer) {
+            return Ok(None);
+        }
+        let dropped = self.layer.take();
+        self.gate_up = None;
+        self.down = None;
+        self.dropped_layer = dropped;
+        self.layer = Some(layer);
+        Ok(dropped)
+    }
+
+    /// Pull both slabs of one expert from the source and stage them.
+    pub fn load(&mut self, layer: usize, expert: u32, slot: usize) -> Result<(), MoEError> {
+        // Idempotent: a caller that only stages one expert still gets a
+        // consistent cache, and the dropped layer is still reported.
+        self.begin_layer(layer)?;
+        for part in [Part::GateUp, Part::Down] {
+            let slab = self
+                .source
+                .slab(layer, expert, part)
+                .map_err(|e| err(&format!("slab L{layer} E{expert} {part:?}"), e))?;
+            self.load_slab(layer, slot, part, &slab)?;
+        }
+        Ok(())
+    }
+
     /// Bytes per expert: packed + scales + globals, so the engine can check the
     /// 8 GB budget before allocating.
     pub fn expert_bytes(&self) -> usize {
@@ -395,54 +426,53 @@ impl TritonMoE {
     }
 }
 
-impl ExpertSlotStore for TritonMoE {
-    /// Switch the device banks to `layer`, reporting the layer whose bytes were
-    /// dropped (decision 27). The caller replays that into
-    /// `ExpertCache::forget_layer` before planning, so the slots it still
-    /// believes in are gone exactly when the plan is computed.
-    fn begin_layer(&mut self, layer: usize) -> Result<Option<usize>, MoEError> {
-        if self.layer == Some(layer) {
-            return Ok(None);
-        }
-        let dropped = self.layer.take();
-        self.gate_up = None;
-        self.down = None;
-        self.dropped_layer = dropped;
-        self.layer = Some(layer);
-        Ok(dropped)
+/// The ports over the shared handle: the engine keeps one `Mutex<TritonMoE>` per
+/// checkpoint and hands it out as both ports, so the plan and the kernel call
+/// see the same banks without the caller juggling borrows.
+impl ExpertSlotStore for Mutex<TritonMoE> {
+    fn begin_layer(&self, layer: usize) -> Result<Option<usize>, MoEError> {
+        self.lock()
+            .map_err(|_| MoEError::Bad("triton slot cache poisoned".into()))?
+            .begin_layer(layer)
     }
 
-    /// Pull both slabs of one expert from the source and stage them.
-    fn load(&mut self, layer: usize, expert: u32, slot: usize) -> Result<(), MoEError> {
-        // Idempotent: a caller that only stages one expert still gets a
-        // consistent cache, and `take_dropped_layer` still reports the switch.
-        self.begin_layer(layer)?;
-        for part in [Part::GateUp, Part::Down] {
-            let slab = self
-                .source
-                .slab(layer, expert, part)
-                .map_err(|e| err(&format!("slab L{layer} E{expert} {part:?}"), e))?;
-            self.load_slab(layer, slot, part, &slab)?;
-        }
-        Ok(())
+    fn load(&self, layer: usize, expert: u32, slot: usize) -> Result<(), MoEError> {
+        self.lock()
+            .map_err(|_| MoEError::Bad("triton slot cache poisoned".into()))?
+            .load(layer, expert, slot)
     }
 
     fn slots(&self) -> usize {
-        self.slots
+        self.lock().map(|m| m.slots).unwrap_or(0)
     }
 }
 
 impl ExpertGemm for Mutex<TritonMoE> {
-    fn grouped_moe(&self, req: &MoEGroup<'_>, out: &mut [f32]) -> Result<(), MoEError> {
+    fn grouped_moe<'a>(&self, req: &MoEGroup<'a>, out: &mut [f32]) -> Result<(), MoEError> {
         let me = self
             .lock()
             .map_err(|_| MoEError::Bad("triton slot cache poisoned".into()))?;
-        if me.layer.is_none() {
+        me.grouped_moe(req, out)
+    }
+}
+
+/// The kernel call itself, on the adapter. A caller that already holds the lock
+/// (the gated test, a single threaded step) implements the port directly; the
+/// engine reaches it through the mutex handle.
+impl ExpertGemm for TritonMoE {
+    fn grouped_moe<'a>(&self, req: &MoEGroup<'a>, out: &mut [f32]) -> Result<(), MoEError> {
+        TritonMoE::grouped_moe(self, req, out)
+    }
+}
+
+impl TritonMoE {
+    pub fn grouped_moe<'a>(&self, req: &MoEGroup<'a>, out: &mut [f32]) -> Result<(), MoEError> {
+        if self.layer.is_none() {
             return Err(MoEError::Bad(
                 "grouped_moe before any expert was staged".into(),
             ));
         }
-        let hidden = me.shapes.hidden;
+        let hidden = self.shapes.hidden;
         let tokens = req.x.len() / hidden;
         if tokens == 0 || out.len() < tokens * hidden || req.top_k == 0 {
             return Err(MoEError::Bad(format!(
@@ -453,12 +483,12 @@ impl ExpertGemm for Mutex<TritonMoE> {
             )));
         }
         let (route_token, route_slot) = route_lists(req.routes, tokens, req.top_k)?;
-        let device = me.runtime.device.clone();
-        let gu = me
+        let device = self.runtime.device.clone();
+        let gu = self
             .gate_up
             .as_ref()
             .ok_or_else(|| MoEError::Bad("no slot cache".into()))?;
-        let dn = me
+        let dn = self
             .down
             .as_ref()
             .ok_or_else(|| MoEError::Bad("no slot cache".into()))?;
@@ -471,7 +501,7 @@ impl ExpertGemm for Mutex<TritonMoE> {
         let slot_list = route_slot;
         let token_list = route_token;
         Python::attach(|py| {
-            let kernel = me.runtime.kernel.clone_ref(py);
+            let kernel = self.runtime.kernel.clone_ref(py);
             let torch = py.import("torch").map_err(|e| err("import torch", e))?;
             let x_t = to_device(
                 method(

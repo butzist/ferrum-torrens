@@ -2,7 +2,7 @@
 
 Status: M2 (API) current, M3 kernel work started out of order -- the NVFP4
 grouped-MoE Triton kernel and its pyo3 adapter both exist and are green on the
-CPU-only box (decisions 24-28): `domain::expert_kernel` (ports + scalar oracle),
+CPU-only box (decisions 24-29): `domain::expert_kernel` (ports + scalar oracle),
 `python/ferrum_kernel/nvfp4_moe.py` (PTX-clean for sm_120) and
 `infrastructure/triton.rs` (feature `triton`: device slot cache, `ExpertSlotStore`,
 `ExpertGemm`). What is missing is the gated GPU numerical run, the
@@ -302,8 +302,18 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
     `plan.rewrites` to `ExpertGemm`. `begin_layer` is the new port method that
     makes the ordering explicit. 7 unit tests over mocked ports, including the
     overflow case where the kernel receives `-1` routes.
-  - [ ] the gated GPU test and the `moe_block` swap in
-    `models/qwen3_6/forward_torch.rs`.
+  - [ ] the `moe_block` swap in `models/qwen3_6/forward_torch.rs` (the inline
+    per-token/per-expert host widening), which is what runs the kernel in the
+    tower.
+  - [x] the gated GPU test written (2026-10-02,
+    `tests/triton_moe_matches_reference.rs`, `--ignored`): real slabs from the
+    mmap banks -> `FtwBanks` -> `TritonMoE` through `run_experts`, then
+    `grouped_moe_reference` over the same host bytes, asserting
+    `max|kernel - scalar| <= 2e-3` of the output scale. NOT yet run: it needs a
+    CUDA device, so hand it to a devshell:
+    `cargo test --release --features triton --test triton_moe_matches_reference -- --ignored --nocapture`
+    (set `FERRUM_KERNEL_SITE_PACKAGES` to the venv's site-packages; it defaults
+    to `FreeToken/.venv/lib/python3.12/site-packages`).
 - [x] P0 everything else libtorch already provides: silu/sigmoid/softplus/softmax/
   topk (router), rmsnorm (+Gemma `1+w`), partial rope, paged GQA attention
   (FlashInfer, `fi` semantics), GDN chunked prefill + single-token decode
@@ -663,7 +673,14 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
     stale residency and never asks for a copy. Consequence, recorded so it is
     not rediscovered: a decode step over 40 layers re-stages the experts it
     touches once per layer switch, which is the cost of fitting in VRAM at all.
-28. **`pyo3` is behind the non-default `triton` feature** (2026-10-02) -- like
+28. **`ExpertSlotStore` is `&self`, and one adapter handle is both ports**
+    (2026-10-02) -- the device slot cache is process-wide, not per step, so the
+    store port takes `&self` and `Mutex<TritonMoE>` implements `ExpertSlotStore`
+    and `ExpertGemm`. That is what lets `run_experts(cache, ports, ports, ...)`
+    take the same shared handle twice: plan and kernel call see the same banks
+    without the caller juggling `&mut` and `&` out of one guard. The lock is
+    uncontended and only held around a launch or one expert's H2D copy.
+29. **`pyo3` is behind the non-default `triton` feature** (2026-10-02) -- like
     `cuda`, it must not be in the default CPU-only build: `auto-initialize`
     links the build-time interpreter (the Nix python), and `kernel.python_path`
     / `kernel.site_packages` exist because the venv's torch is imported into

@@ -7,6 +7,8 @@
 
 use crate::domain::expert_kernel::{ExpertSlabSource, MoEError, Part, Slab};
 use crate::domain::weights::{TensorDesc, TensorKind, WeightsReader};
+use std::sync::Arc;
+
 use crate::infrastructure::ftw::FtwIndex;
 
 /// The two bank families, as the index spells them.
@@ -22,18 +24,19 @@ fn entry(part: Part, layer: usize, field: &str) -> String {
 }
 
 /// Checkpoint-backed slab source. Holds no bytes itself: every call is one
-/// windowed read into a fresh buffer, which the adapter then stages H2D.
-pub struct FtwBanks<'a> {
-    reader: &'a dyn WeightsReader,
-    index: &'a FtwIndex,
+/// windowed read into a fresh buffer, which the adapter then stages H2D. Owned
+/// handles, so the engine can share one source with every step.
+pub struct FtwBanks {
+    reader: Arc<dyn WeightsReader>,
+    index: Arc<FtwIndex>,
 }
 
-impl<'a> FtwBanks<'a> {
-    pub fn new(reader: &'a dyn WeightsReader, index: &'a FtwIndex) -> Self {
+impl FtwBanks {
+    pub fn new(reader: Arc<dyn WeightsReader>, index: Arc<FtwIndex>) -> Self {
         Self { reader, index }
     }
 
-    fn desc(&self, name: &str) -> Result<&'a TensorDesc, MoEError> {
+    fn desc(&self, name: &str) -> Result<&TensorDesc, MoEError> {
         self.index
             .entry(name)
             .filter(|t| t.kind == TensorKind::ExpertsBank)
@@ -90,7 +93,7 @@ impl<'a> FtwBanks<'a> {
     }
 }
 
-impl ExpertSlabSource for FtwBanks<'_> {
+impl ExpertSlabSource for FtwBanks {
     fn slab(&self, layer: usize, expert: u32, part: Part) -> Result<Slab, MoEError> {
         let (_experts, rows, cols) = self.packed_shape(part, layer)?;
         let packed = self.expert_rows(part, layer, expert, "packed")?;
@@ -173,30 +176,35 @@ mod tests {
         }
     }
 
-    /// Fill the reader from an index: every read echoes its own offset, so a
-    /// test can see which window was asked for.
-    fn echoing(index: &FtwIndex) -> MockReader {
-        let tensors = index.tensors.clone();
+    /// A source whose reader echoes each read's own offset, so a test can see
+    /// exactly which window was asked for.
+    fn echoing(ix: &FtwIndex) -> FtwBanks {
         let mut reader = MockReader::new();
         reader
             .expect_read_range()
-            .returning(move |off: u64, nbytes: u64, dst: &mut [u8]| {
+            .returning(|off: u64, nbytes: u64, dst: &mut [u8]| {
                 assert_eq!(dst.len(), nbytes as usize);
                 for (i, byte) in dst.iter_mut().enumerate() {
                     *byte = (off as usize + i) as u8;
                 }
-                // Keep the tensors alive so the closure cannot drift from them.
-                let _ = &tensors;
                 Ok(())
             });
+        FtwBanks::new(Arc::new(reader), Arc::new(ix.clone()))
+    }
+
+    /// The same, but every read fails.
+    fn failing(ix: &FtwIndex) -> FtwBanks {
+        let mut reader = MockReader::new();
         reader
+            .expect_read_range()
+            .returning(|_, _, _| Err("short shard".to_string()));
+        FtwBanks::new(Arc::new(reader), Arc::new(ix.clone()))
     }
 
     #[test]
     fn reads_one_experts_three_fields_from_the_gate_up_bank() {
         let ix = index(banks(7));
-        let reader = echoing(&ix);
-        let src = FtwBanks::new(&reader, &ix);
+        let src = echoing(&ix);
         let slab = src.slab(7, 1, Part::GateUp).unwrap();
         assert_eq!(slab.packed.len(), ROWS * COLS / 2);
         assert_eq!(slab.scale.len(), ROWS * COLS / 16);
@@ -210,8 +218,7 @@ mod tests {
     #[test]
     fn down_reads_the_down_bank() {
         let ix = index(banks(7));
-        let reader = echoing(&ix);
-        let src = FtwBanks::new(&reader, &ix);
+        let src = echoing(&ix);
         let slab = src.slab(7, 0, Part::Down).unwrap();
         let packed = ix.entry("down_packed#L00007").unwrap();
         assert_eq!(packed.shape, vec![EXPERTS, COLS, ROWS / 2]);
@@ -222,8 +229,7 @@ mod tests {
     #[test]
     fn rejects_an_expert_past_the_bank() {
         let ix = index(banks(0));
-        let reader = echoing(&ix);
-        let src = FtwBanks::new(&reader, &ix);
+        let src = echoing(&ix);
         assert!(matches!(
             src.slab(0, EXPERTS as u32, Part::GateUp),
             Err(MoEError::Bad(_))
@@ -233,8 +239,7 @@ mod tests {
     #[test]
     fn rejects_a_missing_layer() {
         let ix = index(banks(0));
-        let reader = echoing(&ix);
-        let src = FtwBanks::new(&reader, &ix);
+        let src = echoing(&ix);
         assert!(matches!(
             src.slab(9, 0, Part::GateUp),
             Err(MoEError::Missing { .. })
@@ -251,8 +256,7 @@ mod tests {
             .unwrap();
         // One scale short per expert: the per-expert split no longer adds up.
         scale.nbytes -= (COLS / 16) as u64;
-        let reader = echoing(&ix);
-        let src = FtwBanks::new(&reader, &ix);
+        let src = echoing(&ix);
         assert!(matches!(
             src.slab(0, 0, Part::GateUp),
             Err(MoEError::Bad(_))
@@ -262,11 +266,7 @@ mod tests {
     #[test]
     fn propagates_a_read_failure_with_the_entry_name() {
         let ix = index(banks(0));
-        let mut reader = MockReader::new();
-        reader
-            .expect_read_range()
-            .returning(|_, _, _| Err("short shard".to_string()));
-        let src = FtwBanks::new(&reader, &ix);
+        let src = failing(&ix);
         match src.slab(0, 0, Part::GateUp) {
             Err(MoEError::Read { entry: name, why }) => {
                 assert_eq!(name, "gate_up_packed#L00000");

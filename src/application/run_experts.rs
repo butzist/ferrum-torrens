@@ -23,7 +23,7 @@ pub struct ExpertStep<'a> {
 /// the slot ids, so the rewrites happen here and never leave the domain.
 pub fn run_experts(
     cache: &mut ExpertCache,
-    store: &mut dyn ExpertSlotStore,
+    store: &dyn ExpertSlotStore,
     gemm: &dyn ExpertGemm,
     layer: usize,
     step: &ExpertStep<'_>,
@@ -131,7 +131,7 @@ mod tests {
         let mut out = [0.0f32; 8];
         run_experts(
             &mut cache,
-            &mut store,
+            &store,
             &gemm,
             0,
             &step(&experts, &weights, &x),
@@ -164,7 +164,7 @@ mod tests {
         gemm.expect_grouped_moe().times(1).returning(|_, _| Ok(()));
         run_experts(
             &mut cache,
-            &mut store,
+            &store,
             &gemm,
             0,
             &step(&experts, &weights, &x),
@@ -182,7 +182,7 @@ mod tests {
         gemm.expect_grouped_moe().times(1).returning(|_, _| Ok(()));
         run_experts(
             &mut cache,
-            &mut store,
+            &store,
             &gemm,
             0,
             &step(&experts, &weights, &x),
@@ -211,7 +211,7 @@ mod tests {
             gemm.expect_grouped_moe().times(1).returning(|_, _| Ok(()));
             run_experts(
                 &mut cache,
-                &mut store,
+                &store,
                 &gemm,
                 0,
                 &step(&experts, &weights, &x),
@@ -235,7 +235,7 @@ mod tests {
         gemm.expect_grouped_moe().times(1).returning(|_, _| Ok(()));
         run_experts(
             &mut cache,
-            &mut store,
+            &store,
             &gemm,
             1,
             &step(&experts, &weights, &x),
@@ -267,7 +267,7 @@ mod tests {
             gemm.expect_grouped_moe().times(1).returning(|_, _| Ok(()));
             run_experts(
                 &mut cache,
-                &mut store,
+                &store,
                 &gemm,
                 0,
                 &step(&experts, &weights, &x),
@@ -285,7 +285,7 @@ mod tests {
         gemm.expect_grouped_moe().times(1).returning(|_, _| Ok(()));
         run_experts(
             &mut cache,
-            &mut store,
+            &store,
             &gemm,
             1,
             &step(&experts, &weights, &x),
@@ -300,7 +300,7 @@ mod tests {
     #[test]
     fn rejects_a_step_whose_routes_do_not_match_the_batch() {
         let mut cache = ExpertCache::new(2, 4, 4);
-        let mut store = strict_store(4);
+        let store = strict_store(4);
         let gemm = MockExpertGemm::new();
         let x = [1.0f32; 8];
         let experts = [1u32, 3];
@@ -309,7 +309,7 @@ mod tests {
         assert!(matches!(
             run_experts(
                 &mut cache,
-                &mut store,
+                &store,
                 &gemm,
                 0,
                 &step(&experts, &weights, &x),
@@ -322,7 +322,7 @@ mod tests {
     #[test]
     fn rejects_a_slot_cache_smaller_than_the_adapter_bank() {
         let mut cache = ExpertCache::new(2, 4, 2);
-        let mut store = strict_store(4);
+        let store = strict_store(4);
         let gemm = MockExpertGemm::new();
         let x = [1.0f32; 8];
         let experts = [1u32, 3, 1, 3];
@@ -331,7 +331,7 @@ mod tests {
         assert!(matches!(
             run_experts(
                 &mut cache,
-                &mut store,
+                &store,
                 &gemm,
                 0,
                 &step(&experts, &weights, &x),
@@ -365,7 +365,7 @@ mod tests {
         let mut out = [0.0f32; 8];
         run_experts(
             &mut cache,
-            &mut store,
+            &store,
             &gemm,
             0,
             &step(&experts, &weights, &x),
