@@ -2,7 +2,7 @@
 
 Status: M2 (API) current, M3 kernel work started out of order -- the NVFP4
 grouped-MoE Triton kernel and its pyo3 adapter both exist and are green on the
-CPU-only box (decisions 24-29): `domain::expert_kernel` (ports + scalar oracle),
+CPU-only box (decisions 24-30), with pyo3 slated for removal (decision 30): `domain::expert_kernel` (ports + scalar oracle),
 `python/ferrum_kernel/nvfp4_moe.py` (PTX-clean for sm_120) and
 `infrastructure/triton.rs` (feature `triton`: device slot cache, `ExpertSlotStore`,
 `ExpertGemm`). What is missing is the gated GPU numerical run, the
@@ -314,6 +314,29 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
     `cargo test --release --features triton --test triton_moe_matches_reference -- --ignored --nocapture`
     (set `FERRUM_KERNEL_SITE_PACKAGES` to the venv's site-packages; it defaults
     to `FreeToken/.venv/lib/python3.12/site-packages`).
+  - [ ] **P1 drop `pyo3`, keep the kernel**: the pyo3 adapter is an interim
+    bridge, not the target shape (decision 30). Everything above it -- the
+    ports, the slot cache sizing, the slab source, `run_experts`, the oracle,
+    the gated test -- survives; only the launch path changes. Three routes, in
+    increasing cost and decreasing "we own the kernel":
+    1. **PTX from Triton, launched through the CUDA driver API** (cudarc,
+       `cuModuleLoadData` + `cuLaunchKernel`): a documented script runs
+       `triton.compile` once and commits the PTX; startup JITs it through the
+       driver, which is arch-portable sm_89+ and needs no nvcc, no nvrtc and no
+       python at runtime. ~1-2 days. Recommended: it removes pyo3 AND keeps the
+       kernel in Triton, so `compile_check.py` keeps its job.
+    2. **hand-written CUDA via `nvrtc` at startup** (no build step, no artifact
+       in git): the same three kernels rewritten in C++ with
+       `__nv_fp4_e2m1`/`__nv_fp8_e4m3` decoding. ~1 week, most of it GPU
+       bring-up; loses Triton's autotuning, so decode/prefill block shapes get
+       picked by hand; `compile_check.py` is replaced by an nvrtc-to-PTX check
+       (which still runs on the CPU-only box, nvrtc needs no device).
+    3. **hand-written CUDA as a build-time fatbin**: route 2 plus the nvcc build
+       step AGENTS.md currently forbids.
+    Whatever is chosen: keep the banks as libtorch tensors and hand raw pointers
+    to the launcher, so there is still exactly one allocator and one CUDA
+    context; update AGENTS.md (it says Triton/python is the production kernel)
+    and drop the `[kernel]` config section with it.
 - [x] P0 everything else libtorch already provides: silu/sigmoid/softplus/softmax/
   topk (router), rmsnorm (+Gemma `1+w`), partial rope, paged GQA attention
   (FlashInfer, `fi` semantics), GDN chunked prefill + single-token decode
@@ -686,6 +709,21 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
     / `kernel.site_packages` exist because the venv's torch is imported into
     THAT interpreter, not the other way round. `kernel.triton = false` is the
     default so the port and the scalar oracle stay runnable without python.
+
+30. **`pyo3` is a bridge with a planned exit** (2026-10-02) -- decision 25 chose
+    an embedded interpreter because it was the shortest honest path to a running
+    NVFP4 kernel, and 29 kept it out of the default build. It is not where this
+    ends. What it costs: a second libtorch (the venv's) inside a process that
+    already links ours, a hardcoded `site_packages` path, ~seconds of torch
+    import at startup, and no way to profile or autotune the kernel without a
+    python toolchain in the loop. What stays regardless: `domain::expert_kernel`
+    (ports, layout, `grouped_moe_reference`), `ExpertCache` +
+    `run_experts` (decision 27's ordering), `infrastructure/banks.rs`, and the
+    gated test -- they are the specification the replacement has to satisfy.
+    Removal is the unchecked P1 under M3 kernels; route 1 (committed PTX +
+    driver API) is the recommendation, routes 2/3 (hand-written CUDA) are listed
+    for completeness. Do it AFTER the gated test passes, so there is a numerical
+    oracle for the replacement to be measured against.
 
 ### Config defaults for the RTX 5060 / 8 GB target
 
