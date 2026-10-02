@@ -127,6 +127,9 @@
 
           inputsFrom = [config.flake-root.devShell];
 
+          # Store-path half of the loader path: cudatoolkit (libcudart) and
+          # libtorch. The shellHook below adds the two parts that are not store
+          # paths: the driver's mount point and a matching libstdc++.
           LD_LIBRARY_PATH = "${pkgs.cudatoolkit}/lib:${libtorchCuda}/lib";
 
           # tch build-script configuration: link the nix-provided libtorch instead
@@ -152,8 +155,21 @@
             # rejects `default-lib-fmt` as an unknown codegen option, and `-mold`
             # is a clang spelling the nix gcc wrapper does not take (it wants
             # `-fuse-ld=mold`). rustc already links through lld from its wrapper.
+            # torch from FreeToken/.venv is a manylinux wheel whose RPATH points
+            # at paths that do not exist here, so importing it (from the venv's
+            # python OR from the interpreter pyo3 embedded, see decision 25)
+            # dies with "libstdc++.so.6: cannot open shared object file" unless a
+            # matching one is on the loader path. Nix never puts it there. Ask the
+            # compiler which one it ships and prepend it; the driver mount comes
+            # from the jail's gpu combinator and has no store path to name.
+            if [ -n "$(command -v gcc)" ]; then
+              libstdcxx="$(dirname "$(gcc -print-file-name=libstdc++.so.6)")"
+              if [ -f "$libstdcxx/libstdc++.so.6" ]; then
+                export LD_LIBRARY_PATH="$libstdcxx:/run/opengl-driver/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+              fi
+            fi
             # via bash, not the shebang: the jail has no /usr/bin/env.
-            alias ft-gate="bash $FLAKE_ROOT/scripts/run-gated.sh"
+            alias ft-gate="bash $FLAKE_ROOT/scripts/run-gate.sh"
           '';
         };
       };

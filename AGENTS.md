@@ -101,13 +101,18 @@ Instructions for AI coding agents working in this repository.
   out into `$FLAKE_ROOT` by the conversion step.
 - Python venv (flake provides python312 + uv), already installed:
   `cd FreeToken && uv venv --python 3.12 && FREETOKEN_ALLOW_CUDA_MISMATCH=1 uv pip install -e ".[accel]"`.
-  When running `ft`/python with the venv, torch needs the driver and libstdc++
-  on the library path:
+  The devShell's `shellHook` already puts a matching `libstdc++.so.6` and the
+  driver mount (`/run/opengl-driver/lib`) on `LD_LIBRARY_PATH`, which torch from
+  the venv needs: its manylinux RPATH points at paths that do not exist here.
+  Outside the devshell, set it by hand:
   `LD_LIBRARY_PATH="/run/opengl-driver/lib:$(dirname "$(gcc -print-file-name=libstdc++.so.6)")"`.
+  This applies to the pyo3-embedded interpreter too (`--features triton`), since
+  it dlopens the same torch: the loader path is read at process start, so the
+  variable must be set before `cargo` launches the test.
 - One-time HF -> FTW conversion (needs CUDA device access; the agent sandbox
-  cannot open the GPU -- cuInit=CUDA_ERROR_NO_DEVICE -- so run in a devshell):
-  `LD_LIBRARY_PATH="/run/opengl-driver/lib:$(dirname "$(gcc -print-file-name=libstdc++.so.6)")" \
-   FreeToken/.venv/bin/ft checkpoint --model /nix/store/mpwkgysbh8dyxz8jlrwkhzcsp01v6my3-qwen3.6-35b-a3b-nvfp4 \
+  cannot open the GPU -- cuInit=CUDA_ERROR_NO_DEVICE -- so run in a devshell,
+  which already has the loader path):
+  `FreeToken/.venv/bin/ft checkpoint --model /nix/store/mpwkgysbh8dyxz8jlrwkhzcsp01v6my3-qwen3.6-35b-a3b-nvfp4 \
    --out .model-cache/Qwen3.6-35B-A3B-NVFP4.ftw --moe-backend offload --shard-gib 8`
 - Verify with: `cargo fmt --check`, `cargo clippy --all-targets`, `cargo test`.
   These are the CPU-only path and must stay green with no libtorch. The libtorch

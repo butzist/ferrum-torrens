@@ -83,6 +83,23 @@ fn err(context: &str, e: impl std::fmt::Display) -> MoEError {
     MoEError::Bad(format!("{context}: {e}"))
 }
 
+/// torch is a manylinux wheel whose RPATH names paths that do not exist in a
+/// nix store, so the loader cannot find `libstdc++.so.6` unless one is on
+/// `LD_LIBRARY_PATH`. That is the overwhelmingly common first failure, and the
+/// loader message says nothing about where to put it, so say it here.
+fn loader_hint(e: &pyo3::PyErr) -> String {
+    let text = e.to_string();
+    if text.contains("libstdc++.so.6") || text.contains("cannot open shared object file") {
+        " (LD_LIBRARY_PATH needs /run/opengl-driver/lib and the dir holding a \
+         matching libstdc++.so.6: the devShell's shellHook exports both; the \
+         loader reads the variable when the process starts, so set it before \
+         cargo launches the test)"
+            .to_string()
+    } else {
+        String::new()
+    }
+}
+
 // The python helpers. Every `?` below maps a PyErr into the port error with the
 // operation that raised it, because the domain core knows nothing about python.
 
@@ -194,7 +211,9 @@ impl TritonRuntime {
             let module = py
                 .import("ferrum_kernel.nvfp4_moe")
                 .map_err(|e| err("import ferrum_kernel.nvfp4_moe (kernel.python_path?)", e))?;
-            let torch = py.import("torch").map_err(|e| err("import torch", e))?;
+            let torch = py
+                .import("torch")
+                .map_err(|e| err(&format!("import torch{}", loader_hint(&e)), e))?;
             let cuda = attribute(&torch, "cuda", "torch.cuda")?;
             let index = method(
                 &cuda,
