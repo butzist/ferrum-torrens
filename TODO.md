@@ -1,8 +1,10 @@
 # FerrumTorrens -- FreeToken MVP port to Rust: TODO
 
 Status: M1b in progress -- libtorch forward cross-checks pass (188/188); scalar
-oracle NVFP4 global-scale fix applied. Next: run the gated oracle against the
-real checkpoint to get first correct completion (id 11751). Why now:
+oracle NVFP4 global-scale fix applied. The gated oracle still disagrees (id 5049
+vs 11751) and runs under the memory cap from decision 22. Next: the `TorchModel`
+adapter and its full tower, then the first oracle-matching completion on CPU.
+Why now:
 the scalar forward is numerically wrong and cannot be debugged into agreement
 (decision 13), costs ~127 s per forward (decision 14), and reading 18 GB of
 experts per forward is not a serving path. libtorch removes all three at once.
@@ -521,6 +523,18 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
     the GPU-only parts (CUDA-graph capture, the Triton NVFP4 kernel, on-device
     expert streaming) need a devshell run, and those are asked for explicitly
     rather than discovered by a red test.
+22. **The gated tests run under an address-space cap** (2026-10-02) -- the FTW is
+    20.3 GiB and one forward pages in ~18 GiB of expert banks, so an uncapped
+    gated run walks a 32 GB host into swap and gets the *machine* OOM-killed
+    rather than failing one test. The sandbox mounts no cgroup and has no
+    systemd, and Linux does not enforce `RLIMIT_RSS`, so the lever is
+    `RLIMIT_AS`: `scripts/run-gated.sh` (aliased `ft-gate` in the devshell,
+    needs `pkgs.util-linux` for `prlimit`) builds just the owning test target
+    and runs it under a 26 GiB cap (`FT_MEM_CAP_GIB` to change). Verified: peak
+    23.8 GiB, the oracle gate completes in 92 s instead of killing the host.
+    `RLIMIT_AS` counts the mapping too, so the cap can never be lower than the
+    checkpoint size plus libtorch -- a cap that fails `mmap` immediately is the
+    symptom of setting it too low.
 
 ### Config defaults for the RTX 5060 / 8 GB target
 

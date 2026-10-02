@@ -68,6 +68,9 @@
           pkgs.gawk
           pkgs.diffutils
           pkgs.just
+          # setsid/prlimit: run the heavy gated tests detached from the agent's
+          # shell and with an address-space cap, see scripts/run-gated.sh.
+          pkgs.util-linux
           pkgs.cudatoolkit
           pkgs.python312
           pkgs.uv
@@ -144,6 +147,7 @@
 
           shellHook = ''
             export RUSTFLAGS="-C link-arg=-mold -C default-lib-fmt=rustls"
+            alias ft-gate="$FLAKE_ROOT/scripts/run-gated.sh"
           '';
         };
       };
