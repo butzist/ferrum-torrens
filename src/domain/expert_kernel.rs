@@ -45,7 +45,14 @@ pub trait ExpertSlabSource: Send + Sync {
 }
 
 /// The slot cache's write side: stage one expert's bytes into `slot`.
+#[cfg_attr(test, mockall::automock)]
 pub trait ExpertSlotStore: Send + Sync {
+    /// Declare the layer that is about to be staged. Returns the layer whose
+    /// device bytes were dropped to make room, if any, so the slot machine can
+    /// forget that layer BEFORE `ExpertCache::ensure_experts` plans the new
+    /// one -- otherwise the plan sees stale residency and never copies
+    /// (decision 27). Idempotent per layer.
+    fn begin_layer(&mut self, layer: usize) -> Result<Option<usize>, MoEError>;
     fn load(&mut self, layer: usize, expert: u32, slot: usize) -> Result<(), MoEError>;
     fn slots(&self) -> usize;
 }
@@ -63,8 +70,9 @@ pub struct MoEGroup<'a> {
     pub weights: &'a [f32],
 }
 
+#[cfg_attr(test, mockall::automock)]
 pub trait ExpertGemm: Send + Sync {
-    fn grouped_moe(&self, req: &MoEGroup<'_>, out: &mut [f32]) -> Result<(), MoEError>;
+    fn grouped_moe<'a>(&self, req: &MoEGroup<'a>, out: &mut [f32]) -> Result<(), MoEError>;
 }
 
 /// Slot-major banks for the reference path: `packed [slots, rows, cols/2]`, the

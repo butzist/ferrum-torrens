@@ -294,8 +294,16 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
     (bank tensors are `[experts, ...]` row-major, so expert `e` is one window),
     with the per-expert byte counts checked against the entry shapes and
     `MoEError::{Missing, Read}` added for actionable errors. 6 unit tests.
-  - [ ] the gated GPU test, plus `application/run_experts.rs` and the
-    `moe_block` swap in `models/qwen3_6/forward_torch.rs`.
+  - [x] the layer orchestration (2026-10-02, `src/application/run_experts.rs`):
+    `run_experts(cache, store, gemm, layer, step, out)` validates the step,
+    calls `ExpertSlotStore::begin_layer` and replays a dropped layer into
+    `ExpertCache::forget_layer` BEFORE `ensure_experts` (the ordering decision 27
+    exists to enforce), copies `plan.misses` into their `write_slots`, then hands
+    `plan.rewrites` to `ExpertGemm`. `begin_layer` is the new port method that
+    makes the ordering explicit. 7 unit tests over mocked ports, including the
+    overflow case where the kernel receives `-1` routes.
+  - [ ] the gated GPU test and the `moe_block` swap in
+    `models/qwen3_6/forward_torch.rs`.
 - [x] P0 everything else libtorch already provides: silu/sigmoid/softplus/softmax/
   topk (router), rmsnorm (+Gemma `1+w`), partial rope, paged GQA attention
   (FlashInfer, `fi` semantics), GDN chunked prefill + single-token decode

@@ -282,8 +282,9 @@ impl TritonMoE {
         self.slots * self.expert_bytes()
     }
 
-    fn banks_for(&mut self, layer: usize) -> Result<(), MoEError> {
-        if self.layer == Some(layer) {
+    /// Allocate the banks for the layer `begin_layer` just selected.
+    fn banks_for(&mut self) -> Result<(), MoEError> {
+        if self.gate_up.is_some() {
             return Ok(());
         }
         let shapes = self.shapes;
@@ -320,9 +321,7 @@ impl TritonMoE {
             self.gate_up = Some(part(Part::GateUp)?);
             self.down = Some(part(Part::Down)?);
             Ok(())
-        })?;
-        self.layer = Some(layer);
-        Ok(())
+        })
     }
 
     /// Copy one slab into `slot`, the H2D half of `copy_missing`. Staged one
@@ -330,7 +329,7 @@ impl TritonMoE {
     /// expert it died on.
     pub fn load_slab(
         &mut self,
-        layer: usize,
+        _layer: usize,
         slot: usize,
         part: Part,
         slab: &Slab,
@@ -355,7 +354,7 @@ impl TritonMoE {
                 cols
             )));
         }
-        self.banks_for(layer)?;
+        self.banks_for()?;
         let banks = match part {
             Part::GateUp => self.gate_up.as_ref().unwrap(),
             Part::Down => self.down.as_ref().unwrap(),
@@ -397,15 +396,27 @@ impl TritonMoE {
 }
 
 impl ExpertSlotStore for TritonMoE {
-    /// Pull both slabs of one expert from the source and stage them. A layer
-    /// switch invalidates the device bytes, so it is reported once through
-    /// `take_dropped_layer` before the banks are reallocated.
-    fn load(&mut self, layer: usize, expert: u32, slot: usize) -> Result<(), MoEError> {
-        if self.layer.is_some() && self.layer != Some(layer) {
-            self.dropped_layer = self.layer.take();
-            self.gate_up = None;
-            self.down = None;
+    /// Switch the device banks to `layer`, reporting the layer whose bytes were
+    /// dropped (decision 27). The caller replays that into
+    /// `ExpertCache::forget_layer` before planning, so the slots it still
+    /// believes in are gone exactly when the plan is computed.
+    fn begin_layer(&mut self, layer: usize) -> Result<Option<usize>, MoEError> {
+        if self.layer == Some(layer) {
+            return Ok(None);
         }
+        let dropped = self.layer.take();
+        self.gate_up = None;
+        self.down = None;
+        self.dropped_layer = dropped;
+        self.layer = Some(layer);
+        Ok(dropped)
+    }
+
+    /// Pull both slabs of one expert from the source and stage them.
+    fn load(&mut self, layer: usize, expert: u32, slot: usize) -> Result<(), MoEError> {
+        // Idempotent: a caller that only stages one expert still gets a
+        // consistent cache, and `take_dropped_layer` still reports the switch.
+        self.begin_layer(layer)?;
         for part in [Part::GateUp, Part::Down] {
             let slab = self
                 .source
