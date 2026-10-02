@@ -243,6 +243,23 @@ fn gdn_recurrence_matches_the_reference() {
         dk as i64,
         dv as i64,
     ));
+    let mut worst = (0f32, 0usize);
+    for (i, (a, b)) in got.iter().zip(&want).enumerate() {
+        let d = (a - b).abs();
+        if d > worst.0 {
+            worst = (d, i);
+        }
+    }
+    eprintln!(
+        "DBG worst={:?} tt={} h={} d={} idx={} got={} want={}",
+        worst.0,
+        worst.1 / (hv * dv),
+        (worst.1 / dv) % hv,
+        worst.1 % dv,
+        worst.1,
+        got[worst.1],
+        want[worst.1]
+    );
     close(&got, &want, 1e-4, "gdn_recurrence");
 }
 
@@ -427,7 +444,9 @@ fn a_widened_nvfp4_weight_matmuls_like_the_reference_gemm() {
     close_rel(&got, &want, 1e-2, "widened nvfp4 matmul");
 
     // And one row by hand, so the tolerance above cannot hide a wrong widening.
-    let manual: f32 = (0..cols).map(|c| x[c] * w[c]).sum();
+    let g = nvfp4_globals(&global, rows);
+    let manual: f32 =
+        (0..cols).map(|c| x[c] * w[c]).sum::<f32>() * if g.is_empty() { 1.0 } else { g[0] };
     assert!(
         (got[0] - manual).abs() < 1e-2,
         "row 0 {} vs hand-computed {manual}",
@@ -461,86 +480,4 @@ fn the_lm_head_block_split_is_exact() {
             "block {start}..{end}"
         );
     }
-}
-
-#[test]
-fn scratch_repeat_interleave_head_mapping() {
-    // k = [t=1, kv_heads=2, hd=2]: head0=(1,2) head1=(3,4)
-    let k = up(&[1.0, 2.0, 3.0, 4.0], &[1, 2, 2]);
-    let (t, kvh, hd) = (1i64, 2i64, 2i64);
-    let qh = 4i64;
-    let rep = qh / kvh;
-    let e = k
-        .unsqueeze(2)
-        .expand([t, kvh, rep, hd], true)
-        .reshape([t, qh, hd]);
-    println!("expand+reshape -> {:?}", to_f32_vec(&e));
-    let idx: Vec<i64> = (0..qh).map(|h| h * kvh / qh).collect();
-    println!("h*kvh/qh = {idx:?}");
-
-    // one timestep, so attention degenerates to v[0, base] and the pairing shows up raw
-    let (t, hd) = (1i64, 2i64);
-    let v = up(&[1.0, 2.0, 3.0, 4.0], &[t, kvh, hd]);
-    let q = up(&[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], &[t, qh, hd]);
-    let got = to_f32_vec(&causal_attention(&q, &k, &v));
-    println!("tt=0 out = {got:?}  (want [1,2, 1,2, 3,4, 3,4])");
-
-    let (t, qh, hd) = (6i64, 3, 8);
-    let scale = 1.0 / (hd as f64).sqrt();
-    let qq = data((t * qh * hd) as usize, 7);
-    let kk = data((t * qh * hd) as usize, 8);
-    let vv = data((t * qh * hd) as usize, 9);
-    let qt = up(&qq, &[t, qh, hd]);
-    let kt = up(&kk, &[t, qh, hd]);
-    let vt = up(&vv, &[t, qh, hd]);
-    let want = super::super::forward::causal_attention(
-        &qq,
-        &kk,
-        &vv,
-        t as usize,
-        qh as usize,
-        qh as usize,
-        hd as usize,
-    );
-
-    let logits = qt.unsqueeze(0).matmul(&kt.unsqueeze(0).transpose(-1, -2)) * scale;
-    let mut mask: Vec<f32> = Vec::new();
-    for i in 0..t {
-        for j in 0..t {
-            mask.push(if j <= i { 0.0 } else { f32::NEG_INFINITY });
-        }
-    }
-    let mt = Tensor::from_slice(&mask).reshape([t, t]).unsqueeze(0);
-    let manual = (logits + mt)
-        .softmax(-1, Kind::Float)
-        .matmul(&vt.unsqueeze(0));
-    let manual = to_f32_vec(&manual.squeeze_dim(0).reshape([t * qh * hd]));
-    println!(
-        "manual vs reference: first_bad={:?}",
-        manual
-            .iter()
-            .zip(&want)
-            .position(|(a, b)| (a - b).abs() > 1e-5)
-    );
-
-    let sdpa = Tensor::scaled_dot_product_attention(
-        &qt.unsqueeze(0),
-        &kt.unsqueeze(0),
-        &vt.unsqueeze(0),
-        None::<&Tensor>,
-        0.0,
-        true,
-        scale,
-        false,
-    );
-    let s = to_f32_vec(&sdpa.squeeze_dim(0).reshape([t * qh * hd]));
-    println!(
-        "sdpa vs manual: first_bad={:?}",
-        s.iter()
-            .zip(&manual)
-            .position(|(a, b)| (a - b).abs() > 1e-5)
-    );
-    println!("want[0..8] = {:?}", &want[..8]);
-    println!("sdpa[0..8] = {:?}", &s[..8]);
-    println!("manu[0..8] = {:?}", &manual[..8]);
 }

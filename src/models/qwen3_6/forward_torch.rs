@@ -323,16 +323,16 @@ fn causal_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Tensor {
         .reshape([t, qh, hd]);
     let scale = 1.0 / (hd as f64).sqrt();
     let attn = Tensor::scaled_dot_product_attention(
-        &q.unsqueeze(0),
-        &k.unsqueeze(0),
-        &v.unsqueeze(0),
+        &q.transpose(0, 1).unsqueeze(0),
+        &k.transpose(0, 1).unsqueeze(0),
+        &v.transpose(0, 1).unsqueeze(0),
         None::<&Tensor>,
         0.0,
         true,
         scale,
         false,
     );
-    attn.squeeze_dim(0).reshape([t, qh * hd])
+    attn.squeeze_dim(0).transpose(0, 1).reshape([t, qh * hd])
 }
 
 /// Repeat each of `kb` key heads to `vb` value heads, as the reference's
@@ -360,47 +360,44 @@ fn gdn_recurrence(
     dv: i64,
 ) -> Tensor {
     let t = q.size()[0];
-    let opts = (Kind::Float, q.device());
-    // State is carried as [hv, dv, dk]: both the `kv_mem` read and the query read
-    // contract over dk, so this orientation makes each one a plain bmm.
-    let mut state = Tensor::zeros([hv, dv, dk], opts);
-    let scale = 1.0 / (dk as f64).sqrt();
     let mut outs: Vec<Tensor> = Vec::with_capacity(t as usize);
-
+    // Build state as [hv, dk, dv] to match reference layout
+    let mut state = Tensor::zeros([hv, dk, dv], (Kind::Float, q.device()));
+    let scale = 1.0f64 / (dk as f64).sqrt();
     for tt in 0..t {
         let qi = f32_(&q.select(0, tt)).view([hv, dk]);
         let ki = f32_(&k.select(0, tt)).view([hv, dk]);
         let vi = f32_(&v.select(0, tt)).view([hv, dv]);
-        let g_t = f32_(&g.select(0, tt)).exp(); // [hv]
-        let beta_t = f32_(&beta.select(0, tt)); // [hv]
-
-        let qinv = (qi
+        let g_t = f32_(&g.select(0, tt)).exp();
+        let beta_t = f32_(&beta.select(0, tt));
+        let q2 = qi
             .pow_tensor_scalar(2.0)
             .sum_dim_intlist(-1, true, Kind::Float)
-            .g_add_scalar(1e-6))
-        .sqrt()
-        .reciprocal();
-        let kinv = (ki
+            .g_add_scalar(1e-6);
+        let k2 = ki
             .pow_tensor_scalar(2.0)
             .sum_dim_intlist(-1, true, Kind::Float)
-            .g_add_scalar(1e-6))
-        .sqrt()
-        .reciprocal();
-
-        // decay every head's state by its own gate
-        state = state * g_t.view([-1, 1, 1]);
-        // kv_mem[h] = state[h] . (k[h] * kinv[h])
-        let kv_mem = state.bmm(&ki.unsqueeze(-1)); // [hv, dv, 1]
-        let delta = (vi.unsqueeze(2) - &kv_mem) * beta_t.view([-1, 1, 1]); // [hv, dv, 1]
-        state = state + ki.unsqueeze(1) * (&delta * kinv.view([-1, 1, 1]));
-        let out = state.bmm(&qi.unsqueeze(-1)); // [hv, dv, 1]
-        outs.push(out.squeeze_dim(-1) * (qinv * scale).view([-1, 1]));
+            .g_add_scalar(1e-6);
+        let qinv = q2.sqrt().reciprocal();
+        let kinv = k2.sqrt().reciprocal();
+        // decay
+        state = (&state) * &g_t.view([-1, 1, 1]);
+        let kiw = ki * kinv;
+        // kv_mem: sum_kk state[h,kk,d] * kiw[h,kk] -> [hv,dv]
+        let kv_mem = ((&state) * kiw.unsqueeze(-1))
+            .sum_dim_intlist(1, true, Kind::Float)
+            .squeeze_dim(1);
+        let delta = (vi - &kv_mem).unsqueeze(1) * beta_t.view([-1, 1, 1]);
+        state = (&state) + kiw.unsqueeze(-1) * delta;
+        let out = ((&state) * qi.unsqueeze(-1))
+            .sum_dim_intlist(1, true, Kind::Float)
+            .squeeze_dim(1)
+            * (qinv * (scale as f64)).view([-1, 1]);
+        outs.push(out);
     }
     Tensor::stack(&outs, 0)
 }
 
-/// Softmax over experts then top-k with the survivors renormalized to sum to 1,
-/// matching `topk_renorm`. Returns `[t, k]` ids and weights.
 fn topk_renorm(probs: &Tensor, k: i64) -> (Tensor, Tensor) {
     let (vals, ids) = probs.topk(k, -1, true, true);
     let total = vals.sum_dim_intlist(-1, true, Kind::Float);

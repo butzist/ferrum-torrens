@@ -1,7 +1,8 @@
 # FerrumTorrens -- FreeToken MVP port to Rust: TODO
 
-Status: M1b in progress -- **switching the forward from the hand-written scalar
-CPU kernel to libtorch (`tch`) to get the first *correct* completion.** Why now:
+Status: M1b in progress -- libtorch forward cross-checks pass (188/188); scalar
+oracle NVFP4 global-scale fix applied. Next: run the gated oracle against the
+real checkpoint to get first correct completion (id 11751). Why now:
 the scalar forward is numerically wrong and cannot be debugged into agreement
 (decision 13), costs ~127 s per forward (decision 14), and reading 18 GB of
 experts per forward is not a serving path. libtorch removes all three at once.

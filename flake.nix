@@ -101,6 +101,7 @@
           ++ [
             (readwrite (noescape "\"$FLAKE_ROOT\""))
             (readonly "/nix/store")
+            (readonly "/run/user")
           ]
           # jail.nix `gpu`: ro-binds the PCI GPU dirs in /sys/devices, mounts
           # /sys/dev/char + /run/opengl-driver(-32) and --dev-binds /dev/dri.

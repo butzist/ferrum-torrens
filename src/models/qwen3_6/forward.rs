@@ -193,7 +193,7 @@ pub fn nvfp4_gemv(
     let cols16 = cols / 16;
     let mut y = vec![0.0f32; rows];
     for r in 0..rows {
-        let g = if global.len() == rows {
+        let g = if global.len() >= 2 * rows {
             f16_to_f32(u16::from_le_bytes([global[2 * r], global[2 * r + 1]]))
         } else {
             1.0
@@ -231,7 +231,7 @@ pub(crate) fn nvfp4_gemm(
         for r in 0..rows {
             let cols2 = cols / 2;
             let cols16 = cols / 16;
-            let g = if global.len() == rows {
+            let g = if global.len() >= 2 * rows {
                 f16_to_f32(u16::from_le_bytes([global[2 * r], global[2 * r + 1]]))
             } else {
                 1.0
