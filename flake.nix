@@ -146,7 +146,12 @@
           CXX = "${pkgs.stdenv.cc.cc}/bin/c++";
 
           shellHook = ''
-            export RUSTFLAGS="-C link-arg=-mold -C default-lib-fmt=rustls"
+            # No RUSTFLAGS here on purpose. The previous
+            # `-C link-arg=-mold -C default-lib-fmt=rustls` made every cargo
+            # invocation die in its target-info probe: the pinned rust-bin.nightly
+            # rejects `default-lib-fmt` as an unknown codegen option, and `-mold`
+            # is a clang spelling the nix gcc wrapper does not take (it wants
+            # `-fuse-ld=mold`). rustc already links through lld from its wrapper.
             # via bash, not the shebang: the jail has no /usr/bin/env.
             alias ft-gate="bash $FLAKE_ROOT/scripts/run-gated.sh"
           '';
