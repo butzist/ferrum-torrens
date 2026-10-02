@@ -121,7 +121,9 @@ Instructions for AI coding agents working in this repository.
   exports `LIBTORCH`, `LIBTORCH_INCLUDE`, `LIBTORCH_LIB`, `CXX`; see
   `TODO.md` decision 19 -- they must be libtorch **roots**). The gated
   oracle tests (`tests/engine_real_generate.rs`) need a GPU, so the agent sandbox
-  cannot run them; hand them to a devshell run.
+  cannot run them; hand them to a devshell run. Run a gated test with
+  `... -- --ignored --nocapture 2>&1 | tee log`: cargo captures a failing test's
+  panic text on stderr, so a plain `| tee` log reads as an empty failure.
 
 ## Commits
 

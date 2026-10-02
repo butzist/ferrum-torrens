@@ -126,6 +126,21 @@ fn tuple1<'py>(py: Python<'py>, arg: Bound<'py, PyAny>) -> Result<Bound<'py, PyT
     PyTuple::new(py, [arg]).map_err(|e| err("argument tuple", e))
 }
 
+/// `torch.device(type, ordinal)`. Passing `torch.cuda.device(i)` instead hands
+/// over the context-manager class of the same name, which has no `.type`.
+fn device_args<'py>(py: Python<'py>, ordinal: i64) -> Result<Bound<'py, PyTuple>, MoEError> {
+    let ty = infallible("cuda".into_pyobject(py)).into_any();
+    let ordinal = infallible(ordinal.into_pyobject(py)).into_any();
+    PyTuple::new(py, [ty, ordinal]).map_err(|e| err("argument tuple", e))
+}
+
+fn infallible<T>(r: Result<T, std::convert::Infallible>) -> T {
+    match r {
+        Ok(v) => v,
+        Err(e) => match e {},
+    }
+}
+
 fn shape<'py>(py: Python<'py>, dims: &[usize]) -> Result<Bound<'py, PyAny>, MoEError> {
     PyTuple::new(py, dims.iter().copied())
         .map(Bound::into_any)
@@ -221,16 +236,17 @@ impl TritonRuntime {
                 PyTuple::empty(py),
                 "torch.cuda.current_device",
             )?;
-            let device_obj = method(
-                &cuda,
-                "device",
-                tuple1(py, index.clone().into_any())?,
-                "torch.cuda.device",
-            )?;
+            let ordinal: i64 = index.extract().map_err(|e| err("device index", e))?;
+            let device_obj = method(&torch, "device", device_args(py, ordinal)?, "torch.device")?;
             module
                 .call_method1("require_native_e4m3", (device_obj,))
                 .map_err(|e| err("require_native_e4m3", e))?;
-            let ordinal: usize = index.extract().map_err(|e| err("device index", e))?;
+            let ordinal: usize = ordinal.try_into().map_err(|_| {
+                err(
+                    "device index",
+                    format!("cuda ordinal {ordinal} does not fit in usize"),
+                )
+            })?;
             Ok(TritonRuntime {
                 kernel: module.unbind().into(),
                 device: format!("cuda:{ordinal}"),
@@ -588,6 +604,23 @@ impl TritonMoE {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The capability probe needs a real `torch.device`. `torch.cuda.device(i)`
+    /// is the context-manager class of the same name and has no `.type`, so the
+    /// probe blew up with `'device' object has no attribute 'type'`. Pin the
+    /// argument shape so it cannot drift back to the context manager.
+    #[test]
+    fn device_args_are_the_type_and_ordinal() {
+        Python::attach(|py| {
+            let args = device_args(py, 0).unwrap();
+            assert_eq!(args.len(), 2);
+            assert_eq!(
+                args.get_item(0).unwrap().extract::<String>().unwrap(),
+                "cuda"
+            );
+            assert_eq!(args.get_item(1).unwrap().extract::<i64>().unwrap(), 0);
+        });
+    }
 
     #[test]
     fn routes_flatten_token_major() {
