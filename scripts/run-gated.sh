@@ -10,21 +10,38 @@
 # The cap has to clear the 20.3 GiB mapping plus libtorch, hence 26 GiB by
 # default; override with FT_MEM_CAP_GIB.
 #
-# Usage: scripts/run-gated.sh [--release] <test-name> [-- extra test args]
+# Usage: scripts/run-gated.sh [--release] [--features <list>] <test-name> [-- args]
 #   scripts/run-gated.sh --release one_token_prediction_matches_the_oracle
+#   scripts/run-gated.sh --release --features cuda one_token_prediction_matches_the_oracle
 #   scripts/run-gated.sh logit_lens_locates_the_first_bad_layer
+#
+# --features matters: without it the build has no libtorch and the engine runs
+# the scalar reference forward, which is ~100x slower and is not the path M1b is
+# gating.
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 profile="debug"
-if [[ "${1:-}" == "--release" ]]; then
-  profile="release"
-  shift
-fi
+features=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --release)
+      profile="release"
+      shift
+      ;;
+    --features)
+      features="$2"
+      shift 2
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
 
 if [[ $# -lt 1 ]]; then
-  echo "usage: $0 [--release] <test-name> [-- extra test args]" >&2
+  echo "usage: $0 [--release] [--features <list>] <test-name> [-- extra test args]" >&2
   exit 2
 fi
 
@@ -48,7 +65,11 @@ fi
 cap_gib="${FT_MEM_CAP_GIB:-26}"
 cap_kb=$((cap_gib * 1024 * 1024))
 
-cargo test "--profile=$profile" --test "$target" --no-run --message-format=json 2>/dev/null |
+cargo_args=("--profile=$profile" --test "$target" --no-run --message-format=json)
+if [[ -n "$features" ]]; then
+  cargo_args+=(--features "$features")
+fi
+cargo test "${cargo_args[@]}" 2>/dev/null |
   jq -r 'select(.reason == "compiler-artifact" and .executable != null) | .executable' |
   grep -E "/${target}-[0-9a-f]+$" >/tmp/ft-gate-bins
 bin="$(tail -n 1 /tmp/ft-gate-bins)"
@@ -57,7 +78,7 @@ if [[ -z "$bin" ]]; then
   exit 1
 fi
 
-echo "running $test_name ($target, cap ${cap_gib}G)" >&2
+echo "running $test_name ($target, cap ${cap_gib}G${features:+, features: $features})" >&2
 
 if command -v prlimit >/dev/null 2>&1; then
   exec prlimit --as="$cap_kb" -- "$bin" "$test_name" --ignored --nocapture "$@"

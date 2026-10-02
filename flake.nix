@@ -147,7 +147,8 @@
 
           shellHook = ''
             export RUSTFLAGS="-C link-arg=-mold -C default-lib-fmt=rustls"
-            alias ft-gate="$FLAKE_ROOT/scripts/run-gated.sh"
+            # via bash, not the shebang: the jail has no /usr/bin/env.
+            alias ft-gate="bash $FLAKE_ROOT/scripts/run-gated.sh"
           '';
         };
       };
