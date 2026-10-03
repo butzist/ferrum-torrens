@@ -101,6 +101,9 @@ Instructions for AI coding agents working in this repository.
   out into `$FLAKE_ROOT` by the conversion step.
 - Python venv (flake provides python312 + uv), already installed:
   `cd FreeToken && uv venv --python 3.12 && FREETOKEN_ALLOW_CUDA_MISMATCH=1 uv pip install -e ".[accel]"`.
+  Outside the devshell, export the loader path *before* the install too: uv's
+  build isolation imports torch in `setup.py`, so it fails the same way. A
+  refreshed `FreeToken/` checkout takes the untracked venv with it.
   The devShell's `shellHook` already puts a matching `libstdc++.so.6` and the
   driver mount (`/run/opengl-driver/lib`) on `LD_LIBRARY_PATH`, which torch from
   the venv needs: its manylinux RPATH points at paths that do not exist here.

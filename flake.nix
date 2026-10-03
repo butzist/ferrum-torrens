@@ -127,10 +127,12 @@
 
           inputsFrom = [config.flake-root.devShell];
 
-          # Store-path half of the loader path: cudatoolkit (libcudart) and
-          # libtorch. The shellHook below adds the two parts that are not store
-          # paths: the driver's mount point and a matching libstdc++.
-          LD_LIBRARY_PATH = "${pkgs.cudatoolkit}/lib:${libtorchCuda}/lib";
+          # Store-path half of the loader path: cudatoolkit (libcudart), libtorch
+          # and zlib (triton's libtriton.so links libz.so.1, which nothing else
+          # here puts on the loader path). The shellHook below adds the two parts
+          # that are not store paths: the driver's mount point and a matching
+          # libstdc++.
+          LD_LIBRARY_PATH = "${pkgs.cudatoolkit}/lib:${libtorchCuda}/lib:${pkgs.zlib}/lib";
 
           # tch build-script configuration: link the nix-provided libtorch instead
           # of downloading one (hence default-features = false in Cargo.toml).
@@ -165,7 +167,9 @@
             if [ -n "$(command -v gcc)" ]; then
               libstdcxx="$(dirname "$(gcc -print-file-name=libstdc++.so.6)")"
               if [ -f "$libstdcxx/libstdc++.so.6" ]; then
-                export LD_LIBRARY_PATH="$libstdcxx:/run/opengl-driver/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+                # ''${...} so nix emits the shell's own ''${...} instead of trying
+                # to evaluate it: "if already set, keep the old value last".
+                export LD_LIBRARY_PATH="$libstdcxx:/run/opengl-driver/lib''${LD_LIBRARY_PATH:+:''$LD_LIBRARY_PATH}"
               fi
             fi
             # via bash, not the shebang: the jail has no /usr/bin/env.
