@@ -304,9 +304,25 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
     `plan.rewrites` to `ExpertGemm`. `begin_layer` is the new port method that
     makes the ordering explicit. 7 unit tests over mocked ports, including the
     overflow case where the kernel receives `-1` routes.
-  - [ ] the `moe_block` swap in `models/qwen3_6/forward_torch.rs` (the inline
-    per-token/per-expert host widening), which is what runs the kernel in the
-    tower.
+  - [x] the `moe_block` swap in `models/qwen3_6/forward_torch.rs` (2026-10-03,
+    `2f134e7` era): the inline per-token/per-expert host widening is now the
+    fallback. The new path is `domain::expert_kernel::MoEExecutor`, an
+    arch-agnostic port the tower hands its router decision to
+    (`MoERequest`: layer, shapes, activations, dense expert ids, top-k
+    weights, `&mut out` as a separate argument so nothing aliases it).
+    `application::run_experts::CachedExperts` implements it over the trio
+    `run_experts` already takes -- the slot machine behind a `Mutex`, because
+    the tower holds the model behind `&self` -- and `registry::moe_port` is the
+    composition root that builds it from `[kernel] triton = true` (one
+    `Mutex<TritonMoE>` is both the staging store and the gemm port).
+    `kernel.triton = false` still builds no port, so the inline path is what
+    M2 and the scalar cross-check keep running. 3 new application tests + 2
+    libtorch tests (the port receives the router's own dense ids, a port
+    failure reaches the caller) + 1 registry test (an off kernel yields no
+    port, without touching python). Gate added, pending its devshell run:
+    `cargo test --release --features "cuda,triton" --test engine_real_generate -- \
+     one_token_through_the_kernel_matches_the_oracle --ignored --nocapture`
+    must still emit oracle token 11751.
   - [x] the gated GPU test written (2026-10-02,
     `tests/triton_moe_matches_reference.rs`, `--ignored`): real slabs from the
     mmap banks -> `FtwBanks` -> `TritonMoE` through `run_experts`, then
