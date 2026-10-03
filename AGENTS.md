@@ -130,6 +130,13 @@ Instructions for AI coding agents working in this repository.
   cannot run them; hand them to a devshell run. Run a gated test with
   `... -- --ignored --nocapture 2>&1 | tee log`: cargo captures a failing test's
   panic text on stderr, so a plain `| tee` log reads as an empty failure.
+- Kernel work has a CPU inner loop, no GPU needed (TODO.md decision 31):
+  `PYTHONPATH=python FreeToken/.venv/bin/python -m ferrum_kernel.selftest --interp`
+  runs the real Triton kernels through triton's interpreter on CPU tensors and
+  compares them against the torch reference, and
+  `... -m ferrum_kernel.compile_check` checks they still compile for sm_120.
+  Both need the loader path above on `LD_LIBRARY_PATH`. Use `--interp` before
+  spending a devshell run on the gated `triton_moe_matches_reference` test.
 
 ## Commits
 

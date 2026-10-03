@@ -101,6 +101,27 @@ pub fn grouped_moe_reference(
     req: &MoEGroup<'_>,
     out: &mut [f32],
 ) -> Result<(), MoEError> {
+    grouped_moe_impl(banks, req, out, None)
+}
+
+/// The same sum, also reporting `abs_sum[t] = sum_j |w[t][j]| * |ic3_j(t)|`.
+/// A route's terms nearly cancel, so `out` alone understates their size by
+/// orders of magnitude and is the wrong yardstick for a kernel's error.
+pub fn grouped_moe_reference_abs_sum(
+    banks: &HostBanks<'_>,
+    req: &MoEGroup<'_>,
+    out: &mut [f32],
+    abs_sum: &mut [f32],
+) -> Result<(), MoEError> {
+    grouped_moe_impl(banks, req, out, Some(abs_sum))
+}
+
+fn grouped_moe_impl(
+    banks: &HostBanks<'_>,
+    req: &MoEGroup<'_>,
+    out: &mut [f32],
+    mut abs_sum: Option<&mut [f32]>,
+) -> Result<(), MoEError> {
     let h = req.hidden;
     let i = req.inter;
     if banks.gu_rows != 2 * i
@@ -152,6 +173,20 @@ pub fn grouped_moe_reference(
 
     let out = &mut out[..tokens * h];
     out.fill(0.0);
+    let mut abs_sum = match abs_sum.as_mut() {
+        Some(buf) if buf.len() >= tokens * h => {
+            let buf = &mut buf[..tokens * h];
+            buf.fill(0.0);
+            Some(&mut buf[..])
+        }
+        Some(buf) => {
+            return Err(MoEError::Bad(format!(
+                "abs_sum needs {tokens} * {h}, got {}",
+                buf.len()
+            )));
+        }
+        None => None,
+    };
     let mut ic1 = vec![0.0f32; 2 * i];
     let mut ic2 = vec![0.0f32; i];
     let mut ic3 = vec![0.0f32; h];
@@ -196,6 +231,9 @@ pub fn grouped_moe_reference(
             );
             for d in 0..h {
                 out[t * h + d] += w * ic3[d];
+                if let Some(abs) = abs_sum.as_deref_mut() {
+                    abs[t * h + d] += (w * ic3[d]).abs();
+                }
             }
         }
     }
@@ -248,6 +286,7 @@ mod tests {
         let bits: u16 = match v {
             0.5 => 0x3800,
             1.0 => 0x3c00,
+            -1.0 => 0xbc00,
             4.0 => 0x4400,
             _ => panic!("unsupported f16 literal"),
         };
@@ -332,6 +371,65 @@ mod tests {
         .unwrap();
         for v in out {
             close(v, want);
+        }
+    }
+
+    #[test]
+    fn the_abs_sum_reports_the_terms_a_cancelling_sum_hides() {
+        // Slot 1 is slot 0 with its down global negated, so two unit-weighted
+        // routes cancel exactly (silu is not odd, so the gate_up global cannot
+        // do it). `out` is then uninformative about the size of the terms that
+        // produced it; `abs_sum` is what an error must be judged by.
+        let silu = |v: f32| v / (1.0 + (-v).exp());
+        let term = 4.0 * silu(4.0) * 4.0;
+
+        let gu_slabs = [
+            slab(2 * I, H, 0x10, E4M3_ONE, 1.0),
+            slab(2 * I, H, 0x10, E4M3_ONE, 1.0),
+        ];
+        let dn_slabs = [
+            slab(H, I, 0x10, E4M3_ONE, 1.0),
+            slab(H, I, 0x10, E4M3_ONE, -1.0),
+        ];
+        let gu = flat(&gu_slabs);
+        let gu_s = flat_scale(&gu_slabs);
+        let gu_g = flat_global(&gu_slabs);
+        let dn = flat(&dn_slabs);
+        let dn_s = flat_scale(&dn_slabs);
+        let dn_g = flat_global(&dn_slabs);
+        let banks = HostBanks {
+            gu_packed: &gu,
+            gu_scale: &gu_s,
+            gu_global: &gu_g,
+            dn_packed: &dn,
+            dn_scale: &dn_s,
+            dn_global: &dn_g,
+            slots: 2,
+            gu_rows: 2 * I,
+            gu_cols: H,
+            dn_rows: H,
+            dn_cols: I,
+        };
+        let x = vec![1.0f32; H];
+        let mut out = vec![0.0f32; H];
+        let mut abs_sum = vec![0.0f32; H];
+        grouped_moe_reference_abs_sum(
+            &banks,
+            &MoEGroup {
+                hidden: H,
+                inter: I,
+                x: &x,
+                top_k: 2,
+                routes: &[0, 1],
+                weights: &[1.0, 1.0],
+            },
+            &mut out,
+            &mut abs_sum,
+        )
+        .unwrap();
+        for (o, a) in out.iter().zip(&abs_sum) {
+            close(*o, 0.0);
+            close(*a, 2.0 * term);
         }
     }
 

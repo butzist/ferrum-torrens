@@ -5,9 +5,10 @@ grouped-MoE Triton kernel and its pyo3 adapter both exist and are green on the
 CPU-only box (decisions 24-30), with pyo3 slated for removal (decision 30): `domain::expert_kernel` (ports + scalar oracle),
 `python/ferrum_kernel/nvfp4_moe.py` (PTX-clean for sm_120) and
 `infrastructure/triton.rs` (feature `triton`: device slot cache, `ExpertSlotStore`,
-`ExpertGemm`). What is missing is the gated GPU numerical run, the
-`infrastructure/banks.rs` slab source, `application/run_experts.rs`, and the
-`moe_block` swap. Last finished: M1b -- the
+`ExpertGemm`), `infrastructure/banks.rs` (the FTW slab source) and
+`application/run_experts.rs`. What is missing is a green gated GPU numerical run
+(its first run found a kernel indexing bug, now fixed and covered on CPU by the
+interpreter test, decision 31) and the `moe_block` swap. Last finished: M1b -- the
 libtorch tower matches the FreeToken oracle: gated
 `one_token_prediction_matches_the_oracle` emits id 11751 (" Paris") for
 `"The capital of France is"` in ~46 s under the 26 GiB cap (decision 22), and
@@ -308,9 +309,14 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
   - [x] the gated GPU test written (2026-10-02,
     `tests/triton_moe_matches_reference.rs`, `--ignored`): real slabs from the
     mmap banks -> `FtwBanks` -> `TritonMoE` through `run_experts`, then
-    `grouped_moe_reference` over the same host bytes, asserting
-    `max|kernel - scalar| <= 2e-3` of the output scale. NOT yet run: it needs a
-    CUDA device, so hand it to a devshell:
+    `grouped_moe_reference` over the same host bytes. Split in two on
+    2026-10-03 so the oracle half needs no GPU (it caught a bank-length mistake
+    the first run would have cost a devshell round trip for) and the tolerance is
+    measured against `grouped_moe_reference_abs_sum`, the size of the terms that
+    cancel into the output, not the surviving sum. First real run: the whole
+    path executed and reported `rel 1.00`, which the interpreter run (decision
+    31) pinned to the down GEMV indexing `ic2` by token; fixed, pending a rerun.
+    Re-run it in a devshell:
     `cargo test --release --features triton --test triton_moe_matches_reference -- --ignored --nocapture`
     (set `FERRUM_KERNEL_SITE_PACKAGES` to the venv's site-packages; it defaults
     to `FreeToken/.venv/lib/python3.12/site-packages`).
@@ -724,6 +730,18 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
     driver API) is the recommendation, routes 2/3 (hand-written CUDA) are listed
     for completeness. Do it AFTER the gated test passes, so there is a numerical
     oracle for the replacement to be measured against.
+
+31. **Kernel numerics are checked on the CPU through Triton's interpreter**
+    (2026-10-03) -- `python -m ferrum_kernel.selftest --interp` re-execs itself
+    with `TRITON_INTERPRET=1` (`@triton.jit` picks the interpreter when it
+    decorates, so the env var has to be set before import) and runs the real
+    kernels on CPU tensors against `grouped_moe_reference`. It is the fast inner
+    loop for kernel work: no GPU, no CUDA device, ~0.1 s per case, and it caught
+    the first real kernel bug (the down GEMV indexed `ic2` by token instead of
+    route) that the gated GPU test had been reporting only as `rel 1.0`. The
+    gated GPU test stays the final gate, because only it runs on real hardware
+    with the checkpoint's own banks; `--interp` also needs no native e4m3, so
+    `require_native_e4m3` returns early there.
 
 ### Config defaults for the RTX 5060 / 8 GB target
 

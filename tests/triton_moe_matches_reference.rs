@@ -268,10 +268,12 @@ fn the_scalar_oracle_runs_on_the_real_expert_slabs() {
     let source: Arc<dyn ExpertSlabSource> = Arc::new(FtwBanks::new(reader, index.clone()));
     let case = plan(&index, &*source);
     let mut want = vec![0.0f32; TOKENS * case.shapes.hidden];
-    ferrum_torrens::domain::expert_kernel::grouped_moe_reference(
+    let mut terms = vec![0.0f32; TOKENS * case.shapes.hidden];
+    ferrum_torrens::domain::expert_kernel::grouped_moe_reference_abs_sum(
         &case.banks.as_host(),
         &case.request(&case.routes),
         &mut want,
+        &mut terms,
     )
     .expect("scalar oracle");
     let scale = scale_of(&want);
@@ -281,6 +283,13 @@ fn the_scalar_oracle_runs_on_the_real_expert_slabs() {
             .iter()
             .collect::<std::collections::HashSet<_>>()
             .len()
+    );
+    let term_scale = scale_of(&terms);
+    let cancels = term_scale / scale_of(&want).max(f32::MIN_POSITIVE);
+    println!(
+        "layer {LAYER}: the {TOP_K} routes per token sum to terms of {term_scale:.3e} \
+         that cancel down to {} ({cancels:.0}x)",
+        scale_of(&want)
     );
     assert!(
         want.iter().all(|v| v.is_finite()),
@@ -340,26 +349,36 @@ fn the_kernel_matches_the_scalar_oracle_on_real_expert_slabs() {
     assert_eq!(routes, case.routes, "the plan must be deterministic");
 
     let mut want = vec![0.0f32; TOKENS * case.shapes.hidden];
+    let mut terms = vec![0.0f32; TOKENS * case.shapes.hidden];
     gate(
         "scalar oracle",
-        ferrum_torrens::domain::expert_kernel::grouped_moe_reference(
+        ferrum_torrens::domain::expert_kernel::grouped_moe_reference_abs_sum(
             &case.banks.as_host(),
             &case.request(&routes),
             &mut want,
+            &mut terms,
         ),
+    );
+    // Every route contributes a term far larger than the surviving sum, so the
+    // terms are the only honest yardstick for a kernel's error here.
+    let term_scale = scale_of(&terms);
+    let cancels = term_scale / scale_of(&want).max(f32::MIN_POSITIVE);
+    println!(
+        "layer {LAYER}: the {TOP_K} routes per token sum to terms of {term_scale:.3e} \
+         that cancel down to {} ({cancels:.0}x)",
+        scale_of(&want)
     );
 
     let diff = max_abs_diff(&got, &want);
-    let scale = scale_of(&want);
-    let rel = diff / scale.max(1e-6);
+    let rel = diff / term_scale.max(1e-6);
     println!(
         "layer {LAYER}: {TOKENS} tokens x top_k {TOP_K}, {SLOTS} slots staged, \
-         max|kernel - scalar| = {diff:.3e} of {scale:.3e} ({rel:.2e} rel) in {kernel_ms:.1} ms"
+         max|kernel - scalar| = {diff:.3e} of {term_scale:.3e} terms ({rel:.2e} rel) in {kernel_ms:.1} ms"
     );
-    if diff > TOLERANCE * scale.max(1.0) {
+    if diff > TOLERANCE * term_scale {
         println!(
             "GATE FAILED at the numeric comparison: {diff:.3e} > {:.3e}",
-            TOLERANCE * scale.max(1.0)
+            TOLERANCE * term_scale
         );
         panic!("kernel drifted from the scalar oracle");
     }
