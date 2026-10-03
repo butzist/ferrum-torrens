@@ -8,6 +8,7 @@ pub mod forward;
 pub mod forward_torch;
 pub mod weights;
 
+use crate::domain::kvcache::CachedModel;
 use crate::domain::model::{ForwardInput, LayerProbe, Model, ModelParams};
 use crate::domain::weights::WeightsReader;
 use crate::infrastructure::ftw::FtwIndex;
@@ -106,3 +107,8 @@ impl Model for Qwen3_6 {
         )
     }
 }
+
+/// The scalar reference has no device cache to read, so it takes the trait's
+/// stateless default: a cached step re-runs its prefix, which is exactly what
+/// this forward always did. Correct, just not incremental.
+impl CachedModel for Qwen3_6 {}

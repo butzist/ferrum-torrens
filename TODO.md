@@ -14,8 +14,11 @@ Qwen3.6 tower routes its experts through it when `kernel.triton=true`. The
 `moe_block` swap's own gate is BLOCKED on the pyo3 exit: an embedded interpreter
 that imports the venv torch cannot initialize CUDA in a process that already
 links libtorch (decision 32), so the tower-with-kernel gate can only run after
-decision 30's PTX + driver API replacement. Incremental KV decode (the next
-ordered step) does not depend on the kernel and can proceed. Last finished: the
+decision 30's PTX + driver API replacement. Incremental KV decode is now proved
+too: chunked prefill + one-token decode off the page table agrees with re-feeding
+the whole prefix on the real checkpoint (same argmax at every step, logits
+within 2e-6 of scale, decision 33), and the engine does not use it yet.
+Last finished: the cached forward and its device cache. Before that the
 `moe_block` swap, on top of M1b -- the
 libtorch tower matches the FreeToken oracle: gated
 `one_token_prediction_matches_the_oracle` emits id 11751 (" Paris") for
@@ -141,7 +144,7 @@ ferrum-torrens/
       banks.rs                  # per-layer expert host banks (pinned; QuantFormat-driven)
       torch.rs                  # libtorch compute runtime: device, tensors, streams, graphs
       triton.rs                 # python/Triton NVFP4 expert GEMV adapter (the one kernel)
-      kvcache_dev.rs            # mha_pool + radix on device tensors
+      kvcache_dev.rs            # mha_pool + gdn state slabs + the DeviceCache port impl
       http.rs                   # axum routes, SSE, chat template, generation
       tokenizers_hf.rs          # HF `tokenizers` crate + minijinja chat template
   scripts/
@@ -404,7 +407,9 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 - [ ] P0 prefill double-buffer and decode path must not clobber each other (begin_prefill fence).
 
 ### KV cache + radix
-- [ ] P0 MHA paged pool `[2, num_full_layers, num_pages, page_size, kv_heads, head_dim]` with global-layer->dense-index remap (only 10 full layers get slabs).
+- [x] P0 MHA paged pool `[2, num_full_layers, num_pages, page_size, kv_heads, head_dim]` with global-layer->dense-index remap (only 10 full layers get slabs). (`infrastructure/kvcache_dev.rs`, decision 33)
+- [x] P0 GDN conv/recurrent state slabs per request slot, f32, recycled slots zeroed. (`infrastructure/kvcache_dev.rs`)
+- [x] P0 cached forward: chunked prefill + one-token decode off the page table instead of re-feeding the prefix (`CachedModel` port, gated `incremental_decode_matches_refeeding_the_whole_prefix`: same argmax every step, logits within 2e-6 of the re-fed forward).
 - [x] P0 page free-list (`free_slots` holds page bases) + per-req page table holding **token locations** + dummy row pointing at a sentinel page. (`domain/kvcache.rs`)
 - [x] P0 radix prefix tree: walk by first-page-key, `std::mismatch`-comparison align-down to page, node split, insert, LRU evict (unlocked leaf only), ref-counted handles. (`domain/kvcache.rs`, page_size=1)
 - [ ] P0 prefill flow: `match_req` -> lock -> allocate_paged -> compute/store kv -> `cache_req` commit (unfinished rows re-point at canonical tree pages).
@@ -809,6 +814,22 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
     stays green (it runs the kernel in its own process), and incremental KV
     decode plus SSE work on `--features cuda` alone. Do not spend more time on
     link flags for `cuda,triton` in one process.
+
+33. **The KV pool is f32, and the cached forward's contract is "same token,
+    same logits"** (2026-10-03) -- the incremental path stores what the re-fed
+    forward would have recomputed: K/V after the norm and the rope (f32, not the
+    checkpoint's bf16) and the GDN conv/recurrent state in f32
+    (`mamba_ssm_dtype=float32`, ALGORITHM.md 3.3). The gate therefore compares
+    against re-feeding the prefix rather than against FreeToken's numbers, and
+    holds argmax equality plus `max|dlogit| / scale < 1e-3` (measured 2e-6; the
+    residual is libtorch summing the attention reduction in another order).
+    f32 KV costs 5 GiB at the `[kv]` default of 131072 tokens, which does not fit
+    the 8 GB target next to the weights, so this is the correctness slice, not
+    the serving configuration: `KvDType::BFloat16` exists for that (2.5 GiB) and
+    the reference itself serves fp8 KV (`kv_cache_dtype = "fp8"`), but neither
+    is switched on until the decode path is proven end to end and the bytes are
+    actually the binding constraint. Recorded so the number is a decision, not an
+    accident.
 
 ### Config defaults for the RTX 5060 / 8 GB target
 

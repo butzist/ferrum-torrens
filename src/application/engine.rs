@@ -235,7 +235,7 @@ pub fn load_engine(config: &crate::config::Config) -> Result<Engine, LoadError> 
     let eos_ids = eos_ids_from_ftw_dir(dir)?;
 
     Ok(Engine::new(
-        std::sync::Arc::from(model),
+        std::sync::Arc::from(model as Box<dyn crate::domain::model::Model>),
         std::sync::Arc::new(tokenizer),
         eos_ids,
         limits,

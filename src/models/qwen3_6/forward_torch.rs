@@ -23,9 +23,11 @@ use tch::Tensor;
 
 use crate::domain::dequant::{bf16_array, e4m3_values, nvfp4_block, nvfp4_expert, nvfp4_globals};
 use crate::domain::expert_kernel::{MoEError, MoEExecutor, MoERequest};
+use crate::domain::kvcache::{CachedModel, KvCache, KvcacheError, SequenceCache};
 use crate::domain::model::{ForwardInput, LayerType, Model, ModelParams};
 use crate::domain::weights::{DType, TensorDesc, TensorKind, WeightsReader};
 use crate::infrastructure::ftw::FtwIndex;
+use crate::infrastructure::kvcache_dev::{DeviceCache, LinearStateSlabs, MhaPool};
 use crate::infrastructure::torch::{Device, bf16_tensor, f32_tensor, to_f32_vec};
 
 #[derive(Debug, thiserror::Error)]
@@ -743,6 +745,9 @@ pub struct TorchQwen3_6 {
     /// widens a routed expert slab itself. `None` keeps the inline host path,
     /// which is what `kernel.triton = false` still runs.
     moe: Option<std::sync::Arc<dyn MoEExecutor>>,
+    /// The KV cache this forward reads and writes, when the engine gave it one.
+    /// The engine keeps a clone of the same allocation to hand out page tables.
+    cache: Option<std::sync::Arc<DeviceCache>>,
 }
 
 struct TorchLayer {
@@ -767,6 +772,7 @@ impl TorchQwen3_6 {
         index: std::sync::Arc<FtwIndex>,
         reader: std::sync::Arc<dyn WeightsReader>,
         moe: Option<std::sync::Arc<dyn MoEExecutor>>,
+        cache: std::sync::Arc<DeviceCache>,
     ) -> Result<Self> {
         let ld = Loader {
             index: &index,
@@ -888,6 +894,7 @@ impl TorchQwen3_6 {
             index,
             reader,
             moe,
+            cache: Some(cache),
         })
     }
 
@@ -940,7 +947,16 @@ impl TorchQwen3_6 {
         self.lm_head_logits(&normed)
     }
 
-    fn full_attention(&self, fa: &FullAttention, x: &Tensor, positions: &[u32]) -> Result<Tensor> {
+    /// The attention projection, up to the point where the two paths diverge:
+    /// rope'd `q`/`k`/`v` for this chunk and the output gate. Both the re-fed
+    /// forward and the cached forward start here, so a cached step cannot drift
+    /// from a re-fed one before the cache is even involved.
+    fn project_attention(
+        &self,
+        fa: &FullAttention,
+        x: &Tensor,
+        positions: &[u32],
+    ) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
         let p = &self.params;
         let dev = self.device;
         let hd = p.head_dim as i64;
@@ -971,7 +987,8 @@ impl TorchQwen3_6 {
             p.rotary_dim as i64,
             p.rope_theta,
             positions,
-        );
+        )
+        .reshape([t, qh, hd]);
         let k = partial_rope(
             &k.reshape([t, kvh, hd]),
             kvh,
@@ -979,17 +996,140 @@ impl TorchQwen3_6 {
             p.rotary_dim as i64,
             p.rope_theta,
             positions,
-        );
-        let attn = causal_attention(
-            &q.reshape([t, qh, hd]),
-            &k.reshape([t, kvh, hd]),
-            &v.reshape([t, kvh, hd]),
-        );
+        )
+        .reshape([t, kvh, hd]);
+        Ok((q, k, v.reshape([t, kvh, hd]), gate))
+    }
+
+    fn full_attention(&self, fa: &FullAttention, x: &Tensor, positions: &[u32]) -> Result<Tensor> {
+        let (q, k, v, gate) = self.project_attention(fa, x, positions)?;
+        let attn = causal_attention(&q, &k, &v);
         let gated = attn * sigmoid(&gate);
-        fa.o.apply(&gated, dev, &self.loader())
+        fa.o.apply(&gated, self.device, &self.loader())
+    }
+
+    /// The same layer, but the keys and values of the tokens already in the
+    /// page table are read back out of the pool instead of recomputed. `q_offset`
+    /// is the absolute position of this chunk's first token, which is both how
+    /// far back attention reaches and where the mask starts.
+    fn full_attention_cached(
+        &self,
+        layer: usize,
+        fa: &FullAttention,
+        x: &Tensor,
+        positions: &[u32],
+        cache: &SequenceCache,
+        pool: &MhaPool,
+    ) -> Result<Tensor> {
+        let (q, k, v, gate) = self.project_attention(fa, x, positions)?;
+        let t = k.size()[0];
+        pool.store(layer, cache.tail(t as usize), &k, &v);
+        let (k_all, v_all) = pool.gather(layer, cache.filled());
+        let attn = attention_cached(&q, &k_all, &v_all, positions[0] as usize);
+        let gated = attn * sigmoid(&gate);
+        fa.o.apply(&gated, self.device, &self.loader())
     }
 
     fn gdn(&self, gdn: &GatedDeltaNet, x: &Tensor) -> Result<Tensor> {
+        let (layer_idx, q, k, v, g, beta, z) = self.gdn_project(gdn, x)?;
+        let p = &self.params;
+        let t = x.size()[0];
+        let dk = p.linear_key_head_dim as i64;
+        let dv = p.linear_value_head_dim as i64;
+        let vb = p.linear_num_value_heads as i64;
+        let value_dim = vb * dv;
+
+        let core = gdn_recurrence(&q, &k, &v, &g, &beta, vb, dk, dv);
+        trace_tensor("gdn.core", layer_idx, &core);
+        let core_n =
+            rms_norm(&core.reshape([t, vb, dv]), &gdn.norm, p.rms_norm_eps).reshape([t, value_dim]);
+        trace_tensor("gdn.norm", layer_idx, &core_n);
+        let out = core_n * z.silu();
+        trace_tensor("gdn.pre", layer_idx, &out);
+        let o = gdn.o.apply(&out, self.device, &self.loader())?;
+        trace_tensor("gdn.out", layer_idx, &o);
+        Ok(o)
+    }
+
+    /// The GDN layer continued from the slot's own conv and recurrent state
+    /// rather than from zeros, and with both written back for the next step.
+    fn gdn_cached(
+        &self,
+        layer: usize,
+        gdn: &GatedDeltaNet,
+        x: &Tensor,
+        cache: &SequenceCache,
+        state: &LinearStateSlabs,
+    ) -> Result<Tensor> {
+        let p = &self.params;
+        let dev = self.device;
+        let (kb, dk, dv) = (
+            p.linear_num_key_heads as i64,
+            p.linear_key_head_dim as i64,
+            p.linear_value_head_dim as i64,
+        );
+        let vb = p.linear_num_value_heads as i64;
+        let key_dim = kb * dk;
+        let value_dim = vb * dv;
+        let conv_dim = 2 * key_dim + value_dim;
+        let t = x.size()[0];
+
+        let qkvz = gdn.qkvz.apply(x, dev, &self.loader())?;
+        trace_tensor("gdn.qkvz", layer, &qkvz);
+        let (conv_in, z) = two(qkvz, [conv_dim, value_dim], 1);
+        let ba = f32_(x).matmul(&f32_(&gdn.ba).transpose(0, 1));
+        let (b, a) = two(ba, [vb, vb], 1);
+
+        let slot = cache.state_slot();
+        let (mixed, conv_out) = conv1d_silu_cached(
+            &conv_in,
+            &f32_(&gdn.conv),
+            conv_dim,
+            p.linear_conv_kernel_dim as i64,
+            &state.conv_state(slot, layer),
+        );
+        state.set_conv_state(slot, layer, conv_out);
+        trace_tensor("gdn.conv", layer, &mixed);
+        let (qf, kf, vf) = three(mixed, [key_dim, key_dim, value_dim], 1);
+        let rep = vb / kb;
+        let q = expand_heads(&qf.view([t, kb, dk]), kb, rep, dk);
+        let k = expand_heads(&kf.view([t, kb, dk]), kb, rep, dk);
+        let v = vf.view([t, vb, dv]);
+
+        let a_log = f32_(&gdn.a_log).exp().neg();
+        let g = softplus(&(&a + &f32_(&gdn.dt_bias))) * &a_log;
+        let beta = sigmoid(&b);
+        let (core, rec) = gdn_recurrence_cached(
+            &q,
+            &k,
+            &v,
+            &g,
+            &beta,
+            vb,
+            dk,
+            dv,
+            &state.recurrent_state(slot, layer),
+        );
+        state.set_recurrent_state(slot, layer, rec);
+        trace_tensor("gdn.core", layer, &core);
+
+        let core_n =
+            rms_norm(&core.reshape([t, vb, dv]), &gdn.norm, p.rms_norm_eps).reshape([t, value_dim]);
+        let out = core_n * z.silu();
+        let o = gdn.o.apply(&out, dev, &self.loader())?;
+        trace_tensor("gdn.out", layer, &o);
+        Ok(o)
+    }
+
+    /// Everything up to the recurrence: the conv projection (carried, not
+    /// re-zeroed), the head expansion and the decay/beta gates. Shared by the
+    /// stateless and cached paths so they cannot differ before the state does.
+    #[allow(clippy::type_complexity)]
+    fn gdn_project(
+        &self,
+        gdn: &GatedDeltaNet,
+        x: &Tensor,
+    ) -> Result<(usize, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)> {
         let layer_idx = self
             .layers
             .iter()
@@ -1033,16 +1173,7 @@ impl TorchQwen3_6 {
         let beta = sigmoid(&b);
 
         trace_tensor("gdn.g", layer_idx, &g);
-        let core = gdn_recurrence(&q, &k, &v, &g, &beta, vb, dk, dv);
-        trace_tensor("gdn.core", layer_idx, &core);
-        let core_n =
-            rms_norm(&core.reshape([t, vb, dv]), &gdn.norm, p.rms_norm_eps).reshape([t, value_dim]);
-        trace_tensor("gdn.norm", layer_idx, &core_n);
-        let out = core_n * z.silu();
-        trace_tensor("gdn.pre", layer_idx, &out);
-        let o = gdn.o.apply(&out, dev, &self.loader())?;
-        trace_tensor("gdn.out", layer_idx, &o);
-        Ok(o)
+        Ok((layer_idx, q, k, v, g, beta, z))
     }
 
     fn moe(&self, layer_idx: usize, x_post: &Tensor) -> Result<Tensor> {
@@ -1149,6 +1280,56 @@ impl TorchQwen3_6 {
     }
 }
 
+impl TorchQwen3_6 {
+    /// `run_sequence` against a page table: identical arithmetic, except the
+    /// attention reads the prefix's K/V out of the pool and the GDN layers carry
+    /// their conv/recurrent state across steps.
+    ///
+    /// `cache` must already be grown by `ids.len()` and hold exactly one
+    /// sequence; `positions` are absolute, so `positions[0]` is how much of the
+    /// prefix is already there.
+    fn run_sequence_cached(
+        &self,
+        ids: &[u32],
+        positions: &[u32],
+        cache: &SequenceCache,
+    ) -> Result<Vec<f32>> {
+        let p = &self.params;
+        let dev = self.device;
+        let t = ids.len();
+        let slab = self.cache.as_ref().expect("no kv cache attached");
+
+        let mut x = self.embed.gather(ids, dev, &self.loader())?;
+        let mut residual: Option<Tensor> = None;
+
+        for (li, layer) in self.layers.iter().enumerate() {
+            let xsum = match residual.take() {
+                None => x.shallow_clone(),
+                Some(r) => &x + &r,
+            };
+            let h1 = rms_norm(&xsum, &layer.input_norm, p.rms_norm_eps);
+            let mixer_out = match &layer.mixer {
+                Mixer::Full(fa) => {
+                    self.full_attention_cached(li, fa, &h1, positions, cache, slab.mha())?
+                }
+                Mixer::Linear(gdn) => self.gdn_cached(li, gdn, &h1, cache, slab.state())?,
+            };
+            let sum2 = &mixer_out + &xsum;
+            let h2 = rms_norm(&sum2, &layer.post_norm, p.rms_norm_eps);
+            x = self.moe(li, &h2)?;
+            residual = Some(sum2);
+        }
+
+        let stream = match residual.take() {
+            Some(r) => &x + &r,
+            None => x,
+        };
+        let last = stream.narrow(0, (t - 1) as i64, 1);
+        let normed = rms_norm(&last, &self.final_norm, p.rms_norm_eps);
+        self.lm_head_logits(&normed)
+    }
+}
+
 impl Model for TorchQwen3_6 {
     fn params(&self) -> &ModelParams {
         &self.params
@@ -1168,6 +1349,41 @@ impl Model for TorchQwen3_6 {
             }
         }
         out
+    }
+}
+
+impl CachedModel for TorchQwen3_6 {
+    fn cache(&self) -> Option<std::sync::Arc<dyn KvCache>> {
+        self.cache
+            .as_ref()
+            .map(|c| c.clone() as std::sync::Arc<dyn KvCache>)
+    }
+
+    fn forward_cached(
+        &self,
+        input: &ForwardInput,
+        cache: &mut SequenceCache,
+    ) -> std::result::Result<Vec<f32>, KvcacheError> {
+        let n = input.input_ids.len();
+        let start = input.positions[0] as usize;
+        if input.answers != vec![n - 1] {
+            return Err(KvcacheError::MisalignedCache {
+                why: "the cached forward takes one sequence and answers its last token".to_string(),
+            });
+        }
+        if cache.cached() != start + n {
+            return Err(KvcacheError::MisalignedCache {
+                why: "the cache must be grown by exactly this step's tokens, at its own position"
+                    .to_string(),
+            });
+        }
+        if self.cache.is_none() {
+            return Err(KvcacheError::MisalignedCache {
+                why: "this model was loaded without a kv cache".to_string(),
+            });
+        }
+        self.run_sequence_cached(&input.input_ids, &input.positions, cache)
+            .map_err(|e| KvcacheError::MisalignedCache { why: e.to_string() })
     }
 }
 

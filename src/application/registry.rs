@@ -2,6 +2,7 @@
 // `Model` implementation. There is no arch label in the FTW index meta, so the
 // FTW dir's copied config.json is the dispatch key (TODO.md section 3).
 
+use crate::domain::kvcache::CachedModel;
 use crate::domain::model::Model;
 use crate::domain::weights::WeightsReader;
 #[cfg(feature = "cuda")]
@@ -51,7 +52,7 @@ pub fn build(
     reader: Arc<dyn WeightsReader>,
     device: Device,
     config: &crate::config::Config,
-) -> Result<Box<dyn Model>, RegistryError> {
+) -> Result<Box<dyn CachedModel>, RegistryError> {
     match arch_of(config_json)? {
         "Qwen3_5MoeForConditionalGeneration" | "Qwen3_5MoeForCausalLM" => {
             let tc = config_json
@@ -65,9 +66,10 @@ pub fn build(
                 let params = crate::models::qwen3_6::config::parse_text_config(tc)
                     .map_err(|e| RegistryError::Build(e.to_string()))?;
                 let moe = moe_port(config, &params, index.clone(), reader.clone())?;
+                let cache = Arc::new(kv_cache(config, &params, device));
                 Ok(Box::new(
                     crate::models::qwen3_6::forward_torch::TorchQwen3_6::load(
-                        params, device, index, reader, moe,
+                        params, device, index, reader, moe, cache,
                     )
                     .map_err(|e| RegistryError::Build(e.to_string()))?,
                 ))
@@ -80,6 +82,28 @@ pub fn build(
         }
         other => Err(RegistryError::Unsupported(other.to_string())),
     }
+}
+
+/// The device KV cache the engine hands page tables out from: `[kv]` sizes it,
+/// one state slot per request the scheduler may run at once.
+///
+/// f32 KV, because the cached forward's contract is to reproduce a re-fed
+/// forward, and this is the lossless option. TODO.md decision 33 keeps the
+/// narrower serving dtypes for when VRAM is the binding constraint.
+#[cfg(feature = "cuda")]
+fn kv_cache(
+    config: &crate::config::Config,
+    params: &ModelParams,
+    device: Device,
+) -> crate::infrastructure::kvcache_dev::DeviceCache {
+    use crate::infrastructure::kvcache_dev::{DeviceCache, KvDType};
+    DeviceCache::new(
+        params,
+        config.kv_tokens(),
+        config.model.max_running_requests,
+        KvDType::F32,
+        device,
+    )
 }
 
 /// The engine's MoE port for `kernel.triton = true`: the Triton adapter over

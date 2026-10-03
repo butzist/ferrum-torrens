@@ -8,14 +8,25 @@
 
 use std::collections::BTreeMap;
 
-use crate::domain::model::ForwardInput;
+use crate::domain::model::{ForwardInput, Model};
 
 pub const SENTINEL_PAGE: u32 = u32::MAX;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KvcacheError {
-    OutOfPages { want: usize, have: usize },
-    NotEnoughEvictable { want: usize, have: usize },
+    OutOfPages {
+        want: usize,
+        have: usize,
+    },
+    /// A cached forward was asked for something its cache cannot serve, e.g. a
+    /// batch, or tokens it was not grown for. `why` says which.
+    MisalignedCache {
+        why: String,
+    },
+    NotEnoughEvictable {
+        want: usize,
+        have: usize,
+    },
     NoLeavesEvictable,
 }
 
@@ -466,7 +477,7 @@ impl SequenceCache {
 /// The port keeps tensors out of the domain: a caller learns the page numbers it
 /// must reserve, hands them to a cached forward, and the adapter does the rest.
 /// Implementation in `infrastructure::kvcache_dev`.
-pub trait KvCache: Send {
+pub trait KvCache: Send + Sync {
     /// A fresh request: an empty page table and a private state slot. Grow it
     /// with `reserve` before the first forward.
     fn begin(&self) -> SequenceCache;
@@ -490,12 +501,27 @@ pub trait KvCache: Send {
 /// `cache` must already be grown by `input`'s token count (`reserve`), and
 /// `input` must hold exactly one sequence: the cached path has no notion of a
 /// batch, since every sequence's KV lives in its own page table.
-pub trait CachedModel {
+pub trait CachedModel: Model {
+    /// The cache this forward reads and writes, if it has one. The engine takes
+    /// it to open sessions; an adapter without a cache returns `None` and falls
+    /// back to the stateless forward below.
+    fn cache(&self) -> Option<std::sync::Arc<dyn KvCache>> {
+        None
+    }
+
+    /// Advance `cache` over `input`'s tokens and return the last token's logits.
+    ///
+    /// The default re-runs the whole prefix and ignores the cache, which is
+    /// correct but slow: a model that cannot cache still answers, it just pays
+    /// for the prefix again every step.
     fn forward_cached(
         &self,
         input: &ForwardInput,
         cache: &mut SequenceCache,
-    ) -> Result<Vec<f32>, KvcacheError>;
+    ) -> Result<Vec<f32>, KvcacheError> {
+        let _ = cache;
+        Ok(self.forward(input))
+    }
 }
 
 #[cfg(test)]

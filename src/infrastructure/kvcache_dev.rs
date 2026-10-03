@@ -289,9 +289,19 @@ impl LinearStateSlabs {
 pub struct DeviceCache {
     pages: Mutex<PagePool>,
     slots: Mutex<LinearStatePool>,
+    slabs: SharedSlabs,
+}
+
+/// `tch::Tensor` is `Send` but not `Sync`, and the engine holds the model (and
+/// through it this cache) behind an `Arc` on its own thread pool. libtorch is
+/// thread-safe; the only thing being shared is the handle, and the engine runs
+/// one forward at a time. Same newtype the dense weights already use.
+struct SharedSlabs {
     mha: MhaPool,
     state: LinearStateSlabs,
 }
+
+unsafe impl Sync for SharedSlabs {}
 
 impl DeviceCache {
     pub fn new(
@@ -304,22 +314,24 @@ impl DeviceCache {
         Self {
             pages: Mutex::new(PagePool::new(PAGE_SIZE as usize, num_pages)),
             slots: Mutex::new(LinearStatePool::new(num_slots)),
-            mha: MhaPool::new(params, num_pages, dtype, device),
-            state: LinearStateSlabs::new(params, num_slots, device),
+            slabs: SharedSlabs {
+                mha: MhaPool::new(params, num_pages, dtype, device),
+                state: LinearStateSlabs::new(params, num_slots, device),
+            },
         }
     }
 
     pub fn mha(&self) -> &MhaPool {
-        &self.mha
+        &self.slabs.mha
     }
 
     pub fn state(&self) -> &LinearStateSlabs {
-        &self.state
+        &self.slabs.state
     }
 
     /// Bytes the whole cache holds, for the config's memory arithmetic.
     pub fn bytes(&self) -> usize {
-        self.mha.bytes() + self.state.bytes()
+        self.slabs.mha.bytes() + self.slabs.state.bytes()
     }
 }
 
@@ -333,7 +345,7 @@ impl KvCache for DeviceCache {
             .expect("state slots exhausted: size the cache for the request concurrency");
         // A recycled slot still holds the last request's GDN state; zero it, or
         // the new request's first chunk would continue someone else's.
-        self.state.reset_slot(slot);
+        self.slabs.state.reset_slot(slot);
         SequenceCache::new(slot)
     }
 
