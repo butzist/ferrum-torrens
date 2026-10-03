@@ -21,6 +21,11 @@ The whole target GPU is sm_120, which has a native fp8e4nv unit, so the scale
 tensors are passed as `torch.float8_e4m3fn` and the emulation branch upstream
 needs for pre-sm_89 targets is deliberately absent; `require_native_e4m3()`
 makes that assumption loud instead of silent.
+
+Every kernel accumulates in fp32 and takes its output type off the pointer
+(`ptr.dtype.element_ty`). A `torch.dtype` passed as a `tl.constexpr` instead
+makes triton treat it as a value and die in its own frame on `.scalar()`;
+`_check_constexprs` rejects that at the launch site.
 """
 
 from __future__ import annotations
