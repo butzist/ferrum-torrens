@@ -6,10 +6,17 @@ CPU-only box (decisions 24-30), with pyo3 slated for removal (decision 30): `dom
 `python/ferrum_kernel/nvfp4_moe.py` (PTX-clean for sm_120) and
 `infrastructure/triton.rs` (feature `triton`: device slot cache, `ExpertSlotStore`,
 `ExpertGemm`), `infrastructure/banks.rs` (the FTW slab source) and
-`application/run_experts.rs`. The gated GPU numerical run is green now
+`application/run_experts.rs`. The gated GPU numerical run is green
 (`8.5e-7` rel against the term scale on the real slabs, after two kernel bugs the
-interpreter test pinned, decision 31); what is missing is the `moe_block` swap,
-then the pyo3 exit (decision 30). Last finished: M1b -- the
+interpreter test pinned, decision 31), and the `moe_block` swap is done (commit
+`6e90b4f`): `CachedExperts` sits behind the new `MoEExecutor` port and the
+Qwen3.6 tower routes its experts through it when `kernel.triton=true`. The
+`moe_block` swap's own gate is BLOCKED on the pyo3 exit: an embedded interpreter
+that imports the venv torch cannot initialize CUDA in a process that already
+links libtorch (decision 32), so the tower-with-kernel gate can only run after
+decision 30's PTX + driver API replacement. Incremental KV decode (the next
+ordered step) does not depend on the kernel and can proceed. Last finished: the
+`moe_block` swap, on top of M1b -- the
 libtorch tower matches the FreeToken oracle: gated
 `one_token_prediction_matches_the_oracle` emits id 11751 (" Paris") for
 `"The capital of France is"` in ~46 s under the 26 GiB cap (decision 22), and
@@ -768,6 +775,40 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
     shape. The gated GPU test stays the final gate, because only it runs on real
     hardware with the checkpoint's own banks; `--interp` also needs no native
     e4m3, so `require_native_e4m3` returns early there.
+
+32. **The pyo3 tower gate is blocked by the embedded interpreter's CUDA
+    bootstrap, not by the kernel** (2026-10-03) -- the `moe_block` swap's gate
+    (`one_token_through_the_kernel_matches_the_oracle`) has to put the real
+    Triton kernel inside the real tower, which means one process holding both
+    libtorch and an embedded CPython that imports a *second* libtorch. Neither
+    build links that way:
+    - Built against the flake's libtorch 2.9.0 (ABI `0`), the embedded import
+      fails: the venv's torch 2.11 libs are picked up instead and
+      `libtorch_nvshmem.so` misses `_ZN3c1013MessageLogger6streamB5cxx11Ev`.
+      The two libtorchs share SONAMEs, so `LD_LIBRARY_PATH` decides which one
+      wins and neither choice works.
+    - Built against the venv's torch 2.11 (`LIBTORCH=$V`, headers at `$V`, and
+      the nix libtorch dir kept off `LD_LIBRARY_PATH` at runtime), the import
+      succeeds and all 220 `--features cuda` tests pass on libtorch's CPU
+      backend, but `TritonRuntime::new`'s `torch.cuda.current_device()` raises
+      "Cannot initialize CUDA without ATen_cuda library". This is not a
+      `--as-needed` pruning problem: `LD_DEBUG=libs` shows `libc10_cuda.so`,
+      `libtorch_cuda.so`, `libtorch_python.so` and `_C.so` all loaded and
+      initialised, and adding the venv's `nvidia/*/lib` to `LD_LIBRARY_PATH`
+      changes nothing. What differs from a working `FreeToken/.venv/bin/python`
+      is `torch._C._cudart`, the object torch's `from torch._C import _cudart`
+      needs, which is absent here; preloading `libc10.so` + `libtorch_cpu.so`
+      does not reproduce it, preloading `_C.so` does change it. In short: torch's
+      lazy cudart bootstrap does not survive being driven from an embedded
+      interpreter in a process that has already initialised libtorch.
+    Consequence: this is the second libtorch problem decision 30 predicted, now
+    with a reproduction and no linker-side workaround. The swap's gate moves
+    behind the pyo3 exit -- committed PTX loaded through the CUDA driver API
+    (`cudarc`), no python, no second libtorch, no `libcudart` bootstrap to
+    inherit. Nothing else is blocked by it: the standalone GPU numerical gate
+    stays green (it runs the kernel in its own process), and incremental KV
+    decode plus SSE work on `--features cuda` alone. Do not spend more time on
+    link flags for `cuda,triton` in one process.
 
 ### Config defaults for the RTX 5060 / 8 GB target
 
