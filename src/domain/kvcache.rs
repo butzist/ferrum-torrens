@@ -8,6 +8,8 @@
 
 use std::collections::BTreeMap;
 
+use crate::domain::model::ForwardInput;
+
 pub const SENTINEL_PAGE: u32 = u32::MAX;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -456,6 +458,44 @@ impl SequenceCache {
         debug_assert!(n <= self.len);
         &self.pages[self.len - n..self.len]
     }
+}
+
+/// The engine-facing side of the cache: a pool of pages and of GDN state slots,
+/// the device slabs behind them included.
+///
+/// The port keeps tensors out of the domain: a caller learns the page numbers it
+/// must reserve, hands them to a cached forward, and the adapter does the rest.
+/// Implementation in `infrastructure::kvcache_dev`.
+pub trait KvCache: Send {
+    /// A fresh request: an empty page table and a private state slot. Grow it
+    /// with `reserve` before the first forward.
+    fn begin(&self) -> SequenceCache;
+
+    /// Make room for `n` more tokens and return them as the cache's tail.
+    fn reserve(&self, cache: &mut SequenceCache, n: usize) -> Result<(), KvcacheError>;
+
+    /// Give the request's pages and state slot back.
+    fn end(&self, cache: &mut SequenceCache);
+
+    /// Pages the pool can still hand out.
+    fn available(&self) -> usize;
+
+    /// Total pages, i.e. the token budget across every live request.
+    fn num_pages(&self) -> usize;
+}
+
+/// A forward that reads and writes a `SequenceCache` instead of re-running the
+/// prefix. Implemented by the compute adapter; the domain owns the contract.
+///
+/// `cache` must already be grown by `input`'s token count (`reserve`), and
+/// `input` must hold exactly one sequence: the cached path has no notion of a
+/// batch, since every sequence's KV lives in its own page table.
+pub trait CachedModel {
+    fn forward_cached(
+        &self,
+        input: &ForwardInput,
+        cache: &mut SequenceCache,
+    ) -> Result<Vec<f32>, KvcacheError>;
 }
 
 #[cfg(test)]

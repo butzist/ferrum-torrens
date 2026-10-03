@@ -13,13 +13,38 @@
 // instead of merely approximating it. fp8 KV is a later memory optimisation and
 // would break that equivalence, so it is not here yet.
 
+use std::sync::Mutex;
+
 use tch::{Kind, Tensor};
 
+use crate::domain::kvcache::{KvCache, KvcacheError, LinearStatePool, PagePool, SequenceCache};
 use crate::domain::model::{LayerType, ModelParams};
 use crate::infrastructure::torch::Device;
 
 /// ALGORITHM.md 3.1: one token per page.
 pub const PAGE_SIZE: i64 = 1;
+
+/// What the KV pool stores a token in.
+///
+/// f32 is the default because the cached forward's job is to reproduce the
+/// re-fed forward exactly, and the re-fed forward keeps K/V in f32 after the
+/// norm and the rope. bf16 is the cheaper serving option and is lossy by design
+/// (FreeToken's reference serves fp8 KV, coarser still); reach for it only once
+/// the decode path is proven and VRAM is the binding constraint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvDType {
+    F32,
+    BFloat16,
+}
+
+impl KvDType {
+    fn kind(self) -> Kind {
+        match self {
+            KvDType::F32 => Kind::Float,
+            KvDType::BFloat16 => Kind::BFloat16,
+        }
+    }
+}
 
 /// Global layer id -> slab index, `None` for a layer that keeps no state of this
 /// kind. Hybrid towers interleave the two kinds, so the remap is what keeps the
@@ -48,22 +73,24 @@ pub struct MhaPool {
     dense_of: Vec<Option<usize>>,
     kv_heads: i64,
     head_dim: i64,
+    dtype: KvDType,
 }
 
 impl MhaPool {
-    pub fn new(params: &ModelParams, num_pages: usize, device: Device) -> Self {
+    pub fn new(params: &ModelParams, num_pages: usize, dtype: KvDType, device: Device) -> Self {
         let dense_of = dense_map(params, LayerType::FullAttention);
         let layers = dense_of.iter().filter(|d| d.is_some()).count() as i64;
         let (kv_heads, head_dim) = (params.num_kv_heads as i64, params.head_dim as i64);
         let kv = Tensor::zeros(
             [2, layers, num_pages as i64, PAGE_SIZE, kv_heads, head_dim],
-            (Kind::BFloat16, device.to_tch()),
+            (dtype.kind(), device.to_tch()),
         );
         Self {
             kv,
             dense_of,
             kv_heads,
             head_dim,
+            dtype,
         }
     }
 
@@ -79,7 +106,7 @@ impl MhaPool {
 
     /// Bytes the pool holds, for the config's memory arithmetic.
     pub fn bytes(&self) -> usize {
-        self.kv.numel() * Kind::BFloat16.elt_size_in_bytes()
+        self.kv.numel() * self.dtype.kind().elt_size_in_bytes()
     }
 
     /// Write this step's `k`/`v` (`[t, kv_heads, head_dim]`) at `locs`.
@@ -98,7 +125,7 @@ impl MhaPool {
             // `select` hands back a view, so the in-place write lands in the
             // pool's storage rather than in a copy.
             let mut view = self.kv.select(0, half).select(0, slab).shallow_clone();
-            let _ = view.index_copy_(0, &idx, &t.unsqueeze(1).to_kind(Kind::BFloat16));
+            let _ = view.index_copy_(0, &idx, &t.unsqueeze(1).to_kind(self.dtype.kind()));
         }
     }
 
@@ -178,6 +205,11 @@ impl LinearStateSlabs {
         self.slots as usize
     }
 
+    /// Bytes the state slabs hold, for the config's memory arithmetic.
+    pub fn bytes(&self) -> usize {
+        (self.conv.numel() + self.recurrent.numel()) * Kind::Float.elt_size_in_bytes()
+    }
+
     pub fn conv_size(&self) -> Vec<i64> {
         vec![self.conv_dim, self.width]
     }
@@ -248,9 +280,88 @@ impl LinearStateSlabs {
     }
 }
 
+/// The device cache the engine hands out from: the two slabs plus the page and
+/// state-slot free lists that make them a cache rather than scratch.
+///
+/// The free lists are behind mutexes and the tensors behind shared borrows, so
+/// the engine can hold one `DeviceCache` for every session while each session's
+/// forward borrows the slabs for the duration of its step.
+pub struct DeviceCache {
+    pages: Mutex<PagePool>,
+    slots: Mutex<LinearStatePool>,
+    mha: MhaPool,
+    state: LinearStateSlabs,
+}
+
+impl DeviceCache {
+    pub fn new(
+        params: &ModelParams,
+        num_pages: usize,
+        num_slots: usize,
+        dtype: KvDType,
+        device: Device,
+    ) -> Self {
+        Self {
+            pages: Mutex::new(PagePool::new(PAGE_SIZE as usize, num_pages)),
+            slots: Mutex::new(LinearStatePool::new(num_slots)),
+            mha: MhaPool::new(params, num_pages, dtype, device),
+            state: LinearStateSlabs::new(params, num_slots, device),
+        }
+    }
+
+    pub fn mha(&self) -> &MhaPool {
+        &self.mha
+    }
+
+    pub fn state(&self) -> &LinearStateSlabs {
+        &self.state
+    }
+
+    /// Bytes the whole cache holds, for the config's memory arithmetic.
+    pub fn bytes(&self) -> usize {
+        self.mha.bytes() + self.state.bytes()
+    }
+}
+
+impl KvCache for DeviceCache {
+    fn begin(&self) -> SequenceCache {
+        let slot = self
+            .slots
+            .lock()
+            .expect("kvcache lock")
+            .allocate()
+            .expect("state slots exhausted: size the cache for the request concurrency");
+        // A recycled slot still holds the last request's GDN state; zero it, or
+        // the new request's first chunk would continue someone else's.
+        self.state.reset_slot(slot);
+        SequenceCache::new(slot)
+    }
+
+    fn reserve(&self, cache: &mut SequenceCache, n: usize) -> Result<(), KvcacheError> {
+        cache.grow(n, &mut self.pages.lock().expect("kvcache lock"))
+    }
+
+    fn end(&self, cache: &mut SequenceCache) {
+        cache.release(&mut self.pages.lock().expect("kvcache lock"));
+        self.slots
+            .lock()
+            .expect("kvcache lock")
+            .release(cache.state_slot());
+    }
+
+    fn available(&self) -> usize {
+        self.pages.lock().expect("kvcache lock").available()
+    }
+
+    fn num_pages(&self) -> usize {
+        self.pages.lock().expect("kvcache lock").total_pages()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::kvcache::KvcacheError;
     use crate::infrastructure::torch::{auto_device, f32_tensor, to_f32_vec};
 
     fn data(n: usize, seed: u32) -> Vec<f32> {
@@ -313,7 +424,7 @@ mod tests {
 
     #[test]
     fn only_full_attention_layers_get_a_slab() {
-        let pool = MhaPool::new(&params(), 16, auto_device());
+        let pool = MhaPool::new(&params(), 16, KvDType::F32, auto_device());
         assert_eq!(pool.dense_of(0), Some(0));
         assert_eq!(pool.dense_of(1), None, "a linear layer has no kv");
         assert_eq!(pool.dense_of(3), Some(1));
@@ -322,7 +433,7 @@ mod tests {
 
     #[test]
     fn a_stored_location_gathers_back_exactly() {
-        let pool = MhaPool::new(&params(), 16, auto_device());
+        let pool = MhaPool::new(&params(), 16, KvDType::F32, auto_device());
         let (k, v) = kv_pair(3, 2, 4, 61);
         pool.store(0, &[5, 2, 9], &k, &v);
         let (gk, gv) = pool.gather(0, &[5, 2, 9]);
@@ -332,7 +443,7 @@ mod tests {
 
     #[test]
     fn gather_reads_locations_in_the_order_asked() {
-        let pool = MhaPool::new(&params(), 16, auto_device());
+        let pool = MhaPool::new(&params(), 16, KvDType::F32, auto_device());
         let (k, v) = kv_pair(3, 2, 4, 63);
         pool.store(0, &[5, 2, 9], &k, &v);
         let (gk, _) = pool.gather(0, &[9, 5, 2]);
@@ -345,7 +456,7 @@ mod tests {
 
     #[test]
     fn a_later_store_replaces_the_earlier_one_at_the_same_location() {
-        let pool = MhaPool::new(&params(), 16, auto_device());
+        let pool = MhaPool::new(&params(), 16, KvDType::F32, auto_device());
         let (k, v) = kv_pair(2, 2, 4, 65);
         pool.store(0, &[1, 2], &k, &v);
         let (k2, v2) = kv_pair(1, 2, 4, 67);
@@ -357,7 +468,7 @@ mod tests {
 
     #[test]
     fn one_layers_slab_does_not_disturb_another() {
-        let pool = MhaPool::new(&params(), 16, auto_device());
+        let pool = MhaPool::new(&params(), 16, KvDType::F32, auto_device());
         let (k, v) = kv_pair(2, 2, 4, 69);
         pool.store(0, &[3, 4], &k, &v);
         let (k2, v2) = kv_pair(2, 2, 4, 71);
@@ -368,10 +479,106 @@ mod tests {
 
     #[test]
     fn an_unwritten_location_reads_as_zero() {
-        let pool = MhaPool::new(&params(), 8, auto_device());
+        let pool = MhaPool::new(&params(), 8, KvDType::F32, auto_device());
         let (gk, gv) = pool.gather(0, &[7]);
         assert_eq!(to_f32_vec(&gk), vec![0.0; 8]);
         assert_eq!(to_f32_vec(&gv), vec![0.0; 8]);
+    }
+
+    #[test]
+    fn a_bf16_pool_hands_back_the_value_rounded_to_bf16() {
+        let pool = MhaPool::new(&params(), 8, KvDType::BFloat16, auto_device());
+        let n = 2 * 2 * 4;
+        let want = data(n, 83);
+        let k = f32_tensor(&want, &[2, 2, 4], auto_device());
+        pool.store(0, &[4, 6], &k, &k);
+        let (gk, _) = pool.gather(0, &[4, 6]);
+        assert_eq!(
+            to_f32_vec(&gk),
+            to_f32_vec(&k.to_kind(Kind::BFloat16)),
+            "a lossy pool must round, not truncate"
+        );
+        assert_ne!(to_f32_vec(&gk), want);
+    }
+
+    #[test]
+    fn a_device_cache_hands_out_pages_and_state_slots() {
+        let cache = DeviceCache::new(&params(), 8, 2, KvDType::F32, auto_device());
+        assert_eq!(cache.num_pages(), 8);
+        assert_eq!(cache.available(), 8);
+
+        let mut a = cache.begin();
+        cache.reserve(&mut a, 3).unwrap();
+        assert_eq!(a.cached(), 3);
+        assert_eq!(cache.available(), 5);
+        assert_eq!(a.state_slot(), 0);
+
+        let mut b = cache.begin();
+        cache.reserve(&mut b, 2).unwrap();
+        assert_eq!(
+            b.state_slot(),
+            1,
+            "a second request gets its own state slot"
+        );
+
+        cache.end(&mut a);
+        assert_eq!(a.cached(), 0);
+        assert_eq!(
+            cache.available(),
+            6,
+            "only a's pages come back; b still holds its two"
+        );
+
+        cache.end(&mut b);
+        assert_eq!(
+            cache.available(),
+            8,
+            "every ended request returns its pages"
+        );
+
+        let mut c = cache.begin();
+        cache.reserve(&mut c, 1).unwrap();
+        assert!(
+            c.state_slot() < 2,
+            "an ended request's slot goes back in play"
+        );
+        assert_eq!(c.cached(), 1);
+    }
+
+    #[test]
+    fn a_device_cache_refuses_to_reserve_past_its_pages() {
+        let cache = DeviceCache::new(&params(), 4, 1, KvDType::F32, auto_device());
+        let mut a = cache.begin();
+        cache.reserve(&mut a, 3).unwrap();
+        assert_eq!(
+            cache.reserve(&mut a, 2),
+            Err(KvcacheError::OutOfPages { want: 2, have: 1 })
+        );
+        assert_eq!(a.cached(), 3, "a refused reserve must not reserve anything");
+    }
+
+    #[test]
+    fn a_recycled_state_slot_is_zeroed() {
+        let cache = DeviceCache::new(&params(), 8, 1, KvDType::F32, auto_device());
+        let a_slot = {
+            let a = cache.begin();
+            cache.state().set_recurrent_state(
+                a.state_slot(),
+                1,
+                f32_tensor(&[1.0; 32], &[2, 4, 4], auto_device()),
+            );
+            a.state_slot()
+        };
+        let mut a = SequenceCache::new(a_slot);
+        cache.end(&mut a);
+        let b = cache.begin();
+        assert_eq!(b.state_slot(), a.state_slot());
+        assert!(
+            to_f32_vec(&cache.state().recurrent_state(b.state_slot(), 1))
+                .iter()
+                .all(|v| *v == 0.0),
+            "a recycled slot must not leak the previous request's state"
+        );
     }
 
     #[test]
