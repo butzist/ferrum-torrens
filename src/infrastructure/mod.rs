@@ -4,6 +4,8 @@
 pub mod banks;
 pub mod ftw;
 pub mod http;
+#[cfg(feature = "cuda")]
+pub mod kvcache_dev;
 pub mod tokenizers_hf;
 pub mod torch;
 #[cfg(feature = "triton")]

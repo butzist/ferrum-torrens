@@ -388,6 +388,76 @@ impl LinearStatePool {
     }
 }
 
+/// One running request's cache bookkeeping: the pool location of every token
+/// whose KV is stored, and the linear-state slot its GDN layers own.
+///
+/// Pure indices. The device slabs behind them belong to the compute adapter
+/// (`infrastructure::kvcache_dev`), which is handed `filled()` to read and
+/// `tail()` to write, so this type stays testable without libtorch.
+pub struct SequenceCache {
+    /// `pages[i]` is the pool location of the request's token `i`. `page_size`
+    /// is 1, so this doubles as the token-location row the radix tree stores.
+    pages: Vec<u32>,
+    /// How many of `pages` have actually been written this request.
+    len: usize,
+    state_slot: u32,
+}
+
+impl SequenceCache {
+    pub fn new(state_slot: u32) -> Self {
+        Self {
+            pages: Vec::new(),
+            len: 0,
+            state_slot,
+        }
+    }
+
+    /// Tokens whose KV and GDN state are already computed.
+    pub fn cached(&self) -> usize {
+        self.len
+    }
+
+    pub fn state_slot(&self) -> u32 {
+        self.state_slot
+    }
+
+    /// Reserve room for `n` more tokens, drawing pages from the pool. The
+    /// caller owns the pool and grows the cache before the forward, because the
+    /// forward only writes into the locations it is handed.
+    pub fn grow(&mut self, n: usize, pool: &mut PagePool) -> Result<(), KvcacheError> {
+        let pages = pool.allocate(n)?;
+        self.pages.extend_from_slice(&pages);
+        self.len += n;
+        Ok(())
+    }
+
+    /// Give `n` of this request's pages back, keeping the earlier ones. Used
+    /// when a prefix is rolled back to a shorter cached length.
+    pub fn truncate(&mut self, n: usize, pool: &mut PagePool) {
+        debug_assert!(n <= self.len);
+        let keep = self.len - n;
+        let tail = self.pages.split_off(keep);
+        pool.free_pages(tail);
+        self.len = keep;
+    }
+
+    /// Hand every page back, e.g. when the request finishes.
+    pub fn release(&mut self, pool: &mut PagePool) {
+        self.truncate(self.len, pool);
+    }
+
+    /// Every filled location, in token order: what attention gathers over.
+    pub fn filled(&self) -> &[u32] {
+        &self.pages[..self.len]
+    }
+
+    /// The `n` locations a step of `n` tokens writes: the tail of `filled()`.
+    pub fn tail(&self, n: usize) -> &[u32] {
+        debug_assert!(n <= self.len);
+        &self.pages[self.len - n..self.len]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -539,5 +609,60 @@ mod tests {
         assert_eq!(p.allocate(), None);
         p.release(a);
         assert_eq!(p.allocate(), Some(a), "freed slot is reused");
+    }
+
+    #[test]
+    fn growing_a_cache_takes_pages_and_keeps_the_earlier_ones() {
+        let mut pool = PagePool::new(1, 4);
+        let mut c = SequenceCache::new(0);
+        assert_eq!(c.cached(), 0);
+        c.grow(3, &mut pool).unwrap();
+        let first = c.filled().to_vec();
+        c.grow(1, &mut pool).unwrap();
+        assert_eq!(c.cached(), 4);
+        assert_eq!(
+            &c.filled()[..3],
+            &first[..],
+            "a decode step must not move the prefix"
+        );
+        assert_eq!(pool.available(), 0);
+    }
+
+    #[test]
+    fn the_tail_is_where_the_next_step_writes() {
+        let mut pool = PagePool::new(1, 8);
+        let mut c = SequenceCache::new(1);
+        c.grow(4, &mut pool).unwrap();
+        c.grow(1, &mut pool).unwrap();
+        assert_eq!(c.tail(1), &c.filled()[4..5]);
+        assert_eq!(c.tail(4), &c.filled()[1..5]);
+        assert_eq!(c.state_slot(), 1);
+    }
+
+    #[test]
+    fn a_cache_cannot_grow_past_the_pool() {
+        let mut pool = PagePool::new(1, 2);
+        let mut c = SequenceCache::new(0);
+        assert_eq!(
+            c.grow(3, &mut pool),
+            Err(KvcacheError::OutOfPages { want: 3, have: 2 })
+        );
+        assert_eq!(c.cached(), 0, "a refused grow must not reserve anything");
+        assert_eq!(pool.available(), 2);
+    }
+
+    #[test]
+    fn truncating_a_cache_returns_its_tail_to_the_pool() {
+        let mut pool = PagePool::new(1, 4);
+        let mut c = SequenceCache::new(0);
+        c.grow(4, &mut pool).unwrap();
+        let kept = c.filled()[..2].to_vec();
+        c.truncate(2, &mut pool);
+        assert_eq!(c.cached(), 2);
+        assert_eq!(c.filled(), &kept[..]);
+        assert_eq!(pool.available(), 2);
+        c.release(&mut pool);
+        assert_eq!(c.cached(), 0);
+        assert_eq!(pool.available(), 4, "release gives every page back");
     }
 }
