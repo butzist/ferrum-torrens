@@ -54,6 +54,19 @@ fn shapes(index: &FtwIndex) -> ExpertShapes {
     shapes
 }
 
+/// Every gate failure prints its port error on **stdout** before panicking:
+/// cargo shows a failing test's captured stdout even without `--nocapture`, so
+/// the log identifies the step and the reason whether or not stderr was teed.
+fn gate<T>(what: &str, r: Result<T, impl std::fmt::Display>) -> T {
+    match r {
+        Ok(v) => v,
+        Err(e) => {
+            println!("GATE FAILED at {what}: {e}");
+            panic!("gate failed at {what}")
+        }
+    }
+}
+
 fn site_packages() -> Vec<PathBuf> {
     match std::env::var("FERRUM_KERNEL_SITE_PACKAGES") {
         Ok(v) => v
@@ -153,17 +166,29 @@ fn owned_banks(
 #[test]
 #[ignore = "needs a CUDA device and the converted checkpoint in .model-cache"]
 fn the_kernel_matches_the_scalar_oracle_on_real_expert_slabs() {
-    let index = Arc::new(
-        FtwIndex::parse(
-            &std::fs::read_to_string(format!("{FTW_DIR}/freetoken_weight.json")).unwrap(),
-        )
-        .unwrap(),
+    let sites = site_packages();
+    println!(
+        "GATE env: cwd={} ftw={} python_path=python site_packages={:?}",
+        std::env::current_dir().unwrap().display(),
+        FTW_DIR,
+        sites,
     );
-    let reader: Arc<dyn WeightsReader> = Arc::new(MmapFtwReader::open(Path::new(FTW_DIR)).unwrap());
+    println!(
+        "GATE loader: LD_LIBRARY_PATH={}",
+        std::env::var("LD_LIBRARY_PATH").unwrap_or_else(|_| "<unset>".into()),
+    );
+    let index_text = gate(
+        "freetoken_weight.json",
+        std::fs::read_to_string(format!("{FTW_DIR}/freetoken_weight.json")),
+    );
+    let index = Arc::new(gate("FtwIndex::parse", FtwIndex::parse(&index_text)));
+    let reader: Arc<dyn WeightsReader> =
+        Arc::new(gate("mmap open", MmapFtwReader::open(Path::new(FTW_DIR))));
     let shapes = shapes(&index);
-    let runtime = Arc::new(
-        TritonRuntime::new(Path::new("python"), &site_packages()).expect("embedded python + torch"),
-    );
+    let runtime = Arc::new(gate(
+        "embedded python + torch",
+        TritonRuntime::new(Path::new("python"), &sites),
+    ));
     let source: Arc<dyn ExpertSlabSource> = Arc::new(FtwBanks::new(reader, index));
     let moe = Arc::new(Mutex::new(TritonMoE::new(
         runtime,
@@ -201,8 +226,10 @@ fn the_kernel_matches_the_scalar_oracle_on_real_expert_slabs() {
         // One shared handle is both ports: the plan copies through the store,
         // the kernel runs through the same banks.
         let ports = moe.as_ref();
-        run_experts(&mut cache, ports, ports, LAYER, &step, &mut got)
-            .expect("run_experts through the triton adapter");
+        gate(
+            "run_experts through the triton adapter",
+            run_experts(&mut cache, ports, ports, LAYER, &step, &mut got),
+        );
     }
     let kernel_ms = t0.elapsed().as_secs_f64() * 1e3;
 
@@ -223,23 +250,28 @@ fn the_kernel_matches_the_scalar_oracle_on_real_expert_slabs() {
         weights: &weights,
     };
     let mut want = vec![0.0f32; TOKENS * hidden];
-    ferrum_torrens::domain::expert_kernel::grouped_moe_reference(
-        &oracle.as_host(),
-        &req,
-        &mut want,
-    )
-    .expect("scalar oracle");
+    gate(
+        "scalar oracle",
+        ferrum_torrens::domain::expert_kernel::grouped_moe_reference(
+            &oracle.as_host(),
+            &req,
+            &mut want,
+        ),
+    );
 
     let diff = max_abs_diff(&got, &want);
     let scale = scale_of(&want);
     let rel = diff / scale.max(1e-6);
-    eprintln!(
+    println!(
         "layer {LAYER}: {TOKENS} tokens x top_k {TOP_K}, {SLOTS} slots staged, \
          max|kernel - scalar| = {diff:.3e} of {scale:.3e} ({rel:.2e} rel) in {kernel_ms:.1} ms"
     );
-    assert!(
-        diff <= TOLERANCE * scale.max(1.0),
-        "kernel drifted from the scalar oracle: {diff} > {}",
-        TOLERANCE * scale.max(1.0)
-    );
+    if diff > TOLERANCE * scale.max(1.0) {
+        println!(
+            "GATE FAILED at the numeric comparison: {diff:.3e} > {:.3e}",
+            TOLERANCE * scale.max(1.0)
+        );
+        panic!("kernel drifted from the scalar oracle");
+    }
+    println!("PASS");
 }
