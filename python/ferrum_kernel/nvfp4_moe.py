@@ -137,7 +137,9 @@ def _nvfp4_gemv_kernel(
     acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
 
     for kb_start in range(0, K_BYTES, BLOCK_KB):
-        byte_idx = kb_start * BLOCK_KB + offs_kb
+        # kb_start already counts bytes: range() steps by BLOCK_KB, so multiplying
+        # it again would jump a full block per iteration and mask every k but the first.
+        byte_idx = kb_start + offs_kb
         byte_mask = byte_idx < K_BYTES
 
         p_ptrs = packed_slot + offs_n[None, :] * stride_pn + byte_idx[:, None] * stride_pkb

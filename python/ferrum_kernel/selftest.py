@@ -131,19 +131,27 @@ def main(argv: list[str] | None = None) -> int:
         print("FAIL: a torch.dtype passed the constexpr guard", file=sys.stderr)
         return 1
 
-    for seed in range(4):
-        x, gu, dn, slot, token, weight = random_case(args.device, seed=seed)
-        want = grouped_moe_reference(x, *gu, *dn, slot, token, weight)
-        if args.device == "cpu" and not args.interp_child:
-            print(f"seed {seed}: reference only, |out|max {want.abs().max():.4f}")
-            continue
-        require_native_e4m3(x.device)
-        got = grouped_moe(x, *gu, *dn, slot, token, weight).to(torch.float32)
-        rel = (got - want).abs().max() / want.abs().max().clamp(min=1e-6)
-        print(f"seed {seed}: max |diff| {(got - want).abs().max():.3e}, rel {rel:.3e}")
-        if rel > args.tol:
-            print("FAIL", file=sys.stderr)
-            return 1
+    # The first shape keeps a single iteration of the gemv k-loop (K_BYTES < 64), so
+    # the wide shapes are what catch a loop that never advances.
+    cases = [
+        ("default", {}),
+        ("wide-k", {"tokens": 1, "hidden": 512, "inter": 256, "slots": 2, "top_k": 2}),
+        ("qwen-shape", {"tokens": 1, "hidden": 2048, "inter": 512, "slots": 2, "top_k": 2}),
+    ]
+    for label, shape in cases:
+        for seed in range(4):
+            x, gu, dn, slot, token, weight = random_case(args.device, seed=seed, **shape)
+            want = grouped_moe_reference(x, *gu, *dn, slot, token, weight)
+            if args.device == "cpu" and not args.interp_child:
+                print(f"{label} seed {seed}: reference only, |out|max {want.abs().max():.4f}")
+                continue
+            require_native_e4m3(x.device)
+            got = grouped_moe(x, *gu, *dn, slot, token, weight).to(torch.float32)
+            rel = (got - want).abs().max() / want.abs().max().clamp(min=1e-6)
+            print(f"{label} seed {seed}: max |diff| {(got - want).abs().max():.3e}, rel {rel:.3e}")
+            if rel > args.tol:
+                print("FAIL", file=sys.stderr)
+                return 1
     if args.device == "cpu" and not args.interp_child:
         print("no cuda device requested: kernel comparison skipped")
     print("PASS")

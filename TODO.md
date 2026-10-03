@@ -7,7 +7,10 @@ CPU-only box (decisions 24-30), with pyo3 slated for removal (decision 30): `dom
 `infrastructure/triton.rs` (feature `triton`: device slot cache, `ExpertSlotStore`,
 `ExpertGemm`), `infrastructure/banks.rs` (the FTW slab source) and
 `application/run_experts.rs`. What is missing is a green gated GPU numerical run
-(its first run found a kernel indexing bug, now fixed and covered on CPU by the
+(its first run reported `rel 1.0`, which the interpreter test pinned to two
+kernel bugs -- the down GEMV indexing `ic2` by token instead of route, and a k-loop
+that re-multiplied the already byte-scaled induction variable and so masked out
+every k after the first block; both are fixed and covered on CPU by the
 interpreter test, decision 31) and the `moe_block` swap. Last finished: M1b -- the
 libtorch tower matches the FreeToken oracle: gated
 `one_token_prediction_matches_the_oracle` emits id 11751 (" Paris") for
@@ -737,11 +740,15 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
     decorates, so the env var has to be set before import) and runs the real
     kernels on CPU tensors against `grouped_moe_reference`. It is the fast inner
     loop for kernel work: no GPU, no CUDA device, ~0.1 s per case, and it caught
-    the first real kernel bug (the down GEMV indexed `ic2` by token instead of
-    route) that the gated GPU test had been reporting only as `rel 1.0`. The
-    gated GPU test stays the final gate, because only it runs on real hardware
-    with the checkpoint's own banks; `--interp` also needs no native e4m3, so
-    `require_native_e4m3` returns early there.
+    the first two real kernel bugs (the down GEMV indexed `ic2` by token instead
+    of route, and the gemv k-loop re-multiplied an induction variable that
+    `range` had already stepped in bytes, masking every k after the first block)
+    that the gated GPU test had been reporting only as `rel 1.0`. Its case list
+    spans the single-iteration shape, a wide-K shape and the real Qwen3.6 shape
+    (hidden 2048, inter 512), because a loop that never advances passes the small
+    shape. The gated GPU test stays the final gate, because only it runs on real
+    hardware with the checkpoint's own banks; `--interp` also needs no native
+    e4m3, so `require_native_e4m3` returns early there.
 
 ### Config defaults for the RTX 5060 / 8 GB target
 
