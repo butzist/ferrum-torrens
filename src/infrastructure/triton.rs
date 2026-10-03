@@ -150,6 +150,11 @@ fn shape<'py>(py: Python<'py>, dims: &[usize]) -> Result<Bound<'py, PyAny>, MoEE
 /// A CPU tensor over a copy of `bytes`, pinned by a python bytearray so
 /// `frombuffer` does not warn about a read-only buffer. The copy is the H2D
 /// staging: `to(device)` is the transfer.
+///
+/// `dtype` is keyword-only in torch's signature, so the dict has to travel in
+/// pyo3's kwargs slot. Handing `(raw, &kwargs)` to `call_method` built a two
+/// element *args* tuple instead, and torch rejected it with "frombuffer() takes
+/// from 2 to 1 positional arguments but 2 were given".
 fn host_tensor<'py>(
     py: Python<'py>,
     torch: &Bound<'py, PyAny>,
@@ -162,7 +167,7 @@ fn host_tensor<'py>(
         .set_item("dtype", attribute(torch, dtype, "torch dtype")?)
         .map_err(|e| err("frombuffer dtype", e))?;
     torch
-        .call_method("frombuffer", (raw, &kwargs), None)
+        .call_method("frombuffer", (raw,), Some(&kwargs))
         .map_err(|e| err("torch.frombuffer", e))
 }
 
@@ -191,6 +196,36 @@ struct DeviceBanks {
     global: Py<PyAny>,
 }
 
+/// The interpreter pyo3 linked is not the venv's, so `torch`/`triton` live
+/// nowhere on its `sys.path` until their site-packages go on, and this repo's
+/// `ferrum_kernel` package is a plain directory that needs the same treatment.
+pub fn prepend_kernel_paths<'py>(
+    py: Python<'py>,
+    site_packages: &[PathBuf],
+    python_path: &Path,
+) -> Result<(), MoEError> {
+    let sys = py.import("sys").map_err(|e| err("import sys", e))?;
+    let path = attribute(&sys, "path", "sys.path")?;
+    for dir in site_packages
+        .iter()
+        .chain(std::iter::once(&python_path.to_path_buf()))
+    {
+        let s = dir
+            .to_str()
+            .ok_or_else(|| err("kernel path", format!("{} is not utf-8", dir.display())))?;
+        let there: bool = path
+            .call_method1("__contains__", (s,))
+            .map_err(|e| err("sys.path lookup", e))?
+            .extract()
+            .map_err(|e| err("sys.path lookup", e))?;
+        if !there {
+            path.call_method1("append", (s,))
+                .map_err(|e| err("sys.path.append", e))?;
+        }
+    }
+    Ok(())
+}
+
 /// The embedded interpreter plus the imported kernel module. Constructing this
 /// imports torch, which is expensive, so the engine keeps exactly one.
 pub struct TritonRuntime {
@@ -204,25 +239,7 @@ impl TritonRuntime {
     /// is not the venv's interpreter.
     pub fn new(python_path: &Path, site_packages: &[PathBuf]) -> Result<Self, MoEError> {
         Python::attach(|py| {
-            let sys = py.import("sys").map_err(|e| err("import sys", e))?;
-            let path = attribute(&sys, "path", "sys.path")?;
-            for dir in site_packages
-                .iter()
-                .chain(std::iter::once(&python_path.to_path_buf()))
-            {
-                let s = dir
-                    .to_str()
-                    .ok_or_else(|| err("kernel path", format!("{} is not utf-8", dir.display())))?;
-                let there: bool = path
-                    .call_method1("__contains__", (s,))
-                    .map_err(|e| err("sys.path lookup", e))?
-                    .extract()
-                    .map_err(|e| err("sys.path lookup", e))?;
-                if !there {
-                    path.call_method1("append", (s,))
-                        .map_err(|e| err("sys.path.append", e))?;
-                }
-            }
+            prepend_kernel_paths(py, site_packages, python_path)?;
             let module = py
                 .import("ferrum_kernel.nvfp4_moe")
                 .map_err(|e| err("import ferrum_kernel.nvfp4_moe (kernel.python_path?)", e))?;
@@ -604,6 +621,40 @@ impl TritonMoE {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `torch.frombuffer` takes `dtype` as a keyword. Verified for real only
+    /// where torch imports (devshell: the loader path comes from the
+    /// shellHook); elsewhere the import is skipped rather than failing the
+    /// CPU-only suite.
+    #[test]
+    fn host_tensor_passes_dtype_as_a_keyword() {
+        Python::attach(|py| {
+            let sites = std::env::var("FERRUM_KERNEL_SITE_PACKAGES")
+                .unwrap_or_else(|_| "FreeToken/.venv/lib/python3.12/site-packages".to_string());
+            let dirs: Vec<PathBuf> = sites
+                .split(':')
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+                .collect();
+            if prepend_kernel_paths(py, &dirs, Path::new("python")).is_err() {
+                println!("skipping host_tensor test: sys.path setup failed");
+                return;
+            }
+            let Ok(torch) = py.import("torch") else {
+                println!("skipping host_tensor test: torch is not importable here");
+                return;
+            };
+            let t = host_tensor(py, &torch, "uint8", &[1, 2, 3, 4]).unwrap();
+            assert_eq!(
+                t.call_method0("numel").unwrap().extract::<i64>().unwrap(),
+                4
+            );
+            assert_eq!(
+                t.getattr("dtype").unwrap().str().unwrap().to_string(),
+                "torch.uint8"
+            );
+        });
+    }
 
     /// The capability probe needs a real `torch.device`. `torch.cuda.device(i)`
     /// is the context-manager class of the same name and has no `.type`, so the
