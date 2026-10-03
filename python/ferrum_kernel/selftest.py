@@ -7,12 +7,14 @@ the `gate_up` rows, routed weights applied on the second GEMM, then a dense sum
 over `top_k`.
 
     python -m ferrum_kernel.selftest          # reference only, no GPU needed
-    python -m ferrum_kernel.selftest --device cuda   # also runs the kernels
+    python -m ferrum_kernel.selftest --interp        # runs the kernels, no GPU needed
+    python -m ferrum_kernel.selftest --device cuda   # runs them for real
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 import torch
@@ -100,7 +102,23 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--tol", type=float, default=2e-2)
+    ap.add_argument(
+        "--interp",
+        action="store_true",
+        help="run the kernels through triton's interpreter on the cpu: no gpu, no fp8 hardware",
+    )
+    ap.add_argument("--interp-child", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
+    if args.interp and not args.interp_child:
+        # `@triton.jit` reads TRITON_INTERPRET when it decorates, so the kernel
+        # modules are already imported by the time we could flip the knob here.
+        os.environ["TRITON_INTERPRET"] = "1"
+        os.execv(
+            sys.executable,
+            [sys.executable, "-m", "ferrum_kernel.selftest", "--interp-child", "--tol", str(args.tol)],
+        )
+    if args.interp_child:
+        args.device = "cpu"
 
     # A torch dtype in a `tl.constexpr` dict only fails inside triton's jit, with
     # a message about `.scalar()` that names neither the kernel nor the argument.
@@ -116,7 +134,7 @@ def main(argv: list[str] | None = None) -> int:
     for seed in range(4):
         x, gu, dn, slot, token, weight = random_case(args.device, seed=seed)
         want = grouped_moe_reference(x, *gu, *dn, slot, token, weight)
-        if args.device == "cpu":
+        if args.device == "cpu" and not args.interp_child:
             print(f"seed {seed}: reference only, |out|max {want.abs().max():.4f}")
             continue
         require_native_e4m3(x.device)
@@ -126,7 +144,7 @@ def main(argv: list[str] | None = None) -> int:
         if rel > args.tol:
             print("FAIL", file=sys.stderr)
             return 1
-    if args.device == "cpu":
+    if args.device == "cpu" and not args.interp_child:
         print("no cuda device requested: kernel comparison skipped")
     print("PASS")
     return 0

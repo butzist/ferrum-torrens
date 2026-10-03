@@ -57,6 +57,10 @@ def _e2m1_lut(device: torch.device) -> torch.Tensor:
 def require_native_e4m3(device: torch.device) -> None:
     """Fail loudly if the target has no native fp8e4nv unit: these kernels pass
     e4m3 tensors as fp8 pointers, which triton refuses to compile pre-sm_89."""
+    if triton.knobs.runtime.interpret:
+        # The interpreter runs the kernel body in python on real tensors, so
+        # torch does every conversion and no fp8 hardware is involved.
+        return
     if device.type != "cuda":
         raise RuntimeError(f"nvfp4_moe needs a cuda device, got {device}")
     major, minor = torch.cuda.get_device_capability(device)
@@ -102,12 +106,17 @@ def _nvfp4_gemv_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_KB: tl.constexpr,
     MUL_WEIGHT: tl.constexpr,
+    A_ROW_IS_ROUTE: tl.constexpr,
 ):
-    """One route's GEMV: `c[r] = w[r] * (global * sum_k a[token, k] * W[slot, k])`.
+    """One route's GEMV: `c[r] = w[r] * (global * sum_k a[row, k] * W[slot, k])`.
 
     The row global is constant along K, so it is applied once after the loop.
     A route whose slot is -1 contributes zeros, which lets the reduce stay a
     dense sum over `tokens * top_k`.
+
+    `A_ROW_IS_ROUTE` picks the activation row: the first GEMM reads `x`, which
+    has one row per token, while the second reads `silu_mul`'s output, which has
+    one row per route.
     """
     route = tl.program_id(0)
     offs_n = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -119,17 +128,17 @@ def _nvfp4_gemv_kernel(
     resident = (slot >= 0).to(tl.float32)
     slot = tl.where(slot < 0, 0, slot)
     token = tl.load(route_token_ptr + route).to(tl.int64)
-    a_base = a_ptr + token * stride_am
+    a_row = route if A_ROW_IS_ROUTE else token
+    a_base = a_ptr + a_row * stride_am
 
     offs_kb = tl.arange(0, BLOCK_KB)
-    k_bytes = K_BYTES
     packed_slot = packed_ptr + slot * stride_pe
     scale_slot = scale_ptr + slot * stride_se
     acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
 
-    for kb_start in range(0, k_bytes, BLOCK_KB):
+    for kb_start in range(0, K_BYTES, BLOCK_KB):
         byte_idx = kb_start * BLOCK_KB + offs_kb
-        byte_mask = byte_idx < k_bytes
+        byte_mask = byte_idx < K_BYTES
 
         p_ptrs = packed_slot + offs_n[None, :] * stride_pn + byte_idx[:, None] * stride_pkb
         bytes_ = tl.load(
@@ -233,6 +242,7 @@ def _gemv(
     route_slot: torch.Tensor,
     route_weight: torch.Tensor,
     mul_weight: bool,
+    a_row_is_route: bool,
 ) -> None:
     M, K = a.shape
     slots, N, k_bytes = packed.shape
@@ -244,6 +254,7 @@ def _gemv(
         "BLOCK_N": DECODE_BLOCK_N,
         "BLOCK_KB": DECODE_BLOCK_KB,
         "MUL_WEIGHT": mul_weight,
+        "A_ROW_IS_ROUTE": a_row_is_route,
     }
     _check_constexprs(consts)
     _nvfp4_gemv_kernel[grid](
@@ -286,7 +297,10 @@ def grouped_moe(
 
     dev, dt = x.device, x.dtype
     ic1 = torch.empty((routes, two_i), device=dev, dtype=dt)
-    _gemv(x, gu_packed, gu_scale, gu_global, ic1, route_token, route_slot, route_weight, False)
+    _gemv(
+        x, gu_packed, gu_scale, gu_global, ic1,
+        route_token, route_slot, route_weight, False, False,
+    )
     ic2 = torch.empty((routes, inter), device=dev, dtype=dt)
     block_i = min(triton.next_power_of_2(inter), 256)
     _silu_mul_kernel[(routes, triton.cdiv(inter, block_i))](
@@ -294,7 +308,10 @@ def grouped_moe(
         BLOCK_I=block_i, num_warps=4,
     )
     ic3 = torch.empty((routes, hidden), device=dev, dtype=dt)
-    _gemv(ic2, dn_packed, dn_scale, dn_global, ic3, route_token, route_slot, route_weight, True)
+    _gemv(
+        ic2, dn_packed, dn_scale, dn_global, ic3,
+        route_token, route_slot, route_weight, True, True,
+    )
     out = torch.empty((tokens, hidden), device=dev, dtype=dt)
     _sum_reduce_kernel[(tokens, triton.cdiv(hidden, DECODE_BLOCK_N))](
         ic3, out, hidden, top_k, ic3.stride(0), ic3.stride(1), out.stride(0), out.stride(1),

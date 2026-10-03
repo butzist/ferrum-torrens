@@ -60,6 +60,7 @@ def _gemv_sig(a_dtype: str, packed_dtype: str = "u8", scale_dtype: str = "fp8e4n
         "stride_gn": "i32",
         "stride_cm": "i64",
         "stride_cn": "i32",
+        "A_ROW_IS_ROUTE": "constexpr",
         "BLOCK_N": "constexpr",
         "BLOCK_KB": "constexpr",
         "MUL_WEIGHT": "constexpr",
@@ -139,6 +140,8 @@ def main() -> int:
                         "BLOCK_N": DECODE_BLOCK_N,
                         "BLOCK_KB": DECODE_BLOCK_KB,
                         "MUL_WEIGHT": weighted,
+                        # The down GEMV's activations have one row per route.
+                        "A_ROW_IS_ROUTE": True,
                     },
                 )
             except Exception as e:  # noqa: BLE001
