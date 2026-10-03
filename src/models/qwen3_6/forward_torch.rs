@@ -392,21 +392,48 @@ fn partial_rope(
 /// Causal depthwise conv1d then silu. `w` is `[c, 1, k]` and `x` is `[t, c]`.
 ///
 /// The reference is `Conv1d(padding=k - 1)` truncated back to `t`, i.e.
-/// `out[t] = sum_j w[j] * x[t + j - (k - 1)]` with the past read as zero: a
-/// cross-correlation with the padding on the left. libtorch correlates too, so
-/// padding left by `k - 1` and keeping the first `t` outputs is exactly it.
+/// `out[t] = sum_j w[j] * x[t + j - (k - 1)]` with the past read as a zero
+/// left-pad. libtorch correlates too, so padding left by `k - 1` and keeping the
+/// first `t` outputs is exactly it.
 fn causal_conv1d_silu(x: &Tensor, w: &Tensor, channels: i64, k: i64) -> Tensor {
+    let zero = Tensor::zeros([channels, k - 1], (Kind::Float, x.device()));
+    conv1d_silu_cached(x, w, channels, k, &zero).0
+}
+
+/// The same conv, but the `k - 1` samples before this chunk are `state`
+/// (`[channels, k - 1]`) instead of zeros. Returns the outputs and the new
+/// state, which is the last `k - 1` columns of `state ++ x` -- so a chunk
+/// shorter than `k - 1` correctly keeps part of the old state.
+fn conv1d_silu_cached(
+    x: &Tensor,
+    w: &Tensor,
+    channels: i64,
+    k: i64,
+    state: &Tensor,
+) -> (Tensor, Tensor) {
     let t = x.size()[0];
     let xt = f32_(x).transpose(0, 1).unsqueeze(0); // [1, c, t]
-    let padded = xt.pad([k - 1, 0, 0, 0], "constant", 0.0f64);
-    let conv = padded.conv1d(w, None::<&Tensor>, [1], [0], [1], channels);
-    conv.silu().squeeze_dim(0).transpose(0, 1).narrow(0, 0, t)
+    let full = Tensor::cat(&[&state.unsqueeze(0), &xt], 2); // [1, c, k - 1 + t]
+    let conv = full.conv1d(w, None::<&Tensor>, [1], [0], [1], channels);
+    let out = conv.silu().squeeze_dim(0).transpose(0, 1).narrow(0, 0, t);
+    let new_state = full.squeeze_dim(0).narrow(1, t, k - 1);
+    (out, new_state)
 }
 
 /// Causal attention with GQA, one `[t, heads, head_dim]` triple in.
 fn causal_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Tensor {
+    attention_cached(q, k, v, 0)
+}
+
+/// Causal attention for the last `q.size()[0]` queries against `q_offset` cached
+/// keys already in front of them. With `q_offset == 0` this is the plain causal
+/// case and libtorch's own flag does the masking; past that, the mask is built
+/// against the absolute positions, which is what keeps a multi-token chunk from
+/// reading the tokens after it inside the same chunk.
+fn attention_cached(q: &Tensor, k: &Tensor, v: &Tensor, q_offset: usize) -> Tensor {
     // `[t, heads, head_dim]` in, `[t, qh * hd]` out.
     let [t, qh, hd] = [q.size()[0], q.size()[1], q.size()[2]];
+    let n = k.size()[0];
     let kv_heads = k.size()[1];
     // Expand the kv heads here rather than passing `enable_gqa`: the pairing is
     // repeat-interleave (q head h reads kv head h * kv_heads / qh), which is the
@@ -415,20 +442,28 @@ fn causal_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Tensor {
     let rep = qh / kv_heads;
     let k = k
         .unsqueeze(2)
-        .expand([t, kv_heads, rep, hd], true)
-        .reshape([t, qh, hd]);
+        .expand([n, kv_heads, rep, hd], true)
+        .reshape([n, qh, hd]);
     let v = v
         .unsqueeze(2)
-        .expand([t, kv_heads, rep, hd], true)
-        .reshape([t, qh, hd]);
+        .expand([n, kv_heads, rep, hd], true)
+        .reshape([n, qh, hd]);
     let scale = 1.0 / (hd as f64).sqrt();
+    let mask = (q_offset > 0).then(|| {
+        let (kind, device) = (Kind::Int64, q.device());
+        // Key j is visible to query i iff j <= q_offset + i: the query's own
+        // position is the last one it may read.
+        let key = Tensor::arange(n, (kind, device)).unsqueeze(0);
+        let query = Tensor::arange(t, (kind, device)).unsqueeze(1) + q_offset as i64;
+        key.le_tensor(&query)
+    });
     let attn = Tensor::scaled_dot_product_attention(
         &q.transpose(0, 1).unsqueeze(0),
         &k.transpose(0, 1).unsqueeze(0),
         &v.transpose(0, 1).unsqueeze(0),
-        None::<&Tensor>,
+        mask.as_ref(),
         0.0,
-        true,
+        q_offset == 0,
         scale,
         false,
     );
@@ -460,10 +495,30 @@ fn gdn_recurrence(
     dk: i64,
     dv: i64,
 ) -> Tensor {
+    let zero = Tensor::zeros([hv, dk, dv], (Kind::Float, q.device()));
+    gdn_recurrence_cached(q, k, v, g, beta, hv, dk, dv, &zero).0
+}
+
+/// The same recurrence entering from `state` (`[hv, dk, dv]` fp32) instead of
+/// zero, and returning it so the next chunk continues. Everything else is
+/// identical, which is what makes a chunked decode step equal to the stateless
+/// run over the whole sequence.
+#[allow(clippy::too_many_arguments)]
+fn gdn_recurrence_cached(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+    hv: i64,
+    dk: i64,
+    dv: i64,
+    state: &Tensor,
+) -> (Tensor, Tensor) {
     let t = q.size()[0];
     let mut outs: Vec<Tensor> = Vec::with_capacity(t as usize);
     // Build state as [hv, dk, dv] to match reference layout
-    let mut state = Tensor::zeros([hv, dk, dv], (Kind::Float, q.device()));
+    let mut state = state.shallow_clone();
     let scale = 1.0f64 / (dk as f64).sqrt();
     for tt in 0..t {
         let qi = f32_(&q.select(0, tt)).view([hv, dk]);
@@ -496,7 +551,7 @@ fn gdn_recurrence(
             * (qinv * scale).view([-1, 1]);
         outs.push(out);
     }
-    Tensor::stack(&outs, 0)
+    (Tensor::stack(&outs, 0), state)
 }
 
 fn topk_renorm(probs: &Tensor, k: i64) -> (Tensor, Tensor) {

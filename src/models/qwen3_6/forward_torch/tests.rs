@@ -594,3 +594,193 @@ fn a_port_failure_reaches_the_caller() {
         Err(TorchError::MoE(MoEError::Bad(_)))
     ));
 }
+
+// ---------------------------------------------------------------------------
+// Incremental decode. Each cached op must agree with its stateless form run
+// over the concatenated sequence, otherwise a decode step that stops re-feeding
+// the prefix would silently drift away from the oracle forward.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_carried_conv_state_matches_the_stateless_conv_over_the_concatenation() {
+    // A decode step sees one token; its conv taps have to reach back into the
+    // tail of the prompt, which is exactly what the zero left-pad threw away.
+    let (t0, t1, c, k) = (4, 3, 8, 4);
+    let x0 = data(t0 * c, 41);
+    let x1 = data(t1 * c, 42);
+    let w = data(c * k, 43);
+    let wt = up(&w, &[c as i64, 1, k as i64]);
+
+    let mut all = x0.clone();
+    all.extend_from_slice(&x1);
+    let want = super::super::forward::causal_conv1d_silu(&all, &w, t0 + t1, c, k);
+
+    let zero = Tensor::zeros([c as i64, k as i64 - 1], (Kind::Float, dev().to_tch()));
+    let (first, state) = conv1d_silu_cached(
+        &up(&x0, &[t0 as i64, c as i64]),
+        &wt,
+        c as i64,
+        k as i64,
+        &zero,
+    );
+    let (second, _) = conv1d_silu_cached(
+        &up(&x1, &[t1 as i64, c as i64]),
+        &wt,
+        c as i64,
+        k as i64,
+        &state,
+    );
+
+    let mut got = to_f32_vec(&first);
+    got.extend(to_f32_vec(&second));
+    close(&got, &want, 1e-5, "cached conv1d_silu");
+}
+
+#[test]
+fn the_conv_state_is_the_last_k_minus_one_columns() {
+    let (t0, t1, c, k) = (5, 2, 4, 4);
+    let x0 = data(t0 * c, 44);
+    let x1 = data(t1 * c, 45);
+    let wt = up(&data(c * k, 46), &[c as i64, 1, k as i64]);
+    let zero = Tensor::zeros([c as i64, k as i64 - 1], (Kind::Float, dev().to_tch()));
+    let (_, state) = conv1d_silu_cached(
+        &up(&x0, &[t0 as i64, c as i64]),
+        &wt,
+        c as i64,
+        k as i64,
+        &zero,
+    );
+    let (_, state2) = conv1d_silu_cached(
+        &up(&x1, &[t1 as i64, c as i64]),
+        &wt,
+        c as i64,
+        k as i64,
+        &state,
+    );
+
+    // After the prompt the state is the prompt's own tail; after the decode step
+    // it is the tail of the concatenation, which for k-1 > t1 spans both.
+    let width = k - 1;
+    let tail_of = |x: &[f32], from: usize| {
+        let mut want = vec![0.0f32; c * width];
+        for ch in 0..c {
+            for j in 0..width {
+                want[ch * width + j] = x[(from + j) * c + ch];
+            }
+        }
+        want
+    };
+    let mut prompt = x0.clone();
+    prompt.extend_from_slice(&x1);
+    close(
+        &to_f32_vec(&state2),
+        &tail_of(&prompt, t0 + t1 - width),
+        0.0,
+        "conv state",
+    );
+}
+
+#[test]
+fn a_carried_gdn_state_matches_the_stateless_recurrence_over_the_concatenation() {
+    // The recurrent state is the whole point of the linear layers: without it a
+    // decode step would restart from zero and lose every earlier token.
+    let (t, hv, dk, dv) = (8, 3, 8, 4);
+    let t0 = 5;
+    let q = data(t * hv * dk, 47);
+    let k = data(t * hv * dk, 48);
+    let v = data(t * hv * dv, 49);
+    let g = data(t * hv, 50).iter().map(|x| x.abs()).collect::<Vec<_>>();
+    let beta = data(t * hv, 51).iter().map(|x| x.abs()).collect::<Vec<_>>();
+    let want = super::super::forward::gdn_recurrence(t, hv, dk, dv, &q, &k, &v, &g, &beta);
+
+    let slice = |d: &[f32], rows: std::ops::Range<usize>, cols: i64| {
+        let rows: Vec<f32> = d
+            .iter()
+            .skip(rows.start * cols as usize)
+            .take((rows.end - rows.start) * cols as usize)
+            .copied()
+            .collect();
+        up(&rows, &[(rows.len() / cols as usize) as i64, cols])
+    };
+    let zero = Tensor::zeros(
+        [hv as i64, dk as i64, dv as i64],
+        (Kind::Float, dev().to_tch()),
+    );
+    let (first, state) = gdn_recurrence_cached(
+        &slice(&q, 0..t0, hv as i64 * dk as i64),
+        &slice(&k, 0..t0, hv as i64 * dk as i64),
+        &slice(&v, 0..t0, hv as i64 * dv as i64),
+        &slice(&g, 0..t0, hv as i64),
+        &slice(&beta, 0..t0, hv as i64),
+        hv as i64,
+        dk as i64,
+        dv as i64,
+        &zero,
+    );
+    let (second, _) = gdn_recurrence_cached(
+        &slice(&q, t0..t, hv as i64 * dk as i64),
+        &slice(&k, t0..t, hv as i64 * dk as i64),
+        &slice(&v, t0..t, hv as i64 * dv as i64),
+        &slice(&g, t0..t, hv as i64),
+        &slice(&beta, t0..t, hv as i64),
+        hv as i64,
+        dk as i64,
+        dv as i64,
+        &state,
+    );
+
+    let mut got = to_f32_vec(&first);
+    got.extend(to_f32_vec(&second));
+    close(&got, &want, 1e-4, "cached gdn_recurrence");
+}
+
+#[test]
+fn attention_over_a_kv_cache_matches_the_stateless_causal_attention() {
+    // The decode step's query must see every cached key, including the ones the
+    // prompt wrote, and only those.
+    let (t, qh, kvh, hd) = (6, 4, 2, 8);
+    let t0 = 4;
+    let q = data(t * qh * hd, 52);
+    let k = data(t * kvh * hd, 53);
+    let v = data(t * kvh * hd, 54);
+    let want = super::super::forward::causal_attention(&q, &k, &v, t, qh, kvh, hd);
+
+    let qh_dim = qh * hd;
+    let got = to_f32_vec(&attention_cached(
+        &up(&q[t0 * qh_dim..], &[(t - t0) as i64, qh as i64, hd as i64]),
+        &up(&k, &[t as i64, kvh as i64, hd as i64]),
+        &up(&v, &[t as i64, kvh as i64, hd as i64]),
+        t0,
+    ));
+    close(
+        &got,
+        &want[t0 * qh_dim..],
+        1e-5,
+        "attention over the kv cache",
+    );
+}
+
+#[test]
+fn attention_over_a_kv_cache_masks_keys_the_query_has_not_reached() {
+    // Within a multi-token chunk the mask is still causal: query t0 must not
+    // read the second token of its own chunk. A mask aligned to the left instead
+    // of the cache offset would let it.
+    let (t, qh, kvh, hd) = (5, 2, 2, 4);
+    let t0 = 3;
+    let q = data(t * qh * hd, 55);
+    let mut k = data(t * kvh * hd, 56);
+    let mut v = data(t * kvh * hd, 57);
+    let attn = |k: &[f32], v: &[f32]| {
+        to_f32_vec(&attention_cached(
+            &up(&q[t0 * qh * hd..], &[(t - t0) as i64, qh as i64, hd as i64]),
+            &up(k, &[t as i64, kvh as i64, hd as i64]),
+            &up(v, &[t as i64, kvh as i64, hd as i64]),
+            t0,
+        ))
+    };
+    let a = attn(&k, &v);
+    k[(t0 + 1) * kvh * hd] += 100.0;
+    v[(t0 + 1) * kvh * hd] += 100.0;
+    let b = attn(&k, &v);
+    close(&a[..kvh * hd], &b[..kvh * hd], 1e-6, "chunked causality");
+}
