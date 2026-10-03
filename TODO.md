@@ -19,7 +19,10 @@ too: chunked prefill + one-token decode off the page table agrees with re-feedin
 the whole prefix on the real checkpoint (same argmax at every step, logits
 within 2e-6 of scale, decision 33), and the engine decodes off it: one page
 table per request, and a forward without a cache still re-feeds the prefix to the
-same tokens. Last finished: the cached decode loop. Before that the
+same tokens. `stream: true` now streams: one SSE frame per sampled token off a
+`TokenSink`, the finish reason and usage on the closing frame, `[DONE]` after it
+(bad prompts still fail before the headers). Last finished: SSE on
+`/v1/completions`. Before that the cached decode loop. Before that the
 `moe_block` swap, on top of M1b -- the
 libtorch tower matches the FreeToken oracle: gated
 `one_token_prediction_matches_the_oracle` emits id 11751 (" Paris") for
@@ -421,8 +424,9 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 ### Scheduler
 - [x] P0 in-process tokenize/detokenize.
 - [x] P0 `POST /v1/completions` (non-stream, n=1, `cmpl-{uid}` ids, usage block, `spawn_blocking` for the forward), `GET /v1/models`, `GET /health`. (`infrastructure/http.rs`, `main.rs`)
-- [ ] P0 SSE framing `data: {json}\n\n` + `data: [DONE]`; `chatcmpl-{uid}` ids; usage block.
-- [ ] P0 streaming (`stream: true`) returns 501 for now; `presence_penalty`/`frequency_penalty`/`best_of`/`user` still 400 (`deny_unknown_fields`).
+- [x] P0 SSE framing `data: {json}\n\n` + `data: [DONE]`; usage block. (`/v1/completions`; `chatcmpl-{uid}` ids land with `/v1/chat/completions`)
+- [x] P0 streaming (`stream: true`): one frame per sampled token as it is produced (`generation::TokenSink`), a frame with the finish reason and the usage, then `[DONE]`; a bad prompt is still a JSON error with its status, a client that hangs up aborts the run, a slow one holds it back. (`infrastructure/http.rs`)
+- [ ] P0 `presence_penalty`/`frequency_penalty`/`best_of`/`user` still 400 (`deny_unknown_fields`).
 - [x] P0 strict prefill-priority `schedule_next_batch()`; chunked prefill budget `max_prefill_length`; no decode starvation guard in v0 (mirror FreeToken, note as known issue). (simple M1 form in `domain/scheduler.rs`)
 - [x] P0 decode batch sorted by uid (deterministic).
 - [x] P0 per-step `run_forward`: build positions/answers -> model forward -> sample -> `complete_one()` advancement -> next-token for stop/detokenize. (M1 reference form in `application/engine.rs` + `application/generation.rs`; `token_pool` scatter and `out_loc` land with the paged KV pool)
@@ -438,8 +442,8 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 
 ### Server (axum recommended)
 - [ ] P0 `POST /v1/chat/completions` stream + non-stream (n=1), reasoning-free.
-- [ ] P0 `POST /v1/completions` (stream single prompt), `GET /v1/models`, `GET /health`.
-- [ ] P0 SSE framing `data: {json}\n\n` + `data: [DONE]`; `chatcmpl-{uid}` ids; usage block.
+- [x] P0 `POST /v1/completions` (stream single prompt), `GET /v1/models`, `GET /health`.
+- [x] P0 SSE framing `data: {json}\n\n` + `data: [DONE]`; usage block.
 - [ ] P0 chat template render via `tokenizers` crate + minijinja (`tokenizer_config.json` in the FTW/model dir; tools not supported in v0).
 - [ ] [opt] Anthropic `/v1/messages` (incl. `/v1/messages/count_tokens`).
 - [ ] [opt] `/v1/responses` (needed only for Codex).

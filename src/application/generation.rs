@@ -87,9 +87,42 @@ pub fn make_request(
     })
 }
 
+/// Where a streaming run hands each token's text the moment it is sampled,
+/// instead of returning it all at the end. `Ok(false)` stops the run: the
+/// consumer is gone, so there is nothing left to compute. The engine layer never
+/// sees an HTTP type; the server turns these calls into SSE frames.
+///
+/// A streamed run can show text the non-streaming answer cuts: a stop string can
+/// straddle a token boundary, and by the time it matches, its first piece has
+/// already been handed over. The final frame carries the finish reason.
+pub trait TokenSink {
+    fn token(&mut self, text: &str, id: u32, index: usize) -> Result<bool, EngineError>;
+}
+
+impl<F> TokenSink for F
+where
+    F: FnMut(&str, u32, usize) -> Result<bool, EngineError>,
+{
+    fn token(&mut self, text: &str, id: u32, index: usize) -> Result<bool, EngineError> {
+        self(text, id, index)
+    }
+}
+
 /// Run one request to completion.
 pub fn generate(engine: &Engine, request: Request, seed: u64) -> Result<Generation, EngineError> {
     let mut out = generate_batch(engine, vec![request], seed)?;
+    out.pop().ok_or(EngineError::EmptyPrompt)
+}
+
+/// Run one request, handing each sampled token to `sink` as it is produced.
+/// `Ok(Generation)` with `FinishReason::Abort` means the sink stopped the run.
+pub fn generate_streaming(
+    engine: &Engine,
+    request: Request,
+    seed: u64,
+    sink: &mut dyn TokenSink,
+) -> Result<Generation, EngineError> {
+    let mut out = run_batch(engine, vec![request], seed, Some(sink))?;
     out.pop().ok_or(EngineError::EmptyPrompt)
 }
 
@@ -100,6 +133,18 @@ pub fn generate_batch(
     engine: &Engine,
     requests: Vec<Request>,
     seed: u64,
+) -> Result<Vec<Generation>, EngineError> {
+    run_batch(engine, requests, seed, None)
+}
+
+/// The one generation loop: forward + sample per step, stop rules around it, and
+/// every finished session turned back into a `Generation`. `sink` is what makes
+/// a run a stream; `None` is a plain run to completion.
+fn run_batch(
+    engine: &Engine,
+    requests: Vec<Request>,
+    seed: u64,
+    mut sink: Option<&mut dyn TokenSink>,
 ) -> Result<Vec<Generation>, EngineError> {
     let limits = engine.limits();
     let budget = Budget {
@@ -193,6 +238,14 @@ pub fn generate_batch(
             match stop {
                 Some(reason) => s.req.finish(reason),
                 None => s.req.complete_one(),
+            }
+            if let Some(sink) = sink.as_deref_mut() {
+                let piece = engine.decode(std::slice::from_ref(&token))?;
+                // The token that ends the run is still streamed; only the reason a
+                // sink stops it never overwrites a real one.
+                if !sink.token(&piece, token, s.generated.len() - 1)? && !s.req.finished() {
+                    s.req.finish(FinishReason::Abort);
+                }
             }
             if s.req.finished() {
                 finished.push(uid);
@@ -345,6 +398,36 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].tokens, vec![99, 100], "uid 1 walks the counter");
         assert_eq!(out[1].tokens, vec![123, 124], "uid 2 walks its own counter");
+    }
+
+    #[test]
+    fn a_stream_sink_sees_every_token_before_the_run_returns() {
+        let (e, _) = test_engine(limits());
+        let mut seen: Vec<String> = Vec::new();
+        let mut collect = |text: &str, _id: u32, _index: usize| {
+            seen.push(text.to_string());
+            Ok(true)
+        };
+        let g = generate_streaming(&e, req(&e, 1, "ab", params(3)), 0, &mut collect).unwrap();
+        assert_eq!(seen, vec!["c", "d", "e"], "one piece per token");
+        assert_eq!(g.tokens, vec![99, 100, 101], "same run as generate");
+        assert_eq!(g.text, "cde");
+        assert_eq!(g.finish_reason, FinishReason::Length);
+    }
+
+    #[test]
+    fn a_sink_that_says_stop_ends_the_run_without_another_forward() {
+        let (e, rec) = test_engine(limits());
+        let mut calls = 0;
+        let mut sink = |_text: &str, _id: u32, _index: usize| {
+            calls += 1;
+            Ok(false)
+        };
+        let g = generate_streaming(&e, req(&e, 1, "ab", params(4)), 0, &mut sink).unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(g.tokens, vec![99], "the token the sink saw is kept");
+        assert_eq!(g.finish_reason, FinishReason::Abort);
+        assert_eq!(rec.calls().len(), 1, "no further step is scheduled");
     }
 
     #[test]

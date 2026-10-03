@@ -1,19 +1,24 @@
-// OpenAI-compatible HTTP surface: `POST /v1/completions` (non-stream),
-// `GET /v1/models`, `GET /health`. Axum types stay here; the handlers call the
-// application layer, which never sees an HTTP type. Streaming and
-// `/v1/chat/completions` land later (TODO.md section "Server").
+// OpenAI-compatible HTTP surface: `POST /v1/completions` (buffered and
+// `stream: true`), `GET /v1/models`, `GET /health`. Axum types stay here; the
+// handlers call the application layer, which never sees an HTTP type.
+// `/v1/chat/completions` lands later (TODO.md section "Server").
 
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
 
 use axum::Json;
+use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Router, serve};
+use futures_core::Stream;
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 
 use crate::application::engine::{Engine, EngineError};
 use crate::application::generation::{self, make_request};
@@ -139,7 +144,8 @@ pub struct CompletionResponse {
     pub created: u64,
     pub model: String,
     pub choices: Vec<CompletionChoice>,
-    pub usage: Usage,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
 }
 
 #[derive(Debug, Serialize)]
@@ -147,7 +153,8 @@ pub struct CompletionChoice {
     pub text: String,
     pub index: u32,
     pub logprobs: Option<()>,
-    pub finish_reason: &'static str,
+    /// `null` while the stream is still open; set on the frame that closes it.
+    pub finish_reason: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -225,15 +232,6 @@ impl ApiError {
             message: message.into(),
         }
     }
-
-    fn not_implemented(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::NOT_IMPLEMENTED,
-            kind: "invalid_request_error",
-            code: "not_implemented",
-            message: message.into(),
-        }
-    }
 }
 
 impl From<EngineError> for ApiError {
@@ -289,7 +287,7 @@ fn finish_reason_str(r: FinishReason) -> &'static str {
 async fn completions(
     State(state): State<Arc<AppState>>,
     payload: Result<Json<CompletionRequest>, JsonRejection>,
-) -> Result<Json<CompletionResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let Json(req) =
         payload.map_err(|e| ApiError::bad_request(format!("invalid json body: {e}")))?;
 
@@ -298,11 +296,6 @@ async fn completions(
             "model {} not found, this server serves {}",
             req.model, state.served_model_name
         )));
-    }
-    if req.stream.unwrap_or(false) {
-        return Err(ApiError::not_implemented(
-            "streaming is not implemented yet",
-        ));
     }
     if req.n.unwrap_or(1) != 1 {
         return Err(ApiError::unprocessable("only n=1 is supported"));
@@ -313,6 +306,10 @@ async fn completions(
     let params = req.sampling_params();
     let seed = req.seed.unwrap_or(uid);
     let prompt = req.prompt;
+
+    if req.stream.unwrap_or(false) {
+        return Ok(stream_completions(&state, &engine, uid, prompt, params, seed).await);
+    }
 
     // The forward pass is CPU-bound and long-running; never on the runtime.
     let outcome = tokio::task::spawn_blocking(move || {
@@ -331,6 +328,7 @@ async fn completions(
             )));
         }
     };
+    let usage = usage_of(&generated);
     Ok(Json(CompletionResponse {
         id: format!("cmpl-{}", generated.uid),
         object: "text_completion",
@@ -340,14 +338,134 @@ async fn completions(
             text: generated.text,
             index: 0,
             logprobs: None,
-            finish_reason: finish_reason_str(generated.finish_reason),
+            finish_reason: Some(finish_reason_str(generated.finish_reason)),
         }],
-        usage: Usage {
-            prompt_tokens: generated.prompt_tokens,
-            completion_tokens: generated.tokens.len(),
-            total_tokens: generated.prompt_tokens + generated.tokens.len(),
-        },
-    }))
+        usage: Some(usage),
+    })
+    .into_response())
+}
+
+fn usage_of(g: &generation::Generation) -> Usage {
+    Usage {
+        prompt_tokens: g.prompt_tokens,
+        completion_tokens: g.tokens.len(),
+        total_tokens: g.prompt_tokens + g.tokens.len(),
+    }
+}
+
+/// `stream: true`: one `data: {...}` frame per token as it is sampled, a frame
+/// carrying the finish reason plus the usage, then `data: [DONE]`.
+///
+/// The prompt is tokenized and clamped before the stream starts, so a bad
+/// request is still an ordinary JSON error with its status code. Everything
+/// after that has already sent headers, so a failure mid-run rides on the stream
+/// as an `error` frame. The generation runs on a blocking task and pushes frames
+/// through a bounded channel: a slow client holds the run back instead of
+/// buffering it, and a client that hangs up closes the channel, which stops the
+/// run.
+async fn stream_completions(
+    state: &Arc<AppState>,
+    engine: &Arc<Engine>,
+    uid: u64,
+    prompt: String,
+    params: SamplingParams,
+    seed: u64,
+) -> Response {
+    let tokenizer = Arc::clone(engine);
+    let encoded = tokio::task::spawn_blocking(move || tokenizer.encode(&prompt))
+        .await
+        .expect("encoding task is not cancellable");
+    let ids = match encoded {
+        Ok(ids) => ids,
+        Err(e) => return ApiError::from(e).into_response(),
+    };
+    let request = match make_request(engine, uid, ids, params) {
+        Ok(r) => r,
+        Err(e) => return ApiError::from(e).into_response(),
+    };
+
+    let (tx, rx) = mpsc::channel::<String>(8);
+    let id = format!("cmpl-{uid}");
+    let created = unix_now();
+    let model = state.served_model_name.clone();
+    let engine = Arc::clone(engine);
+    let sink_tx = tx.clone();
+    tokio::task::spawn_blocking(move || {
+        let send = |frame: String| sink_tx.blocking_send(frame).is_ok();
+        let push = |text: &str, finish: Option<&'static str>, usage: Option<Usage>| {
+            let chunk = CompletionResponse {
+                id: id.clone(),
+                object: "text_completion",
+                created,
+                model: model.clone(),
+                choices: vec![CompletionChoice {
+                    text: text.to_string(),
+                    index: 0,
+                    logprobs: None,
+                    finish_reason: finish,
+                }],
+                usage,
+            };
+            send(sse_data(
+                &serde_json::to_string(&chunk).expect("chunk serializes"),
+            ))
+        };
+
+        match generation::generate_streaming(
+            &engine,
+            request,
+            seed,
+            &mut |text: &str, _id: u32, _index: usize| {
+                Ok::<bool, EngineError>(push(text, None, None))
+            },
+        ) {
+            Ok(g) => {
+                if g.finish_reason != FinishReason::Abort {
+                    let usage = usage_of(&g);
+                    let reason = finish_reason_str(g.finish_reason);
+                    push("", Some(reason), Some(usage));
+                    send(sse_data("[DONE]"));
+                }
+            }
+            Err(e) => {
+                let _ = send(sse_data(
+                    &serde_json::to_string(&serde_json::json!({
+                        "error": { "message": e.to_string(), "type": "engine_error" }
+                    }))
+                    .expect("error frame serializes"),
+                ));
+                send(sse_data("[DONE]"));
+            }
+        }
+        drop(tx);
+    });
+
+    let body = Body::from_stream(SseBody { rx });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(body)
+        .expect("a static response builder succeeds")
+}
+
+fn sse_data(payload: &str) -> String {
+    format!("data: {payload}\n\n")
+}
+
+/// The SSE body: whole frames off the channel, in order, as they arrive.
+struct SseBody {
+    rx: mpsc::Receiver<String>,
+}
+
+impl Stream for SseBody {
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.rx
+            .poll_recv(cx)
+            .map(|frame| frame.map(|f| Ok(Bytes::from(f))))
+    }
 }
 
 async fn models(State(state): State<Arc<AppState>>) -> Json<ModelsResponse> {
@@ -488,10 +606,97 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streaming_is_501() {
-        let (status, body) = post_json(serde_json::json!({ "prompt": "a", "stream": true })).await;
-        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-        assert_eq!(body["error"]["code"], "not_implemented");
+    async fn streaming_sends_one_frame_per_token_then_the_final_frame_and_done() {
+        let response = test_router()
+            .oneshot(
+                Request::post("/v1/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "prompt": "ab", "max_tokens": 3, "stream": true })
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_TYPE],
+            "text/event-stream"
+        );
+
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        let frames: Vec<&str> = body.split("\n\n").filter(|f| !f.is_empty()).collect();
+        assert_eq!(frames.len(), 5, "3 tokens, the final frame, [DONE]");
+        assert!(frames[0].starts_with("data: "));
+
+        let chunk = |frame: &str| serde_json::from_str::<serde_json::Value>(&frame[6..]).unwrap();
+        let texts: Vec<String> = frames[..3]
+            .iter()
+            .map(|f| chunk(f)["choices"][0]["text"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(texts, ["c", "d", "e"], "one frame per token, in order");
+        assert_eq!(texts.concat(), "cde", "the frames carry the whole text");
+        assert!(
+            frames[..3]
+                .iter()
+                .all(|f| chunk(f)["choices"][0]["finish_reason"].is_null()),
+            "only the final frame closes the choice"
+        );
+        assert!(
+            frames[..3].iter().all(|f| chunk(f).get("usage").is_none()),
+            "usage rides on the final frame only"
+        );
+        assert!(
+            chunk(frames[0])["id"]
+                .as_str()
+                .unwrap()
+                .starts_with("cmpl-")
+        );
+        assert_eq!(chunk(frames[0])["object"], "text_completion");
+
+        let last = chunk(frames[3]);
+        assert_eq!(last["choices"][0]["finish_reason"], "length");
+        assert_eq!(last["choices"][0]["text"], "");
+        assert_eq!(last["usage"]["prompt_tokens"], 2);
+        assert_eq!(last["usage"]["completion_tokens"], 3);
+        assert_eq!(last["usage"]["total_tokens"], 5);
+        assert_eq!(frames[4], "data: [DONE]");
+    }
+
+    #[tokio::test]
+    async fn a_stream_with_a_bad_prompt_fails_before_any_frame() {
+        let (status, body) = post_json(serde_json::json!({ "prompt": "", "stream": true })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "invalid_request");
+    }
+
+    #[tokio::test]
+    async fn a_stream_stops_at_eos_and_says_so() {
+        let response = test_router()
+            .oneshot(
+                Request::post("/v1/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "prompt": "<before-eos>", "max_tokens": 4, "stream": true })
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        let frames: Vec<&str> = body.split("\n\n").filter(|f| !f.is_empty()).collect();
+        assert_eq!(frames.len(), 3, "the eos token, the final frame, [DONE]");
+        let last: serde_json::Value = serde_json::from_str(&frames[1][6..]).unwrap();
+        assert_eq!(last["choices"][0]["finish_reason"], "stop");
+        assert_eq!(last["usage"]["completion_tokens"], 1);
     }
 
     #[tokio::test]
