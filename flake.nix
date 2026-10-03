@@ -157,6 +157,12 @@
             # rejects `default-lib-fmt` as an unknown codegen option, and `-mold`
             # is a clang spelling the nix gcc wrapper does not take (it wants
             # `-fuse-ld=mold`). rustc already links through lld from its wrapper.
+            # triton finds libcuda by running /sbin/ldconfig, which a nix store
+            # has never heard of, and it hardcodes that path (nvidia/driver.py
+            # libcuda_dirs). TRITON_LIBCUDA_PATH is the knob upstream offers to
+            # skip the ldconfig probe; point it at the driver mount, where the
+            # jail puts libcuda.so.1. Same directory as below.
+            export TRITON_LIBCUDA_PATH=/run/opengl-driver/lib
             # torch from FreeToken/.venv is a manylinux wheel whose RPATH points
             # at paths that do not exist here, so importing it (from the venv's
             # python OR from the interpreter pyo3 embedded, see decision 25)
@@ -169,7 +175,9 @@
               if [ -f "$libstdcxx/libstdc++.so.6" ]; then
                 # ''${...} so nix emits the shell's own ''${...} instead of trying
                 # to evaluate it: "if already set, keep the old value last".
-                export LD_LIBRARY_PATH="$libstdcxx:/run/opengl-driver/lib''${LD_LIBRARY_PATH:+:''$LD_LIBRARY_PATH}"
+                # ''${...} escapes nix interpolation; the shell then reads its own
+                # ${...}, i.e. append the old value only if it was already set.
+                export LD_LIBRARY_PATH="$libstdcxx:/run/opengl-driver/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
               fi
             fi
             # via bash, not the shebang: the jail has no /usr/bin/env.

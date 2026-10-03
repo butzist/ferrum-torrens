@@ -106,7 +106,10 @@ Instructions for AI coding agents working in this repository.
   refreshed `FreeToken/` checkout takes the untracked venv with it.
   The devShell's `shellHook` already puts a matching `libstdc++.so.6` and the
   driver mount (`/run/opengl-driver/lib`) on `LD_LIBRARY_PATH`, which torch from
-  the venv needs: its manylinux RPATH points at paths that do not exist here.
+  the venv needs: its manylinux RPATH points at paths that do not exist here. It
+  also exports `TRITON_LIBCUDA_PATH=/run/opengl-driver/lib`, because triton
+  otherwise probes the driver with a hardcoded `/sbin/ldconfig`, which does not
+  exist in a nix store.
   Outside the devshell, set it by hand:
   `LD_LIBRARY_PATH="/run/opengl-driver/lib:$(dirname "$(gcc -print-file-name=libstdc++.so.6)")"`.
   This applies to the pyo3-embedded interpreter too (`--features triton`), since
