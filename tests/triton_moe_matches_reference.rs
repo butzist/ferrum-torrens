@@ -122,9 +122,17 @@ fn scale_of(values: &[f32]) -> f32 {
     values.iter().fold(0.0f32, |acc, v| acc.max(v.abs()))
 }
 
-/// Slot-major banks over the experts the plan made resident, read straight from
-/// the checkpoint. Slots the plan never wrote read as zeros, exactly what the
-/// device cache holds for them.
+/// A slot nobody routed still has to occupy its bytes: the oracle checks the
+/// bank lengths the way the device cache holds them, all `slots` experts wide,
+/// so an unwritten slot is zeros rather than nothing at all.
+fn zero_slab(rows: usize, cols: usize) -> Slab {
+    Slab {
+        packed: vec![0u8; rows * cols / 2],
+        scale: vec![0u8; rows * cols / 16],
+        global: vec![0u8; rows * 2],
+    }
+}
+
 fn owned_banks(
     source: &dyn ExpertSlabSource,
     shapes: ExpertShapes,
@@ -132,7 +140,9 @@ fn owned_banks(
     routed: &[u32],
     routes: &[i32],
 ) -> OwnedBanks {
-    let mut slabs: Vec<(Slab, Slab)> = vec![(Slab::default(), Slab::default()); slots];
+    let gu = shapes.slab_shape(Part::GateUp);
+    let dn = shapes.slab_shape(Part::Down);
+    let mut slabs: Vec<(Slab, Slab)> = vec![(zero_slab(gu.0, gu.1), zero_slab(dn.0, dn.1)); slots];
     for (expert, &slot) in routed.iter().zip(routes) {
         if slot < 0 {
             continue;
@@ -163,6 +173,122 @@ fn owned_banks(
     banks
 }
 
+/// One deterministic case: seeded activations, a spread of expert ids, the
+/// routes a plan hands out, and host banks holding the same slabs the slot cache
+/// would hold. Shared by the oracle-only test and the GPU gate so a harness bug
+/// cannot masquerade as a kernel bug.
+struct Case {
+    shapes: ExpertShapes,
+    x: Vec<f32>,
+    routed: Vec<u32>,
+    weights: Vec<f32>,
+    routes: Vec<i32>,
+    banks: OwnedBanks,
+}
+
+impl Case {
+    fn request<'a>(&'a self, routes: &'a [i32]) -> MoEGroup<'a> {
+        MoEGroup {
+            hidden: self.shapes.hidden,
+            inter: self.shapes.inter,
+            x: &self.x,
+            top_k: TOP_K,
+            routes,
+            weights: &self.weights,
+        }
+    }
+
+    fn step(&self) -> ExpertStep<'_> {
+        ExpertStep {
+            hidden: self.shapes.hidden,
+            inter: self.shapes.inter,
+            top_k: TOP_K,
+            x: &self.x,
+            experts: &self.routed,
+            weights: &self.weights,
+        }
+    }
+}
+
+fn plan(index: &FtwIndex, source: &dyn ExpertSlabSource) -> Case {
+    let shapes = shapes(index);
+    let hidden = shapes.hidden;
+    // Deterministic inputs: a seeded activation and a spread of expert ids, so
+    // a failure is reproducible. Experts stay inside the slot cache, so every
+    // route the kernel sees is resident and no rewrite happens.
+    let x: Vec<f32> = (0..TOKENS * hidden)
+        .map(|i| ((i * 2654435761usize % 1009) as f32 / 1009.0) - 0.5)
+        .collect();
+    let routed: Vec<u32> = (0..TOKENS * TOP_K)
+        .map(|i| ((i * 7 + 3) % SLOTS) as u32)
+        .collect();
+    let weights: Vec<f32> = (0..TOKENS * TOP_K)
+        .map(|i| 1.0 / TOP_K as f32 + i as f32 * 1e-3)
+        .collect();
+    let mut cache = ExpertCache::new(LAYER + 1, SLOTS, SLOTS);
+    let routes = cache.ensure_experts(LAYER, &routed).rewrites;
+    assert!(
+        routes.iter().all(|&r| r >= 0),
+        "the gate keeps every routed expert resident"
+    );
+    let banks = owned_banks(source, shapes, SLOTS, &routed, &routes);
+    Case {
+        shapes,
+        x,
+        routed,
+        weights,
+        routes,
+        banks,
+    }
+}
+
+fn open_checkpoint() -> Option<(Arc<FtwIndex>, Arc<dyn WeightsReader>)> {
+    if !Path::new(FTW_DIR).is_dir() {
+        println!("skipping: no checkpoint in {FTW_DIR}");
+        return None;
+    }
+    let index = Arc::new(
+        FtwIndex::parse(
+            &std::fs::read_to_string(format!("{FTW_DIR}/freetoken_weight.json")).unwrap(),
+        )
+        .unwrap(),
+    );
+    let reader: Arc<dyn WeightsReader> = Arc::new(MmapFtwReader::open(Path::new(FTW_DIR)).unwrap());
+    Some((index, reader))
+}
+
+/// The oracle half of the gate, with no GPU and no python: the real slabs out of
+/// the real checkpoint, through the scalar reference. Shape and length mistakes
+/// in the harness show up here instead of costing a GPU run.
+#[test]
+fn the_scalar_oracle_runs_on_the_real_expert_slabs() {
+    let Some((index, reader)) = open_checkpoint() else {
+        return;
+    };
+    let source: Arc<dyn ExpertSlabSource> = Arc::new(FtwBanks::new(reader, index.clone()));
+    let case = plan(&index, &*source);
+    let mut want = vec![0.0f32; TOKENS * case.shapes.hidden];
+    ferrum_torrens::domain::expert_kernel::grouped_moe_reference(
+        &case.banks.as_host(),
+        &case.request(&case.routes),
+        &mut want,
+    )
+    .expect("scalar oracle");
+    let scale = scale_of(&want);
+    println!(
+        "layer {LAYER}: {TOKENS} tokens x top_k {TOP_K} over {} experts, |out|max {scale:.4e}",
+        case.routes
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+    );
+    assert!(
+        want.iter().all(|v| v.is_finite()),
+        "oracle produced non-finite output"
+    );
+    assert!(scale > 0.0, "oracle produced all zeros");
+}
+
 #[test]
 #[ignore = "needs a CUDA device and the converted checkpoint in .model-cache"]
 fn the_kernel_matches_the_scalar_oracle_on_real_expert_slabs() {
@@ -177,50 +303,25 @@ fn the_kernel_matches_the_scalar_oracle_on_real_expert_slabs() {
         "GATE loader: LD_LIBRARY_PATH={}",
         std::env::var("LD_LIBRARY_PATH").unwrap_or_else(|_| "<unset>".into()),
     );
-    let index_text = gate(
-        "freetoken_weight.json",
-        std::fs::read_to_string(format!("{FTW_DIR}/freetoken_weight.json")),
-    );
-    let index = Arc::new(gate("FtwIndex::parse", FtwIndex::parse(&index_text)));
-    let reader: Arc<dyn WeightsReader> =
-        Arc::new(gate("mmap open", MmapFtwReader::open(Path::new(FTW_DIR))));
-    let shapes = shapes(&index);
+    let Some((index, reader)) = open_checkpoint() else {
+        panic!("gate needs the checkpoint in {FTW_DIR}");
+    };
     let runtime = Arc::new(gate(
         "embedded python + torch",
         TritonRuntime::new(Path::new("python"), &sites),
     ));
-    let source: Arc<dyn ExpertSlabSource> = Arc::new(FtwBanks::new(reader, index));
+    let source: Arc<dyn ExpertSlabSource> = Arc::new(FtwBanks::new(reader, index.clone()));
+    let case = plan(&index, &*source);
     let moe = Arc::new(Mutex::new(TritonMoE::new(
         runtime,
-        source.clone(),
-        shapes,
+        source,
+        case.shapes,
         SLOTS,
     )));
 
-    // Deterministic inputs: a seeded activation and a spread of expert ids, so
-    // a failure is reproducible. Experts stay inside the slot cache, so the
-    // routes the kernel sees are all resident.
-    let hidden = shapes.hidden;
-    let x: Vec<f32> = (0..TOKENS * hidden)
-        .map(|i| ((i * 2654435761usize % 1009) as f32 / 1009.0) - 0.5)
-        .collect();
-    let routed: Vec<u32> = (0..TOKENS * TOP_K)
-        .map(|i| ((i * 7 + 3) % SLOTS) as u32)
-        .collect();
-    let weights: Vec<f32> = (0..TOKENS * TOP_K)
-        .map(|i| 1.0 / TOP_K as f32 + i as f32 * 1e-3)
-        .collect();
-
-    let step = ExpertStep {
-        hidden,
-        inter: shapes.inter,
-        top_k: TOP_K,
-        x: &x,
-        experts: &routed,
-        weights: &weights,
-    };
+    let step = case.step();
     let mut cache = ExpertCache::new(LAYER + 1, SLOTS, SLOTS);
-    let mut got = vec![0.0f32; TOKENS * hidden];
+    let mut got = vec![0.0f32; TOKENS * case.shapes.hidden];
     let t0 = Instant::now();
     {
         // One shared handle is both ports: the plan copies through the store,
@@ -233,28 +334,17 @@ fn the_kernel_matches_the_scalar_oracle_on_real_expert_slabs() {
     }
     let kernel_ms = t0.elapsed().as_secs_f64() * 1e3;
 
-    // Everything routed is resident now, so this plan copies nothing and its
-    // rewrites are the very routes the kernel used.
-    let routes = cache.ensure_experts(LAYER, &routed).rewrites;
-    assert!(
-        routes.iter().all(|&r| r >= 0),
-        "the gate keeps every routed expert resident"
-    );
-    let oracle = owned_banks(&*source, shapes, SLOTS, &routed, &routes);
-    let req = MoEGroup {
-        hidden,
-        inter: shapes.inter,
-        x: &x,
-        top_k: TOP_K,
-        routes: &routes,
-        weights: &weights,
-    };
-    let mut want = vec![0.0f32; TOKENS * hidden];
+    // The plan is deterministic and every routed expert was already resident in
+    // the oracle case too, so these are the routes the kernel saw.
+    let routes = cache.ensure_experts(LAYER, &case.routed).rewrites;
+    assert_eq!(routes, case.routes, "the plan must be deterministic");
+
+    let mut want = vec![0.0f32; TOKENS * case.shapes.hidden];
     gate(
         "scalar oracle",
         ferrum_torrens::domain::expert_kernel::grouped_moe_reference(
-            &oracle.as_host(),
-            &req,
+            &case.banks.as_host(),
+            &case.request(&routes),
             &mut want,
         ),
     );
