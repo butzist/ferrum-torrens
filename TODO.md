@@ -6,12 +6,10 @@ CPU-only box (decisions 24-30), with pyo3 slated for removal (decision 30): `dom
 `python/ferrum_kernel/nvfp4_moe.py` (PTX-clean for sm_120) and
 `infrastructure/triton.rs` (feature `triton`: device slot cache, `ExpertSlotStore`,
 `ExpertGemm`), `infrastructure/banks.rs` (the FTW slab source) and
-`application/run_experts.rs`. What is missing is a green gated GPU numerical run
-(its first run reported `rel 1.0`, which the interpreter test pinned to two
-kernel bugs -- the down GEMV indexing `ic2` by token instead of route, and a k-loop
-that re-multiplied the already byte-scaled induction variable and so masked out
-every k after the first block; both are fixed and covered on CPU by the
-interpreter test, decision 31) and the `moe_block` swap. Last finished: M1b -- the
+`application/run_experts.rs`. The gated GPU numerical run is green now
+(`8.5e-7` rel against the term scale on the real slabs, after two kernel bugs the
+interpreter test pinned, decision 31); what is missing is the `moe_block` swap,
+then the pyo3 exit (decision 30). Last finished: M1b -- the
 libtorch tower matches the FreeToken oracle: gated
 `one_token_prediction_matches_the_oracle` emits id 11751 (" Paris") for
 `"The capital of France is"` in ~46 s under the 26 GiB cap (decision 22), and
@@ -318,7 +316,12 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
     measured against `grouped_moe_reference_abs_sum`, the size of the terms that
     cancel into the output, not the surviving sum. First real run: the whole
     path executed and reported `rel 1.00`, which the interpreter run (decision
-    31) pinned to the down GEMV indexing `ic2` by token; fixed, pending a rerun.
+    31) pinned to the down GEMV indexing `ic2` by token and, once that was fixed,
+    to a k-loop that re-multiplied an induction variable `range` had already
+    stepped in bytes, so every k after the first block was masked out (the shape
+    bisect found it: only shapes with `K_BYTES <= 64` had ever passed).
+    Green as of 2026-10-03: `max|kernel - scalar| = 4.6e-9` of `5.427e-3` terms,
+    `8.5e-7` rel, in 366 ms for 4 tokens x top_k 8 over 32 experts, 64 slots.
     Re-run it in a devshell:
     `cargo test --release --features triton --test triton_moe_matches_reference -- --ignored --nocapture`
     (set `FERRUM_KERNEL_SITE_PACKAGES` to the venv's site-packages; it defaults
