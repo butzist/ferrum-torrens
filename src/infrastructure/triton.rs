@@ -277,6 +277,22 @@ fn stage_into_slot<'py>(
     Ok(())
 }
 
+/// `[tokens, hidden]` on whatever device the kernel wrote, back as a flat
+/// `Vec<f32>`. `tolist` is the crossing point: pyo3 cannot extract a sequence
+/// straight out of a tensor, and only the list gives it one.
+fn to_f32_vec<'py>(t: &Bound<'py, PyAny>) -> Result<Vec<f32>, MoEError> {
+    let host = t
+        .call_method1("cpu", ())
+        .map_err(|e| err("result.cpu()", e))?;
+    let flat = host
+        .call_method1("reshape", (-1,))
+        .map_err(|e| err("result.reshape(-1)", e))?;
+    let list = flat
+        .call_method0("tolist")
+        .map_err(|e| err("result.tolist()", e))?;
+    list.extract().map_err(|e| err("result to Vec<f32>", e))
+}
+
 /// The interpreter pyo3 linked is not the venv's, so `torch`/`triton` live
 /// nowhere on its `sys.path` until their site-packages go on, and this repo's
 /// `ferrum_kernel` package is a plain directory that needs the same treatment.
@@ -641,13 +657,7 @@ impl TritonMoE {
                     ),
                 )
                 .map_err(|e| err("ferrum_kernel grouped_moe", e))?;
-            let host = result
-                .call_method1("cpu", ())
-                .map_err(|e| err("result.cpu()", e))?;
-            let flat = host
-                .call_method1("reshape", (-1,))
-                .map_err(|e| err("result.reshape(-1)", e))?;
-            let values: Vec<f32> = flat.extract().map_err(|e| err("result to Vec<f32>", e))?;
+            let values = to_f32_vec(&result)?;
             if values.len() < tokens * hidden {
                 return Err(MoEError::Bad(format!(
                     "kernel returned {} values for {tokens} tokens",
@@ -663,6 +673,36 @@ impl TritonMoE {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The readback: pyo3 extracts a sequence only from a python list, never
+    /// straight out of a tensor, so this is where a result comes home.
+    #[test]
+    fn a_result_tensor_reads_back_as_floats() {
+        Python::attach(|py| {
+            let sites = std::env::var("FERRUM_KERNEL_SITE_PACKAGES")
+                .unwrap_or_else(|_| "FreeToken/.venv/lib/python3.12/site-packages".to_string());
+            let dirs: Vec<PathBuf> = sites
+                .split(':')
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+                .collect();
+            if prepend_kernel_paths(py, &dirs, Path::new("python")).is_err() {
+                println!("skipping readback test: sys.path setup failed");
+                return;
+            }
+            let Ok(torch) = py.import("torch") else {
+                println!("skipping readback test: torch is not importable here");
+                return;
+            };
+            let rows = torch.call_method1("arange", (6,)).unwrap();
+            let as_float = rows.call_method1("float", ()).unwrap();
+            let shaped = as_float.call_method1("reshape", (2, 3)).unwrap();
+            assert_eq!(
+                to_f32_vec(&shaped).unwrap(),
+                vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+            );
+        });
+    }
 
     /// Staging runs on the CPU with the same code path the device uses, so the
     /// copy shapes are checkable without a GPU. `copy_` does not flatten: a
