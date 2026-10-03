@@ -17,8 +17,9 @@ links libtorch (decision 32), so the tower-with-kernel gate can only run after
 decision 30's PTX + driver API replacement. Incremental KV decode is now proved
 too: chunked prefill + one-token decode off the page table agrees with re-feeding
 the whole prefix on the real checkpoint (same argmax at every step, logits
-within 2e-6 of scale, decision 33), and the engine does not use it yet.
-Last finished: the cached forward and its device cache. Before that the
+within 2e-6 of scale, decision 33), and the engine decodes off it: one page
+table per request, and a forward without a cache still re-feeds the prefix to the
+same tokens. Last finished: the cached decode loop. Before that the
 `moe_block` swap, on top of M1b -- the
 libtorch tower matches the FreeToken oracle: gated
 `one_token_prediction_matches_the_oracle` emits id 11751 (" Paris") for
@@ -410,6 +411,7 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 - [x] P0 MHA paged pool `[2, num_full_layers, num_pages, page_size, kv_heads, head_dim]` with global-layer->dense-index remap (only 10 full layers get slabs). (`infrastructure/kvcache_dev.rs`, decision 33)
 - [x] P0 GDN conv/recurrent state slabs per request slot, f32, recycled slots zeroed. (`infrastructure/kvcache_dev.rs`)
 - [x] P0 cached forward: chunked prefill + one-token decode off the page table instead of re-feeding the prefix (`CachedModel` port, gated `incremental_decode_matches_refeeding_the_whole_prefix`: same argmax every step, logits within 2e-6 of the re-fed forward).
+- [x] P0 the engine decodes off the page table: one `SequenceCache` per request, opened on its first step and released when it finishes; a forward without a cache keeps re-feeding and must produce the same tokens (`application/generation.rs`).
 - [x] P0 page free-list (`free_slots` holds page bases) + per-req page table holding **token locations** + dummy row pointing at a sentinel page. (`domain/kvcache.rs`)
 - [x] P0 radix prefix tree: walk by first-page-key, `std::mismatch`-comparison align-down to page, node split, insert, LRU evict (unlocked leaf only), ref-counted handles. (`domain/kvcache.rs`, page_size=1)
 - [ ] P0 prefill flow: `match_req` -> lock -> allocate_paged -> compute/store kv -> `cache_req` commit (unfinished rows re-point at canonical tree pages).
@@ -467,7 +469,9 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 - **M3 performance**: the NVFP4 expert Triton kernel (kernels + port DONE, the
   `triton.rs` adapter and the GPU gate pending -- decisions 24-26), paged KV +
   radix, fast chunked GDN, CUDA-graph decode, prefill/decode split so decode
-  stops re-feeding the prefix. Note the kernel work pulls the device slot cache
+  stops re-feeding the prefix (the decode side of this is done: the engine takes
+  its steps off the KV page table, M3 keeps the batching and the radix
+  prefix reuse). Note the kernel work pulls the device slot cache
   (M4's `copy_missing`) forward: the adapter cannot run without somewhere to
   stage an expert, so `copy_missing` lands with the adapter, not after it.
 - **M4 offload**: LRU slot cache + fused copy + prefill double buffer; radix

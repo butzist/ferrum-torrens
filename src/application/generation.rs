@@ -2,15 +2,22 @@
 // scheduler, and applies the stop rules (length, EOS, stop-strings) around one
 // forward + sample per step.
 //
-// The CPU reference forward recomputes the whole sequence on every call
-// (TODO.md decision 12), so each batch row is its request's full id sequence and
-// the prefill chunk the scheduler granted is irrelevant to the ids fed to the
-// model: a prefill step advances the entire prompt. KV reuse replaces the
-// per-step refeed in M3 without changing this call shape.
+// Two shapes of step, chosen by whether the model has a KV cache:
+//
+// - With one, a session owns a page table and each step feeds only the tokens
+//   the cache does not hold yet: the whole prompt on the prefill step, then the
+//   one token the previous step sampled. The cached forward reads the rest back
+//   out of the pool, so a decode step costs one token instead of the prefix.
+// - Without one (the scalar reference, decision 12), each step re-feeds the
+//   request's full id sequence, because that is all such a forward can do.
+//
+// Both produce the same tokens: the cached path is gated against exactly this
+// re-fed one on the real checkpoint (`tests/kvcache_incremental_decode.rs`).
 
 use std::collections::HashMap;
 
-use crate::application::engine::{BatchRow, Engine, EngineError};
+use crate::application::engine::{BatchRow, CachedStep, Engine, EngineError};
+use crate::domain::kvcache::SequenceCache;
 use crate::domain::sampling::{Rng, SamplingParams};
 use crate::domain::scheduler::{
     Budget, FinishReason, Phase, Req, check_stop, match_stop_str, schedule_next_batch,
@@ -44,6 +51,9 @@ struct Session {
     req: Req,
     ids: Vec<u32>,
     generated: Vec<u32>,
+    /// This request's page table, opened on its first step. `None` until then,
+    /// and for a model with no cache at all.
+    cache: Option<SequenceCache>,
 }
 
 /// Build a request, clamping `max_tokens` by the engine's output limit and by
@@ -107,6 +117,7 @@ pub fn generate_batch(
                 req: req.clone(),
                 ids: r.prompt_ids,
                 generated: Vec::new(),
+                cache: None,
             },
         );
         pending.push(req);
@@ -121,19 +132,51 @@ pub fn generate_batch(
         };
         debug_assert!(!batch.reqs.is_empty());
 
-        let rows: Vec<BatchRow<'_>> = batch
-            .reqs
-            .iter()
-            .map(|req| {
-                let s = &sessions[&req.uid];
-                BatchRow {
-                    uid: s.req.uid,
-                    ids: &s.ids,
-                    params: &s.req.sampling,
-                }
-            })
-            .collect();
-        let sampled = engine.run_forward(&rows, &mut rng)?;
+        let sampled = if engine.cache().is_some() {
+            // One page table per request, and every step advances it by the
+            // tokens it has not seen: the prompt first, then one token each.
+            let kv = engine.cache().expect("checked above").clone();
+            let mut out = Vec::with_capacity(batch.reqs.len());
+            for req in &batch.reqs {
+                let s = sessions
+                    .get_mut(&req.uid)
+                    .expect("scheduled row has a session");
+                let Session {
+                    ids,
+                    generated: _,
+                    cache: slot,
+                    req,
+                } = s;
+                let cache = slot.get_or_insert_with(|| kv.begin());
+                let start = cache.cached();
+                let step = engine.run_forward_cached(
+                    CachedStep {
+                        uid: req.uid,
+                        ids: &ids[start..],
+                        start,
+                        cache,
+                        params: &req.sampling,
+                    },
+                    &mut rng,
+                )?;
+                out.push(step);
+            }
+            out
+        } else {
+            let rows: Vec<BatchRow<'_>> = batch
+                .reqs
+                .iter()
+                .map(|req| {
+                    let s = &sessions[&req.uid];
+                    BatchRow {
+                        uid: s.req.uid,
+                        ids: &s.ids,
+                        params: &s.req.sampling,
+                    }
+                })
+                .collect();
+            engine.run_forward(&rows, &mut rng)?
+        };
 
         for (uid, token) in sampled {
             let s = sessions.get_mut(&uid).expect("sampled row has a session");
@@ -162,7 +205,10 @@ pub fn generate_batch(
     finished.sort_unstable();
     let mut out = Vec::with_capacity(finished.len());
     for uid in finished {
-        let s = sessions.remove(&uid).expect("finished session");
+        let mut s = sessions.remove(&uid).expect("finished session");
+        if let (Some(kv), Some(mut cache)) = (engine.cache(), s.cache.take()) {
+            kv.end(&mut cache);
+        }
         let text = finish_text(engine, &s)?;
         out.push(Generation {
             uid,
@@ -240,6 +286,65 @@ mod tests {
         );
         assert_eq!(calls[1].positions, vec![0, 1, 2]);
         assert_eq!(calls[1].answers, vec![2], "answer row is the last token");
+    }
+
+    #[test]
+    fn decode_feeds_only_the_new_token_when_the_model_has_a_cache() {
+        let (e, rec, _cache) = test_cached_engine(limits());
+        let g = generate(&e, req(&e, 1, "ab", params(3)), 0).unwrap();
+        assert_eq!(
+            g.tokens,
+            vec![99, 100, 101],
+            "same tokens as the re-fed path"
+        );
+
+        let calls = rec.cached_calls();
+        assert_eq!(calls.len(), 3, "prefill plus two decode steps");
+        assert_eq!(
+            calls[0].input_ids,
+            vec![97, 98],
+            "prefill feeds the prompt once"
+        );
+        assert_eq!(
+            calls[1].input_ids,
+            vec![99],
+            "decode feeds only the sampled token"
+        );
+        assert_eq!(
+            calls[1].positions,
+            vec![2],
+            "at its own position, not restarted"
+        );
+        assert_eq!(calls[2].input_ids, vec![100]);
+        assert_eq!(calls[2].positions, vec![3]);
+        assert!(
+            rec.calls().is_empty(),
+            "the cached path never re-feeds a prefix"
+        );
+    }
+
+    #[test]
+    fn a_finished_request_returns_its_cache_pages() {
+        let (e, rec, cache) = test_cached_engine(limits());
+        let pages = cache.pages_left();
+        let g = generate(&e, req(&e, 1, "abcd", params(2)), 0).unwrap();
+        assert_eq!(g.tokens.len(), 2);
+        assert_eq!(rec.cached_calls().len(), 2, "prefill plus one decode step");
+        assert_eq!(
+            cache.pages_left(),
+            pages,
+            "ending the session gives every page back"
+        );
+    }
+
+    #[test]
+    fn a_cached_batch_keeps_every_request_on_its_own_pages() {
+        let (e, _rec, _cache) = test_cached_engine(limits());
+        let batch = vec![req(&e, 1, "ab", params(2)), req(&e, 2, "xyz", params(2))];
+        let out = generate_batch(&e, batch, 0).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].tokens, vec![99, 100], "uid 1 walks the counter");
+        assert_eq!(out[1].tokens, vec![123, 124], "uid 2 walks its own counter");
     }
 
     #[test]

@@ -249,6 +249,11 @@ impl From<EngineError> for ApiError {
                 ApiError::unprocessable(format!("model returned {got} logits, expected {want}"))
             }
             NoParams(uid) => ApiError::unprocessable(format!("no sampling parameters for {uid}")),
+            // Engine-side faults, not anything the caller can fix: the cache is
+            // a server resource and its bookkeeping failing is a server bug.
+            e @ (NoKvCache | EmptyStep { .. } | CacheOutOfStep { .. } | KvCache(_)) => {
+                ApiError::unprocessable(format!("engine kv cache: {e}"))
+            }
         }
     }
 }

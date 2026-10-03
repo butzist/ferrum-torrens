@@ -12,21 +12,17 @@ use crate::domain::model::{ForwardInput, Model};
 
 pub const SENTINEL_PAGE: u32 = u32::MAX;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum KvcacheError {
-    OutOfPages {
-        want: usize,
-        have: usize,
-    },
+    #[error("kv cache out of pages: wanted {want}, have {have}")]
+    OutOfPages { want: usize, have: usize },
     /// A cached forward was asked for something its cache cannot serve, e.g. a
     /// batch, or tokens it was not grown for. `why` says which.
-    MisalignedCache {
-        why: String,
-    },
-    NotEnoughEvictable {
-        want: usize,
-        have: usize,
-    },
+    #[error("cached forward asked for something its cache cannot serve: {why}")]
+    MisalignedCache { why: String },
+    #[error("not enough evictable pages: wanted {want}, have {have}")]
+    NotEnoughEvictable { want: usize, have: usize },
+    #[error("no unlocked leaf to evict")]
     NoLeavesEvictable,
 }
 

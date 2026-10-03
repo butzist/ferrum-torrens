@@ -76,6 +76,11 @@ fn one_token_prediction_matches_the_oracle() {
 #[test]
 #[ignore = "requires the converted checkpoint, a cuda device and the triton feature"]
 fn one_token_through_the_kernel_matches_the_oracle() {
+    // Without the `triton` feature the registry hands the tower no kernel port,
+    // so this would silently pass on the inline host path and prove nothing.
+    if !cfg!(feature = "triton") {
+        panic!("this gate needs --features cuda,triton; without it there is no kernel in the loop");
+    }
     let mut cfg = config(1);
     cfg.kernel.triton = true;
     cfg.kernel.site_packages = std::env::var("FERRUM_KERNEL_SITE_PACKAGES")

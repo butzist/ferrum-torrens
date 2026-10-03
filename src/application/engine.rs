@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use crate::domain::kvcache::{CachedModel, KvCache, SequenceCache};
 use crate::domain::model::{ForwardInput, LayerProbe, Model, ModelParams};
 use crate::domain::sampling::{Rng, SamplingParams, sample};
 use crate::domain::tokenizer::{Tokenizer, TokenizerError};
@@ -24,6 +25,18 @@ pub struct EngineLimits {
 pub enum EngineError {
     #[error("tokenizer error: {0}")]
     Tokenize(#[from] TokenizerError),
+    #[error("this engine has no kv cache, so it cannot take a cached step")]
+    NoKvCache,
+    #[error("cached step for uid {uid} carries no tokens")]
+    EmptyStep { uid: u64 },
+    #[error("cached step for uid {uid} starts at {start} but its cache holds {cached} tokens")]
+    CacheOutOfStep {
+        uid: u64,
+        start: usize,
+        cached: usize,
+    },
+    #[error("kv cache: {0}")]
+    KvCache(String),
     #[error("prompt is empty")]
     EmptyPrompt,
     #[error("prompt has {len} tokens, over the {max} limit")]
@@ -42,8 +55,20 @@ pub struct BatchRow<'a> {
     pub params: &'a SamplingParams,
 }
 
+/// One request's step against its own KV page table: only the tokens this step
+/// adds, at the position they belong to. `cache` must hold everything before
+/// `ids`, i.e. `cache.cached() == start`; the engine reserves the rest.
+pub struct CachedStep<'a> {
+    pub uid: u64,
+    pub ids: &'a [u32],
+    pub start: usize,
+    pub cache: &'a mut SequenceCache,
+    pub params: &'a SamplingParams,
+}
+
 pub struct Engine {
-    model: Arc<dyn Model>,
+    model: Arc<dyn CachedModel>,
+    cache: Option<Arc<dyn KvCache>>,
     tokenizer: Arc<dyn Tokenizer>,
     eos_ids: Vec<u32>,
     limits: EngineLimits,
@@ -235,7 +260,7 @@ pub fn load_engine(config: &crate::config::Config) -> Result<Engine, LoadError> 
     let eos_ids = eos_ids_from_ftw_dir(dir)?;
 
     Ok(Engine::new(
-        std::sync::Arc::from(model as Box<dyn crate::domain::model::Model>),
+        std::sync::Arc::from(model),
         std::sync::Arc::new(tokenizer),
         eos_ids,
         limits,
@@ -244,8 +269,12 @@ pub fn load_engine(config: &crate::config::Config) -> Result<Engine, LoadError> 
 }
 
 impl Engine {
+    /// `cache` is the model's own KV cache, if it has one: the registry builds
+    /// it from `[kv]` and hands the same allocation to the engine and the model
+    /// (see `infrastructure::kvcache_dev`), so the engine can hand out page
+    /// tables the model's forward then reads.
     pub fn new(
-        model: Arc<dyn Model>,
+        model: Arc<dyn CachedModel>,
         tokenizer: Arc<dyn Tokenizer>,
         eos_ids: Vec<u32>,
         limits: EngineLimits,
@@ -255,13 +284,22 @@ impl Engine {
         assert!(limits.max_output_tokens > 0);
         assert!(limits.max_running_requests > 0);
         assert!(limits.max_prefill_length > 0);
+        let cache = model.cache();
         Self {
             model,
+            cache,
             tokenizer,
             eos_ids,
             limits,
             device,
         }
+    }
+
+    /// The KV cache, `None` for a forward that has none (the scalar reference,
+    /// or a model built without one). Callers branch on it: with a cache, decode
+    /// steps only the new token; without one, every step re-feeds the prefix.
+    pub fn cache(&self) -> Option<&Arc<dyn KvCache>> {
+        self.cache.as_ref()
     }
 
     pub fn model(&self) -> &dyn Model {
@@ -313,9 +351,51 @@ impl Engine {
         self.model.probe_layers(input, every)
     }
 
-    /// One batched forward: the rows are concatenated (the model splits them
-    /// where positions restart), each row's last index is its answer row, and
-    /// one token per row is sampled.
+    /// One step of one request off its page table: reserve pages for `ids`,
+    /// forward them at position `start`, sample from the logits.
+    ///
+    /// Single-sequence by construction: the cached forward has no batch, because
+    /// every request's KV lives in its own page table. Batching cached decode is
+    /// a kernel question (one paged attention over several tables), not a
+    /// scheduling one.
+    pub fn run_forward_cached(
+        &self,
+        row: CachedStep<'_>,
+        rng: &mut Rng,
+    ) -> Result<(u64, u32), EngineError> {
+        let kv = self.cache.as_ref().ok_or(EngineError::NoKvCache)?.clone();
+        if row.ids.is_empty() {
+            return Err(EngineError::EmptyStep { uid: row.uid });
+        }
+        if row.start != row.cache.cached() {
+            return Err(EngineError::CacheOutOfStep {
+                uid: row.uid,
+                start: row.start,
+                cached: row.cache.cached(),
+            });
+        }
+        kv.reserve(row.cache, row.ids.len())
+            .map_err(|e| EngineError::KvCache(e.to_string()))?;
+        let n = row.ids.len();
+        let input = crate::domain::model::ForwardInput {
+            input_ids: row.ids.to_vec(),
+            positions: (row.start..row.start + n).map(|p| p as u32).collect(),
+            answers: vec![n - 1],
+        };
+        let logits = self
+            .model
+            .forward_cached(&input, row.cache)
+            .map_err(|e| EngineError::KvCache(e.to_string()))?;
+        let vocab = self.model.params().vocab_size;
+        if logits.len() != vocab {
+            return Err(EngineError::BadLogits {
+                got: logits.len(),
+                want: vocab,
+            });
+        }
+        Ok((row.uid, sample(&logits, row.params, rng)))
+    }
+
     pub fn run_forward(
         &self,
         rows: &[BatchRow<'_>],
@@ -406,11 +486,17 @@ pub(crate) mod fake {
     #[derive(Clone, Default)]
     pub struct Recorder {
         calls: Arc<Mutex<Vec<ForwardInput>>>,
+        cached_calls: Arc<Mutex<Vec<ForwardInput>>>,
     }
 
     impl Recorder {
         pub fn calls(&self) -> Vec<ForwardInput> {
             self.calls.lock().unwrap().clone()
+        }
+
+        /// The steps taken through `forward_cached`, in order.
+        pub fn cached_calls(&self) -> Vec<ForwardInput> {
+            self.cached_calls.lock().unwrap().clone()
         }
     }
 
@@ -429,13 +515,9 @@ pub(crate) mod fake {
 
     static FAKE_PARAMS: std::sync::OnceLock<ModelParams> = std::sync::OnceLock::new();
 
-    impl Model for FakeModel {
-        fn params(&self) -> &ModelParams {
-            FAKE_PARAMS.get_or_init(fake_params)
-        }
-
-        fn forward(&self, input: &ForwardInput) -> Vec<f32> {
-            self.rec.calls.lock().unwrap().push(input.clone());
+    impl FakeModel {
+        /// Argmax of each answered row is `(last_id + 1) % vocab`.
+        fn argmax_logits(input: &ForwardInput) -> Vec<f32> {
             let mut out = Vec::with_capacity(FAKE_VOCAB);
             for &row in &input.answers {
                 let last = input.input_ids[row] as usize;
@@ -444,6 +526,128 @@ pub(crate) mod fake {
                 out[base + (last + 1) % FAKE_VOCAB] = 10.0;
             }
             out
+        }
+    }
+
+    impl Model for FakeModel {
+        fn params(&self) -> &ModelParams {
+            FAKE_PARAMS.get_or_init(fake_params)
+        }
+
+        fn forward(&self, input: &ForwardInput) -> Vec<f32> {
+            self.rec.calls.lock().unwrap().push(input.clone());
+            Self::argmax_logits(input)
+        }
+    }
+
+    /// No cache, so it takes the trait's stateless default and every step
+    /// re-feeds its prefix: the path the cached engine has to keep matching.
+    impl crate::domain::kvcache::CachedModel for FakeModel {}
+
+    /// The bookkeeping half of a cache, with no tensors behind it: enough to
+    /// assert that the engine reserves pages, hands them over and gets them
+    /// back.
+    pub struct FakeCache {
+        pages: Mutex<crate::domain::kvcache::PagePool>,
+        slots: Mutex<crate::domain::kvcache::LinearStatePool>,
+    }
+
+    impl FakeCache {
+        pub const PAGES: usize = 64;
+
+        pub fn new() -> Self {
+            Self {
+                pages: Mutex::new(crate::domain::kvcache::PagePool::new(1, Self::PAGES)),
+                slots: Mutex::new(crate::domain::kvcache::LinearStatePool::new(4)),
+            }
+        }
+
+        pub fn pages_left(&self) -> usize {
+            self.pages.lock().unwrap().available()
+        }
+    }
+
+    impl crate::domain::kvcache::KvCache for FakeCache {
+        fn begin(&self) -> crate::domain::kvcache::SequenceCache {
+            crate::domain::kvcache::SequenceCache::new(
+                self.slots.lock().unwrap().allocate().expect("fake slot"),
+            )
+        }
+
+        fn reserve(
+            &self,
+            cache: &mut crate::domain::kvcache::SequenceCache,
+            n: usize,
+        ) -> Result<(), crate::domain::kvcache::KvcacheError> {
+            cache.grow(n, &mut self.pages.lock().unwrap())
+        }
+
+        fn end(&self, cache: &mut crate::domain::kvcache::SequenceCache) {
+            cache.release(&mut self.pages.lock().unwrap());
+        }
+
+        fn available(&self) -> usize {
+            self.pages_left()
+        }
+
+        fn num_pages(&self) -> usize {
+            Self::PAGES
+        }
+    }
+
+    /// `FakeModel` with a cache behind it: answers the same way, and records
+    /// cached steps separately so a test can tell the two paths apart.
+    pub struct FakeCachedModel {
+        rec: Recorder,
+        cache: Arc<FakeCache>,
+    }
+
+    impl FakeCachedModel {
+        pub fn new() -> (Self, Recorder, Arc<FakeCache>) {
+            let rec = Recorder::default();
+            let cache = Arc::new(FakeCache::new());
+            (
+                Self {
+                    rec: rec.clone(),
+                    cache: cache.clone(),
+                },
+                rec,
+                cache,
+            )
+        }
+    }
+
+    impl Model for FakeCachedModel {
+        fn params(&self) -> &ModelParams {
+            FAKE_PARAMS.get_or_init(fake_params)
+        }
+
+        fn forward(&self, input: &ForwardInput) -> Vec<f32> {
+            self.rec.calls.lock().unwrap().push(input.clone());
+            FakeModel::argmax_logits(input)
+        }
+    }
+
+    impl crate::domain::kvcache::CachedModel for FakeCachedModel {
+        fn cache(&self) -> Option<Arc<dyn crate::domain::kvcache::KvCache>> {
+            Some(self.cache.clone())
+        }
+
+        fn forward_cached(
+            &self,
+            input: &ForwardInput,
+            cache: &mut crate::domain::kvcache::SequenceCache,
+        ) -> Result<Vec<f32>, crate::domain::kvcache::KvcacheError> {
+            // The engine owns the contract: the cache is already grown for
+            // exactly this step's tokens, at their own position.
+            let n = input.input_ids.len();
+            assert_eq!(
+                cache.cached(),
+                input.positions[0] as usize + n,
+                "the engine must grow the cache before the step"
+            );
+            self.rec.cached_calls.lock().unwrap().push(input.clone());
+            Ok(FakeModel::argmax_logits(input))
         }
     }
 
@@ -478,6 +682,21 @@ pub(crate) mod fake {
                 Device::Cpu,
             ),
             rec,
+        )
+    }
+
+    pub fn test_cached_engine(limits: EngineLimits) -> (Engine, Recorder, Arc<FakeCache>) {
+        let (model, rec, cache) = FakeCachedModel::new();
+        (
+            Engine::new(
+                Arc::new(model),
+                Arc::new(FakeTokenizer),
+                vec![FAKE_EOS],
+                limits,
+                Device::Cpu,
+            ),
+            rec,
+            cache,
         )
     }
 
