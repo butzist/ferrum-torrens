@@ -186,14 +186,95 @@ fn to_device<'py>(t: Bound<'py, PyAny>, device: &str) -> Result<Bound<'py, PyAny
 
 /// One field of a slab, ready to be staged: which device bank, the host bytes
 /// and the shape the kernel expects inside one slot.
-type Stage<'a> = (&'a Py<PyAny>, &'a [u8], &'static str, Vec<usize>);
-
 /// One python-side NVFP4 bank set: `packed [slots, rows, cols/2]`,
 /// `scale [slots, rows, cols/16]`, `global [slots, rows]`.
+type Stage<'a> = (&'a Py<PyAny>, &'a [u8], &'static str, Vec<usize>);
+
 struct DeviceBanks {
     packed: Py<PyAny>,
     scale: Py<PyAny>,
     global: Py<PyAny>,
+}
+
+/// `[slots, rows, cols / 2]` uint8, `[slots, rows, cols / 16]` e4m3 and
+/// `[slots, rows]` f16, so one expert is a contiguous `banks[slot]` and the
+/// kernel indexes the slot directly. `device` is a torch device string; a CPU
+/// test drives the same allocation the device path does.
+fn new_banks<'py>(
+    py: Python<'py>,
+    torch: &Bound<'py, PyAny>,
+    slots: usize,
+    rows: usize,
+    cols: usize,
+    device: &str,
+) -> Result<DeviceBanks, MoEError> {
+    let empty = |third: Option<usize>, dtype: &str| -> Result<Py<PyAny>, MoEError> {
+        let kwargs = PyDict::new(py);
+        kwargs
+            .set_item("device", device)
+            .map_err(|e| err("device kwarg", e))?;
+        kwargs
+            .set_item("dtype", attribute(torch, dtype, "torch dtype")?)
+            .map_err(|e| err("dtype kwarg", e))?;
+        let dims: &[usize] = match third {
+            Some(third) => &[slots, rows, third],
+            None => &[slots, rows],
+        };
+        let t = torch
+            .call_method("empty", (shape(py, dims)?,), Some(&kwargs))
+            .map_err(|e| err("torch.empty", e))?;
+        Ok(t.unbind())
+    };
+    Ok(DeviceBanks {
+        packed: empty(Some(cols / 2), "uint8")?,
+        scale: empty(Some(cols / 16), "float8_e4m3fn")?,
+        global: empty(None, "float16")?,
+    })
+}
+
+/// Copy one expert slab into `slot`. The bank rows are already
+/// `[rows, cols / 2]`, so the staged CPU tensor has to be viewed to the same
+/// shape: `copy_` does not flatten, and a flat source is a shape error.
+fn stage_into_slot<'py>(
+    py: Python<'py>,
+    torch: &Bound<'py, PyAny>,
+    banks: &DeviceBanks,
+    slot: usize,
+    slab: &Slab,
+    rows: usize,
+    cols: usize,
+) -> Result<(), MoEError> {
+    let parts: [Stage<'_>; 3] = [
+        (
+            &banks.packed,
+            slab.packed.as_slice(),
+            "uint8",
+            vec![rows, cols / 2],
+        ),
+        (
+            &banks.scale,
+            slab.scale.as_slice(),
+            "float8_e4m3fn",
+            vec![rows, cols / 16],
+        ),
+        (&banks.global, slab.global.as_slice(), "float16", vec![rows]),
+    ];
+    for (bank, bytes, dtype, dims) in parts {
+        let src = method(
+            &host_tensor(py, torch, dtype, bytes)?,
+            "view",
+            tuple1(py, shape(py, &dims)?)?,
+            &format!("{dtype} slab view"),
+        )?;
+        let slot_view = bank
+            .bind(py)
+            .get_item(slot)
+            .map_err(|e| err("bank[slot]", e))?;
+        slot_view
+            .call_method1("copy_", (src,))
+            .map_err(|e| err("copy_ into the slot cache", e))?;
+    }
+    Ok(())
 }
 
 /// The interpreter pyo3 linked is not the venv's, so `torch`/`triton` live
@@ -387,31 +468,9 @@ impl TritonMoE {
         let device = self.runtime.device.clone();
         Python::attach(|py| {
             let torch = py.import("torch").map_err(|e| err("import torch", e))?;
-            let empty =
-                |rows: usize, third: Option<usize>, dtype: &str| -> Result<Py<PyAny>, MoEError> {
-                    let kwargs = PyDict::new(py);
-                    kwargs
-                        .set_item("device", device.as_str())
-                        .map_err(|e| err("device kwarg", e))?;
-                    kwargs
-                        .set_item("dtype", attribute(&torch, dtype, "torch dtype")?)
-                        .map_err(|e| err("dtype kwarg", e))?;
-                    let dims: &[usize] = match third {
-                        Some(third) => &[slots, rows, third],
-                        None => &[slots, rows],
-                    };
-                    let t = torch
-                        .call_method("empty", (shape(py, dims)?,), Some(&kwargs))
-                        .map_err(|e| err("torch.empty", e))?;
-                    Ok(t.unbind())
-                };
             let part = |part: Part| -> Result<DeviceBanks, MoEError> {
                 let (rows, cols) = shapes.slab_shape(part);
-                Ok(DeviceBanks {
-                    packed: empty(rows, Some(cols / 2), "uint8")?,
-                    scale: empty(rows, Some(cols / 16), "float8_e4m3fn")?,
-                    global: empty(rows, None, "float16")?,
-                })
+                new_banks(py, &torch, slots, rows, cols, &device)
             };
             self.gate_up = Some(part(Part::GateUp)?);
             self.down = Some(part(Part::Down)?);
@@ -454,38 +513,9 @@ impl TritonMoE {
             Part::GateUp => self.gate_up.as_ref().unwrap(),
             Part::Down => self.down.as_ref().unwrap(),
         };
-        let device = self.runtime.device.clone();
-        let parts: [Stage<'_>; 3] = [
-            (
-                &banks.packed,
-                slab.packed.as_slice(),
-                "uint8",
-                vec![rows, cols / 2],
-            ),
-            (
-                &banks.scale,
-                &slab.scale,
-                "float8_e4m3fn",
-                vec![rows, cols / 16],
-            ),
-            (&banks.global, slab.global.as_slice(), "float16", vec![rows]),
-        ];
         Python::attach(|py| {
             let torch = py.import("torch").map_err(|e| err("import torch", e))?;
-            for (bank, bytes, dtype, dims) in parts {
-                let src = host_tensor(py, &torch, dtype, bytes)?;
-                let slot_view = bank
-                    .bind(py)
-                    .get_item(slot)
-                    .map_err(|e| err("bank[slot]", e))?;
-                let view = slot_view
-                    .call_method1("view", (shape(py, &dims)?,))
-                    .map_err(|e| err("slot view", e))?;
-                view.call_method1("copy_", (src,))
-                    .map_err(|e| err("copy_ into the slot cache", e))?;
-            }
-            let _ = device;
-            Ok(())
+            stage_into_slot(py, &torch, banks, slot, slab, rows, cols)
         })
     }
 }
@@ -633,6 +663,88 @@ impl TritonMoE {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Staging runs on the CPU with the same code path the device uses, so the
+    /// copy shapes are checkable without a GPU. `copy_` does not flatten: a
+    /// flat staged tensor against a `[rows, cols / 2]` bank row is a shape
+    /// error, which is what the device-only gate used to find.
+    #[test]
+    fn staging_one_slab_lands_in_its_slot_row() {
+        Python::attach(|py| {
+            let sites = std::env::var("FERRUM_KERNEL_SITE_PACKAGES")
+                .unwrap_or_else(|_| "FreeToken/.venv/lib/python3.12/site-packages".to_string());
+            let dirs: Vec<PathBuf> = sites
+                .split(':')
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+                .collect();
+            if prepend_kernel_paths(py, &dirs, Path::new("python")).is_err() {
+                println!("skipping staging test: sys.path setup failed");
+                return;
+            }
+            let Ok(torch) = py.import("torch") else {
+                println!("skipping staging test: torch is not importable here");
+                return;
+            };
+            const SLOTS: usize = 4;
+            const ROWS: usize = 32;
+            const COLS: usize = 64;
+            let banks = new_banks(py, &torch, SLOTS, ROWS, COLS, "cpu").unwrap();
+            let n = |i: usize| (i % 251) as u8;
+            let slab = Slab {
+                packed: (0..ROWS * COLS / 2).map(n).collect(),
+                scale: (0..ROWS * COLS / 16).map(|i| n(i + 7)).collect(),
+                global: (0..ROWS * 2).map(|i| n(i + 13)).collect(),
+            };
+            stage_into_slot(py, &torch, &banks, 2, &slab, ROWS, COLS).unwrap();
+
+            let read = |t: &Py<PyAny>, dtype: &str, slot_len: usize| -> Vec<u8> {
+                let raw = t.bind(py).call_method0("flatten").unwrap();
+                let ints = raw
+                    .call_method1("view", (attribute(&torch, dtype, "dtype").unwrap(),))
+                    .unwrap();
+                let at = (2 * slot_len).min(
+                    ints.call_method0("numel")
+                        .unwrap()
+                        .extract::<usize>()
+                        .unwrap(),
+                );
+                (0..slot_len)
+                    .map(|i| ints.get_item(at + i).unwrap().extract::<i64>().unwrap() as u8)
+                    .collect()
+            };
+            let want_packed = slab.packed.clone();
+            assert_eq!(
+                read(&banks.packed, "uint8", ROWS * COLS / 2),
+                want_packed,
+                "packed bytes must land in slot 2"
+            );
+            // fp8 and f16 have no byte extraction here; compare the numeric
+            // values the kernel would read instead.
+            let values = |t: &Py<PyAny>, row: usize| -> Vec<f64> {
+                t.bind(py)
+                    .get_item(row)
+                    .unwrap()
+                    .call_method1("to", (attribute(&torch, "float32", "dtype").unwrap(),))
+                    .unwrap()
+                    .call_method0("flatten")
+                    .unwrap()
+                    .call_method0("tolist")
+                    .unwrap()
+                    .extract::<Vec<f64>>()
+                    .unwrap()
+            };
+            let staged_scale = values(&banks.scale, 2);
+            assert_eq!(staged_scale.len(), ROWS * COLS / 16);
+            assert!(
+                staged_scale.iter().any(|v| *v != 0.0),
+                "scale row is not all zero"
+            );
+            let staged_global = values(&banks.global, 2);
+            assert_eq!(staged_global.len(), ROWS);
+            assert!(staged_global.iter().all(|v| v.is_finite()));
+        });
+    }
 
     /// A refreshed `FreeToken/` checkout takes the untracked venv with it, and
     /// the symptom is a bare "No module named 'torch'" from deep inside the
