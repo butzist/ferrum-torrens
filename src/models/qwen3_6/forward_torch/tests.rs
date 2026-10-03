@@ -481,3 +481,116 @@ fn the_lm_head_block_split_is_exact() {
         );
     }
 }
+
+/// What the engine's MoE port is handed, recorded so the test can check the
+/// router's own decision survives the trip: layer, shapes, activations, dense
+/// expert ids and weights.
+type SeenRoute = (usize, usize, usize, usize, Vec<f32>, Vec<u32>, Vec<f32>);
+
+struct RecordingMoE {
+    seen: std::sync::Mutex<Option<SeenRoute>>,
+    fail: bool,
+}
+
+impl MoEExecutor for RecordingMoE {
+    fn execute<'a>(
+        &self,
+        req: &MoERequest<'a>,
+        out: &mut [f32],
+    ) -> std::result::Result<(), MoEError> {
+        if self.fail {
+            return Err(MoEError::Bad("planned refusal".into()));
+        }
+        *self.seen.lock().unwrap() = Some((
+            req.layer,
+            req.hidden,
+            req.inter,
+            req.top_k,
+            req.x.to_vec(),
+            req.experts.to_vec(),
+            req.weights.to_vec(),
+        ));
+        // Stand in for the grouped GEMM: every route's weight lands in the sum.
+        let tokens = req.x.len() / req.hidden;
+        for t in 0..tokens {
+            let w: f32 = (0..req.top_k).map(|j| req.weights[t * req.top_k + j]).sum();
+            for h in 0..req.hidden {
+                out[t * req.hidden + h] = w * 3.0;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Shapes the two tests below share: 2 tokens, hidden 3, inter 5, top_k 2.
+fn params() -> ModelParams {
+    let tc: serde_json::Value = serde_json::from_str(
+        r#"{
+          "hidden_size": 3,
+          "num_hidden_layers": 1,
+          "vocab_size": 16,
+          "num_experts": 8,
+          "num_experts_per_tok": 2,
+          "moe_intermediate_size": 5,
+          "shared_expert_intermediate_size": 4,
+          "num_attention_heads": 1,
+          "num_key_value_heads": 1,
+          "head_dim": 3,
+          "partial_rotary_factor": 1.0,
+          "rope_parameters": {"rope_theta": 10000.0},
+          "layer_types": ["full_attention"],
+          "eos_token_id": 1
+        }"#,
+    )
+    .unwrap();
+    crate::models::qwen3_6::config::parse_text_config(&tc).unwrap()
+}
+
+fn routing() -> (Vec<f32>, Tensor, Tensor) {
+    let x = data(6, 71);
+    let ids = up(&[5.0, 1.0, 2.0, 7.0], &[2, 2]);
+    let weights = up(&[0.25, 0.75, 0.5, 0.25], &[2, 2]);
+    (x, ids, weights)
+}
+
+#[test]
+fn the_moe_port_receives_the_routers_decision_and_answers_with_the_routed_sum() {
+    let (x, ids, weights) = routing();
+    let exec = RecordingMoE {
+        seen: std::sync::Mutex::new(None),
+        fail: false,
+    };
+    let got =
+        routed_via_port(&exec, 4, &up(&x, &[2, 3]), &ids, &weights, &params(), dev()).unwrap();
+
+    let (layer, hidden, inter, top_k, xr, experts, w) = exec
+        .seen
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the port was called");
+    assert_eq!((layer, hidden, inter, top_k), (4, 3, 5, 2));
+    close(&xr, &x, 0.0, "activations");
+    // Dense expert ids, in the router's `tokens x top_k` order, not slot ids.
+    assert_eq!(experts, vec![5, 1, 2, 7]);
+    close(&w, &[0.25, 0.75, 0.5, 0.25], 0.0, "weights");
+    close(
+        &to_f32_vec(&got),
+        &[3.0, 3.0, 3.0, 2.25, 2.25, 2.25],
+        1e-6,
+        "routed sum",
+    );
+}
+
+#[test]
+fn a_port_failure_reaches_the_caller() {
+    let (x, ids, weights) = routing();
+    let exec = RecordingMoE {
+        seen: std::sync::Mutex::new(None),
+        fail: true,
+    };
+    assert!(matches!(
+        routed_via_port(&exec, 0, &up(&x, &[2, 3]), &ids, &weights, &params(), dev()),
+        Err(TorchError::MoE(MoEError::Bad(_)))
+    ));
+}

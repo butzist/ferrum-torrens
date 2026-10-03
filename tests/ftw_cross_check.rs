@@ -14,6 +14,7 @@ use ferrum_torrens::domain::weights::WeightsReader;
 use ferrum_torrens::infrastructure::ftw::{FtwIndex, MmapFtwReader};
 use ferrum_torrens::infrastructure::tokenizers_hf::HfTokenizer;
 use ferrum_torrens::infrastructure::torch::Device;
+use std::str::FromStr;
 use std::sync::Arc;
 
 const FTW_DIR: &str = ".model-cache/Qwen3.6-35B-A3B-NVFP4.ftw";
@@ -30,6 +31,13 @@ fn index() -> Arc<FtwIndex> {
 
 fn reader() -> Arc<dyn WeightsReader> {
     Arc::new(MmapFtwReader::open(std::path::Path::new(FTW_DIR)).unwrap())
+}
+
+/// Server config for the cross-check: the kernel stays off, so both towers run
+/// the inline host path and the comparison is scalar vs libtorch arithmetic
+/// rather than scalar vs kernel.
+fn server_config() -> ferrum_torrens::config::Config {
+    ferrum_torrens::config::Config::from_str("[model]\npath = \".model-cache\"\n").unwrap()
 }
 
 fn config() -> serde_json::Value {
@@ -68,7 +76,7 @@ fn scalar_and_libtorch_paths_agree_on_the_oracle_prompt() {
     let scalar = build_scalar(&cfg, ix.clone(), rd.clone()).unwrap();
     eprintln!("--- scalar ---");
     let a = scalar.forward(&inp);
-    let torch = build(&cfg, ix, rd, Device::Cpu).unwrap();
+    let torch = build(&cfg, ix, rd, Device::Cpu, &server_config()).unwrap();
     eprintln!("--- libtorch ---");
     let b = torch.forward(&inp);
 

@@ -211,6 +211,7 @@ pub fn load_engine(config: &crate::config::Config) -> Result<Engine, LoadError> 
         std::sync::Arc::new(index),
         reader,
         device,
+        config,
     )?;
     let params = model.params().clone();
 

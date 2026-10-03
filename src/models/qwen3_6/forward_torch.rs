@@ -22,6 +22,7 @@ use tch::Kind;
 use tch::Tensor;
 
 use crate::domain::dequant::{bf16_array, e4m3_values, nvfp4_block, nvfp4_expert, nvfp4_globals};
+use crate::domain::expert_kernel::{MoEError, MoEExecutor, MoERequest};
 use crate::domain::model::{ForwardInput, LayerType, Model, ModelParams};
 use crate::domain::weights::{DType, TensorDesc, TensorKind, WeightsReader};
 use crate::infrastructure::ftw::FtwIndex;
@@ -37,6 +38,8 @@ pub enum TorchError {
     Bad(&'static str, String),
     #[error("not an experts_bank: {0:?}")]
     NotBank(String),
+    #[error("moe executor refused the step: {0}")]
+    MoE(#[from] MoEError),
 }
 
 type Result<T> = std::result::Result<T, TorchError>;
@@ -503,6 +506,53 @@ fn topk_renorm(probs: &Tensor, k: i64) -> (Tensor, Tensor) {
     (ids, w)
 }
 
+/// `sum_j w[t][j] * expert_j(x[t])` through the engine's MoE port.
+///
+/// The router hands over dense expert ids, not slot ids: the port owns the slot
+/// cache, so it plans residency, stages the misses and launches the grouped
+/// GEMM. Everything crosses to the host once per layer, which is the same
+/// hand-off the inline path makes.
+fn routed_via_port(
+    port: &dyn MoEExecutor,
+    layer_idx: usize,
+    x_post: &Tensor,
+    ids: &Tensor,
+    weights: &Tensor,
+    p: &ModelParams,
+    dev: Device,
+) -> Result<Tensor> {
+    let (hidden, inter, top_k) = (p.hidden_size, p.moe_intermediate_size, p.top_k);
+    let tokens = x_post.size()[0] as usize;
+    let x = to_f32_vec(x_post);
+    // `topk` returns f32 holding exact small integers.
+    let experts: Vec<u32> = to_f32_vec(ids).into_iter().map(|e| e as u32).collect();
+    let w = to_f32_vec(weights);
+    if experts.len() != tokens * top_k || w.len() != tokens * top_k {
+        return Err(TorchError::Bad(
+            "routing",
+            format!(
+                "{} experts and {} weights for {tokens} tokens",
+                experts.len(),
+                w.len()
+            ),
+        ));
+    }
+    let mut out = vec![0.0f32; tokens * hidden];
+    port.execute(
+        &MoERequest {
+            layer: layer_idx,
+            hidden,
+            inter,
+            top_k,
+            x: &x,
+            experts: &experts,
+            weights: &w,
+        },
+        &mut out,
+    )?;
+    Ok(f32_tensor(&out, &[tokens as i64, hidden as i64], dev))
+}
+
 // ---------------------------------------------------------------------------
 // The model
 // ---------------------------------------------------------------------------
@@ -633,6 +683,11 @@ pub struct TorchQwen3_6 {
     lm_head: Dense,
     index: std::sync::Arc<FtwIndex>,
     reader: std::sync::Arc<dyn WeightsReader>,
+    /// The engine's MoE port when the kernel is configured: the slot cache,
+    /// the staging and the grouped GEMM live behind it, so this forward never
+    /// widens a routed expert slab itself. `None` keeps the inline host path,
+    /// which is what `kernel.triton = false` still runs.
+    moe: Option<std::sync::Arc<dyn MoEExecutor>>,
 }
 
 struct TorchLayer {
@@ -656,6 +711,7 @@ impl TorchQwen3_6 {
         device: Device,
         index: std::sync::Arc<FtwIndex>,
         reader: std::sync::Arc<dyn WeightsReader>,
+        moe: Option<std::sync::Arc<dyn MoEExecutor>>,
     ) -> Result<Self> {
         let ld = Loader {
             index: &index,
@@ -776,6 +832,7 @@ impl TorchQwen3_6 {
             lm_head,
             index,
             reader,
+            moe,
         })
     }
 
@@ -937,7 +994,6 @@ impl TorchQwen3_6 {
         let layer = &self.layers[layer_idx];
         let p = &self.params;
         let dev = self.device;
-        let t = x_post.size()[0];
 
         // router: `[t, experts]`, softmax over experts, then top-k renormalized
         let logits = f32_(x_post).matmul(&f32_(&layer.gate).transpose(0, 1));
@@ -953,14 +1009,38 @@ impl TorchQwen3_6 {
         let ic2 = gate_part.silu() * up_part;
         let se = layer.shared.down.apply(&ic2, dev, &self.loader())? * se_gate.sigmoid();
 
-        // The routing decision indexes host-side banks, so it comes back to the
-        // host once per token instead of per (token, expert).
-        let ids_host = to_f32_vec(&ids);
-        let w_host = to_f32_vec(&weights);
+        // The routing decision is host-side either way: the port hands it to the
+        // slot cache, and the inline path indexes the banks with it.
+        let routed = match &self.moe {
+            Some(port) => {
+                routed_via_port(port.as_ref(), layer_idx, x_post, &ids, &weights, p, dev)?
+            }
+            None => self.routed_inline(layer_idx, x_post, &ids, &weights)?,
+        };
+        Ok(&se + &routed)
+    }
+
+    /// The routed sum without a kernel: per token, per top-k expert, widen both
+    /// NVFP4 slabs on the host and accumulate. This is the stand-in the NVFP4
+    /// Triton kernel replaces, and what `kernel.triton = false` keeps running.
+    fn routed_inline(
+        &self,
+        layer_idx: usize,
+        x_post: &Tensor,
+        ids: &Tensor,
+        weights: &Tensor,
+    ) -> Result<Tensor> {
+        let p = &self.params;
+        let t = x_post.size()[0];
+        let ids_host = to_f32_vec(ids);
+        let w_host = to_f32_vec(weights);
         let mut routed = Vec::with_capacity(t as usize);
         for tt in 0..t as usize {
             let row = x_post.narrow(0, tt as i64, 1);
-            let mut acc = Tensor::zeros([1, p.hidden_size as i64], (Kind::Float, dev.to_tch()));
+            let mut acc = Tensor::zeros(
+                [1, p.hidden_size as i64],
+                (Kind::Float, self.device.to_tch()),
+            );
             for j in 0..p.top_k {
                 let ex = ids_host[tt * p.top_k + j] as usize;
                 let wj = w_host[tt * p.top_k + j];
@@ -969,7 +1049,7 @@ impl TorchQwen3_6 {
             }
             routed.push(acc);
         }
-        Ok((&se + &Tensor::cat(&routed, 0)).reshape([t, p.hidden_size as i64]))
+        Ok(Tensor::cat(&routed, 0))
     }
 
     /// One routed expert for one token: widen its two NVFP4 slabs, apply

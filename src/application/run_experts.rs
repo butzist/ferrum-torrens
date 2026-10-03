@@ -6,7 +6,69 @@
 // decision-27 ordering (forget the dropped layer BEFORE planning) is enforced.
 
 use crate::domain::expert_cache::ExpertCache;
-use crate::domain::expert_kernel::{ExpertGemm, ExpertSlotStore, MoEError, MoEGroup};
+use crate::domain::expert_kernel::{
+    ExpertGemm, ExpertSlotStore, MoEError, MoEExecutor, MoEGroup, MoERequest,
+};
+use std::sync::{Arc, Mutex};
+
+/// The engine's `MoEExecutor`: the same three pieces `run_experts` takes, held
+/// behind one shared handle so a tower that only has `&self` can call it. The
+/// slot machine is the mutable part (it counts touches for the LRU), the two
+/// ports are `&self`, and one device cache serves every step, which is why the
+/// adapter takes its own lock.
+pub struct CachedExperts {
+    cache: Mutex<ExpertCache>,
+    store: Arc<dyn ExpertSlotStore>,
+    gemm: Arc<dyn ExpertGemm>,
+}
+
+impl CachedExperts {
+    pub fn new(
+        store: Arc<dyn ExpertSlotStore>,
+        gemm: Arc<dyn ExpertGemm>,
+        num_layers: usize,
+        num_experts: usize,
+        cache_size: usize,
+    ) -> Self {
+        Self {
+            cache: Mutex::new(ExpertCache::new(num_layers, num_experts, cache_size)),
+            store,
+            gemm,
+        }
+    }
+
+    /// Slots the machine can hand out. A step's plan needs this to be at least
+    /// the adapter's bank size, which `run_experts` checks.
+    pub fn cache_size(&self) -> usize {
+        self.locked().cache_size()
+    }
+
+    fn locked(&self) -> std::sync::MutexGuard<'_, ExpertCache> {
+        self.cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl MoEExecutor for CachedExperts {
+    fn execute<'a>(&self, req: &MoERequest<'a>, out: &mut [f32]) -> Result<(), MoEError> {
+        run_experts(
+            &mut self.locked(),
+            self.store.as_ref(),
+            self.gemm.as_ref(),
+            req.layer,
+            &ExpertStep {
+                hidden: req.hidden,
+                inter: req.inter,
+                top_k: req.top_k,
+                x: req.x,
+                experts: req.experts,
+                weights: req.weights,
+            },
+            out,
+        )
+    }
+}
 
 /// One layer's routed expert step. `experts` is dense over `tokens * top_k`,
 /// the same layout the router produces.
@@ -84,7 +146,105 @@ pub fn run_experts(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::expert_kernel::{MockExpertGemm, MockExpertSlotStore};
+    use crate::domain::expert_kernel::{
+        MoEExecutor, MoERequest, MockExpertGemm, MockExpertSlotStore,
+    };
+    use std::sync::{Arc, Mutex};
+
+    /// Routes plus the three shapes the kernel was handed.
+    type SeenKernel = (Vec<i32>, usize, usize, usize);
+
+    fn request<'a>(experts: &'a [u32], weights: &'a [f32], x: &'a [f32]) -> MoERequest<'a> {
+        MoERequest {
+            layer: 3,
+            hidden: 4,
+            inter: 2,
+            top_k: 2,
+            x,
+            experts,
+            weights,
+        }
+    }
+
+    /// The port the tower sees: expert ids go in, slot ids reach the kernel and
+    /// the kernel's output comes back in `out`.
+    #[test]
+    fn the_executor_rewrites_expert_ids_into_slots_for_the_kernel() {
+        let mut store = strict_store(4);
+        store
+            .expect_begin_layer()
+            .withf(|l| *l == 3)
+            .returning(|_| Ok(None));
+        store.expect_load().times(2).returning(|_, _, _| Ok(()));
+        let seen: Arc<Mutex<Option<SeenKernel>>> = Arc::new(Mutex::new(None));
+        let sink = seen.clone();
+        let mut gemm = MockExpertGemm::new();
+        gemm.expect_grouped_moe().returning(move |req, out| {
+            *sink.lock().unwrap() = Some((req.routes.to_vec(), req.hidden, req.inter, req.top_k));
+            for (i, o) in out.iter_mut().enumerate() {
+                *o = req.weights[i / req.hidden] * 2.0;
+            }
+            Ok(())
+        });
+        let exec = CachedExperts::new(Arc::new(store), Arc::new(gemm), 4, 8, 4);
+        let x = [1.0f32; 8];
+        let experts = [6u32, 1, 6, 1];
+        let weights = [0.25f32; 4];
+        let mut out = [0.0f32; 8];
+        exec.execute(&request(&experts, &weights, &x), &mut out)
+            .unwrap();
+
+        // The kernel is told slots, not expert ids, and it keeps the shapes.
+        let (routes, hidden, inter, top_k) = seen.lock().unwrap().clone().unwrap();
+        assert_eq!(routes.len(), 4);
+        assert!(routes.iter().all(|s| *s >= 0 && *s < 4));
+        assert_ne!(routes[0], 6);
+        assert_eq!(routes[0], routes[2]);
+        assert_eq!((hidden, inter, top_k), (4, 2, 2));
+        assert_eq!(out, [0.5f32; 8]);
+    }
+
+    /// A second step over the same layer stages nothing: the slot machine is the
+    /// executor's own state, which is why the port can be `&self`.
+    #[test]
+    fn a_repeated_step_over_one_layer_stages_nothing() {
+        let mut store = strict_store(4);
+        store
+            .expect_begin_layer()
+            .withf(|l| *l == 3)
+            .returning(|_| Ok(None));
+        store.expect_load().times(2).returning(|_, _, _| Ok(()));
+        let mut gemm = MockExpertGemm::new();
+        gemm.expect_grouped_moe().times(2).returning(|_, _| Ok(()));
+        let exec = CachedExperts::new(Arc::new(store), Arc::new(gemm), 4, 8, 4);
+        let x = [1.0f32; 8];
+        let experts = [6u32, 1, 6, 1];
+        let weights = [0.25f32; 4];
+        let mut out = [0.0f32; 8];
+        exec.execute(&request(&experts, &weights, &x), &mut out)
+            .unwrap();
+        // `store` allows no further `load` calls, so this second step only
+        // passes if both experts were still resident.
+        exec.execute(&request(&experts, &weights, &x), &mut out)
+            .unwrap();
+    }
+
+    /// A malformed request is rejected by the use case without staging
+    /// anything or launching the kernel.
+    #[test]
+    fn a_request_that_does_not_match_its_batch_never_reaches_the_adapter() {
+        let store = strict_store(4);
+        let gemm = MockExpertGemm::new();
+        let exec = CachedExperts::new(Arc::new(store), Arc::new(gemm), 4, 8, 4);
+        let x = [1.0f32; 8];
+        let experts = [6u32, 1];
+        let weights = [0.25f32; 4];
+        let mut out = [0.0f32; 8];
+        assert!(matches!(
+            exec.execute(&request(&experts, &weights, &x), &mut out),
+            Err(MoEError::Bad(_))
+        ));
+    }
 
     /// A store that answers exactly the calls the test expects and fails on
     /// any other: the plan must not copy experts that are already resident.

@@ -77,6 +77,31 @@ pub trait ExpertGemm: Send + Sync {
     fn grouped_moe<'a>(&self, req: &MoEGroup<'a>, out: &mut [f32]) -> Result<(), MoEError>;
 }
 
+/// One routed-expert layer step the way a tower hands it over: the router's
+/// dense expert ids, the top-k weights and the post-norm activations, all on
+/// the host. Slot ids deliberately do not appear here -- only the executor
+/// knows what is resident, so rewriting routes to slots is part of answering
+/// this request rather than something the arch has to do. The output is a
+/// separate `&mut`, as in `ExpertGemm`, so nothing can alias it.
+pub struct MoERequest<'a> {
+    pub layer: usize,
+    pub hidden: usize,
+    pub inter: usize,
+    pub top_k: usize,
+    pub x: &'a [f32],
+    pub experts: &'a [u32],
+    pub weights: &'a [f32],
+}
+
+/// The engine's MoE port: one call per routed layer per step. Arch-agnostic on
+/// purpose. The offload cache and the grouped GEMM are core engine obligations
+/// shared by every supported model, so an arch forward only hands over its
+/// routing decision and never widens an expert slab itself.
+#[cfg_attr(test, mockall::automock)]
+pub trait MoEExecutor: Send + Sync {
+    fn execute<'a>(&self, req: &MoERequest<'a>, out: &mut [f32]) -> Result<(), MoEError>;
+}
+
 /// Slot-major banks for the reference path: `packed [slots, rows, cols/2]`, the
 /// scales and globals the same way. This is exactly what a device slot cache
 /// holds, so the Triton kernel sees the same byte layout.

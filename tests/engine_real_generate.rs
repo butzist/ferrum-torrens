@@ -66,6 +66,43 @@ fn one_token_prediction_matches_the_oracle() {
     );
 }
 
+/// The same one-token gate with `kernel.triton = true`: the tower's routed
+/// experts go through the slot cache and the Triton kernel instead of the inline
+/// host widening, and the answer must be the same oracle token. This is the
+/// `moe_block` swap's gate -- the kernel is only allowed to change the speed.
+///
+///   cargo test --release --features "cuda,triton" --test engine_real_generate -- \
+///     one_token_through_the_kernel_matches_the_oracle --ignored --nocapture
+#[test]
+#[ignore = "requires the converted checkpoint, a cuda device and the triton feature"]
+fn one_token_through_the_kernel_matches_the_oracle() {
+    let mut cfg = config(1);
+    cfg.kernel.triton = true;
+    cfg.kernel.site_packages = std::env::var("FERRUM_KERNEL_SITE_PACKAGES")
+        .map(|s| vec![s])
+        .unwrap_or_else(|_| vec!["FreeToken/.venv/lib/python3.12/site-packages".to_string()]);
+    let engine = load_engine(&cfg).unwrap();
+    let ids = engine.encode(PROMPT).unwrap();
+    eprintln!(
+        "kernel on: {slots} slots, prompt {PROMPT:?} -> {} tokens",
+        ids.len(),
+        slots = cfg.moe.cache_size_slots
+    );
+
+    let request = make_request(&engine, 1, ids, greedy(1)).unwrap();
+    let start = Instant::now();
+    let g = generation::generate(&engine, request, 0).unwrap();
+    eprintln!("1 token in {:.1}s", start.elapsed().as_secs_f64());
+    eprintln!("text {:?}", g.text);
+
+    assert_eq!(g.tokens.len(), 1);
+    assert_eq!(
+        g.tokens[0], ORACLE_FIRST_TOKEN,
+        "the kernel path must reach the same oracle token, got {:?} ({:?})",
+        g.tokens[0], g.text
+    );
+}
+
 /// Bisect the forward with a logit lens: print what the final norm + lm_head
 /// make of the residual stream after every `EVERY`-th layer. A healthy model
 /// sharpens into sensible tokens with depth; the first layer where the reading

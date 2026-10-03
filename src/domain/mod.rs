@@ -12,6 +12,10 @@ pub mod tokenizer;
 pub mod weights;
 
 pub use expert_cache::{ExpertCache, ExpertPlan};
+pub use expert_kernel::{
+    ExpertGemm, ExpertSlabSource, ExpertSlotStore, MoEError, MoEExecutor, MoEGroup, MoERequest,
+    Part, Slab,
+};
 pub use kvcache::{
     KvcacheError, LinearStatePool, PagePool, RadixIndex, ReqPageTable, SENTINEL_PAGE,
 };
