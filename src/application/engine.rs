@@ -10,7 +10,7 @@ use std::sync::Arc;
 use crate::domain::kvcache::{CachedModel, KvCache, SequenceCache};
 use crate::domain::model::{ForwardInput, LayerProbe, Model, ModelParams};
 use crate::domain::sampling::{Rng, SamplingParams, sample};
-use crate::domain::tokenizer::{Tokenizer, TokenizerError};
+use crate::domain::tokenizer::{ChatMessage, Tokenizer, TokenizerError};
 use crate::infrastructure::torch::{CudaProbe, Device, DeviceRequest};
 
 #[derive(Debug, Clone, Copy)]
@@ -25,6 +25,8 @@ pub struct EngineLimits {
 pub enum EngineError {
     #[error("tokenizer error: {0}")]
     Tokenize(#[from] TokenizerError),
+    #[error("chat template: {0}")]
+    Chat(String),
     #[error("this engine has no kv cache, so it cannot take a cached step")]
     NoKvCache,
     #[error("cached step for uid {uid} carries no tokens")]
@@ -344,6 +346,14 @@ impl Engine {
 
     pub fn decode(&self, ids: &[u32]) -> Result<String, EngineError> {
         Ok(self.tokenizer.decode(ids)?)
+    }
+
+    /// Turn a conversation into a prompt with the checkpoint's own chat
+    /// template, ready for `encode`.
+    pub fn render_chat(&self, messages: &[ChatMessage]) -> Result<String, EngineError> {
+        self.tokenizer
+            .render_chat(messages)
+            .map_err(|e| EngineError::Chat(e.to_string()))
     }
 
     /// Diagnostic: logit-lens probes every `every`-th layer. Not a serving path.
@@ -668,6 +678,18 @@ pub(crate) mod fake {
 
         fn decode(&self, ids: &[u32]) -> Result<String, TokenizerError> {
             Ok(ids.iter().map(|&b| char::from(b as u8)).collect())
+        }
+
+        fn render_chat(&self, messages: &[ChatMessage]) -> Result<String, TokenizerError> {
+            let mut out = String::new();
+            for m in messages {
+                out.push_str(&m.role);
+                out.push('\n');
+                out.push_str(&m.content);
+                out.push('\n');
+            }
+            out.push_str("assistant\n");
+            Ok(out)
         }
     }
 

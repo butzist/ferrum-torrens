@@ -22,6 +22,7 @@ use tokio::sync::mpsc;
 
 use crate::application::engine::{Engine, EngineError};
 use crate::application::generation::{self, make_request};
+use crate::domain::ChatMessage;
 use crate::domain::sampling::SamplingParams;
 use crate::domain::scheduler::FinishReason;
 
@@ -60,6 +61,7 @@ impl AppState {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/v1/completions", post(completions))
+        .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/models", get(models))
         .route("/health", get(health))
         .with_state(Arc::new(state))
@@ -125,14 +127,32 @@ impl CompletionRequest {
     /// OpenAI field mapping onto the domain params; omitted fields fall back to
     /// the domain defaults (greedy, no top_k/top_p filtering).
     fn sampling_params(&self) -> SamplingParams {
+        CompletionRequest::params_of(
+            self.max_tokens,
+            self.temperature,
+            self.top_p,
+            self.top_k,
+            self.stop.clone(),
+            self.ignore_eos,
+        )
+    }
+
+    fn params_of(
+        max_tokens: Option<u32>,
+        temperature: Option<f32>,
+        top_p: Option<f32>,
+        top_k: Option<i64>,
+        stop: Option<Stop>,
+        ignore_eos: Option<bool>,
+    ) -> SamplingParams {
         let d = SamplingParams::default();
         SamplingParams {
-            temperature: self.temperature.unwrap_or(d.temperature),
-            top_k: self.top_k.unwrap_or(d.top_k),
-            top_p: self.top_p.unwrap_or(d.top_p),
-            ignore_eos: self.ignore_eos.unwrap_or(d.ignore_eos),
-            max_tokens: self.max_tokens.unwrap_or(d.max_tokens),
-            stop_strs: self.stop.clone().map(Stop::into_vec).unwrap_or_default(),
+            temperature: temperature.unwrap_or(d.temperature),
+            top_k: top_k.unwrap_or(d.top_k),
+            top_p: top_p.unwrap_or(d.top_p),
+            ignore_eos: ignore_eos.unwrap_or(d.ignore_eos),
+            max_tokens: max_tokens.unwrap_or(d.max_tokens),
+            stop_strs: stop.map(Stop::into_vec).unwrap_or_default(),
         }
     }
 }
@@ -162,6 +182,105 @@ pub struct Usage {
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
     pub total_tokens: usize,
+}
+
+/// `POST /v1/chat/completions`. The conversation is rendered with the
+/// checkpoint's own chat template, so the body carries turns and not a prompt.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatCompletionRequest {
+    #[serde(default)]
+    pub model: String,
+    pub messages: Vec<ChatTurn>,
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    #[serde(default)]
+    pub top_k: Option<i64>,
+    #[serde(default)]
+    pub stop: Option<Stop>,
+    #[serde(default)]
+    pub ignore_eos: Option<bool>,
+    #[serde(default)]
+    pub seed: Option<u64>,
+    #[serde(default)]
+    pub stream: Option<bool>,
+    #[serde(default)]
+    pub n: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatTurn {
+    pub role: String,
+    pub content: String,
+}
+
+impl ChatCompletionRequest {
+    fn sampling_params(&self) -> SamplingParams {
+        CompletionRequest::params_of(
+            self.max_tokens,
+            self.temperature,
+            self.top_p,
+            self.top_k,
+            self.stop.clone(),
+            self.ignore_eos,
+        )
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChatCompletionResponse {
+    pub id: String,
+    pub object: &'static str,
+    pub created: u64,
+    pub model: String,
+    pub choices: Vec<ChatChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChatChoice {
+    pub index: u32,
+    pub message: ChatMessageOut,
+    pub finish_reason: Option<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChatMessageOut {
+    pub role: &'static str,
+    pub content: String,
+}
+
+/// One streamed chat chunk: `delta` carries the role on the opening frame and
+/// the content after it, `finish_reason` only on the frame that closes it.
+#[derive(Debug, Serialize)]
+pub struct ChatChunk {
+    pub id: String,
+    pub object: &'static str,
+    pub created: u64,
+    pub model: String,
+    pub choices: Vec<ChatChunkChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChatChunkChoice {
+    pub index: u32,
+    pub delta: ChatDelta,
+    pub finish_reason: Option<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChatDelta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<&'static str>,
+    pub content: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -243,6 +362,7 @@ impl From<EngineError> for ApiError {
                 ApiError::unprocessable(format!("prompt has {len} tokens, over the {max} limit"))
             }
             Tokenize(m) => ApiError::bad_request(format!("prompt could not be tokenized: {m}")),
+            Chat(m) => ApiError::bad_request(m),
             BadLogits { got, want } => {
                 ApiError::unprocessable(format!("model returned {got} logits, expected {want}"))
             }
@@ -308,7 +428,16 @@ async fn completions(
     let prompt = req.prompt;
 
     if req.stream.unwrap_or(false) {
-        return Ok(stream_completions(&state, &engine, uid, prompt, params, seed).await);
+        let tokenizer = Arc::clone(&engine);
+        let encoded = tokio::task::spawn_blocking(move || tokenizer.encode(&prompt))
+            .await
+            .expect("encoding task is not cancellable");
+        let ids = match encoded {
+            Ok(ids) => ids,
+            Err(e) => return Err(ApiError::from(e)),
+        };
+        let request = make_request(&engine, uid, ids, params)?;
+        return Ok(stream_body(&state, &engine, request, seed, Wire::Text));
     }
 
     // The forward pass is CPU-bound and long-running; never on the runtime.
@@ -363,29 +492,42 @@ fn usage_of(g: &generation::Generation) -> Usage {
 /// through a bounded channel: a slow client holds the run back instead of
 /// buffering it, and a client that hangs up closes the channel, which stops the
 /// run.
-async fn stream_completions(
+/// Which wire shape a stream speaks: `/v1/completions` frames carry `text`,
+/// `/v1/chat/completions` frames carry a `delta`.
+#[derive(Clone, Copy)]
+enum Wire {
+    Text,
+    Chat,
+}
+
+impl Wire {
+    fn id(self, uid: u64) -> String {
+        match self {
+            Wire::Text => format!("cmpl-{uid}"),
+            Wire::Chat => format!("chatcmpl-{uid}"),
+        }
+    }
+}
+
+/// `stream: true`: one `data: {...}` frame per token as it is sampled, a frame
+/// carrying the finish reason plus the usage, then `data: [DONE]`.
+///
+/// The prompt is tokenized and clamped before the stream starts, so a bad
+/// request is still an ordinary JSON error with its status code. Everything
+/// after that has already sent headers, so a failure mid-run rides on the stream
+/// as an `error` frame. The generation runs on a blocking task and pushes frames
+/// through a bounded channel: a slow client holds the run back instead of
+/// buffering it, and a client that hangs up closes the channel, which stops the
+/// run.
+fn stream_body(
     state: &Arc<AppState>,
     engine: &Arc<Engine>,
-    uid: u64,
-    prompt: String,
-    params: SamplingParams,
+    request: generation::Request,
     seed: u64,
+    wire: Wire,
 ) -> Response {
-    let tokenizer = Arc::clone(engine);
-    let encoded = tokio::task::spawn_blocking(move || tokenizer.encode(&prompt))
-        .await
-        .expect("encoding task is not cancellable");
-    let ids = match encoded {
-        Ok(ids) => ids,
-        Err(e) => return ApiError::from(e).into_response(),
-    };
-    let request = match make_request(engine, uid, ids, params) {
-        Ok(r) => r,
-        Err(e) => return ApiError::from(e).into_response(),
-    };
-
     let (tx, rx) = mpsc::channel::<String>(8);
-    let id = format!("cmpl-{uid}");
+    let id = wire.id(request.uid);
     let created = unix_now();
     let model = state.served_model_name.clone();
     let engine = Arc::clone(engine);
@@ -393,23 +535,60 @@ async fn stream_completions(
     tokio::task::spawn_blocking(move || {
         let send = |frame: String| sink_tx.blocking_send(frame).is_ok();
         let push = |text: &str, finish: Option<&'static str>, usage: Option<Usage>| {
-            let chunk = CompletionResponse {
-                id: id.clone(),
-                object: "text_completion",
-                created,
-                model: model.clone(),
-                choices: vec![CompletionChoice {
-                    text: text.to_string(),
-                    index: 0,
-                    logprobs: None,
-                    finish_reason: finish,
-                }],
-                usage,
+            let payload = match wire {
+                Wire::Text => serde_json::to_string(&CompletionResponse {
+                    id: id.clone(),
+                    object: "text_completion",
+                    created,
+                    model: model.clone(),
+                    choices: vec![CompletionChoice {
+                        text: text.to_string(),
+                        index: 0,
+                        logprobs: None,
+                        finish_reason: finish,
+                    }],
+                    usage,
+                }),
+                Wire::Chat => serde_json::to_string(&ChatChunk {
+                    id: id.clone(),
+                    object: "chat.completion.chunk",
+                    created,
+                    model: model.clone(),
+                    choices: vec![ChatChunkChoice {
+                        index: 0,
+                        delta: ChatDelta {
+                            role: (finish.is_none() && text.is_empty()).then_some("assistant"),
+                            content: text.to_string(),
+                        },
+                        finish_reason: finish,
+                    }],
+                    usage,
+                }),
             };
-            send(sse_data(
-                &serde_json::to_string(&chunk).expect("chunk serializes"),
-            ))
+            send(sse_data(&payload.expect("chunk serializes")))
         };
+
+        if let Wire::Chat = wire {
+            // The opening frame names the role before any content arrives.
+            send(sse_data(
+                &serde_json::to_string(&ChatChunk {
+                    id: id.clone(),
+                    object: "chat.completion.chunk",
+                    created,
+                    model: model.clone(),
+                    choices: vec![ChatChunkChoice {
+                        index: 0,
+                        delta: ChatDelta {
+                            role: Some("assistant"),
+                            content: String::new(),
+                        },
+                        finish_reason: None,
+                    }],
+                    usage: None,
+                })
+                .expect("chunk serializes"),
+            ));
+        }
 
         match generation::generate_streaming(
             &engine,
@@ -447,6 +626,87 @@ async fn stream_completions(
         .header(header::CACHE_CONTROL, "no-cache")
         .body(body)
         .expect("a static response builder succeeds")
+}
+
+async fn chat_completions(
+    State(state): State<Arc<AppState>>,
+    payload: Result<Json<ChatCompletionRequest>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    let Json(req) =
+        payload.map_err(|e| ApiError::bad_request(format!("invalid json body: {e}")))?;
+
+    if !req.model.is_empty() && req.model != state.served_model_name {
+        return Err(ApiError::not_found(format!(
+            "model {} not found, this server serves {}",
+            req.model, state.served_model_name
+        )));
+    }
+    if req.n.unwrap_or(1) != 1 {
+        return Err(ApiError::unprocessable("only n=1 is supported"));
+    }
+    if req.messages.is_empty() {
+        return Err(ApiError::bad_request("messages must not be empty"));
+    }
+
+    let uid = state.next_uid();
+    let engine = Arc::clone(&state.engine);
+    let params = req.sampling_params();
+    let seed = req.seed.unwrap_or(uid);
+    let streaming = req.stream.unwrap_or(false);
+    let messages: Vec<ChatMessage> = req
+        .messages
+        .iter()
+        .map(|t| ChatMessage::new(&t.role, &t.content))
+        .collect();
+
+    // Rendering the template and tokenizing it both run off the runtime, and both
+    // still have to answer with a status code rather than a frame.
+    let worker = Arc::clone(&engine);
+    let prepared =
+        tokio::task::spawn_blocking(move || -> Result<generation::Request, EngineError> {
+            let prompt = worker.render_chat(&messages)?;
+            let ids = worker.encode(&prompt)?;
+            make_request(&worker, uid, ids, params)
+        })
+        .await
+        .expect("preparation task is not cancellable");
+    let request = match prepared {
+        Ok(r) => r,
+        Err(e) => return Err(ApiError::from(e)),
+    };
+
+    if streaming {
+        return Ok(stream_body(&state, &engine, request, seed, Wire::Chat));
+    }
+
+    let outcome =
+        tokio::task::spawn_blocking(move || generation::generate(&engine, request, seed)).await;
+    let generated = match outcome {
+        Ok(Ok(g)) => g,
+        Ok(Err(e)) => return Err(ApiError::from(e)),
+        Err(join) => {
+            return Err(ApiError::unprocessable(format!(
+                "generation task failed: {join}"
+            )));
+        }
+    };
+    let usage = usage_of(&generated);
+    Ok(Json(ChatCompletionResponse {
+        id: format!("chatcmpl-{}", generated.uid),
+        object: "chat.completion",
+        created: unix_now(),
+        model: state.served_model_name.clone(),
+        choices: vec![ChatChoice {
+            index: 0,
+            message: ChatMessageOut {
+                role: "assistant",
+                content: generated.text,
+            },
+            finish_reason: Some(finish_reason_str(generated.finish_reason)),
+        }],
+        usage: Some(usage),
+    })
+    .into_response())
 }
 
 fn sse_data(payload: &str) -> String {
@@ -496,9 +756,184 @@ mod tests {
     use tower::ServiceExt;
 
     fn test_router() -> Router {
-        let (engine, _) = test_engine(limits());
+        test_router_with_rec().0
+    }
+
+    /// The fake tokenizer renders `"{role}\n{content}\n"` per turn plus the
+    /// `assistant\n` generation prompt, and encodes bytes one to one.
+    fn rendered(system: &str, user: &str) -> String {
+        format!("system\n{system}\nuser\n{user}\nassistant\n")
+    }
+
+    /// The fake model answers with the counter one past the prompt's last id, so
+    /// the expected tokens follow from the rendered prompt.
+    fn fake_tokens(prompt: &str, n: usize) -> Vec<u32> {
+        let last = u32::from(*prompt.as_bytes().last().expect("a prompt"));
+        (1..=n as u32).map(|i| last + i).collect()
+    }
+
+    fn fake_text(tokens: &[u32]) -> String {
+        tokens.iter().map(|&b| char::from(b as u8)).collect()
+    }
+
+    fn test_router_with_rec() -> (Router, Recorder) {
+        let (engine, rec) = test_engine(limits());
         let state = AppState::new(Arc::new(engine), "test-model".to_string());
-        router(state)
+        (router(state), rec)
+    }
+
+    async fn post_chat(router: Router, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+        let response = router
+            .oneshot(
+                Request::post("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    async fn post_chat_sse(body: serde_json::Value) -> Vec<String> {
+        let response = test_router()
+            .oneshot(
+                Request::post("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec())
+            .unwrap()
+            .split("\n\n")
+            .filter(|f| !f.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn chunk_of(frame: &str) -> serde_json::Value {
+        serde_json::from_str(&frame[6..]).expect("a data frame holds one json")
+    }
+
+    #[tokio::test]
+    async fn chat_completions_answer_with_the_rendered_template() {
+        let (router, rec) = test_router_with_rec();
+        let (status, body) = post_chat(
+            router,
+            serde_json::json!({
+                "model": "test-model",
+                "messages": [
+                    { "role": "system", "content": "be brief" },
+                    { "role": "user", "content": "ab" }
+                ],
+                "max_tokens": 3,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["object"], "chat.completion");
+        assert!(body["id"].as_str().unwrap().starts_with("chatcmpl-"));
+        assert_eq!(body["choices"][0]["message"]["role"], "assistant");
+        assert_eq!(
+            body["choices"][0]["message"]["content"],
+            fake_text(&fake_tokens(&rendered("be brief", "ab"), 3))
+        );
+        assert_eq!(body["choices"][0]["finish_reason"], "length");
+        assert_eq!(
+            body["usage"]["prompt_tokens"],
+            rendered("be brief", "ab").len()
+        );
+        assert_eq!(body["usage"]["completion_tokens"], 3);
+
+        let prompt: Vec<u32> = rendered("be brief", "ab").bytes().map(u32::from).collect();
+        assert_eq!(
+            rec.calls()[0].input_ids,
+            prompt,
+            "the model must see the template-rendered prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chat_stream_opens_with_the_role_then_streams_content() {
+        let frames = post_chat_sse(serde_json::json!({
+            "messages": [
+                { "role": "system", "content": "be brief" },
+                { "role": "user", "content": "ab" }
+            ],
+            "max_tokens": 3,
+            "stream": true,
+        }))
+        .await;
+        assert_eq!(frames.len(), 6, "role, 3 tokens, the final frame, [DONE]");
+
+        let opening = chunk_of(&frames[0]);
+        assert_eq!(opening["object"], "chat.completion.chunk");
+        assert_eq!(opening["choices"][0]["delta"]["role"], "assistant");
+        assert_eq!(opening["choices"][0]["delta"]["content"], "");
+        assert!(opening["choices"][0]["finish_reason"].is_null());
+
+        let contents: Vec<String> = frames[1..4]
+            .iter()
+            .map(|f| {
+                chunk_of(f)["choices"][0]["delta"]["content"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            contents,
+            fake_tokens(&rendered("be brief", "ab"), 3)
+                .iter()
+                .map(|&b| char::from(b as u8).to_string())
+                .collect::<Vec<String>>()
+        );
+        assert!(
+            frames[1..4]
+                .iter()
+                .all(|f| chunk_of(f)["choices"][0]["delta"].get("role").is_none()),
+            "only the opening frame names the role"
+        );
+
+        let last = chunk_of(&frames[4]);
+        assert_eq!(last["choices"][0]["finish_reason"], "length");
+        assert_eq!(last["choices"][0]["delta"]["content"], "");
+        assert_eq!(last["usage"]["completion_tokens"], 3);
+        assert_eq!(frames[5], "data: [DONE]");
+    }
+
+    #[tokio::test]
+    async fn an_empty_conversation_is_400() {
+        let (status, body) = post_chat(test_router(), serde_json::json!({ "messages": [] })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("messages")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turn_with_an_unknown_field_is_400() {
+        let (status, _) = post_chat(
+            test_router(),
+            serde_json::json!({
+                "messages": [{ "role": "user", "content": "a", "name": "bob" }]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     async fn post_json(body: serde_json::Value) -> (StatusCode, serde_json::Value) {

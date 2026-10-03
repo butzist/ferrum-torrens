@@ -21,7 +21,15 @@ within 2e-6 of scale, decision 33), and the engine decodes off it: one page
 table per request, and a forward without a cache still re-feeds the prefix to the
 same tokens. `stream: true` now streams: one SSE frame per sampled token off a
 `TokenSink`, the finish reason and usage on the closing frame, `[DONE]` after it
-(bad prompts still fail before the headers). Last finished: SSE on
+(bad prompts still fail before the headers), on both endpoints. The chat surface
+is in too: `POST /v1/chat/completions` renders the conversation with the
+checkpoint's own template on minijinja (Python string methods rewritten to
+filters, decision 34), then runs the same engine loop, so a chat turn and the
+equivalent `/v1/completions` prompt share one code path. The rendered prompt
+encodes to the ids `transformers.apply_chat_template` gives on the same
+checkpoint (22 ids for a system+user turn) and the gated
+`a_chat_request_answers_from_the_rendered_template` answers from it. Last
+finished: `/v1/chat/completions`. Before that SSE on
 `/v1/completions`. Before that the cached decode loop. Before that the
 `moe_block` swap, on top of M1b -- the
 libtorch tower matches the FreeToken oracle: gated
@@ -424,7 +432,7 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 ### Scheduler
 - [x] P0 in-process tokenize/detokenize.
 - [x] P0 `POST /v1/completions` (non-stream, n=1, `cmpl-{uid}` ids, usage block, `spawn_blocking` for the forward), `GET /v1/models`, `GET /health`. (`infrastructure/http.rs`, `main.rs`)
-- [x] P0 SSE framing `data: {json}\n\n` + `data: [DONE]`; usage block. (`/v1/completions`; `chatcmpl-{uid}` ids land with `/v1/chat/completions`)
+- [x] P0 SSE framing `data: {json}\n\n` + `data: [DONE]`; usage block. (both `/v1/completions` and `/v1/chat/completions`)
 - [x] P0 streaming (`stream: true`): one frame per sampled token as it is produced (`generation::TokenSink`), a frame with the finish reason and the usage, then `[DONE]`; a bad prompt is still a JSON error with its status, a client that hangs up aborts the run, a slow one holds it back. (`infrastructure/http.rs`)
 - [ ] P0 `presence_penalty`/`frequency_penalty`/`best_of`/`user` still 400 (`deny_unknown_fields`).
 - [x] P0 strict prefill-priority `schedule_next_batch()`; chunked prefill budget `max_prefill_length`; no decode starvation guard in v0 (mirror FreeToken, note as known issue). (simple M1 form in `domain/scheduler.rs`)
@@ -441,10 +449,10 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
   renormalize, deterministic splitmix64 draw. CUDA kernel parity later.
 
 ### Server (axum recommended)
-- [ ] P0 `POST /v1/chat/completions` stream + non-stream (n=1), reasoning-free.
+- [x] P0 `POST /v1/chat/completions` stream + non-stream (n=1), reasoning-free.
 - [x] P0 `POST /v1/completions` (stream single prompt), `GET /v1/models`, `GET /health`.
 - [x] P0 SSE framing `data: {json}\n\n` + `data: [DONE]`; usage block.
-- [ ] P0 chat template render via `tokenizers` crate + minijinja (`tokenizer_config.json` in the FTW/model dir; tools not supported in v0).
+- [x] P0 chat template render via `tokenizers` crate + minijinja (`chat_template.jinja`, else `tokenizer_config.json`; Python string methods rewritten, decision 34; tools not supported in v0).
 - [ ] [opt] Anthropic `/v1/messages` (incl. `/v1/messages/count_tokens`).
 - [ ] [opt] `/v1/responses` (needed only for Codex).
 
@@ -838,6 +846,29 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
     is switched on until the decode path is proven end to end and the bytes are
     actually the binding constraint. Recorded so the number is a decision, not an
     accident.
+
+34. **The chat template runs on minijinja with a Python-method rewrite pass**
+    (2026-10-03) -- HF renders chat templates with python's jinja2, where
+    `content` is a `str` and so carries methods; minijinja strings do not. The
+    adapter (`infrastructure/tokenizers_hf.rs`) rewrites the handful of methods a
+    template may call (`startswith`, `endswith`, `split`, `lstrip`, `rstrip`) into
+    same-named filters, exposes `raise_exception` as a global (the template uses it
+    to reject a bad conversation), and renders with `add_generation_prompt=true`,
+    `enable_thinking=true`, `tools=null`, which is what FreeToken's tokenize
+    manager passes. Everything minijinja still cannot do fails the render with
+    minijinja's own message rather than falling back to a hand-rolled prompt, so
+    a template the engine cannot honour is a 400 and not a silently wrong prompt.
+    The converted FTW template turned out to need only `split`/`lstrip`/`rstrip`
+    plus `namespace`, so the rewrite is small; it is still a rewrite because the
+    template text belongs to the checkpoint and must not be patched here.
+    Oracle: the rendered prompt for `[system "be brief", user "The capital of
+    France is"]` must encode to the same 22 ids
+    `transformers.apply_chat_template(..., add_generation_prompt=True)` produces
+    on the same checkpoint (`real_checkpoint_chat_template_matches_the_transformers_oracle`,
+    CPU-only, so it runs in `cargo test` when `.model-cache` is present). Note the
+    per-token oracle `ORACLE_FIRST_TOKEN` (" Paris") belongs to the *bare*
+    completions prompt; a templated conversation answers differently, so the chat
+    gate pins its own token and checks the ids instead.
 
 ### Config defaults for the RTX 5060 / 8 GB target
 

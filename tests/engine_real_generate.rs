@@ -16,6 +16,7 @@ use std::time::Instant;
 use ferrum_torrens::application::engine::{BatchRow, load_engine};
 use ferrum_torrens::application::generation::{self, make_request};
 use ferrum_torrens::config::Config;
+use ferrum_torrens::domain::ChatMessage;
 use ferrum_torrens::domain::sampling::{Rng, SamplingParams};
 use ferrum_torrens::domain::scheduler::FinishReason;
 
@@ -23,6 +24,18 @@ const FTW_DIR: &str = ".model-cache/Qwen3.6-35B-A3B-NVFP4.ftw";
 const PROMPT: &str = "The capital of France is";
 /// Token id of " Paris" in this checkpoint's tokenizer.
 const ORACLE_FIRST_TOKEN: u32 = 11751;
+/// The ids `transformers` produces for the templated conversation below, from
+/// `apply_chat_template(msgs, add_generation_prompt=True, enable_thinking=True)`
+/// on this checkpoint.
+const CHAT_TEMPLATE_ORACLE_IDS: &[u32] = &[
+    248045, 8678, 198, 1323, 9522, 248046, 198, 248045, 846, 198, 760, 6511, 314, 9338, 369,
+    248046, 198, 248045, 74455, 198, 248068, 198,
+];
+/// Regression pin for the templated conversation, not a reference-server oracle:
+/// `ORACLE_FIRST_TOKEN` is the bare completions prompt, this run sees the system
+/// turn and the open thinking block, so the model answers differently. Re-check it
+/// with a GPU run of the FreeToken reference server.
+const CHAT_PIN_FIRST_TOKEN: u32 = 8160;
 
 fn config(max_output_tokens: u32) -> Config {
     format!(
@@ -63,6 +76,39 @@ fn one_token_prediction_matches_the_oracle() {
         g.tokens[0], ORACLE_FIRST_TOKEN,
         "greedy next token must match the FreeToken GPU oracle ({ORACLE_FIRST_TOKEN} = \" Paris\"), got {:?} ({:?})",
         g.tokens[0], g.text
+    );
+}
+
+/// The chat path end to end: the checkpoint's own chat template renders the
+/// conversation and the model answers from that prompt.
+///
+/// The ids are the transformers oracle for this exact conversation, which is what
+/// catches a template rendered to the wrong thing. The token is a pin rather than
+/// an oracle, see `CHAT_PIN_FIRST_TOKEN`.
+///
+///   cargo test --release --features cuda --test engine_real_generate -- \
+///     a_chat_request_answers_from_the_rendered_template --ignored --nocapture
+#[test]
+#[ignore = "requires converted checkpoint in .model-cache"]
+fn a_chat_request_answers_from_the_rendered_template() {
+    let engine = load_engine(&config(1)).unwrap();
+    let conversation = [
+        ChatMessage::new("system", "be brief"),
+        ChatMessage::new("user", PROMPT),
+    ];
+    let prompt = engine.render_chat(&conversation).unwrap();
+    let ids = engine.encode(&prompt).unwrap();
+    assert_eq!(
+        ids, CHAT_TEMPLATE_ORACLE_IDS,
+        "the template must render the transformers prompt, got {prompt:?}"
+    );
+
+    let request = make_request(&engine, 1, ids, greedy(1)).unwrap();
+    let g = generation::generate(&engine, request, 0).unwrap();
+    assert_eq!(
+        g.tokens[0], CHAT_PIN_FIRST_TOKEN,
+        "the templated conversation must answer the pinned token, got {:?}",
+        g.text
     );
 }
 
