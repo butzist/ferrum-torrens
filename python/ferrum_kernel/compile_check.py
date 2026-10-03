@@ -63,7 +63,6 @@ def _gemv_sig(a_dtype: str, packed_dtype: str = "u8", scale_dtype: str = "fp8e4n
         "BLOCK_N": "constexpr",
         "BLOCK_KB": "constexpr",
         "MUL_WEIGHT": "constexpr",
-        "compute_type": "constexpr",
     }
 
 
@@ -137,7 +136,6 @@ def main() -> int:
                         "BLOCK_N": DECODE_BLOCK_N,
                         "BLOCK_KB": DECODE_BLOCK_KB,
                         "MUL_WEIGHT": weighted,
-                        "compute_type": tl_dtypes[a_dtype],
                     },
                 )
             except Exception as e:  # noqa: BLE001

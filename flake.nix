@@ -176,7 +176,7 @@
                 # ''${...} so nix emits the shell's own ''${...} instead of trying
                 # to evaluate it: "if already set, keep the old value last".
                 # ''${...} escapes nix interpolation; the shell then reads its own
-                # ${...}, i.e. append the old value only if it was already set.
+                # ''${...}, i.e. append the old value only if it was already set.
                 export LD_LIBRARY_PATH="$libstdcxx:/run/opengl-driver/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
               fi
             fi

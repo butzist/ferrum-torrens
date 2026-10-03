@@ -61,6 +61,20 @@ def require_native_e4m3(device: torch.device) -> None:
         )
 
 
+def _check_constexprs(values: dict) -> None:
+    """A `torch.dtype` handed to a `tl.constexpr` parameter does not fail where
+    it is passed: triton treats it as a value, and the launch dies deep in the
+    jit's own frame with "'torch.dtype' object has no attribute 'scalar'". Use
+    `ptr.dtype.element_ty` inside the kernel instead and reject the object here,
+    where the message can name the parameter."""
+    for name, value in values.items():
+        if isinstance(value, torch.dtype):
+            raise TypeError(
+                f"kernel constexpr {name} is a torch.dtype; a kernel reads the "
+                f"element type off its pointer (ptr.dtype.element_ty)"
+            )
+
+
 @triton.jit
 def _nvfp4_gemv_kernel(
     a_ptr,  # [M, K] activations, compute dtype
@@ -83,7 +97,6 @@ def _nvfp4_gemv_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_KB: tl.constexpr,
     MUL_WEIGHT: tl.constexpr,
-    compute_type: tl.constexpr,
 ):
     """One route's GEMV: `c[r] = w[r] * (global * sum_k a[token, k] * W[slot, k])`.
 
@@ -151,7 +164,7 @@ def _nvfp4_gemv_kernel(
 
     tl.store(
         c_ptr + route * stride_cm + offs_n * stride_cn,
-        acc.to(compute_type),
+        acc.to(c_ptr.dtype.element_ty),
         mask=n_mask,
     )
 
@@ -221,6 +234,12 @@ def _gemv(
     assert K // 2 == k_bytes, f"K {K} vs packed {k_bytes}"
     require_native_e4m3(a.device)
     grid = (route_slot.numel(), triton.cdiv(N, DECODE_BLOCK_N))
+    consts = {
+        "BLOCK_N": DECODE_BLOCK_N,
+        "BLOCK_KB": DECODE_BLOCK_KB,
+        "MUL_WEIGHT": mul_weight,
+    }
+    _check_constexprs(consts)
     _nvfp4_gemv_kernel[grid](
         a, packed, scale, glob, c, route_token, route_slot, route_weight,
         _e2m1_lut(a.device),
@@ -230,10 +249,7 @@ def _gemv(
         scale.stride(0), scale.stride(1), scale.stride(2),
         glob.stride(0), glob.stride(1),
         c.stride(0), c.stride(1),
-        BLOCK_N=DECODE_BLOCK_N,
-        BLOCK_KB=DECODE_BLOCK_KB,
-        MUL_WEIGHT=mul_weight,
-        compute_type=c.dtype,
+        **consts,
         num_warps=DECODE_WARPS,
     )
 

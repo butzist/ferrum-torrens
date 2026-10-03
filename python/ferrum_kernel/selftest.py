@@ -17,7 +17,7 @@ import sys
 
 import torch
 
-from .nvfp4_moe import grouped_moe, require_native_e4m3
+from .nvfp4_moe import _check_constexprs, grouped_moe, require_native_e4m3
 
 E4M1_LUT = torch.tensor(
     [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
@@ -101,6 +101,17 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--tol", type=float, default=2e-2)
     args = ap.parse_args(argv)
+
+    # A torch dtype in a `tl.constexpr` dict only fails inside triton's jit, with
+    # a message about `.scalar()` that names neither the kernel nor the argument.
+    _check_constexprs({"BLOCK_N": 128, "MUL_WEIGHT": True})
+    try:
+        _check_constexprs({"compute_type": torch.float32})
+    except TypeError as e:
+        print(f"constexpr guard: {e}")
+    else:
+        print("FAIL: a torch.dtype passed the constexpr guard", file=sys.stderr)
+        return 1
 
     for seed in range(4):
         x, gu, dn, slot, token, weight = random_case(args.device, seed=seed)
