@@ -870,6 +870,40 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
     completions prompt; a templated conversation answers differently, so the chat
     gate pins its own token and checks the ids instead.
 
+35. **The kernel python comes from nixpkgs; FreeToken keeps its venv**
+    (2026-10-03) -- the pyo3 CUDA bootstrap failure (decision 32) is a
+    two-libtorch problem, not a missing-package one. `libtorch.so` has one
+    SONAME, so whichever copy the process loads first is the one every later
+    `libtorch_python.so` binds against; that is why torch's
+    `Cannot initialize CUDA without ATen_cuda library` shows up. Nix cannot fix
+    it by supplying torch, because the two sides cannot be made equal here:
+    tch 0.22 links `pkgs.libtorch-bin` (2.9.0, cu130) while nixpkgs'
+    `python3Packages.torch` is 2.13.0 (cu12), and unifying would mean either
+    bumping tch onto 2.13's C++ ABI (the whole validated libtorch adapter moves
+    with it) or pinning nixpkgs to the 2.11 that FreeToken wants. What nix *can*
+    remove is torch itself from the kernel path: `import triton` does not pull
+    torch in (checked on the venv's triton 3.6), so the interpreter pyo3 embeds
+    needs triton only, and the kernel call itself takes raw device pointers
+    (decision 30). So the devShell gained
+    `pythonEnv = python3.withPackages (ps: [ ps.torch ps.triton ])` and
+    `PYO3_PYTHON` points at it, which also makes the kernel selftest and the
+    oracle work runnable without FreeToken/.venv. `ft checkpoint` keeps the venv:
+    FreeToken pins `torch>=2.11,<2.12` plus `sglang-kernel` 0.4.5, whose libtorch
+    symbols exist only in 2.11, so the nix torch cannot satisfy it.
+    Verified after the reload: the nix env is torch 2.13.0/cu12.9 with triton
+    3.7.1, the kernel selftest passes on it unchanged (rel ~7e-7, same tolerances
+    as the venv's triton 3.6), `import triton` alone still does not pull torch in
+    on 3.7.1, and `cargo test --features triton` is green. There is no `withCuda`
+    argument to add: `torch` takes `cudaSupport`, which defaults to
+    `config.cudaSupport`, which defaults to true, so it is already the CUDA build
+    (`ps.torch-bin` is the same package off the official +cu130 wheel if the
+    source build ever matters). The one non-obvious requirement: an embedded
+    interpreter takes `sys.prefix` from the host binary, not from the python it
+    was built against, so `PYTHONPATH` has to name
+    `${pythonEnv}/${pkgs.python3.sitePackages}` explicitly or `import torch`
+    finds nothing inside pyo3. The two interpreter-only triton tests skip
+    silently when torch is missing, so they need `--nocapture` to prove they ran.
+
 ### Config defaults for the RTX 5060 / 8 GB target
 
 ```
