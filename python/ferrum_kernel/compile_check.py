@@ -47,7 +47,7 @@ def _gemv_sig(a_dtype: str, packed_dtype: str = "u8", scale_dtype: str = "fp8e4n
         "lut_ptr": "*fp32",
         "M": "i32",
         "N": "i32",
-        "K": "i32",
+        "K_BYTES": "constexpr",
         "stride_am": "i32",
         "stride_ak": "i32",
         "stride_pe": "i64",
@@ -133,6 +133,9 @@ def main() -> int:
                     _nvfp4_gemv_kernel,
                     _gemv_sig(a_dtype, c_dtype=a_dtype),
                     {
+                        # One hidden size and one intermediate size in a serving
+                        # checkpoint; both are constexpr trip counts.
+                        "K_BYTES": 1024,
                         "BLOCK_N": DECODE_BLOCK_N,
                         "BLOCK_KB": DECODE_BLOCK_KB,
                         "MUL_WEIGHT": weighted,

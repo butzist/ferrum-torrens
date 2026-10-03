@@ -93,12 +93,12 @@ def _nvfp4_gemv_kernel(
     lut_ptr,  # [16] f32
     M,
     N,
-    K,
     stride_am, stride_ak,
     stride_pe, stride_pn, stride_pkb,
     stride_se, stride_sn, stride_sblk,
     stride_ge, stride_gn,
     stride_cm, stride_cn,
+    K_BYTES: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_KB: tl.constexpr,
     MUL_WEIGHT: tl.constexpr,
@@ -122,7 +122,7 @@ def _nvfp4_gemv_kernel(
     a_base = a_ptr + token * stride_am
 
     offs_kb = tl.arange(0, BLOCK_KB)
-    k_bytes = K // 2
+    k_bytes = K_BYTES
     packed_slot = packed_ptr + slot * stride_pe
     scale_slot = scale_ptr + slot * stride_se
     acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
@@ -240,6 +240,7 @@ def _gemv(
     require_native_e4m3(a.device)
     grid = (route_slot.numel(), triton.cdiv(N, DECODE_BLOCK_N))
     consts = {
+        "K_BYTES": K // 2,
         "BLOCK_N": DECODE_BLOCK_N,
         "BLOCK_KB": DECODE_BLOCK_KB,
         "MUL_WEIGHT": mul_weight,
@@ -248,7 +249,7 @@ def _gemv(
     _nvfp4_gemv_kernel[grid](
         a, packed, scale, glob, c, route_token, route_slot, route_weight,
         _e2m1_lut(a.device),
-        M, N, K,
+        M, N,
         a.stride(0), a.stride(1),
         packed.stride(0), packed.stride(1), packed.stride(2),
         scale.stride(0), scale.stride(1), scale.stride(2),
