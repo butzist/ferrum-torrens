@@ -204,6 +204,18 @@ pub fn prepend_kernel_paths<'py>(
     site_packages: &[PathBuf],
     python_path: &Path,
 ) -> Result<(), MoEError> {
+    for dir in site_packages {
+        if !dir.is_dir() {
+            return Err(err(
+                "kernel site-packages",
+                format!(
+                    "{} does not exist: recreate FreeToken/.venv (see AGENTS.md) or point \
+                     FERRUM_KERNEL_SITE_PACKAGES at the torch/triton install",
+                    dir.display()
+                ),
+            ));
+        }
+    }
     let sys = py.import("sys").map_err(|e| err("import sys", e))?;
     let path = attribute(&sys, "path", "sys.path")?;
     for dir in site_packages
@@ -621,6 +633,24 @@ impl TritonMoE {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A refreshed `FreeToken/` checkout takes the untracked venv with it, and
+    /// the symptom is a bare "No module named 'torch'" from deep inside the
+    /// kernel module. Name the missing directory instead.
+    #[test]
+    fn a_missing_site_packages_dir_is_reported_as_such() {
+        let err = Python::attach(|py| {
+            prepend_kernel_paths(
+                py,
+                &[PathBuf::from("/nonexistent/site-packages")],
+                Path::new("python"),
+            )
+            .unwrap_err()
+        });
+        let msg = err.to_string();
+        assert!(msg.contains("/nonexistent/site-packages"), "{msg}");
+        assert!(msg.contains("does not exist"), "{msg}");
+    }
 
     /// `torch.frombuffer` takes `dtype` as a keyword. Verified for real only
     /// where torch imports (devshell: the loader path comes from the
