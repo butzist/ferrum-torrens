@@ -1,0 +1,3 @@
+[submodule "FreeToken"]
+	path = FreeToken
+	url = https://github.com/FlashML-org/FreeToken
