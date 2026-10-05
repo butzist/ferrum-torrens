@@ -156,6 +156,13 @@ pub struct MoERequest<'a> {
 #[cfg_attr(test, mockall::automock)]
 pub trait MoEExecutor: Send + Sync {
     fn execute<'a>(&self, req: &MoERequest<'a>, out: &mut [f32]) -> Result<(), MoEError>;
+
+    /// How many steps this executor has run since it was built. A forward that
+    /// widens routed experts on the host answers with the same logits as one
+    /// that goes through this port, so this is the only way a caller (or a gate)
+    /// can tell which one actually happened. No default: an adapter that cannot
+    /// count must say so rather than report zero.
+    fn steps(&self) -> u64;
 }
 
 /// Slot-major banks for the reference path: `packed [slots, rows, cols/2]`, the

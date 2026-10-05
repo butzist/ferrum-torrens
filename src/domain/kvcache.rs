@@ -505,6 +505,15 @@ pub trait CachedModel: Model {
         None
     }
 
+    /// How many routed-expert steps this forward has run through its MoE port.
+    /// Zero means the experts were widened on the host, which is what the
+    /// default says: a forward with no kernel port has nothing to count. Kept
+    /// beside `cache()` because both answer "was the kernel in the loop", and
+    /// both are what a gate needs to tell the two paths apart.
+    fn expert_steps(&self) -> u64 {
+        0
+    }
+
     /// Advance `cache` over `input`'s tokens and return the last token's logits.
     ///
     /// The default re-runs the whole prefix and ignores the cache, which is

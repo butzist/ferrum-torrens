@@ -113,32 +113,36 @@ fn a_chat_request_answers_from_the_rendered_template() {
 }
 
 /// The same one-token gate with `kernel.triton = true`: the tower's routed
-/// experts go through the slot cache and the Triton kernel instead of the inline
-/// host widening, and the answer must be the same oracle token. This is the
-/// `moe_block` swap's gate -- the kernel is only allowed to change the speed.
+/// experts go through the slot cache and the committed NVFP4 cubins, launched
+/// over the CUDA driver API, instead of the inline host widening, and the
+/// answer must be the same oracle token. This is the `moe_block` swap's gate --
+/// the kernel is only allowed to change the speed.
 ///
-///   cargo test --release --features "cuda,triton" --test engine_real_generate -- \
+/// It also asserts that the kernel actually ran (`expert_steps`), which the
+/// token alone cannot show: the inline host path answers with the same logits,
+/// so a silently dropped port would pass a token-only check.
+///
+///   cargo test --release --features cuda --test engine_real_generate -- \
 ///     one_token_through_the_kernel_matches_the_oracle --ignored --nocapture
 #[test]
-#[ignore = "requires the converted checkpoint, a cuda device and the triton feature"]
+#[ignore = "requires the converted checkpoint and a cuda device"]
 fn one_token_through_the_kernel_matches_the_oracle() {
-    // Without the `triton` feature the registry hands the tower no kernel port,
-    // so this would silently pass on the inline host path and prove nothing.
-    if !cfg!(feature = "triton") {
-        panic!("this gate needs --features cuda,triton; without it there is no kernel in the loop");
+    // Without the `cuda` feature there is no libtorch forward, so no MoE port,
+    // and the gate would quietly measure the inline host path instead.
+    if !cfg!(feature = "cuda") {
+        panic!("this gate needs --features cuda; without it there is no kernel in the loop");
     }
     let mut cfg = config(1);
     cfg.kernel.triton = true;
-    cfg.kernel.site_packages = std::env::var("FERRUM_KERNEL_SITE_PACKAGES")
-        .map(|s| vec![s])
-        .unwrap_or_else(|_| vec!["FreeToken/.venv/lib/python3.12/site-packages".to_string()]);
     let engine = load_engine(&cfg).unwrap();
+    let layers = engine.model().params().num_layers as u64;
     let ids = engine.encode(PROMPT).unwrap();
     eprintln!(
         "kernel on: {slots} slots, prompt {PROMPT:?} -> {} tokens",
         ids.len(),
         slots = cfg.moe.cache_size_slots
     );
+    assert_eq!(engine.expert_steps(), 0, "nothing has run yet");
 
     let request = make_request(&engine, 1, ids, greedy(1)).unwrap();
     let start = Instant::now();
@@ -146,6 +150,14 @@ fn one_token_through_the_kernel_matches_the_oracle() {
     eprintln!("1 token in {:.1}s", start.elapsed().as_secs_f64());
     eprintln!("text {:?}", g.text);
 
+    let steps = engine.expert_steps();
+    eprintln!("{steps} expert steps over {layers} layers");
+    assert_eq!(
+        steps % layers,
+        0,
+        "every layer of every forward went through the kernel port"
+    );
+    assert!(steps >= layers, "at least the prefill ran, got {steps}");
     assert_eq!(g.tokens.len(), 1);
     assert_eq!(
         g.tokens[0], ORACLE_FIRST_TOKEN,

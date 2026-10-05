@@ -326,6 +326,12 @@ impl Engine {
 
     /// The compute device the model runs on, as resolved from `model.device` at
     /// load. Reported at startup so an operator can see which one was picked.
+    /// Steps this engine's forward has run through the MoE kernel port. Zero
+    /// means the routed experts were widened on the host.
+    pub fn expert_steps(&self) -> u64 {
+        self.model.expert_steps()
+    }
+
     pub fn device(&self) -> Device {
         self.device
     }
@@ -610,6 +616,7 @@ pub(crate) mod fake {
     pub struct FakeCachedModel {
         rec: Recorder,
         cache: Arc<FakeCache>,
+        steps: std::sync::Arc<std::sync::atomic::AtomicU64>,
     }
 
     impl FakeCachedModel {
@@ -620,6 +627,7 @@ pub(crate) mod fake {
                 Self {
                     rec: rec.clone(),
                     cache: cache.clone(),
+                    steps: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 },
                 rec,
                 cache,
@@ -639,6 +647,10 @@ pub(crate) mod fake {
     }
 
     impl crate::domain::kvcache::CachedModel for FakeCachedModel {
+        fn expert_steps(&self) -> u64 {
+            self.steps.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
         fn cache(&self) -> Option<Arc<dyn crate::domain::kvcache::KvCache>> {
             Some(self.cache.clone())
         }
@@ -657,6 +669,8 @@ pub(crate) mod fake {
                 "the engine must grow the cache before the step"
             );
             self.rec.cached_calls.lock().unwrap().push(input.clone());
+            self.steps
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(FakeModel::argmax_logits(input))
         }
     }

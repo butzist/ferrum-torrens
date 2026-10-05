@@ -376,6 +376,19 @@ mod tests {
         );
     }
 
+    /// The engine can say how many routed-expert steps went through the kernel
+    /// port. The inline host path answers with the same logits, so a gate that
+    /// only checks the token cannot tell the two apart, and this is the number
+    /// that tells it.
+    #[test]
+    fn the_engine_reports_the_kernel_steps_its_forward_ran() {
+        let (e, _rec, _cache) = test_cached_engine(limits());
+        assert_eq!(e.expert_steps(), 0, "no port has been reached yet");
+        let g = generate(&e, req(&e, 1, "ab", params(2)), 0).unwrap();
+        assert_eq!(g.tokens.len(), 2);
+        assert_eq!(e.expert_steps(), 2, "prefill plus one decode step");
+    }
+
     #[test]
     fn a_finished_request_returns_its_cache_pages() {
         let (e, rec, cache) = test_cached_engine(limits());

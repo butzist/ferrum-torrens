@@ -1353,6 +1353,10 @@ impl Model for TorchQwen3_6 {
 }
 
 impl CachedModel for TorchQwen3_6 {
+    fn expert_steps(&self) -> u64 {
+        self.moe.as_ref().map_or(0, |port| port.steps())
+    }
+
     fn cache(&self) -> Option<std::sync::Arc<dyn KvCache>> {
         self.cache
             .as_ref()

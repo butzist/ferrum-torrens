@@ -9,7 +9,10 @@ use crate::domain::expert_cache::ExpertCache;
 use crate::domain::expert_kernel::{
     ExpertGemm, ExpertSlotStore, MoEError, MoEExecutor, MoEGroup, MoERequest,
 };
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 
 /// The engine's `MoEExecutor`: the same three pieces `run_experts` takes, held
 /// behind one shared handle so a tower that only has `&self` can call it. The
@@ -20,6 +23,7 @@ pub struct CachedExperts {
     cache: Mutex<ExpertCache>,
     store: Arc<dyn ExpertSlotStore>,
     gemm: Arc<dyn ExpertGemm>,
+    steps: AtomicU64,
 }
 
 impl CachedExperts {
@@ -34,6 +38,7 @@ impl CachedExperts {
             cache: Mutex::new(ExpertCache::new(num_layers, num_experts, cache_size)),
             store,
             gemm,
+            steps: AtomicU64::new(0),
         }
     }
 
@@ -41,6 +46,12 @@ impl CachedExperts {
     /// the adapter's bank size, which `run_experts` checks.
     pub fn cache_size(&self) -> usize {
         self.locked().cache_size()
+    }
+
+    /// Steps this executor has run, counted at the port so a caller can prove
+    /// the kernel was in the loop.
+    pub fn steps(&self) -> u64 {
+        self.steps.load(Ordering::Relaxed)
     }
 
     fn locked(&self) -> std::sync::MutexGuard<'_, ExpertCache> {
@@ -51,7 +62,14 @@ impl CachedExperts {
 }
 
 impl MoEExecutor for CachedExperts {
+    fn steps(&self) -> u64 {
+        self.steps()
+    }
+
     fn execute<'a>(&self, req: &MoERequest<'a>, out: &mut [f32]) -> Result<(), MoEError> {
+        // Counted before the work, so a step the kernel refuses still shows up:
+        // the count is evidence that the port was reached, not that it succeeded.
+        self.steps.fetch_add(1, Ordering::Relaxed);
         run_experts(
             &mut self.locked(),
             self.store.as_ref(),
@@ -202,6 +220,33 @@ mod tests {
         assert_eq!(routes[0], routes[2]);
         assert_eq!((hidden, inter, top_k), (4, 2, 2));
         assert_eq!(out, [0.5f32; 8]);
+    }
+
+    /// The executor counts the steps it ran, which is the only way a caller can
+    /// tell the kernel path from the inline host one: both answer with logits,
+    /// so a gate that only checks the token cannot see a silently dropped port.
+    #[test]
+    fn the_executor_counts_the_steps_it_ran() {
+        let mut store = strict_store(4);
+        store
+            .expect_begin_layer()
+            .withf(|l| *l == 3)
+            .returning(|_| Ok(None));
+        store.expect_load().times(2).returning(|_, _, _| Ok(()));
+        let mut gemm = MockExpertGemm::new();
+        gemm.expect_grouped_moe().times(2).returning(|_, _| Ok(()));
+        let exec = CachedExperts::new(Arc::new(store), Arc::new(gemm), 4, 8, 4);
+        assert_eq!(exec.steps(), 0, "nothing has run yet");
+
+        let x = [1.0f32; 8];
+        let experts = [6u32, 1, 6, 1];
+        let weights = [0.25f32; 4];
+        let mut out = [0.0f32; 8];
+        exec.execute(&request(&experts, &weights, &x), &mut out)
+            .unwrap();
+        exec.execute(&request(&experts, &weights, &x), &mut out)
+            .unwrap();
+        assert_eq!(exec.steps(), 2);
     }
 
     /// A second step over the same layer stages nothing: the slot machine is the

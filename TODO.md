@@ -17,12 +17,14 @@ language), `infrastructure/cuda_moe.rs` (feature `cuda`: device slot cache,
 `ExpertSlotStore`, `ExpertGemm`), `infrastructure/triton.rs` (feature `triton`,
 the interim pyo3 adapter, no longer on the serving path),
 `infrastructure/banks.rs` (the FTW slab source) and `application/run_experts.rs`.
-The `moe_block` swap is done (commit `6e90b4f`): `CachedExperts` sits behind the
-new `MoEExecutor` port and the Qwen3.6 tower routes its experts through it when
-`kernel.triton=true`. The `moe_block` swap's own gate is next (the tower with the
-driver-API kernel through libtorch); the pyo3 feature and
-`infrastructure/triton.rs` come out once nothing needs them. Last finished:
-decision 36 slices 3-5. Before that the chat surface, SSE and the cached decode
+The `moe_block` swap is done (commit `6e90b4f`) and its own gate is green:
+`CachedExperts` sits behind the new `MoEExecutor` port, the Qwen3.6 tower routes
+its experts through it when `kernel.triton=true`, and the gated one-token
+tower-with-the-kernel run answers the same oracle token (" Paris") while
+reporting its expert steps (decision 37). Next: the pyo3 feature and
+`infrastructure/triton.rs` come out, since nothing is left on that path.
+Last finished: decision 37 (the step counter) and decision 36 slice 6 (the
+tower-with-the-kernel gate). Before that the chat surface, SSE and the cached decode
 loop. Incremental KV decode is proved too: chunked prefill + one-token decode
 off the page table agrees with re-feeding the whole prefix on the real checkpoint
 (same argmax at every step, logits within 2e-6 of scale, decision 33), and the
@@ -348,10 +350,11 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
     M2 and the scalar cross-check keep running. 3 new application tests + 2
     libtorch tests (the port receives the router's own dense ids, a port
     failure reaches the caller) + 1 registry test (an off kernel yields no
-    port, without touching python). Gate added, pending its devshell run:
-    `cargo test --release --features "cuda,triton" --test engine_real_generate -- \
-     one_token_through_the_kernel_matches_the_oracle --ignored --nocapture`
-    must still emit oracle token 11751.
+    port, without touching python). Its gate is green over the driver-API
+    cubins (2026-10-05, decision 36): the gated
+    `one_token_through_the_kernel_matches_the_oracle` in
+    `tests/engine_real_generate.rs`, on `--features cuda` alone, still emits
+    oracle token 11751 (" Paris"): 40 expert steps over the 40 layers, 32.7 s.
   - [x] the gated GPU test written (2026-10-02,
     `tests/triton_moe_matches_reference.rs`, `--ignored`): real slabs from the
     mmap banks -> `FtwBanks` -> `TritonMoE` through `run_experts`, then
@@ -1007,9 +1010,38 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
     cost `9.158e-6` of the terms, the kernel's own rounding `7.587e-6` more. It
     still reports how much of any future drift is the activation dtype, because
     that was the one thing worth knowing when this gate first failed.
-    Remaining: the `moe_block` swap's own gate (the tower with the kernel
-    through libtorch), and dropping `infrastructure/triton.rs` plus the pyo3
-    feature once nothing else needs them.
+    Done (slice 6): the `moe_block` swap's own gate, the whole tower with the
+    kernel in it -- the gated
+    `one_token_through_the_kernel_matches_the_oracle` in
+    `tests/engine_real_generate.rs`, now on `--features cuda` alone. Green:
+    11751 (" Paris") off the FreeToken oracle, 40 expert steps over the 40 layers,
+    32.7 s for the one-token forward (the inline host widening takes ~46 s on
+    the same box, and it is not faster than that until the MoE is the only
+    thing left in the forward, which is M3's problem, not this gate's).
+    It needed one new thing to be worth anything: a way to see that the kernel
+    ran at all. Both paths answer with logits, and the inline one is within its
+    own noise of the kernel's bf16 rounding, so a token-only check would pass on
+    a silently dropped port. Hence decision 37.
+    Remaining: dropping `infrastructure/triton.rs` plus the pyo3 feature once
+    nothing else needs them.
+
+37. **The MoE port counts its steps, and the forward reports them** (2026-10-05)
+    -- a gate cannot tell the kernel path from the inline host path by its
+    output. Both answer with logits, and the kernel rounds in bf16 (decision
+    36), so "same token" is a claim about 40 layers of rounding agreeing, not
+    evidence that the kernel ran. A dropped `Option<Arc<dyn MoEExecutor>>` in
+    the registry, or a config that never set `kernel.triton`, would have left the
+    old gate green forever.
+    So `MoEExecutor` gained `steps() -> u64` (no default: an adapter that
+    cannot count must say so instead of reporting zero),
+    `CachedExperts` counts at the port before the work (a step the kernel refuses
+    still counts, since the count is evidence the port was reached),
+    `CachedModel::expert_steps()` defaults to 0 (the scalar forward genuinely has
+    no port), `TorchQwen3_6` forwards the port's number, and `Engine::expert_
+    steps()` exposes it. The tower gate asserts `steps % num_layers == 0` and
+    `steps >= num_layers`, which also catches a kernel that ran for some layers
+    only. Cost: two counters and four one-line methods; they are the difference
+    between a gate and a vibe.
 
 37. **Anthropic `/v1/messages` is out of the MVP** (2026-10-03) -- dropped
     deliberately, not deferred: the MVP speaks the OpenAI surface only. FreeToken

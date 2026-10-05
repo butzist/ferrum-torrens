@@ -490,9 +490,14 @@ type SeenRoute = (usize, usize, usize, usize, Vec<f32>, Vec<u32>, Vec<f32>);
 struct RecordingMoE {
     seen: std::sync::Mutex<Option<SeenRoute>>,
     fail: bool,
+    steps: std::sync::atomic::AtomicU64,
 }
 
 impl MoEExecutor for RecordingMoE {
+    fn steps(&self) -> u64 {
+        self.steps.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     fn execute<'a>(
         &self,
         req: &MoERequest<'a>,
@@ -501,6 +506,8 @@ impl MoEExecutor for RecordingMoE {
         if self.fail {
             return Err(MoEError::Bad("planned refusal".into()));
         }
+        self.steps
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         *self.seen.lock().unwrap() = Some((
             req.layer,
             req.hidden,
@@ -559,6 +566,7 @@ fn the_moe_port_receives_the_routers_decision_and_answers_with_the_routed_sum() 
     let exec = RecordingMoE {
         seen: std::sync::Mutex::new(None),
         fail: false,
+        steps: std::sync::atomic::AtomicU64::new(0),
     };
     let got =
         routed_via_port(&exec, 4, &up(&x, &[2, 3]), &ids, &weights, &params(), dev()).unwrap();
@@ -588,6 +596,7 @@ fn a_port_failure_reaches_the_caller() {
     let exec = RecordingMoE {
         seen: std::sync::Mutex::new(None),
         fail: true,
+        steps: std::sync::atomic::AtomicU64::new(0),
     };
     assert!(matches!(
         routed_via_port(&exec, 0, &up(&x, &[2, 3]), &ids, &weights, &params(), dev()),
