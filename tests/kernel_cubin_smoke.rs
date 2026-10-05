@@ -14,7 +14,8 @@
 
 use ferrum_torrens::infrastructure::cuda_driver::{CudaKernels, Driver};
 use ferrum_torrens::infrastructure::kernel_abi::{
-    Abi, MoEArgs, SILU_MUL, SUM_REDUCE, grid, silu_mul_args, sum_reduce_args,
+    Abi, GEMV_DOWN, GEMV_GATE_UP, MoEArgs, SILU_MUL, SUM_REDUCE, grid, silu_mul_args,
+    sum_reduce_args,
 };
 
 /// bf16 round-to-nearest-even, the same rounding the conversion does.
@@ -82,11 +83,12 @@ fn check(name: &str, got: &[f32], want: &[f32]) {
 #[test]
 #[ignore = "needs a CUDA device"]
 fn the_committed_cubins_match_a_cpu_reference_through_the_driver_api() {
-    let driver = Driver::open().expect("libcuda");
+    let driver = std::sync::Arc::new(Driver::open().expect("libcuda"));
     driver.init().expect("cuInit");
     driver.attach_primary_context(0).expect("primary context");
     let abi = Abi::committed().expect("committed manifest");
-    let kernels = CudaKernels::load(&driver, abi.clone()).expect("load the committed cubins");
+    let kernels =
+        CudaKernels::load(driver.clone(), abi.clone()).expect("load the committed cubins");
 
     // Default stream: null, which the driver accepts for the legacy stream. The
     // real path uses libtorch's stream, which is what the checkpoint gate needs.
@@ -170,4 +172,42 @@ fn the_committed_cubins_match_a_cpu_reference_through_the_driver_api() {
         unsafe { driver.copy_d2h(&mut out, d_ic2.ptr).expect("read ic2") };
         check("silu_mul", &read_bf16(&out), &want);
     }
+}
+
+/// The two GEMV cubins are compiled from one Triton entry, so they are only
+/// distinguishable by their manifest *name*. An entry-keyed handle table hands
+/// out the gate/up function for the down one, which still runs: it just reads
+/// `K_BYTES = inter/2` out of a slab laid out for `hidden` and drops the route
+/// weights. The numbers come out plausible, so this has to be an explicit
+/// identity check rather than a tolerance.
+#[test]
+#[ignore = "needs a CUDA device"]
+fn every_committed_kernel_resolves_to_its_own_function() {
+    let driver = std::sync::Arc::new(Driver::open().expect("libcuda"));
+    driver.init().expect("cuInit");
+    driver.attach_primary_context(0).expect("primary context");
+    let abi = Abi::committed().expect("committed manifest");
+    let kernels =
+        CudaKernels::load(driver.clone(), abi.clone()).expect("load the committed cubins");
+
+    for a in Abi::kernel_names() {
+        for b in Abi::kernel_names() {
+            if a == b {
+                continue;
+            }
+            let fa = kernels.function(abi.kernel(a).unwrap()).expect(a);
+            let fb = kernels.function(abi.kernel(b).unwrap()).expect(b);
+            assert_ne!(
+                fa,
+                fb,
+                "{a} and {b} resolved to the same function; both cubins share the entry {}",
+                abi.kernel(a).unwrap().entry
+            );
+        }
+    }
+    // The pair that started this: same entry, different constexprs.
+    assert_eq!(
+        abi.kernel(GEMV_GATE_UP).unwrap().entry,
+        abi.kernel(GEMV_DOWN).unwrap().entry
+    );
 }

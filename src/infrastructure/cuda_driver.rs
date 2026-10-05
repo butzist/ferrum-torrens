@@ -13,6 +13,7 @@
 //! driver string is carried in the error.
 
 use std::ffi::{CString, c_char, c_int, c_void};
+use std::sync::Arc;
 
 use thiserror::Error;
 
@@ -375,19 +376,51 @@ impl DeviceBuf<'_> {
     }
 }
 
+/// Loaded function handles keyed by manifest kernel name.
+///
+/// The key is the name and not the Triton entry, because both GEMV cubins are
+/// compiled from `_nvfp4_gemv_kernel` with different constexprs. An entry-keyed
+/// table resolves the down projection to the gate/up cubin, and that still runs
+/// to completion: it reads `inter/2` packed bytes out of a `hidden`-row slab,
+/// takes the activation row from `route_token` and drops the route weights, so
+/// the result is wrong but plausible.
+#[derive(Default)]
+struct FunctionTable(Vec<(&'static str, CUfunction)>);
+
+impl FunctionTable {
+    fn push(&mut self, name: &'static str, f: CUfunction) {
+        self.0.push((name, f));
+    }
+
+    fn get(&self, kernel: &Kernel) -> Option<CUfunction> {
+        self.0
+            .iter()
+            .find(|(name, _)| *name == kernel.name)
+            .map(|(_, f)| *f)
+    }
+}
+
 /// One committed kernel, loaded and ready to launch.
 ///
 /// The module and function handles are owned by the `CudaKernels` that made
 /// them; a bare `CUfunction` would be a dangling pointer waiting to happen.
-pub struct CudaKernels<'a> {
-    driver: &'a Driver,
+pub struct CudaKernels {
+    driver: Arc<Driver>,
     abi: Abi,
-    loaded: Vec<(CUmodule, Vec<(String, CUfunction)>)>,
+    loaded: Vec<(CUmodule, FunctionTable)>,
 }
 
-impl<'a> CudaKernels<'a> {
-    /// Load every kernel in `abi` from the committed cubins.
-    pub fn load(driver: &'a Driver, abi: Abi) -> Result<Self, CudaError> {
+// SAFETY: the module and function handles are immutable once `load` returns and
+// the driver behind them is thread-safe (see `Driver`). Launching the same
+// function concurrently is what the driver API is for.
+unsafe impl Send for CudaKernels {}
+unsafe impl Sync for CudaKernels {}
+
+impl CudaKernels {
+    /// Load every kernel in `abi` from the committed cubins. The driver is
+    /// shared, because the caller launches on libtorch's streams too and there
+    /// must be exactly one driver handle in the process.
+    pub fn load(driver: Arc<Driver>, abi: Abi) -> Result<Self, CudaError> {
         let mut loaded = Vec::new();
         for name in Abi::kernel_names() {
             let image = crate::infrastructure::kernel_abi::cubin(name)
@@ -399,7 +432,9 @@ impl<'a> CudaKernels<'a> {
             // SAFETY: `module` was just loaded by `driver`, whose context is
             // current on this thread.
             let f = unsafe { driver.function(module, &kernel.entry)? };
-            loaded.push((module, vec![(kernel.entry.clone(), f)]));
+            let mut table = FunctionTable::default();
+            table.push(kernel.name, f);
+            loaded.push((module, table));
         }
         Ok(Self {
             driver,
@@ -413,16 +448,14 @@ impl<'a> CudaKernels<'a> {
     }
 
     pub fn function(&self, kernel: &Kernel) -> Result<CUfunction, CudaError> {
-        for (_, entries) in &self.loaded {
-            for (entry, f) in entries {
-                if *entry == kernel.entry {
-                    return Ok(*f);
-                }
+        for (_, table) in &self.loaded {
+            if let Some(f) = table.get(kernel) {
+                return Ok(f);
             }
         }
         Err(CudaError::Driver(format!(
             "no loaded function for {}",
-            kernel.entry
+            kernel.name
         )))
     }
 
@@ -465,6 +498,48 @@ impl<'a> CudaKernels<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The GEMV pair shares one Triton entry, so the table has to key on the
+    /// manifest name. Handles here are fabricated integers, never dereferenced:
+    /// the table is pure lookup.
+    #[test]
+    fn the_function_table_keys_on_kernel_name_and_not_on_entry() {
+        use crate::infrastructure::kernel_abi::{GEMV_DOWN, GEMV_GATE_UP};
+
+        let abi = Abi::committed().expect("committed manifest");
+        let mut table = FunctionTable::default();
+        for (i, name) in Abi::kernel_names().iter().enumerate() {
+            table.push(name, (i + 1) as CUfunction);
+        }
+
+        let gate_up = table.get(abi.kernel(GEMV_GATE_UP).unwrap());
+        let down = table.get(abi.kernel(GEMV_DOWN).unwrap());
+        assert!(gate_up.is_some() && down.is_some());
+        assert_ne!(
+            gate_up,
+            down,
+            "the two GEMV cubins share the entry {} and must not share a handle",
+            abi.kernel(GEMV_DOWN).unwrap().entry
+        );
+
+        for name in Abi::kernel_names() {
+            let kernel = abi.kernel(name).unwrap();
+            let handle = table.get(kernel).expect(name);
+            assert!(!handle.is_null(), "{name} resolved to a null handle");
+        }
+
+        let unknown = Kernel {
+            name: "no_such_kernel",
+            entry: abi.kernel(GEMV_DOWN).unwrap().entry.clone(),
+            args: Vec::new(),
+            scratch_params: 0,
+            num_warps: 1,
+            shared: 0,
+            n: 1,
+            block: 1,
+        };
+        assert!(table.get(&unknown).is_none());
+    }
 
     /// The riskiest part of the FFI is a symbol name that does not exist, and the
     /// sandbox's driver mount is loadable even though it has no device, so this
