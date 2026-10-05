@@ -26,8 +26,12 @@ feature, no `infrastructure/triton.rs`, no `python_path`/`site_packages` in the
 config, and nothing at runtime imports Python (decision 30, closed by decision
 36). Python is a build-time toolchain now: it authors the kernel in Triton,
 compiles it AOT into the committed `kernel/*.cubin`, and runs the interpreter
-selftest. Next: CUDA-graph capture, then M2 (API) / M3 proper.
-Last finished: decision 30 (the pyo3 exit). Before that the chat surface, SSE and the cached decode
+selftest. Next is CUDA-graph capture for decode, which decision 39 says is not
+the `tch` call the plan assumed (no capture API in `tch` 0.22, the legacy stream
+cannot be captured, and the offload staging is data-dependent), so read
+FreeToken's `engine/graph.py` before designing it. After that, M2 (API) proper and the
+remaining M3 perf items. Last finished: decision 30 (the pyo3 exit), decision 37
+(the step counter) and decision 36 slice 6 (the tower-with-the-kernel gate). Before that the chat surface, SSE and the cached decode
 loop. Incremental KV decode is proved too: chunked prefill + one-token decode
 off the page table agrees with re-feeding the whole prefix on the real checkpoint
 (same argmax at every step, logits within 2e-6 of scale, decision 33), and the
@@ -1056,17 +1060,47 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
     `CachedExperts` counts at the port before the work (a step the kernel refuses
     still counts, since the count is evidence the port was reached),
     `CachedModel::expert_steps()` defaults to 0 (the scalar forward genuinely has
-    no port), `TorchQwen3_6` forwards the port's number, and `Engine::expert_
-    steps()` exposes it. The tower gate asserts `steps % num_layers == 0` and
+    no port), `TorchQwen3_6` forwards the port's number, and
+    `Engine::expert_steps()` exposes it. The tower gate asserts `steps % num_layers == 0` and
     `steps >= num_layers`, which also catches a kernel that ran for some layers
     only. Cost: two counters and four one-line methods; they are the difference
     between a gate and a vibe.
 
-37. **Anthropic `/v1/messages` is out of the MVP** (2026-10-03) -- dropped
+38. **Anthropic `/v1/messages` is out of the MVP** (2026-10-03) -- dropped
     deliberately, not deferred: the MVP speaks the OpenAI surface only. FreeToken
     has `tests/server/test_anthropic_api.py` if the wire details are ever wanted,
     and the engine-side half (render a conversation, stream tokens) already
     exists from the chat work.
+
+39. **Decode CUDA-graph capture is not a `tch` call, and it collides with the
+    offload design** (2026-10-05) -- the P1 under M3 ("CUDA-graph capture for
+    decode batch sizes `{1,2,4, max_running}` via tch") is written as if it were
+    one. It is not, and the audit is worth recording before anyone spends a day
+    on it.
+    - **`tch` 0.22 exposes no capture API.** No `CUDAGraph` wrapper, no
+      `capture_begin`/`capture_end`; the only `graph` symbols in the crate are
+      autograd's. So it is not "via tch" at all. The honest options are the
+      hand-rolled driver FFI this repo already owns (`cuda_driver.rs` binds entry
+      points by hand, decision 36), or `cudarc` for the `cudaGraph*` family.
+    - **Capture cannot use the legacy default stream.** `cuStreamBeginCapture`
+      rejects stream 0, and libtorch's `current_stream` hands back 0, which is
+      exactly what `CudaMoE` launches its four kernels on. Capturing decode
+      therefore needs a real side stream, a way to make the whole forward
+      (libtorch ops and our driver-API launches) run on it for the duration of
+      the capture, and a decision about the legacy stream the rest of the process
+      assumes.
+    - **The MoE staging is data-dependent and host-resident**, and that is the
+      real problem: a graph is fixed at capture time, but each layer's expert
+      slots depend on which experts the router picked for that step.
+      `CudaMoE::load` reads slabs out of the mmap on the host and copies them
+      per layer, and `run_experts` derives the plan from the routing decision.
+      Capturing decode with offload on means either capturing only the non-MoE
+      part, staging outside the graph into fixed device buffers, or keeping the
+      staging data-dependent and capturing nothing. This is the same trade
+      FreeToken makes; read `FreeToken/engine/graph.py` before designing it.
+    So: read how FreeToken splits capture from staging, then settle the stream
+    story, then write a binding. Recorded here so the next session does not
+    rediscover it from a red test.
 
 ### Config defaults for the RTX 5060 / 8 GB target
 
