@@ -1,0 +1,119 @@
+"""Triton kernel signatures, shared by the compile check and the AOT build.
+
+One table per kernel, so `compile_check.py` (does it compile) and `aot.py`
+(emit the cubins the engine launches) cannot drift apart: a signature edited in
+one place and forgotten in the other would leave the committed cubin disagreeing
+with the committed PTX the Rust ABI test parses.
+
+Types are triton's spelling, not torch's: `*fp8e4nv` is the native e4m3 unit the
+scale banks need, `*u8` the packed nibbles, and `constexpr` marks an argument
+baked into the cubin rather than passed at launch.
+"""
+
+from __future__ import annotations
+
+from .nvfp4_moe import DECODE_BLOCK_KB, DECODE_BLOCK_N
+
+# One hidden size and one intermediate size in a serving checkpoint; both are
+# constexpr trip counts, so the committed cubins are shape-specialized and the
+# manifest records the shapes (TODO.md decision 36).
+SERVING_HIDDEN = 2048
+SERVING_INTER = 512
+SERVING_TOP_K = 8
+SERVING_DTYPE = "bf16"
+
+
+def gemv(
+    a_dtype: str = SERVING_DTYPE,
+    packed_dtype: str = "u8",
+    scale_dtype: str = "fp8e4nv",
+    glob_dtype: str = "fp16",
+    c_dtype: str | None = None,
+) -> dict:
+    return {
+        "a_ptr": f"*{a_dtype}",
+        "packed_ptr": f"*{packed_dtype}",
+        "scale_ptr": f"*{scale_dtype}",
+        "global_ptr": f"*{glob_dtype}",
+        "c_ptr": f"*{c_dtype or a_dtype}",
+        "route_token_ptr": "*i32",
+        "route_slot_ptr": "*i32",
+        "route_weight_ptr": "*fp32",
+        "lut_ptr": "*fp32",
+        "M": "i32",
+        "N": "i32",
+        "K_BYTES": "constexpr",
+        "stride_am": "i32",
+        "stride_ak": "i32",
+        "stride_pe": "i64",
+        "stride_pn": "i32",
+        "stride_pkb": "i32",
+        "stride_se": "i64",
+        "stride_sn": "i32",
+        "stride_sblk": "i32",
+        "stride_ge": "i64",
+        "stride_gn": "i32",
+        "stride_cm": "i64",
+        "stride_cn": "i32",
+        "A_ROW_IS_ROUTE": "constexpr",
+        "BLOCK_N": "constexpr",
+        "BLOCK_KB": "constexpr",
+        "MUL_WEIGHT": "constexpr",
+    }
+
+
+def silu(dtype: str = SERVING_DTYPE) -> dict:
+    return {
+        "ic1_ptr": f"*{dtype}",
+        "ic2_ptr": f"*{dtype}",
+        "inter": "i32",
+        "stride_m1": "i32",
+        "stride_n1": "i32",
+        "stride_m2": "i32",
+        "stride_n2": "i32",
+        "BLOCK_I": "constexpr",
+    }
+
+
+def reduce(dtype: str = SERVING_DTYPE) -> dict:
+    return {
+        "ic3_ptr": f"*{dtype}",
+        "out_ptr": f"*{dtype}",
+        "H": "i32",
+        "top_k": "constexpr",
+        "stride_rm": "i64",
+        "stride_rn": "i32",
+        "stride_om": "i64",
+        "stride_on": "i32",
+        "BLOCK_N": "constexpr",
+    }
+
+
+def gate_up_constexprs() -> dict:
+    """`x[token] @ gate_up^T`, one row per route, no route weight applied."""
+    return {
+        "K_BYTES": SERVING_HIDDEN // 2,
+        "BLOCK_N": DECODE_BLOCK_N,
+        "BLOCK_KB": DECODE_BLOCK_KB,
+        "MUL_WEIGHT": False,
+        "A_ROW_IS_ROUTE": False,
+    }
+
+
+def down_constexprs() -> dict:
+    """`ic2[route] @ down^T`, activations one row per route, weight applied."""
+    return {
+        "K_BYTES": SERVING_INTER // 2,
+        "BLOCK_N": DECODE_BLOCK_N,
+        "BLOCK_KB": DECODE_BLOCK_KB,
+        "MUL_WEIGHT": True,
+        "A_ROW_IS_ROUTE": True,
+    }
+
+
+def silu_constexprs() -> dict:
+    return {"BLOCK_I": min(1 << (SERVING_INTER - 1).bit_length(), 256)}
+
+
+def reduce_constexprs() -> dict:
+    return {"top_k": SERVING_TOP_K, "BLOCK_N": DECODE_BLOCK_N}

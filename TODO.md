@@ -2,7 +2,13 @@
 
 Status: M2 (API) current, M3 kernel work started out of order -- the NVFP4
 grouped-MoE Triton kernel and its pyo3 adapter both exist and are green on the
-CPU-only box (decisions 24-30), with pyo3 slated for removal (decision 30): `domain::expert_kernel` (ports + scalar oracle),
+CPU-only box (decisions 24-30), with pyo3 slated for removal (decision 30).
+Decision 36 slices 1-2 are done: the sm_120 cubins are committed under `kernel/`
+with an ABI manifest, and `infrastructure/kernel_abi.rs` packs the launch
+arguments and checks them against the committed PTX on the CPU-only box. The
+driver-API FFI (slice 3) is next and needs a GPU to prove, so it is written here
+and gated. Ports and the kernel sources:
+`domain::expert_kernel` (ports + scalar oracle),
 `python/ferrum_kernel/nvfp4_moe.py` (PTX-clean for sm_120) and
 `infrastructure/triton.rs` (feature `triton`: device slot cache, `ExpertSlotStore`,
 `ExpertGemm`), `infrastructure/banks.rs` (the FTW slab source) and
@@ -102,7 +108,7 @@ with `--text-model-only`). Known-good bf16/Fp8 siblings: `Qwen/Qwen3.6-35B-A3B`,
 - Prefill: chunked (default budget 8192), strict prefill-priority scheduling.
 - Decode: batched, CUDA-graph captured per batch size up to `max_running_req`, one model step per token.
 - Sampling: temperature / top_k / top_p / greedy (argmax) only. EOS + stop-strings + max-tokens.
-- OpenAI-compatible HTTP API (recommended baseline; Anthropic optional, see decisions).
+- OpenAI-compatible HTTP API (the whole MVP surface; Anthropic is out, decision 37).
 - Reuse FreeToken's one-time `ft checkpoint` conversion to FTW (+ aligned 4096 shards), then read it with mmap. Do **not** write our own converter in v0.
 
 ### Out of scope (explicitly deferred, will not be implemented in MVP)
@@ -116,7 +122,7 @@ with `--text-model-only`). Known-good bf16/Fp8 siblings: `Qwen/Qwen3.6-35B-A3B`,
 - DSV4 / SWA / DSA / MLA / QSA / BSA attention families (full-attention GQA only).
 - Reasoning parsers, tool-call streaming parsers (buffered tool JSON optional later).
 - Daemon, proxy, shell/TUI, `ft ctl`, accounting, log ring.
-- Anthropic/Responses APIs (optional, in decisions).
+- `/v1/responses` API (optional, in decisions).
 
 ## 3. Repo/crate layout (target, clean architecture / hexagonal / DDD)
 
@@ -453,8 +459,8 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 - [x] P0 `POST /v1/completions` (stream single prompt), `GET /v1/models`, `GET /health`.
 - [x] P0 SSE framing `data: {json}\n\n` + `data: [DONE]`; usage block.
 - [x] P0 chat template render via `tokenizers` crate + minijinja (`chat_template.jinja`, else `tokenizer_config.json`; Python string methods rewritten, decision 34; tools not supported in v0).
-- [ ] [opt] Anthropic `/v1/messages` (incl. `/v1/messages/count_tokens`).
 - [ ] [opt] `/v1/responses` (needed only for Codex).
+- Anthropic `/v1/messages` is out of the MVP (decision 37).
 
 ### Hygiene
 - [ ] P0 `cargo clippy`, `cargo fmt`, unit tests for ftw index parsing, radix, LRU, config parse, and a reference `gdn_reference.rs` used in correctness tests vs the libtorch/flash-attention GDN path.
@@ -488,7 +494,7 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
   stage an expert, so `copy_missing` lands with the adapter, not after it.
 - **M4 offload**: LRU slot cache + fused copy + prefill double buffer; radix
   prefix cache wired to the running server; batch concurrency.
-- **M5**: optional APIs (Anthropic/Responses), hybrid_radix GDN reuse, startup
+- **M5**: optional `/v1/responses`, hybrid_radix GDN reuse, startup
   load tuning.
 
 ## 7. Decisions (confirmed)
@@ -903,6 +909,56 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
     `${pythonEnv}/${pkgs.python3.sitePackages}` explicitly or `import torch`
     finds nothing inside pyo3. The two interpreter-only triton tests skip
     silently when torch is missing, so they need `--nocapture` to prove they ran.
+
+36. **The serving path loses Python entirely: AOT cubin plus the driver API**
+    (2026-10-03) -- decision 30's exit is forced, not preferred, because both
+    cheaper ways out are closed. (a) A torch-free pyo3 does not work: triton's
+    NVIDIA backend imports torch to *select* itself (`CudaDriver.is_active` calls
+    `torch.cuda.is_available()`) and takes its stream, current device and compute
+    capability from torch in `GPUDriver.__init__`, so a torch-free interpreter
+    cannot launch anything short of lying to triton's driver selection.
+    (b) One libtorch for both sides does not work either: tch 0.22's generated
+    bindings call `at::Tensor::align_as` and `torch::align_tensors`, both gone
+    in the nixpkgs torch 2.13 that Python would have to share, so the compute
+    runtime cannot be pointed at it (the build fails in `torch-sys`). So Triton
+    keeps authoring the kernel, and only the *runtime* leaves Python.
+    Offline AOT is confirmed working on the CPU-only box: `triton.compile` with
+    an explicit `GPUTarget("cuda", 120, 32)` and the nixpkgs ptxas 12.9 emits a
+    real 182 KB sm_120 cubin, `global_scratch_size` and `profile_scratch_size`
+    are both 0, and the entry takes 25 params: our 23 declared args plus two
+    trailing scratch pointers. That last fact is the whole ABI risk, and it is
+    checkable from the committed PTX without a GPU.
+    Slices, in order: (1) `python/ferrum_kernel/aot.py` emits the committed
+    cubins plus a manifest of entry/params/warps/shared for the serving
+    specializations (hidden 2048, inter 512, bf16, top_k 8), with the signature
+    tables shared with `compile_check.py` so the two cannot drift; (2) a Rust
+    `kernel_abi` module parses the committed PTX and packs the argument buffer,
+    unit-tested on the CPU against the PTX entry itself; (3) the driver-API FFI
+    (dlopen `libcuda.so.1`, no new crate) loads the module and launches on
+    libtorch's current stream; (4) the slot cache moves to libtorch device
+    tensors, which removes the last `torch` call in `infrastructure/triton.rs`;
+    (5) the gate runs the committed cubins against the scalar oracle on the real
+    checkpoint. The cubins are shape-specialized, since `K_BYTES` and `BLOCK_I`
+    are constexpr trip counts, so the manifest records the shapes and a test
+    asserts they match the loaded model.
+    Done (slice 1): `aot.py` emits `kernel/*.cubin`, `kernel/*.ptx` and
+    `kernel/manifest.json` for the serving specializations, and
+    `python/ferrum_kernel/signatures.py` holds the signature tables shared with
+    `compile_check.py`. `--check` recompiles and compares every artifact in
+    memory, so a kernel edit that leaves the manifest alone still fails. Note the
+    `cubin` stage in `compile_check.py` is no longer stubbed: triton 3.7 changed
+    `add_stages_inspection_hook` to a no-argument hook, and nixpkgs ships ptxas
+    12.9 anyway, so the check now assembles real cubins and needs no GPU.
+    Done (slice 2): `infrastructure/kernel_abi.rs` parses the manifest, derives
+    the four launches' argument packs (all strides come from the manifest
+    shapes), zeroes the two trailing scratch pointers, and unit-tests the result
+    against the committed PTX entry parameters -- 11 CPU-only tests.
+
+37. **Anthropic `/v1/messages` is out of the MVP** (2026-10-03) -- dropped
+    deliberately, not deferred: the MVP speaks the OpenAI surface only. FreeToken
+    has `tests/server/test_anthropic_api.py` if the wire details are ever wanted,
+    and the engine-side half (render a conversation, stream tokens) already
+    exists from the chat work.
 
 ### Config defaults for the RTX 5060 / 8 GB target
 

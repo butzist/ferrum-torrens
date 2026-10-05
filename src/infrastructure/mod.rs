@@ -4,6 +4,7 @@
 pub mod banks;
 pub mod ftw;
 pub mod http;
+pub mod kernel_abi;
 #[cfg(feature = "cuda")]
 pub mod kvcache_dev;
 pub mod tokenizers_hf;

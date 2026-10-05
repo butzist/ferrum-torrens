@@ -1,0 +1,399 @@
+{
+  "kernels": {
+    "gemv_down": {
+      "declared_args": [
+        "a_ptr",
+        "packed_ptr",
+        "scale_ptr",
+        "global_ptr",
+        "c_ptr",
+        "route_token_ptr",
+        "route_slot_ptr",
+        "route_weight_ptr",
+        "lut_ptr",
+        "M",
+        "N",
+        "stride_am",
+        "stride_ak",
+        "stride_pe",
+        "stride_pn",
+        "stride_pkb",
+        "stride_se",
+        "stride_sn",
+        "stride_sblk",
+        "stride_ge",
+        "stride_gn",
+        "stride_cm",
+        "stride_cn"
+      ],
+      "entry": "_nvfp4_gemv_kernel",
+      "global_scratch_size": 0,
+      "n": 2048,
+      "num_warps": 4,
+      "params": [
+        {
+          "index": 0,
+          "kind": "ptr"
+        },
+        {
+          "index": 1,
+          "kind": "ptr"
+        },
+        {
+          "index": 2,
+          "kind": "ptr"
+        },
+        {
+          "index": 3,
+          "kind": "ptr"
+        },
+        {
+          "index": 4,
+          "kind": "ptr"
+        },
+        {
+          "index": 5,
+          "kind": "ptr"
+        },
+        {
+          "index": 6,
+          "kind": "ptr"
+        },
+        {
+          "index": 7,
+          "kind": "ptr"
+        },
+        {
+          "index": 8,
+          "kind": "ptr"
+        },
+        {
+          "index": 9,
+          "kind": "u32"
+        },
+        {
+          "index": 10,
+          "kind": "u32"
+        },
+        {
+          "index": 11,
+          "kind": "u32"
+        },
+        {
+          "index": 12,
+          "kind": "u32"
+        },
+        {
+          "index": 13,
+          "kind": "u64"
+        },
+        {
+          "index": 14,
+          "kind": "u32"
+        },
+        {
+          "index": 15,
+          "kind": "u32"
+        },
+        {
+          "index": 16,
+          "kind": "u64"
+        },
+        {
+          "index": 17,
+          "kind": "u32"
+        },
+        {
+          "index": 18,
+          "kind": "u32"
+        },
+        {
+          "index": 19,
+          "kind": "u64"
+        },
+        {
+          "index": 20,
+          "kind": "u32"
+        },
+        {
+          "index": 21,
+          "kind": "u64"
+        },
+        {
+          "index": 22,
+          "kind": "u32"
+        },
+        {
+          "index": 23,
+          "kind": "ptr"
+        },
+        {
+          "index": 24,
+          "kind": "ptr"
+        }
+      ],
+      "profile_scratch_size": 0,
+      "scratch_params": 2,
+      "shared": 0
+    },
+    "gemv_gate_up": {
+      "declared_args": [
+        "a_ptr",
+        "packed_ptr",
+        "scale_ptr",
+        "global_ptr",
+        "c_ptr",
+        "route_token_ptr",
+        "route_slot_ptr",
+        "route_weight_ptr",
+        "lut_ptr",
+        "M",
+        "N",
+        "stride_am",
+        "stride_ak",
+        "stride_pe",
+        "stride_pn",
+        "stride_pkb",
+        "stride_se",
+        "stride_sn",
+        "stride_sblk",
+        "stride_ge",
+        "stride_gn",
+        "stride_cm",
+        "stride_cn"
+      ],
+      "entry": "_nvfp4_gemv_kernel",
+      "global_scratch_size": 0,
+      "n": 1024,
+      "num_warps": 4,
+      "params": [
+        {
+          "index": 0,
+          "kind": "ptr"
+        },
+        {
+          "index": 1,
+          "kind": "ptr"
+        },
+        {
+          "index": 2,
+          "kind": "ptr"
+        },
+        {
+          "index": 3,
+          "kind": "ptr"
+        },
+        {
+          "index": 4,
+          "kind": "ptr"
+        },
+        {
+          "index": 5,
+          "kind": "ptr"
+        },
+        {
+          "index": 6,
+          "kind": "ptr"
+        },
+        {
+          "index": 7,
+          "kind": "ptr"
+        },
+        {
+          "index": 8,
+          "kind": "ptr"
+        },
+        {
+          "index": 9,
+          "kind": "u32"
+        },
+        {
+          "index": 10,
+          "kind": "u32"
+        },
+        {
+          "index": 11,
+          "kind": "u32"
+        },
+        {
+          "index": 12,
+          "kind": "u32"
+        },
+        {
+          "index": 13,
+          "kind": "u64"
+        },
+        {
+          "index": 14,
+          "kind": "u32"
+        },
+        {
+          "index": 15,
+          "kind": "u32"
+        },
+        {
+          "index": 16,
+          "kind": "u64"
+        },
+        {
+          "index": 17,
+          "kind": "u32"
+        },
+        {
+          "index": 18,
+          "kind": "u32"
+        },
+        {
+          "index": 19,
+          "kind": "u64"
+        },
+        {
+          "index": 20,
+          "kind": "u32"
+        },
+        {
+          "index": 21,
+          "kind": "u64"
+        },
+        {
+          "index": 22,
+          "kind": "u32"
+        },
+        {
+          "index": 23,
+          "kind": "ptr"
+        },
+        {
+          "index": 24,
+          "kind": "ptr"
+        }
+      ],
+      "profile_scratch_size": 0,
+      "scratch_params": 2,
+      "shared": 0
+    },
+    "silu_mul": {
+      "declared_args": [
+        "ic1_ptr",
+        "ic2_ptr",
+        "inter",
+        "stride_m1",
+        "stride_n1",
+        "stride_m2",
+        "stride_n2"
+      ],
+      "entry": "_silu_mul_kernel",
+      "global_scratch_size": 0,
+      "n": 512,
+      "num_warps": 4,
+      "params": [
+        {
+          "index": 0,
+          "kind": "ptr"
+        },
+        {
+          "index": 1,
+          "kind": "ptr"
+        },
+        {
+          "index": 2,
+          "kind": "u32"
+        },
+        {
+          "index": 3,
+          "kind": "u32"
+        },
+        {
+          "index": 4,
+          "kind": "u32"
+        },
+        {
+          "index": 5,
+          "kind": "u32"
+        },
+        {
+          "index": 6,
+          "kind": "u32"
+        },
+        {
+          "index": 7,
+          "kind": "ptr"
+        },
+        {
+          "index": 8,
+          "kind": "ptr"
+        }
+      ],
+      "profile_scratch_size": 0,
+      "scratch_params": 2,
+      "shared": 0
+    },
+    "sum_reduce": {
+      "declared_args": [
+        "ic3_ptr",
+        "out_ptr",
+        "H",
+        "stride_rm",
+        "stride_rn",
+        "stride_om",
+        "stride_on"
+      ],
+      "entry": "_sum_reduce_kernel",
+      "global_scratch_size": 0,
+      "n": 2048,
+      "num_warps": 4,
+      "params": [
+        {
+          "index": 0,
+          "kind": "ptr"
+        },
+        {
+          "index": 1,
+          "kind": "ptr"
+        },
+        {
+          "index": 2,
+          "kind": "u32"
+        },
+        {
+          "index": 3,
+          "kind": "u64"
+        },
+        {
+          "index": 4,
+          "kind": "u32"
+        },
+        {
+          "index": 5,
+          "kind": "u64"
+        },
+        {
+          "index": 6,
+          "kind": "u32"
+        },
+        {
+          "index": 7,
+          "kind": "ptr"
+        },
+        {
+          "index": 8,
+          "kind": "ptr"
+        }
+      ],
+      "profile_scratch_size": 0,
+      "scratch_params": 2,
+      "shared": 0
+    }
+  },
+  "shapes": {
+    "dtype": "bf16",
+    "hidden": 2048,
+    "inter": 512,
+    "top_k": 8
+  },
+  "target": {
+    "arch": "sm_120",
+    "warp_size": 32
+  },
+  "triton": "3.7.1"
+}
