@@ -94,11 +94,70 @@ impl Device {
     }
 }
 
+/// Load libtorch's CUDA backend into the process.
+///
+/// `libtorch_cuda.so` registers the CUDA kernels with ATen, and a statically
+/// dispatched Rust binary never references a symbol from it, so the linker's
+/// default `--as-needed` leaves it out of `DT_NEEDED` (only `libtorch_cpu.so` and
+/// `libc10.so` make it in). Without it `aten::empty` on a CUDA device raises
+/// "only available for these backends: [CPU, ...]" no matter how real the GPU
+/// is. Python's `torch` avoids this by importing `_C` with the CUDA extension
+/// built in; an embedded runtime has to do what it does by hand.
+///
+/// The directory comes from where `libtorch_cpu.so` was actually mapped
+/// (`/proc/self/maps`) rather than from an env var, so it cannot name a different
+/// libtorch than the one already linked in. Idempotent: the loader refcounts, and
+/// `RTLD_GLOBAL` makes the registration visible to the already-loaded ATen.
+#[cfg(feature = "cuda")]
+pub fn load_cuda_backend() -> Result<(), String> {
+    use std::ffi::CString;
+    unsafe extern "C" {
+        fn dlopen(
+            filename: *const std::ffi::c_char,
+            flag: std::ffi::c_int,
+        ) -> *mut std::ffi::c_void;
+    }
+    const RTLD_NOW: std::ffi::c_int = 2;
+    const RTLD_GLOBAL: std::ffi::c_int = 0x100;
+
+    let maps = std::fs::read_to_string("/proc/self/maps").map_err(|e| e.to_string())?;
+    let dir = ["libtorch_cpu.so", "libtorch.so"]
+        .iter()
+        .find_map(|wanted| {
+            maps.lines().find_map(|line| {
+                let path = line.split_whitespace().last()?;
+                path.ends_with(wanted)
+                    .then_some(std::path::Path::new(path))?
+                    .parent()
+            })
+        })
+        .ok_or_else(|| "no libtorch is mapped, so its lib dir is unknown".to_string())?;
+    let entry = dir.join("libtorch_cuda.so");
+    let name = CString::new(
+        entry
+            .to_str()
+            .ok_or("libtorch path is not utf-8")?
+            .as_bytes(),
+    )
+    .map_err(|e| e.to_string())?;
+    // SAFETY: `name` is a NUL-terminated path that outlives the call, and the
+    // loader keeps whatever it mapped; we hold no handle and never unload it.
+    let handle = unsafe { dlopen(name.as_ptr(), RTLD_NOW | RTLD_GLOBAL) };
+    if handle.is_null() {
+        return Err(format!("dlopen {} failed", entry.display()));
+    }
+    Ok(())
+}
+
 /// Inspect the host. Returns `available = false` with a zero count rather than
 /// erroring when libtorch was built with CUDA but no device is visible, so a
 /// CPU-only run needs no config change.
 #[cfg(feature = "cuda")]
 pub fn probe_cuda() -> CudaProbe {
+    // The probe is the first thing in the process to ask libtorch about CUDA, so
+    // it is where the backend gets loaded. A failure means no CUDA kernels are
+    // registered, which is exactly `available = false`.
+    let _ = load_cuda_backend();
     let count = tch::Cuda::device_count().max(0) as usize;
     CudaProbe {
         available: tch::Cuda::is_available() && count > 0,
