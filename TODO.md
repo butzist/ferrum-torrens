@@ -1,29 +1,32 @@
 # FerrumTorrens -- FreeToken MVP port to Rust: TODO
 
-Status: M2 (API) current, M3 kernel work started out of order -- the NVFP4
-grouped-MoE Triton kernel and its pyo3 adapter both exist and are green on the
-CPU-only box (decisions 24-30), with pyo3 slated for removal (decision 30).
-Decision 36 slices 1-2 are done: the sm_120 cubins are committed under `kernel/`
-with an ABI manifest, and `infrastructure/kernel_abi.rs` packs the launch
-arguments and checks them against the committed PTX on the CPU-only box. The
-driver-API FFI (slice 3) is next and needs a GPU to prove, so it is written here
-and gated. Ports and the kernel sources:
+Status: M2 (API) current, M3 kernel work started out of order. Decision 36 is
+done end to end: the serving path is Python-free. The sm_120 cubins are
+committed under `kernel/` with an ABI manifest, `infrastructure/kernel_abi.rs`
+packs the launch arguments and checks them against the committed PTX,
+`infrastructure/cuda_driver.rs` launches them through the CUDA driver API (no
+pyo3, no new crate), and `infrastructure/cuda_moe.rs` holds the slot cache in
+libtorch device tensors, so `kernel.triton=true` now means the driver adapter,
+not an embedded interpreter. Both gated GPU gates are green: the cubin smoke
+test and `tests/cuda_moe_matches_reference.rs`, which matches the scalar oracle
+on the real checkpoint at `3.31e-3` of the route terms (four bf16 rounding
+sites). Ports and the kernel sources:
 `domain::expert_kernel` (ports + scalar oracle),
-`python/ferrum_kernel/nvfp4_moe.py` (PTX-clean for sm_120) and
-`infrastructure/triton.rs` (feature `triton`: device slot cache, `ExpertSlotStore`,
-`ExpertGemm`), `infrastructure/banks.rs` (the FTW slab source) and
-`application/run_experts.rs`. The gated GPU numerical run is green
-(`8.5e-7` rel against the term scale on the real slabs, after two kernel bugs the
-interpreter test pinned, decision 31), and the `moe_block` swap is done (commit
-`6e90b4f`): `CachedExperts` sits behind the new `MoEExecutor` port and the
-Qwen3.6 tower routes its experts through it when `kernel.triton=true`. The
-`moe_block` swap's own gate is BLOCKED on the pyo3 exit: an embedded interpreter
-that imports the venv torch cannot initialize CUDA in a process that already
-links libtorch (decision 32), so the tower-with-kernel gate can only run after
-decision 30's PTX + driver API replacement. Incremental KV decode is now proved
-too: chunked prefill + one-token decode off the page table agrees with re-feeding
-the whole prefix on the real checkpoint (same argmax at every step, logits
-within 2e-6 of scale, decision 33), and the engine decodes off it: one page
+`python/ferrum_kernel/nvfp4_moe.py` (PTX-clean for sm_120, still the authoring
+language), `infrastructure/cuda_moe.rs` (feature `cuda`: device slot cache,
+`ExpertSlotStore`, `ExpertGemm`), `infrastructure/triton.rs` (feature `triton`,
+the interim pyo3 adapter, no longer on the serving path),
+`infrastructure/banks.rs` (the FTW slab source) and `application/run_experts.rs`.
+The `moe_block` swap is done (commit `6e90b4f`): `CachedExperts` sits behind the
+new `MoEExecutor` port and the Qwen3.6 tower routes its experts through it when
+`kernel.triton=true`. The `moe_block` swap's own gate is next (the tower with the
+driver-API kernel through libtorch); the pyo3 feature and
+`infrastructure/triton.rs` come out once nothing needs them. Last finished:
+decision 36 slices 3-5. Before that the chat surface, SSE and the cached decode
+loop. Incremental KV decode is proved too: chunked prefill + one-token decode
+off the page table agrees with re-feeding the whole prefix on the real checkpoint
+(same argmax at every step, logits within 2e-6 of scale, decision 33), and the
+engine decodes off it: one page
 table per request, and a forward without a cache still re-feeds the prefix to the
 same tokens. `stream: true` now streams: one SSE frame per sampled token off a
 `TokenSink`, the finish reason and usage on the closing frame, `[DONE]` after it
@@ -34,10 +37,8 @@ filters, decision 34), then runs the same engine loop, so a chat turn and the
 equivalent `/v1/completions` prompt share one code path. The rendered prompt
 encodes to the ids `transformers.apply_chat_template` gives on the same
 checkpoint (22 ids for a system+user turn) and the gated
-`a_chat_request_answers_from_the_rendered_template` answers from it. Last
-finished: `/v1/chat/completions`. Before that SSE on
-`/v1/completions`. Before that the cached decode loop. Before that the
-`moe_block` swap, on top of M1b -- the
+`a_chat_request_answers_from_the_rendered_template` answers from it. All of that
+sits on the `moe_block` swap, which sits on M1b -- the
 libtorch tower matches the FreeToken oracle: gated
 `one_token_prediction_matches_the_oracle` emits id 11751 (" Paris") for
 `"The capital of France is"` in ~46 s under the 26 GiB cap (decision 22), and
@@ -955,16 +956,60 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
     against the committed PTX entry parameters -- 11 CPU-only tests. The
     manifest also records each kernel's column tile (`block`), because it is a
     constexpr like `K_BYTES` and the launch grid has to divide by it.
-    Written (slice 3): `infrastructure/cuda_driver.rs` dlopens `libcuda.so.1` and
+    Done (slice 3): `infrastructure/cuda_driver.rs` dlopens `libcuda.so.1` and
     binds 15 entry points by hand (no new crate), with the handle-taking calls
     `unsafe` and `CudaKernels` as the owning safe facade. Four CPU-only tests
-    cover symbol resolution, the no-device path and the driver error strings, and
-    `tests/kernel_cubin_smoke.rs` is the gate: it loads the committed cubins and
-    runs `sum_reduce` and `silu_mul` against a CPU reference through the packed
-    argument array. BLOCKED: that gate needs a GPU, so it has never run; the
-    sandbox has no device (`cuInit` is NO_DEVICE) and the driver mount only
-    exposes `libcuda.so.1` without an openable device. Slice 4 needs the slot
-    cache on libtorch tensors and then the stream, which is also GPU-only.
+    cover symbol resolution, the no-device path and the driver error strings,
+    and `tests/kernel_cubin_smoke.rs` is the gate: it loads the committed cubins
+    and runs `sum_reduce` and `silu_mul` against a CPU reference through the
+    packed argument array. It is green (worst rel `3.891e-3` and `8.491e-3`,
+    which is bf16's own), and the sandbox turned out to have a device after all,
+    so every gate from here runs in-process.
+    The gate caught the one bug this slice could not see from the ABI: the
+    handle table was keyed by Triton *entry*, and both GEMV cubins are compiled
+    from `_nvfp4_gemv_kernel` with different constexprs, so `gemv_down` resolved
+    to the gate/up cubin. It ran and produced plausible numbers, because the
+    wrong cubin reads `inter/2` packed bytes out of a `hidden`-row slab, takes
+    the activation row from `route_token` and drops the route weights -- and the
+    down GEMV was the one stage whose error that leaves looking like a numeric
+    drift rather than an indexing bug. `CudaKernels` now keys on the manifest
+    kernel name (`FunctionTable`, with a CPU-only unit test), and a second gated
+    test asserts all four kernels resolve to four distinct handles.
+    Done (slice 4): `infrastructure/cuda_moe.rs` is the port pair in one
+    `Mutex<CudaMoE>`, the slot cache included. Banks are flattened libtorch
+    `uint8` tensors (`narrow` stages a slot, since `select` is wrong on the
+    flattened view): packed `rows * cols / 2`, scales `rows * cols / 16`, globals
+    `rows * 2`, so one expert is 1,775,616 bytes at hidden 2048 / inter 512.
+    Activations and intermediates are bf16 tensors, routes I32, weights and the
+    FP4 LUT f32, and the four launches go out in order on libtorch's stream
+    (`current_stream` handle `0`, the legacy default stream the driver also takes
+    as `CU_STREAM_LEGACY`, so there is one stream, not two). Seven CPU-only unit
+    tests cover the reject paths.
+    libtorch's CUDA backend also had to be loaded by hand: it is not in
+    `DT_NEEDED`, because a statically dispatched Rust binary references no symbol
+    from it and the linker's `--as-needed` drops it, so `aten::empty` on a CUDA
+    device fails with "only available for these backends: [CPU, ...]" on a
+    perfectly real GPU. `infrastructure/torch.rs` now finds the mapped
+    `libtorch_cpu.so` in `/proc/self/maps` and `dlopen`s `libtorch_cuda.so` from
+    that directory with `RTLD_NOW | RTLD_GLOBAL`, which is what Python's `torch`
+    gets by importing `_C` with the CUDA extension built in.
+    Done (slice 5): `application/registry.rs` builds `CudaMoE` when
+    `kernel.triton` is set under the `cuda` feature, so pyo3 is off the serving
+    path, and `tests/cuda_moe_matches_reference.rs` is the gate: real slabs out of
+    the mmap banks -> `FtwBanks` -> `CudaMoE` through `run_experts`, the four
+    committed cubins over the slot routes through the driver API, and
+    `grouped_moe_reference_abs_sum` over the same host bytes. Green:
+    `max|kernel - scalar| = 1.797e-5` of `5.427e-3` terms (`3.31e-3` rel) in 33 ms
+    for 4 tokens x top_k 8, 64 slots, layer 17. The tolerance stopped being the
+    pyo3 path's `2e-3`: these cubins are the serving specialization and round in
+    bf16 four times (`x`, `ic1`, `ic2`, `out`), so the gate budgets four half
+    ulps (`4 * 2^-9 = 7.8e-3`) and prints the split -- the bf16 activations alone
+    cost `9.158e-6` of the terms, the kernel's own rounding `7.587e-6` more. It
+    still reports how much of any future drift is the activation dtype, because
+    that was the one thing worth knowing when this gate first failed.
+    Remaining: the `moe_block` swap's own gate (the tower with the kernel
+    through libtorch), and dropping `infrastructure/triton.rs` plus the pyo3
+    feature once nothing else needs them.
 
 37. **Anthropic `/v1/messages` is out of the MVP** (2026-10-03) -- dropped
     deliberately, not deferred: the MVP speaks the OpenAI surface only. FreeToken

@@ -20,64 +20,9 @@ use pyo3::prelude::*;
 use pyo3::types::{PyByteArray, PyDict, PyTuple};
 
 use crate::domain::expert_kernel::{
-    ExpertGemm, ExpertSlabSource, ExpertSlotStore, MoEError, MoEGroup, Part, Slab,
+    ExpertGemm, ExpertShapes, ExpertSlabSource, ExpertSlotStore, MoEError, MoEGroup, Part, Slab,
+    route_lists,
 };
-
-/// Shapes of one expert's two slabs, the numbers the kernels index with:
-/// `gate_up [2 * inter, hidden]`, `down [hidden, inter]`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ExpertShapes {
-    pub hidden: usize,
-    pub inter: usize,
-}
-
-impl ExpertShapes {
-    pub fn new(hidden: usize, inter: usize) -> Result<Self, MoEError> {
-        if hidden == 0 || inter == 0 || !hidden.is_multiple_of(16) || !inter.is_multiple_of(16) {
-            return Err(MoEError::Bad(format!(
-                "expert shapes hidden {hidden} inter {inter} must be nonzero multiples of 16"
-            )));
-        }
-        Ok(Self { hidden, inter })
-    }
-
-    pub fn gate_up_rows(self) -> usize {
-        2 * self.inter
-    }
-
-    /// `(rows, cols)` of one part, the shape both the device bank and the
-    /// per-expert slab use.
-    pub fn slab_shape(self, part: Part) -> (usize, usize) {
-        match part {
-            Part::GateUp => (self.gate_up_rows(), self.hidden),
-            Part::Down => (self.hidden, self.inter),
-        }
-    }
-}
-
-/// The route lists the kernel wants, flattened out of the domain's dense
-/// `[tokens, top_k]` slot ids. Pure, so it is tested without python.
-pub fn route_lists(
-    routes: &[i32],
-    tokens: usize,
-    top_k: usize,
-) -> Result<(Vec<i32>, Vec<i32>), MoEError> {
-    if tokens == 0 || top_k == 0 || routes.len() != tokens * top_k {
-        return Err(MoEError::Bad(format!(
-            "routes {} for {tokens} tokens x top_k {top_k}",
-            routes.len()
-        )));
-    }
-    let mut route_token = Vec::with_capacity(routes.len());
-    let mut route_slot = Vec::with_capacity(routes.len());
-    for (t, chunk) in routes.chunks(top_k).enumerate() {
-        for &slot in chunk {
-            route_token.push(t as i32);
-            route_slot.push(slot);
-        }
-    }
-    Ok((route_token, route_slot))
-}
 
 fn err(context: &str, e: impl std::fmt::Display) -> MoEError {
     MoEError::Bad(format!("{context}: {e}"))
@@ -853,30 +798,6 @@ mod tests {
             );
             assert_eq!(args.get_item(1).unwrap().extract::<i64>().unwrap(), 0);
         });
-    }
-
-    #[test]
-    fn routes_flatten_token_major() {
-        let (token, slot) = route_lists(&[3, -1, 1, 1, 0, 2], 3, 2).unwrap();
-        assert_eq!(token, vec![0, 0, 1, 1, 2, 2]);
-        assert_eq!(slot, vec![3, -1, 1, 1, 0, 2]);
-    }
-
-    #[test]
-    fn routes_reject_wrong_shapes() {
-        assert!(route_lists(&[0, 1], 2, 2).is_err());
-        assert!(route_lists(&[], 0, 1).is_err());
-        assert!(route_lists(&[0], 1, 0).is_err());
-    }
-
-    #[test]
-    fn shapes_need_multiples_of_sixteen() {
-        assert!(ExpertShapes::new(1024, 512).is_ok());
-        assert!(ExpertShapes::new(1000, 512).is_err());
-        assert!(ExpertShapes::new(1024, 0).is_err());
-        let s = ExpertShapes::new(1024, 512).unwrap();
-        assert_eq!(s.slab_shape(Part::GateUp), (1024, 1024));
-        assert_eq!(s.slab_shape(Part::Down), (1024, 512));
     }
 
     #[test]

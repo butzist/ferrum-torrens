@@ -4,6 +4,8 @@
 pub mod banks;
 #[cfg(feature = "cuda")]
 pub mod cuda_driver;
+#[cfg(feature = "cuda")]
+pub mod cuda_moe;
 pub mod ftw;
 pub mod http;
 pub mod kernel_abi;

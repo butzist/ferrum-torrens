@@ -22,11 +22,12 @@ use std::time::Instant;
 
 use ferrum_torrens::application::run_experts::{ExpertStep, run_experts};
 use ferrum_torrens::domain::expert_cache::ExpertCache;
+use ferrum_torrens::domain::expert_kernel::ExpertShapes;
 use ferrum_torrens::domain::expert_kernel::{ExpertSlabSource, HostBanks, MoEGroup, Part, Slab};
 use ferrum_torrens::domain::weights::WeightsReader;
 use ferrum_torrens::infrastructure::banks::FtwBanks;
 use ferrum_torrens::infrastructure::ftw::{FtwIndex, MmapFtwReader};
-use ferrum_torrens::infrastructure::triton::{ExpertShapes, TritonMoE, TritonRuntime};
+use ferrum_torrens::infrastructure::triton::{TritonMoE, TritonRuntime};
 
 const FTW_DIR: &str = ".model-cache/Qwen3.6-35B-A3B-NVFP4.ftw";
 const LAYER: usize = 17;
