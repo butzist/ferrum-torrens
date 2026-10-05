@@ -952,7 +952,19 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
     Done (slice 2): `infrastructure/kernel_abi.rs` parses the manifest, derives
     the four launches' argument packs (all strides come from the manifest
     shapes), zeroes the two trailing scratch pointers, and unit-tests the result
-    against the committed PTX entry parameters -- 11 CPU-only tests.
+    against the committed PTX entry parameters -- 11 CPU-only tests. The
+    manifest also records each kernel's column tile (`block`), because it is a
+    constexpr like `K_BYTES` and the launch grid has to divide by it.
+    Written (slice 3): `infrastructure/cuda_driver.rs` dlopens `libcuda.so.1` and
+    binds 15 entry points by hand (no new crate), with the handle-taking calls
+    `unsafe` and `CudaKernels` as the owning safe facade. Four CPU-only tests
+    cover symbol resolution, the no-device path and the driver error strings, and
+    `tests/kernel_cubin_smoke.rs` is the gate: it loads the committed cubins and
+    runs `sum_reduce` and `silu_mul` against a CPU reference through the packed
+    argument array. BLOCKED: that gate needs a GPU, so it has never run; the
+    sandbox has no device (`cuInit` is NO_DEVICE) and the driver mount only
+    exposes `libcuda.so.1` without an openable device. Slice 4 needs the slot
+    cache on libtorch tensors and then the stream, which is also GPU-only.
 
 37. **Anthropic `/v1/messages` is out of the MVP** (2026-10-03) -- dropped
     deliberately, not deferred: the MVP speaks the OpenAI surface only. FreeToken

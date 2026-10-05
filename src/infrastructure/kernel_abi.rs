@@ -61,6 +61,7 @@ struct KernelEntry {
     global_scratch_size: u32,
     profile_scratch_size: u32,
     n: usize,
+    block: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -91,6 +92,10 @@ pub struct Kernel {
     pub shared: u32,
     /// The kernel's output columns, a constexpr trip count baked into the cubin.
     pub n: usize,
+    /// The columns one program covers, also a constexpr. The grid is
+    /// `cdiv(n, block)` in y, so a launcher that gets this wrong either skips
+    /// columns or reads past them.
+    pub block: usize,
 }
 
 /// The committed kernels, parsed. Every access is fallible because a stale
@@ -169,6 +174,7 @@ impl Abi {
                     num_warps: entry.num_warps,
                     shared: entry.shared,
                     n: entry.n,
+                    block: entry.block,
                 },
             );
         }
@@ -190,6 +196,11 @@ impl Abi {
     /// The manifest as committed.
     pub fn committed() -> Result<Self, MoEError> {
         Self::parse(MANIFEST_JSON)
+    }
+
+    /// The kernel names, in the order `grouped_moe` launches them.
+    pub fn kernel_names() -> &'static [&'static str] {
+        &NAMES
     }
 
     pub fn kernel(&self, name: &str) -> Result<&Kernel, MoEError> {
@@ -358,12 +369,16 @@ impl ArgPack {
     }
 
     /// The `kernelParams` array: one pointer per parameter, into `slots`.
-    pub fn kernel_params(&self) -> Result<Vec<*const std::ffi::c_void>, MoEError> {
+    ///
+    /// The pointers are `*mut` only because the CUDA header's
+    /// `cuLaunchKernel` takes `void**`; the driver reads the argument values and
+    /// writes none of them, and each points into `slots`, which this borrows.
+    pub fn kernel_params(&self) -> Result<Vec<*mut std::ffi::c_void>, MoEError> {
         self.finish()?;
         Ok(self
             .slots
             .iter()
-            .map(|s| s as *const u64 as *const std::ffi::c_void)
+            .map(|s| (s as *const u64).cast_mut().cast())
             .collect())
     }
 
@@ -376,7 +391,10 @@ impl ArgPack {
 /// Device addresses and shapes for one layer's four launches. Everything is a
 /// raw address: the caller owns the memory (libtorch tensors, or the slot cache),
 /// and this module never allocates.
-#[derive(Debug, Clone, Copy)]
+///
+/// `Default` is all zeroes so a caller that runs one kernel of the four only has
+/// to name the buffers that kernel reads.
+#[derive(Debug, Clone, Copy, Default)]
 pub struct MoEArgs {
     pub tokens: usize,
     pub routes: usize,
@@ -498,27 +516,14 @@ pub fn sum_reduce_args(abi: &Abi, a: &MoEArgs) -> Result<ArgPack, MoEError> {
     Ok(p)
 }
 
-/// `(grid_x, grid_y, 1)` for a GEMV: one program per route, one per N block.
-pub fn gemv_grid(routes: usize, kernel: &Kernel) -> (u32, u32, u32) {
-    (routes as u32, div_ceil(kernel.n, abi_block_n()), 1)
-}
-
-/// The silu launch: one program per route, one per intermediate block.
-pub fn silu_grid(routes: usize, inter: usize) -> (u32, u32, u32) {
-    (routes as u32, div_ceil(inter, 256), 1)
-}
-
-/// The reduce launch: one program per token, one per hidden block.
-pub fn sum_reduce_grid(tokens: usize, hidden: usize, block_n: usize) -> (u32, u32, u32) {
-    (tokens as u32, div_ceil(hidden, block_n), 1)
-}
-
-/// `BLOCK_N` is a constexpr in the cubin, so the grid has to use the same value
-/// the AOT build baked in. It is fixed for decode (upstream's offline sweep),
-/// and the manifest's `n` plus this must divide evenly or the tail block runs
-/// masked; the manifest test pins both.
-const fn abi_block_n() -> usize {
-    128
+/// The launch grid for a kernel: one program per row (a route, or a token for
+/// the reduce) and one per `block`-column tile.
+///
+/// All four kernels are shaped this way, which is why the y extent comes from
+/// the cubin's own trip counts rather than from the caller: `n` and `block` are
+/// both constexpr, so the grid cannot be derived from the runtime shapes alone.
+pub fn grid(rows: usize, kernel: &Kernel) -> (u32, u32, u32) {
+    (rows as u32, div_ceil(kernel.n, kernel.block), 1)
 }
 
 #[cfg(test)]
@@ -637,24 +642,14 @@ mod tests {
     #[test]
     fn the_shapes_divide_the_committed_trip_counts() {
         let abi = abi();
-        for name in [GEMV_GATE_UP, GEMV_DOWN] {
+        for name in Abi::kernel_names() {
             let kernel = abi.kernel(name).unwrap();
             assert_eq!(
-                kernel.n % abi_block_n(),
+                kernel.n % kernel.block,
                 0,
-                "{name}: N is not a multiple of BLOCK_N"
+                "{name}: the tile does not divide n"
             );
         }
-        assert_eq!(
-            abi.inter % 256,
-            0,
-            "silu tile does not divide the intermediate size"
-        );
-        assert_eq!(
-            abi.hidden % abi_block_n(),
-            0,
-            "reduce tile does not divide hidden"
-        );
         // The e4m3 scale bank is K/16 bytes per row, so K must be a multiple of 16.
         assert_eq!(abi.hidden % 16, 0);
         assert_eq!(abi.inter % 16, 0);
@@ -717,11 +712,15 @@ mod tests {
         let abi = abi();
         let gate_up = abi.kernel(GEMV_GATE_UP).unwrap();
         let routes = 3 * abi.top_k;
-        assert_eq!(gemv_grid(routes, gate_up), (routes as u32, 8, 1));
-        assert_eq!(silu_grid(routes, abi.inter), (routes as u32, 2, 1));
+        assert_eq!(grid(routes, gate_up), (routes as u32, 8, 1));
         assert_eq!(
-            sum_reduce_grid(abi.top_k, abi.hidden, abi_block_n()),
-            (8, 16, 1)
+            grid(routes, abi.kernel(GEMV_DOWN).unwrap()),
+            (routes as u32, 16, 1)
         );
+        assert_eq!(
+            grid(routes, abi.kernel(SILU_MUL).unwrap()),
+            (routes as u32, 2, 1)
+        );
+        assert_eq!(grid(abi.top_k, abi.kernel(SUM_REDUCE).unwrap()), (8, 16, 1));
     }
 }

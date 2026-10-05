@@ -34,7 +34,16 @@ from triton.backends.compiler import GPUTarget
 from triton.backends.nvidia.compiler import CUDAOptions
 from triton.compiler import ASTSource, compile as triton_compile
 
-from .nvfp4_moe import _nvfp4_gemv_kernel, _silu_mul_kernel, _sum_reduce_kernel
+from .nvfp4_moe import (
+    DECODE_BLOCK_N,
+    _nvfp4_gemv_kernel,
+    _silu_mul_kernel,
+    _sum_reduce_kernel,
+)
+
+# The silu kernel's tile is derived from the intermediate size at launch
+# (`min(next_power_of_2(inter), 256)`), so the AOT build pins the serving value.
+SILU_BLOCK_I = 256
 from .signatures import (
     SERVING_DTYPE,
     SERVING_HIDDEN,
@@ -61,26 +70,28 @@ KERNELS: dict[str, dict] = {
         "signature": gemv(),
         "constexprs": gate_up_constexprs(),
         "n": SERVING_INTER * 2,
-        "k_bytes": SERVING_HIDDEN // 2,
+        "block": DECODE_BLOCK_N,
     },
     "gemv_down": {
         "fn": _nvfp4_gemv_kernel,
         "signature": gemv(),
         "constexprs": down_constexprs(),
         "n": SERVING_HIDDEN,
-        "k_bytes": SERVING_INTER // 2,
+        "block": DECODE_BLOCK_N,
     },
     "silu_mul": {
         "fn": _silu_mul_kernel,
         "signature": silu(),
         "constexprs": silu_constexprs(),
         "n": SERVING_INTER,
+        "block": SILU_BLOCK_I,
     },
     "sum_reduce": {
         "fn": _sum_reduce_kernel,
         "signature": reduce(),
         "constexprs": reduce_constexprs(),
         "n": SERVING_HIDDEN,
+        "block": DECODE_BLOCK_N,
     },
 }
 
@@ -137,6 +148,9 @@ def _compile_one(spec: dict) -> dict:
         "global_scratch_size": kern.metadata.global_scratch_size,
         "profile_scratch_size": kern.metadata.profile_scratch_size,
         "n": spec["n"],
+        # The columns one program covers. A constexpr, so it is baked into the
+        # cubin and the launch grid has to use the same number.
+        "block": spec["block"],
     }
 
 

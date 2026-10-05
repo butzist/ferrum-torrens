@@ -2,6 +2,8 @@
 // CUDA and HTTP types; never imported by the domain core.
 
 pub mod banks;
+#[cfg(feature = "cuda")]
+pub mod cuda_driver;
 pub mod ftw;
 pub mod http;
 pub mod kernel_abi;

@@ -1,6 +1,7 @@
 {
   "kernels": {
     "gemv_down": {
+      "block": 128,
       "declared_args": [
         "a_ptr",
         "packed_ptr",
@@ -137,6 +138,7 @@
       "shared": 0
     },
     "gemv_gate_up": {
+      "block": 128,
       "declared_args": [
         "a_ptr",
         "packed_ptr",
@@ -273,6 +275,7 @@
       "shared": 0
     },
     "silu_mul": {
+      "block": 256,
       "declared_args": [
         "ic1_ptr",
         "ic2_ptr",
@@ -329,6 +332,7 @@
       "shared": 0
     },
     "sum_reduce": {
+      "block": 128,
       "declared_args": [
         "ic3_ptr",
         "out_ptr",

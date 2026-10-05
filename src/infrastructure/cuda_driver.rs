@@ -1,0 +1,519 @@
+//! The CUDA driver API, loaded by hand.
+//!
+//! Decision 36: the serving path must not import Python, and torch 2.11+ ships no
+//! kernel-launch binding, so the driver is the only launcher left. `libcuda` is
+//! dlopen'd and its entry points resolved by name rather than linked, for two
+//! reasons: the crate then builds and tests with no CUDA at all, and the exact
+//! version of the driver that ends up loaded is the one already on
+//! `LD_LIBRARY_PATH` next to the libtorch this engine is using.
+//!
+//! Only what the MoE launch path needs is bound. Anything the driver reports as
+//! a `CUresult` is an error: a launch that silently failed would show up as
+//! garbage tokens much later, so every fallible call returns `Result` and the
+//! driver string is carried in the error.
+
+use std::ffi::{CString, c_char, c_int, c_void};
+
+use thiserror::Error;
+
+use crate::infrastructure::kernel_abi::{Abi, Kernel};
+
+#[derive(Debug, Error)]
+pub enum CudaError {
+    #[error("cuda: cannot load {lib} ({why})")]
+    Load { lib: String, why: String },
+    #[error("cuda: {lib} has no {symbol}")]
+    Symbol { lib: String, symbol: &'static str },
+    #[error("cuda: {0}")]
+    Driver(String),
+    #[error("cuda: no device")]
+    NoDevice,
+}
+
+pub type CUresult = c_int;
+pub type CUdevice = c_int;
+/// An opaque driver handle. The driver API's own opaque types are pointers on
+/// every platform this engine targets.
+pub type CUdeviceptr = u64;
+#[allow(clippy::type_complexity)]
+pub type CUmodule = *mut c_void;
+pub type CUfunction = *mut c_void;
+pub type CUcontext = *mut c_void;
+pub type CUstream = *mut c_void;
+
+const RTLD_NOW: c_int = 2;
+const RTLD_GLOBAL: c_int = 0x100;
+
+/// `libcuda.so.1` is the SONAME every NVIDIA driver ships under, and the stub
+/// `libcuda.so` only exists with the toolkit installed. The devshell puts the
+/// driver's own mount first on `LD_LIBRARY_PATH`.
+const LIB: &str = "libcuda.so.1";
+
+unsafe extern "C" {
+    fn dlopen(filename: *const c_char, flag: c_int) -> *mut c_void;
+    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    fn dlerror() -> *const c_char;
+}
+
+/// The bound entry points, one alias per CUDA signature. Spelling the types out
+/// here is the whole point: a wrong signature is a memory-corrupting bug, and
+/// `dlsym` cannot check it for us.
+type InitFn = unsafe extern "C" fn(u32) -> CUresult;
+type DriverVersionFn = unsafe extern "C" fn(*mut c_int) -> CUresult;
+type ErrorStringFn = unsafe extern "C" fn(CUresult, *mut *const c_char) -> CUresult;
+type DeviceCountFn = unsafe extern "C" fn(*mut c_int) -> CUresult;
+type PrimaryCtxRetainFn = unsafe extern "C" fn(*mut CUcontext, CUdevice) -> CUresult;
+type CtxSetCurrentFn = unsafe extern "C" fn(CUcontext) -> CUresult;
+type ModuleLoadFn = unsafe extern "C" fn(*mut CUmodule, *const c_void) -> CUresult;
+type ModuleGetFn = unsafe extern "C" fn(*mut CUfunction, CUmodule, *const c_char) -> CUresult;
+#[allow(clippy::too_many_arguments)]
+type LaunchFn = unsafe extern "C" fn(
+    CUfunction,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    CUstream,
+    *mut *mut c_void,
+    *mut *mut c_void,
+) -> CUresult;
+type StreamSyncFn = unsafe extern "C" fn(CUstream) -> CUresult;
+type MemAllocFn = unsafe extern "C" fn(*mut CUdeviceptr, usize) -> CUresult;
+type MemFreeFn = unsafe extern "C" fn(CUdeviceptr) -> CUresult;
+type MemcpyHtoDFn = unsafe extern "C" fn(CUdeviceptr, *const c_void, usize) -> CUresult;
+type MemcpyDtoHFn = unsafe extern "C" fn(*mut c_void, CUdeviceptr, usize) -> CUresult;
+
+struct Fns {
+    cu_init: InitFn,
+    cu_driver_get_version: DriverVersionFn,
+    cu_get_error_string: ErrorStringFn,
+    cu_device_get_count: DeviceCountFn,
+    cu_device_primary_ctx_retain: PrimaryCtxRetainFn,
+    cu_ctx_set_current: CtxSetCurrentFn,
+    cu_module_load_data: ModuleLoadFn,
+    cu_module_get_function: ModuleGetFn,
+    cu_launch_kernel: LaunchFn,
+    cu_stream_synchronize: StreamSyncFn,
+    cu_mem_alloc: MemAllocFn,
+    cu_mem_free: MemFreeFn,
+    cu_memcpy_htod: MemcpyHtoDFn,
+    cu_memcpy_dtoh: MemcpyDtoHFn,
+}
+
+/// A loaded `libcuda`, plus whatever context the caller made current.
+pub struct Driver {
+    /// Kept only so the library outlives every module loaded from it; we never
+    /// `dlclose`, because a module holds the driver's allocations.
+    _lib: *mut c_void,
+    fns: Fns,
+}
+
+// SAFETY: the driver API is thread-safe, and this table is immutable after
+// `open`. The engine launches from its own worker threads, not just the one
+// that loaded the library.
+unsafe impl Send for Driver {}
+unsafe impl Sync for Driver {}
+
+impl Driver {
+    /// dlopen `libcuda` and resolve every symbol below. The only fallible part
+    /// of the whole boundary that is not a `CUresult`: everything else goes
+    /// through `check`.
+    pub fn open() -> Result<Self, CudaError> {
+        let lib_name = CString::new(LIB).expect("no NUL in the library name");
+        // SAFETY: a NUL-terminated name. The handle is kept for the life of the
+        // Driver and never closed.
+        let lib = unsafe { dlopen(lib_name.as_ptr(), RTLD_NOW | RTLD_GLOBAL) };
+        if lib.is_null() {
+            let why = unsafe {
+                let e = dlerror();
+                if e.is_null() {
+                    "dlopen failed".to_string()
+                } else {
+                    std::ffi::CStr::from_ptr(e).to_string_lossy().into_owned()
+                }
+            };
+            return Err(CudaError::Load {
+                lib: LIB.to_string(),
+                why,
+            });
+        }
+
+        macro_rules! sym {
+            ($name:literal, $ty:ty) => {{
+                let c = CString::new($name).expect("no NUL in a symbol name");
+                // SAFETY: the handle came from dlopen above and outlives this
+                // struct; the driver's exports are plain C functions.
+                let p = unsafe { dlsym(lib, c.as_ptr()) };
+                if p.is_null() {
+                    return Err(CudaError::Symbol {
+                        lib: LIB.to_string(),
+                        symbol: $name,
+                    });
+                }
+                // SAFETY: `p` points at an `extern "C"` export whose signature is
+                // the CUDA header's for `$name`, named in the call site below.
+                unsafe { std::mem::transmute::<*mut c_void, $ty>(p) }
+            }};
+        }
+
+        let fns = Fns {
+            cu_init: sym!("cuInit", InitFn),
+            cu_driver_get_version: sym!("cuDriverGetVersion", DriverVersionFn),
+            cu_get_error_string: sym!("cuGetErrorString", ErrorStringFn),
+            cu_device_get_count: sym!("cuDeviceGetCount", DeviceCountFn),
+            cu_device_primary_ctx_retain: sym!("cuDevicePrimaryCtxRetain", PrimaryCtxRetainFn),
+            cu_ctx_set_current: sym!("cuCtxSetCurrent", CtxSetCurrentFn),
+            cu_module_load_data: sym!("cuModuleLoadData", ModuleLoadFn),
+            cu_module_get_function: sym!("cuModuleGetFunction", ModuleGetFn),
+            cu_launch_kernel: sym!("cuLaunchKernel", LaunchFn),
+            cu_stream_synchronize: sym!("cuStreamSynchronize", StreamSyncFn),
+            // The `_v2` names are the 64-bit device-pointer ABI; the unsuffixed
+            // ones are the 32-bit-pointer era and a modern driver does not export
+            // them.
+            cu_mem_alloc: sym!("cuMemAlloc_v2", MemAllocFn),
+            cu_mem_free: sym!("cuMemFree_v2", MemFreeFn),
+            cu_memcpy_htod: sym!("cuMemcpyHtoD_v2", MemcpyHtoDFn),
+            cu_memcpy_dtoh: sym!("cuMemcpyDtoH_v2", MemcpyDtoHFn),
+        };
+        Ok(Self { _lib: lib, fns })
+    }
+
+    fn check(&self, r: CUresult) -> Result<(), CudaError> {
+        if r == 0 {
+            return Ok(());
+        }
+        // SAFETY: `cuGetErrorString` writes to the pointer we own, or leaves it
+        // null, which we handle rather than deref.
+        let mut msg: *const c_char = std::ptr::null();
+        // SAFETY: the resolved signature takes (CUresult, *const c_char **).
+        unsafe { (self.fns.cu_get_error_string)(r, &raw mut msg) };
+        let text = if msg.is_null() {
+            format!("CUresult {r}")
+        } else {
+            // SAFETY: non-null string the driver just wrote; the lifetime is the
+            // driver's static table.
+            unsafe { std::ffi::CStr::from_ptr(msg) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        if r == 100 {
+            return Err(CudaError::NoDevice);
+        }
+        Err(CudaError::Driver(text))
+    }
+
+    /// `cuInit(0)`. Must succeed before anything else, and the sandbox has no
+    /// device, so this is where a CPU-only box stops.
+    pub fn init(&self) -> Result<(), CudaError> {
+        // SAFETY: no arguments, no output.
+        self.check(unsafe { (self.fns.cu_init)(0) })
+    }
+
+    pub fn driver_version(&self) -> Result<i32, CudaError> {
+        let mut v = 0;
+        // SAFETY: `v` is a live i32 for the call's duration.
+        self.check(unsafe { (self.fns.cu_driver_get_version)(&raw mut v) })?;
+        Ok(v)
+    }
+
+    pub fn device_count(&self) -> Result<i32, CudaError> {
+        let mut n = 0;
+        // SAFETY: `n` is a live i32 for the call's duration.
+        self.check(unsafe { (self.fns.cu_device_get_count)(&raw mut n) })?;
+        Ok(n)
+    }
+
+    /// Retain the primary context of `device` and make it current on this
+    /// thread. Retaining (not creating) is what libtorch does too, so a launch
+    /// here and a launch from a libtorch op land in the same context.
+    pub fn attach_primary_context(&self, device: CUdevice) -> Result<CUcontext, CudaError> {
+        let mut ctx: CUcontext = std::ptr::null_mut();
+        // SAFETY: `ctx` is a live pointer-sized slot for the duration of the call.
+        self.check(unsafe { (self.fns.cu_device_primary_ctx_retain)(&raw mut ctx, device) })?;
+        // SAFETY: a retained primary context is a valid handle to set current.
+        self.check(unsafe { (self.fns.cu_ctx_set_current)(ctx) })?;
+        Ok(ctx)
+    }
+
+    /// Load a cubin image (`kernel_abi::cubin`) as a module.
+    pub fn load_module(&self, image: &[u8]) -> Result<CUmodule, CudaError> {
+        let mut module: CUmodule = std::ptr::null_mut();
+        // SAFETY: `image` outlives the call (the driver copies what it needs at
+        // load time), and `module` is a live slot.
+        self.check(unsafe {
+            (self.fns.cu_module_load_data)(&raw mut module, image.as_ptr().cast())
+        })?;
+        Ok(module)
+    }
+
+    /// # Safety
+    /// `module` must be a live module from `load_module` on this driver, in the
+    /// context that is current on this thread.
+    pub unsafe fn function(&self, module: CUmodule, entry: &str) -> Result<CUfunction, CudaError> {
+        let c = CString::new(entry).expect("no NUL in an entry name");
+        let mut f: CUfunction = std::ptr::null_mut();
+        // SAFETY: a live module, a NUL-terminated name, a live output slot.
+        let r = unsafe { (self.fns.cu_module_get_function)(&raw mut f, module, c.as_ptr()) };
+        self.check(r)
+            .map_err(|why| CudaError::Driver(format!("{entry}: {why}")))?;
+        Ok(f)
+    }
+
+    /// Launch `f` with a grid and block of 1D extents.
+    ///
+    /// `params` is `kernel_abi`'s `kernelParams` array: one pointer per entry
+    /// parameter, and it must stay alive until the launch returns, which it does
+    /// because it is borrowed here. The driver copies the values out before
+    /// returning, so the launches can be async on a non-default stream.
+    ///
+    /// # Safety
+    /// `f` must be a live function of a module loaded on this driver, `params`
+    /// must hold one pointer per entry parameter with the right width, and
+    /// `stream` must be a stream of the current context (or null).
+    pub unsafe fn launch(
+        &self,
+        f: CUfunction,
+        grid: (u32, u32, u32),
+        block: (u32, u32, u32),
+        shared: u32,
+        stream: CUstream,
+        params: &mut [*mut c_void],
+    ) -> Result<(), CudaError> {
+        // SAFETY: `f` came from `cuModuleGetFunction`, the grid and block are the
+        // kernel's, and `params` holds one pointer per parameter of a live
+        // ArgPack. The driver reads the argument values during the call.
+        // SAFETY: the caller guarantees a live function and a well-formed
+        // `kernelParams` array.
+        let r = unsafe {
+            (self.fns.cu_launch_kernel)(
+                f,
+                grid.0,
+                grid.1,
+                grid.2,
+                block.0,
+                block.1,
+                block.2,
+                shared,
+                stream,
+                params.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        self.check(r)
+    }
+
+    /// # Safety
+    /// `stream` must be a stream of the current context, or null for the legacy
+    /// default stream.
+    pub unsafe fn synchronize(&self, stream: CUstream) -> Result<(), CudaError> {
+        // SAFETY: the caller guarantees `stream` belongs to the current context.
+        self.check(unsafe { (self.fns.cu_stream_synchronize)(stream) })
+    }
+
+    /// A device allocation, freed on drop. Used by the tests and by the slot
+    /// cache's first slice; the steady state is libtorch tensors.
+    pub fn alloc<'d>(&'d self, bytes: usize) -> Result<DeviceBuf<'d>, CudaError> {
+        let mut ptr: CUdeviceptr = 0;
+        // SAFETY: `ptr` is a live slot; the length is the whole allocation.
+        self.check(unsafe { (self.fns.cu_mem_alloc)(&raw mut ptr, bytes) })?;
+        Ok(DeviceBuf {
+            driver: self,
+            ptr,
+            bytes,
+        })
+    }
+
+    /// # Safety
+    /// `dst` must be a live device address with room for `src.len()` bytes.
+    pub unsafe fn copy_h2d(&self, dst: CUdeviceptr, src: &[u8]) -> Result<(), CudaError> {
+        // SAFETY: the caller guarantees `dst` has room for `src.len()` bytes.
+        self.check(unsafe { (self.fns.cu_memcpy_htod)(dst, src.as_ptr().cast(), src.len()) })
+    }
+
+    /// # Safety
+    /// `src` must be a live device address with at least `dst.len()` bytes.
+    pub unsafe fn copy_d2h(&self, dst: &mut [u8], src: CUdeviceptr) -> Result<(), CudaError> {
+        // SAFETY: the caller guarantees `src` holds at least `dst.len()` bytes.
+        self.check(unsafe { (self.fns.cu_memcpy_dtoh)(dst.as_mut_ptr().cast(), src, dst.len()) })
+    }
+}
+
+impl CudaError {
+    pub fn is_no_device(&self) -> bool {
+        matches!(self, CudaError::NoDevice)
+    }
+}
+
+/// Owns a device allocation. Dropping frees it; a leaked cache would pin VRAM
+/// across a request, which is exactly the failure the slot cache has to avoid.
+pub struct DeviceBuf<'a> {
+    driver: &'a Driver,
+    pub ptr: CUdeviceptr,
+    bytes: usize,
+}
+
+impl Drop for DeviceBuf<'_> {
+    fn drop(&mut self) {
+        // A failure here means the driver is already gone; there is nothing
+        // useful to do about it in a destructor.
+        let _ = self
+            .driver
+            .check(unsafe { (self.driver.fns.cu_mem_free)(self.ptr) });
+    }
+}
+
+impl DeviceBuf<'_> {
+    pub fn len(&self) -> usize {
+        self.bytes
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes == 0
+    }
+}
+
+/// One committed kernel, loaded and ready to launch.
+///
+/// The module and function handles are owned by the `CudaKernels` that made
+/// them; a bare `CUfunction` would be a dangling pointer waiting to happen.
+pub struct CudaKernels<'a> {
+    driver: &'a Driver,
+    abi: Abi,
+    loaded: Vec<(CUmodule, Vec<(String, CUfunction)>)>,
+}
+
+impl<'a> CudaKernels<'a> {
+    /// Load every kernel in `abi` from the committed cubins.
+    pub fn load(driver: &'a Driver, abi: Abi) -> Result<Self, CudaError> {
+        let mut loaded = Vec::new();
+        for name in Abi::kernel_names() {
+            let image = crate::infrastructure::kernel_abi::cubin(name)
+                .map_err(|e| CudaError::Driver(format!("cubin: {e}")))?;
+            let module = driver.load_module(image)?;
+            let kernel = abi
+                .kernel(name)
+                .map_err(|e| CudaError::Driver(format!("abi: {e}")))?;
+            // SAFETY: `module` was just loaded by `driver`, whose context is
+            // current on this thread.
+            let f = unsafe { driver.function(module, &kernel.entry)? };
+            loaded.push((module, vec![(kernel.entry.clone(), f)]));
+        }
+        Ok(Self {
+            driver,
+            abi,
+            loaded,
+        })
+    }
+
+    pub fn abi(&self) -> &Abi {
+        &self.abi
+    }
+
+    pub fn function(&self, kernel: &Kernel) -> Result<CUfunction, CudaError> {
+        for (_, entries) in &self.loaded {
+            for (entry, f) in entries {
+                if *entry == kernel.entry {
+                    return Ok(*f);
+                }
+            }
+        }
+        Err(CudaError::Driver(format!(
+            "no loaded function for {}",
+            kernel.entry
+        )))
+    }
+
+    /// Launch `kernel` with `grid` and the block its manifest entry recorded.
+    ///
+    /// # Safety
+    /// `stream` must belong to the context that is current on this thread, and
+    /// `params` must be the `kernel_abi` pack for this same kernel.
+    pub unsafe fn launch(
+        &self,
+        kernel: &Kernel,
+        grid: (u32, u32, u32),
+        params: &mut [*mut c_void],
+        stream: CUstream,
+    ) -> Result<(), CudaError> {
+        let f = self.function(kernel)?;
+        // SAFETY: `f` came from this type's own `load`, so it is live in the
+        // driver's current context, and the grid matches the kernel's constexpr
+        // trip counts by construction in `kernel_abi`.
+        unsafe {
+            self.driver.launch(
+                f,
+                grid,
+                (Abi::block_threads(kernel), 1, 1),
+                kernel.shared,
+                stream,
+                params,
+            )
+        }
+    }
+
+    /// # Safety
+    /// As `Driver::synchronize`: `stream` must belong to the current context.
+    pub unsafe fn synchronize(&self, stream: CUstream) -> Result<(), CudaError> {
+        // SAFETY: the caller's contract is this method's contract.
+        unsafe { self.driver.synchronize(stream) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The riskiest part of the FFI is a symbol name that does not exist, and the
+    /// sandbox's driver mount is loadable even though it has no device, so this
+    /// test actually resolves all of them.
+    #[test]
+    fn every_symbol_resolves_and_the_driver_reports_itself() {
+        let Ok(driver) = Driver::open() else {
+            eprintln!("no libcuda on this box, skipping");
+            return;
+        };
+        assert!(driver.driver_version().is_ok());
+        // No device here is fine; that is decision 36's whole premise.
+        match driver.init() {
+            Ok(()) => assert!(driver.device_count().unwrap_or(0) >= 1),
+            Err(e) => {
+                assert!(e.is_no_device(), "unexpected init error: {e}");
+                assert_eq!(e.to_string(), "cuda: no device");
+            }
+        }
+    }
+
+    #[test]
+    fn a_missing_library_is_a_load_error() {
+        let err = Driver::open().err();
+        if let Some(e) = err {
+            assert!(matches!(e, CudaError::Load { .. }), "{e}");
+            assert!(e.to_string().contains(LIB), "{e}");
+        }
+    }
+
+    /// A `CudaError` from `check` must carry the driver's own string, because
+    /// that is what tells us which call failed. CUresult 999 is
+    /// `CUDA_ERROR_UNKNOWN`, and its string is driver-provided.
+    #[test]
+    fn a_driver_error_carries_the_driver_string() {
+        let Ok(driver) = Driver::open() else {
+            return;
+        };
+        let err = driver.check(999).unwrap_err();
+        assert!(matches!(err, CudaError::Driver(_)), "{err}");
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn no_device_is_its_own_variant() {
+        let Ok(driver) = Driver::open() else {
+            return;
+        };
+        let r = driver.check(100);
+        assert!(matches!(r, Err(CudaError::NoDevice)), "{r:?}");
+    }
+}
