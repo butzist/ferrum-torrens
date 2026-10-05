@@ -106,26 +106,9 @@
           libtorchCuda
         ];
 
-        # CUDA device paths for jail access (unfree, requires allowUnfree).
-        #
-        # Mirror the working reference config: bind the driver libraries plus
-        # the sysfs device tree read-only (libcuda enumerates the GPU through
-        # /sys/devices and /sys/class/drm; without them cuInit sees no device
-        # even when the nodes are mounted) and the device/shm nodes write.
-        # try-* skips paths absent on this host. noescape passes the string
-        # through unquoted so bwrap does not split or glob it.
         cudaDevicePaths = with combinators; [
-          (try-readonly (noescape "/proc/driver/nvidia"))
-          (try-readonly (noescape "/sys/class/drm"))
-          (try-readonly (noescape "/sys/devices"))
-          (try-readonly "/etc/nvidia")
-          (try-readwrite "/dev/nvidia0")
-          (try-readwrite "/dev/nvidia1")
-          (try-readwrite "/dev/nvidiactl")
-          (try-readwrite "/dev/nvidia-uvm")
-          (try-readwrite "/dev/nvidia-uvm-tools")
-          (try-readwrite "/dev/nvidia-modeset")
-          (try-readwrite "/dev/nvidia-caps")
+          (unsafe-add-raw-args
+            ''--dev-bind /dev dev'')
         ];
 
         jailOptions = with combinators;
