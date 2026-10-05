@@ -13,5 +13,3 @@ pub mod kernel_abi;
 pub mod kvcache_dev;
 pub mod tokenizers_hf;
 pub mod torch;
-#[cfg(feature = "triton")]
-pub mod triton;

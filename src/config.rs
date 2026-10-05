@@ -18,7 +18,6 @@ pub const DEFAULT_NUM_TOKENS: usize = 131072;
 pub const DEFAULT_TEMPERATURE: f32 = 0.0;
 pub const DEFAULT_TOP_K: i64 = -1;
 pub const DEFAULT_TOP_P: f32 = 1.0;
-pub const DEFAULT_PYTHON_PATH: &str = "python";
 pub const MIN_CACHE_SIZE_SLOTS: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
@@ -141,33 +140,20 @@ impl Default for Moe {
     }
 }
 
-/// Where the Triton kernel module lives. `triton = false` keeps the libtorch
-/// NVFP4 path (the stand-in), so a deployment can start without python at all.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// The grouped NVFP4 expert kernel. `triton = false` leaves the routed experts
+/// to the tower's inline host widening, so a deployment can start without the
+/// kernel (and without a GPU) at all.
+///
+/// The key is `triton` because that is what it used to select: the pyo3 adapter
+/// that embedded an interpreter to import a Triton module. It now selects the
+/// committed cubins launched over the CUDA driver API (decision 30), which is
+/// the same code, just no longer through python. The name stays: renaming it
+/// would break every deployed config for nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Kernel {
     #[serde(default)]
     pub triton: bool,
-    #[serde(default = "default_python_path")]
-    pub python_path: String,
-    /// Extra `sys.path` entries holding `torch`/`triton`; the embedded
-    /// interpreter is the one pyo3 linked, which is not the venv's.
-    #[serde(default)]
-    pub site_packages: Vec<String>,
-}
-
-impl Default for Kernel {
-    fn default() -> Self {
-        Self {
-            triton: false,
-            python_path: DEFAULT_PYTHON_PATH.to_string(),
-            site_packages: Vec::new(),
-        }
-    }
-}
-
-fn default_python_path() -> String {
-    DEFAULT_PYTHON_PATH.to_string()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
@@ -403,8 +389,6 @@ top_p = 1.0
 
 [kernel]
 triton = true
-python_path = "python"
-site_packages = ["/nix/store/...-python3-3.12.14/lib/python3.12/site-packages"]
 "#;
 
     #[test]
@@ -436,8 +420,6 @@ site_packages = ["/nix/store/...-python3-3.12.14/lib/python3.12/site-packages"]
         assert_eq!(c.sampling.top_k, -1);
         assert_eq!(c.sampling.top_p, 1.0);
         assert!(c.kernel.triton, "the example turns the kernel on");
-        assert_eq!(c.kernel.python_path, DEFAULT_PYTHON_PATH);
-        assert_eq!(c.kernel.site_packages.len(), 1);
     }
 
     #[test]
@@ -463,29 +445,39 @@ path = "/tmp/Qwen.ftw"
         assert_eq!(c.sampling.temperature, 0.0);
         assert_eq!(c.sampling.top_k, -1);
         assert_eq!(c.sampling.top_p, 1.0);
-        assert!(!c.kernel.triton, "the stand-in path is the default");
-        assert_eq!(c.kernel.python_path, DEFAULT_PYTHON_PATH);
-        assert!(c.kernel.site_packages.is_empty());
+        assert!(!c.kernel.triton, "the inline host widening is the default");
     }
 
     #[test]
-    fn kernel_section_points_at_the_python_kernel() {
+    fn the_kernel_section_is_a_bare_flag() {
         let c = Config::from_str(
             r#"[model]
 path = "/tmp/Qwen.ftw"
 [kernel]
 triton = true
-python_path = "/opt/ferrum/python"
-site_packages = ["/opt/venv/lib/python3.12/site-packages"]
 "#,
         )
         .unwrap();
         assert!(c.kernel.triton);
-        assert_eq!(c.kernel.python_path, "/opt/ferrum/python");
-        assert_eq!(
-            c.kernel.site_packages,
-            vec!["/opt/venv/lib/python3.12/site-packages"]
-        );
+    }
+
+    #[test]
+    fn the_python_knobs_are_gone_with_the_embedded_interpreter() {
+        // The kernel is the committed cubin launched over the driver API now
+        // (decision 30), so a config that still points at an interpreter must
+        // fail loudly rather than be silently ignored.
+        for key in [
+            "python_path = \"python\"",
+            "site_packages = [\"/opt/venv/lib/python3.12/site-packages\"]",
+        ] {
+            assert!(
+                Config::from_str(&format!(
+                    "[model]\npath = \"/tmp/Qwen.ftw\"\n[kernel]\ntriton = true\n{key}\n"
+                ))
+                .is_err(),
+                "{key} must not parse"
+            );
+        }
     }
 
     #[test]

@@ -21,10 +21,13 @@ The `moe_block` swap is done (commit `6e90b4f`) and its own gate is green:
 `CachedExperts` sits behind the new `MoEExecutor` port, the Qwen3.6 tower routes
 its experts through it when `kernel.triton=true`, and the gated one-token
 tower-with-the-kernel run answers the same oracle token (" Paris") while
-reporting its expert steps (decision 37). Next: the pyo3 feature and
-`infrastructure/triton.rs` come out, since nothing is left on that path.
-Last finished: decision 37 (the step counter) and decision 36 slice 6 (the
-tower-with-the-kernel gate). Before that the chat surface, SSE and the cached decode
+reporting its expert steps (decision 37). pyo3 is gone: no `triton` cargo
+feature, no `infrastructure/triton.rs`, no `python_path`/`site_packages` in the
+config, and nothing at runtime imports Python (decision 30, closed by decision
+36). Python is a build-time toolchain now: it authors the kernel in Triton,
+compiles it AOT into the committed `kernel/*.cubin`, and runs the interpreter
+selftest. Next: CUDA-graph capture, then M2 (API) / M3 proper.
+Last finished: decision 30 (the pyo3 exit). Before that the chat surface, SSE and the cached decode
 loop. Incremental KV decode is proved too: chunked prefill + one-token decode
 off the page table agrees with re-feeding the whole prefix on the real checkpoint
 (same argmax at every step, logits within 2e-6 of scale, decision 33), and the
@@ -164,7 +167,9 @@ ferrum-torrens/
       ftw.rs                    # FreeTokenWeight index parser + mmap reader (generic)
       banks.rs                  # per-layer expert host banks (pinned; QuantFormat-driven)
       torch.rs                  # libtorch compute runtime: device, tensors, streams, graphs
-      triton.rs                 # python/Triton NVFP4 expert GEMV adapter (the one kernel)
+      cuda_driver.rs            # hand-rolled libcuda FFI: load cubins, launch, copy
+      kernel_abi.rs             # the committed cubin ABI manifest, argument packing
+      cuda_moe.rs               # NVFP4 expert GEMV adapter over the driver API (the one kernel)
       kvcache_dev.rs            # mha_pool + gdn state slabs + the DeviceCache port impl
       http.rs                   # axum routes, SSE, chat template, generation
       tokenizers_hf.rs          # HF `tokenizers` crate + minijinja chat template
@@ -180,8 +185,8 @@ ferrum-torrens/
 Superseded by decision 2 (libtorch): the `build.rs` + `sources/csrc/` nvcc
 fatbin step, `infrastructure/gpu.rs` (cudarc wrapper) and
 `infrastructure/kernels/mod.rs` (FFI to a hand-built `libferrum_kernels`).
-`torch.rs` + `triton.rs` take their place. `moe_offload.rs` is folded into
-`triton.rs` + `run_experts.rs`.
+`torch.rs` + `cuda_moe.rs` take their place. `moe_offload.rs` is folded into
+`cuda_moe.rs` + `run_experts.rs`.
 
 Model boundary contract:
 - `ModelParams` (from FTW `meta` + checkpoint config) is what the engine uses to
@@ -294,7 +299,7 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
   shape: `Model::forward(&ForwardInput) -> Vec<f32>` and `Engine::run_forward`
   stay unchanged (no KV cache, no graph, no offload yet).
 
-### Kernels (Triton via the python adapter; the NVFP4 expert GEMV only)
+### Kernels (Triton sources, cubins launched over the CUDA driver API; the NVFP4 expert GEMV only)
 - [x] P0 **the one hand-written kernel**, part 1 (2026-10-02): the kernels
   themselves plus the port they implement. e2m1 LUT
   {0,0.5,1,1.5,2,3,4,6,-...}, e4m3 block scale, fp16 per-row global applied once
@@ -304,14 +309,17 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
   (`python/ferrum_kernel/nvfp4_moe.py`, `domain/expert_kernel.rs`: ports
   `ExpertGemm`/`ExpertSlotStore`/`ExpertSlabSource` + the `grouped_moe_reference`
   oracle the GPU gate compares against, 9 unit tests.)
-- [ ] P0 **the one hand-written kernel**, part 2: `infrastructure/triton.rs`
+- [x] P0 **the one hand-written kernel**, part 2 (closed 2026-10-05 by decision
+  36, which replaced this pyo3 adapter with `infrastructure/cuda_moe.rs` over the
+  driver API): `infrastructure/triton.rs`
   (pyo3, device slot cache, `ExpertGemm` over the python `grouped_moe`) plus the
   gated GPU test (kernel vs `grouped_moe_reference` on a real expert slab, then
   the oracle token through the full tower). The marlin-style int32 wide-load
   decode and the `tl.dot` prefill tile stay later perf swaps behind the same
   `grouped_moe` entry point (decision 24).
   - [x] the adapter itself (2026-10-02, `src/infrastructure/triton.rs`, feature
-    `triton`): `TritonRuntime` puts `kernel.python_path` plus
+    `triton`; deleted 2026-10-05 with the pyo3 exit, its ports now served by
+    `infrastructure/cuda_moe.rs`): `TritonRuntime` puts `kernel.python_path` plus
     `kernel.site_packages` on `sys.path`, imports the module, resolves
     `cuda:N` and refuses to run without native e4m3; `TritonMoE` allocates the
     `[slots, rows, cols/2]` banks on the device, stages one slab per expert
@@ -356,7 +364,9 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
     `tests/engine_real_generate.rs`, on `--features cuda` alone, still emits
     oracle token 11751 (" Paris"): 40 expert steps over the 40 layers, 32.7 s.
   - [x] the gated GPU test written (2026-10-02,
-    `tests/triton_moe_matches_reference.rs`, `--ignored`): real slabs from the
+    `tests/triton_moe_matches_reference.rs`, `--ignored`, deleted with pyo3 in
+    2026-10-05 -- `tests/cuda_moe_matches_reference.rs` is its successor): real
+    slabs from the
     mmap banks -> `FtwBanks` -> `TritonMoE` through `run_experts`, then
     `grouped_moe_reference` over the same host bytes. Split in two on
     2026-10-03 so the oracle half needs no GPU (it caught a bank-length mistake
@@ -370,21 +380,25 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
     bisect found it: only shapes with `K_BYTES <= 64` had ever passed).
     Green as of 2026-10-03: `max|kernel - scalar| = 4.6e-9` of `5.427e-3` terms,
     `8.5e-7` rel, in 366 ms for 4 tokens x top_k 8 over 32 experts, 64 slots.
-    Re-run it in a devshell:
-    `cargo test --release --features triton --test triton_moe_matches_reference -- --ignored --nocapture`
-    (set `FERRUM_KERNEL_SITE_PACKAGES` to the venv's site-packages; it defaults
-    to `FreeToken/.venv/lib/python3.12/site-packages`).
-  - [ ] **P1 drop `pyo3`, keep the kernel**: the pyo3 adapter is an interim
-    bridge, not the target shape (decision 30). Everything above it -- the
-    ports, the slot cache sizing, the slab source, `run_experts`, the oracle,
-    the gated test -- survives; only the launch path changes. Three routes, in
-    increasing cost and decreasing "we own the kernel":
-    1. **PTX from Triton, launched through the CUDA driver API** (cudarc,
-       `cuModuleLoadData` + `cuLaunchKernel`): a documented script runs
-       `triton.compile` once and commits the PTX; startup JITs it through the
-       driver, which is arch-portable sm_89+ and needs no nvcc, no nvrtc and no
-       python at runtime. ~1-2 days. Recommended: it removes pyo3 AND keeps the
-       kernel in Triton, so `compile_check.py` keeps its job.
+    Superseded by `tests/cuda_moe_matches_reference.rs` (decision 36), which
+    covers both halves on the driver-API cubins: `cargo test --release --features
+    cuda --test cuda_moe_matches_reference -- --ignored --nocapture`.
+  - [x] **P1 drop `pyo3`, keep the kernel** (2026-10-05, decisions 30 + 36): the
+    pyo3 adapter was an interim bridge, not the target shape. Everything above it
+    -- the ports, the slot cache sizing, the slab source, `run_experts`, the
+    oracle, the gated test -- survived; only the launch path changed. Route 1 was
+    taken: **Triton, compiled AOT and committed as cubins, launched through the
+    CUDA driver API**, hand-rolled FFI in `infrastructure/cuda_driver.rs` (no new
+    crate, no cudarc) with `kernel_abi.rs` pinning the argument layout against
+    the committed PTX. `python/ferrum_kernel/aot.py` runs `triton.compile` once
+    and writes `kernel/*.cubin` + `kernel/*.ptx`, which are committed, so
+    startup needs no nvcc, no nvrtc and no python. `compile_check.py` keeps its
+    job, and `selftest.py --interp` is still the CPU inner loop for kernel work.
+    What it cost, recorded here because the decision predicted most of it: the
+    `gemv_down` cubin silently ran the gate/up cubin because both share the
+    Triton entry name (decision 36), and `libtorch_cuda.so` is not in
+    `DT_NEEDED` so it has to be dlopened (decision 36). The two routes below
+    stay on the list for completeness only.
     2. **hand-written CUDA via `nvrtc` at startup** (no build step, no artifact
        in git): the same three kernels rewritten in C++ with
        `__nv_fp4_e2m1`/`__nv_fp8_e4m3` decoding. ~1 week, most of it GPU
@@ -769,27 +783,32 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
     take the same shared handle twice: plan and kernel call see the same banks
     without the caller juggling `&mut` and `&` out of one guard. The lock is
     uncontended and only held around a launch or one expert's H2D copy.
-29. **`pyo3` is behind the non-default `triton` feature** (2026-10-02) -- like
-    `cuda`, it must not be in the default CPU-only build: `auto-initialize`
-    links the build-time interpreter (the Nix python), and `kernel.python_path`
-    / `kernel.site_packages` exist because the venv's torch is imported into
-    THAT interpreter, not the other way round. `kernel.triton = false` is the
-    default so the port and the scalar oracle stay runnable without python.
+29. **`pyo3` is behind the non-default `triton` feature** (2026-10-02, historical
+    -- the feature is gone as of decision 36) -- like `cuda`, it must not be in the
+    default CPU-only build: `auto-initialize` linked the build-time interpreter
+    (the Nix python), and `kernel.python_path` / `kernel.site_packages` existed
+    because the venv's torch was imported into THAT interpreter, not the other
+    way round. `kernel.triton = false` is the default so the port and the scalar
+    oracle stay runnable without python, and the key survives: it now selects the
+    driver-API cubins.
 
-30. **`pyo3` is a bridge with a planned exit** (2026-10-02) -- decision 25 chose
-    an embedded interpreter because it was the shortest honest path to a running
-    NVFP4 kernel, and 29 kept it out of the default build. It is not where this
-    ends. What it costs: a second libtorch (the venv's) inside a process that
-    already links ours, a hardcoded `site_packages` path, ~seconds of torch
-    import at startup, and no way to profile or autotune the kernel without a
-    python toolchain in the loop. What stays regardless: `domain::expert_kernel`
-    (ports, layout, `grouped_moe_reference`), `ExpertCache` +
-    `run_experts` (decision 27's ordering), `infrastructure/banks.rs`, and the
-    gated test -- they are the specification the replacement has to satisfy.
-    Removal is the unchecked P1 under M3 kernels; route 1 (committed PTX +
-    driver API) is the recommendation, routes 2/3 (hand-written CUDA) are listed
-    for completeness. Do it AFTER the gated test passes, so there is a numerical
-    oracle for the replacement to be measured against.
+30. **`pyo3` is a bridge with a planned exit** (2026-10-02, **closed 2026-10-05
+    by decision 36**) -- decision 25 chose an embedded interpreter because it was
+    the shortest honest path to a running NVFP4 kernel, and 29 kept it out of the
+    default build. What it cost, as predicted: a second libtorch (the venv's)
+    inside a process that already linked ours (that collision, not the kernel, is
+    what finally blocked the tower gate, decision 32), a hardcoded
+    `site_packages` path, and no way to profile or autotune without a python
+    toolchain in the loop. What stayed, as promised: `domain::expert_kernel`
+    (ports, layout, `grouped_moe_reference`), `ExpertCache` + `run_experts`
+    (decision 27's ordering), `infrastructure/banks.rs`, and the gated tests --
+    they are the specification the replacement had to satisfy, and the sequence
+    mattered: the oracle half went green before the replacement was measured
+    against it. Route 1 (Triton compiled AOT to committed cubins, launched over
+    the CUDA driver API) is what shipped; there is no `triton` feature, no
+    `infrastructure/triton.rs`, and no python in the runtime. Routes 2/3
+    (hand-written CUDA, cudarc) are still on the list if the committed cubins
+    ever stop being maintainable.
 
 31. **Kernel numerics are checked on the CPU through Triton's interpreter**
     (2026-10-03) -- `python -m ferrum_kernel.selftest --interp` re-execs itself

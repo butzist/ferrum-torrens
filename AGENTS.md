@@ -27,8 +27,8 @@ Instructions for AI coding agents working in this repository.
 - Clean architecture, hexagonal, domain-driven. `TODO.md` section 3 groups code
   into a pure domain core (no CUDA, no IO), an application layer of use-cases
   (scheduler, generation, `run_experts`), and infrastructure adapters (libtorch
-  compute runtime, the Triton kernel adapter, FTW/mmap reader, axum server) that
-  implement domain ports.
+  compute runtime, the CUDA driver-API MoE adapter, FTW/mmap reader, axum
+  server) that implement domain ports.
 - Ports are Rust traits defined in the domain core. Adapters depend on the core;
   the core never imports an adapter. Keep infra types (device tensors, mmap
   handles, HTTP types) out of the domain.
@@ -75,26 +75,31 @@ Instructions for AI coding agents working in this repository.
   comments. ASCII only (no em-dash, no arrows).
 - Keep everything GPU-only single-process in-process. This repo has no JS
   runtime (node/bun/deno were intentionally removed from the flake).
-- Rust is the production language. Python is used for the one-time HF -> FTW
-  conversion via FreeToken's `ft` CLI (see below) and, at runtime, for the fused
-  Triton kernels. Triton is a Python-embedded GPU kernel DSL; libtorch has no
-  CUDA NVFP4 GEMM (neither does upstream FreeToken, which is why it hand-writes
-  this kernel in Triton), so the one custom kernel stays Python/Triton for now.
-  A hand-written cudarc version is deferred, not ruled out. Keep Triton kernels
-  confined to the kernel adapter; the domain core stays pure Rust.
+- Rust is the only language at runtime. Python is used for the one-time HF -> FTW
+  conversion via FreeToken's `ft` CLI (see below) and as the kernel toolchain:
+  the NVFP4 grouped-MoE kernel is authored in Triton (libtorch has no CUDA NVFP4
+  GEMM, and neither does upstream FreeToken, which is why it hand-writes the
+  kernel in Triton), compiled ahead of time by `python/ferrum_kernel/aot.py`, and
+  the resulting `kernel/*.cubin` are committed and launched by the driver-API
+  adapter (`infrastructure/cuda_driver.rs`, `infrastructure/cuda_moe.rs`).
+  The pyo3 interpreter path is gone (`TODO.md` decision 30): there is no
+  `triton` cargo feature and `infrastructure/triton.rs` no longer exists.
+  A hand-written cudarc version of the kernel is deferred, not ruled out. Keep
+  Triton sources confined to `python/ferrum_kernel/`; the domain core stays pure
+  Rust, and nothing at runtime imports Python.
 
 ## Reference and tooling
 
 - `FreeToken/` is the reference implementation. It is READ-ONLY. Never edit it.
 - GPU runtime facts and target defaults live in `TODO.md` section 7
   (RTX 5060 Mobile 8 GB VRAM, sm_120) and `ALGORITHM.md` section 0.
-- **The sandbox has no GPU** (`cuInit=CUDA_ERROR_NO_DEVICE`) but the compute
-  runtime auto-detects that and falls back to CPU, so
-  `cargo test --features cuda` runs the libtorch forward and the correctness
-  gate on libtorch's CPU backend and needs no devshell. `model.device = "cuda"`
-  forces the GPU and is the only setting that needs a devshell; the GPU-only
-  pieces (CUDA-graph capture, the Triton NVFP4 kernel) are asked for explicitly
-  rather than discovered by a red test. See `TODO.md` decision 21.
+- **The sandbox has a working CUDA device** (the driver is at
+  `/run/opengl-driver/lib/libcuda.so.1` and `cuInit` succeeds), so the gated GPU
+  tests run here once `LIBTORCH*`, `LD_LIBRARY_PATH` and `CXX` are exported (see
+  below). The compute runtime still auto-detects and falls back to CPU, which is
+  what keeps `cargo test --features cuda` meaningful on a box with no device
+  (`TODO.md` decision 21). `model.device = "cuda"` forces the GPU. CUDA-graph
+  capture is still asked for explicitly rather than discovered by a red test.
 - The FTW checkpoint is served from the Nix store: add it with
   `nix store add-path <dir> --name qwen3.6-35b-a3b-nvfp4`; the jail binds
   `/nix/store` read-only, so agents can mmap the converted `.ftw` output turned
@@ -112,11 +117,11 @@ Instructions for AI coding agents working in this repository.
   exist in a nix store.
   Outside the devshell, set it by hand:
   `LD_LIBRARY_PATH="/run/opengl-driver/lib:$(dirname "$(gcc -print-file-name=libstdc++.so.6)")"`.
-  This applies to the pyo3-embedded interpreter too (`--features triton`), since
-  it dlopens the same torch: the loader path is read at process start, so the
-  variable must be set before `cargo` launches the test.
-- One-time HF -> FTW conversion (needs CUDA device access; the agent sandbox
-  cannot open the GPU -- cuInit=CUDA_ERROR_NO_DEVICE -- so run in a devshell,
+  The loader path is read at process start, so export it before `cargo` launches
+  anything. The devShell also provides the kernel toolchain (torch + triton from
+  nixpkgs) with `kernel-selftest`, `kernel-compile-check` and `kernel-aot`
+  aliases; the venv is only needed for the FTW conversion.
+- One-time HF -> FTW conversion (needs CUDA device access; run in a devshell,
   which already has the loader path):
   `FreeToken/.venv/bin/ft checkpoint --model /nix/store/mpwkgysbh8dyxz8jlrwkhzcsp01v6my3-qwen3.6-35b-a3b-nvfp4 \
    --out .model-cache/Qwen3.6-35B-A3B-NVFP4.ftw --moe-backend offload --shard-gib 8`
@@ -135,8 +140,13 @@ Instructions for AI coding agents working in this repository.
   runs the real Triton kernels through triton's interpreter on CPU tensors and
   compares them against the torch reference, and
   `... -m ferrum_kernel.compile_check` checks they still compile for sm_120.
-  Both need the loader path above on `LD_LIBRARY_PATH`. Use `--interp` before
-  spending a devshell run on the gated `triton_moe_matches_reference` test.
+  Both need the loader path above on `LD_LIBRARY_PATH`, and the devShell runs
+  them through the `kernel-selftest` and `kernel-compile-check` aliases. Use
+  `--interp` before running the gated
+  `tests/cuda_moe_matches_reference.rs`, which is the real-hardware gate for the
+  same kernels. `kernel-aot` rebuilds `kernel/*.cubin` and `kernel/*.ptx` from the
+  Triton sources; those artifacts are committed, so only touch them when the
+  kernel itself changes.
 
 ## Commits
 

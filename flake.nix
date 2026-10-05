@@ -52,10 +52,13 @@
         # conversion) keeps its existing resolution.
         libtorchCuda = pkgs.libtorch-bin.override {cudaSupport = true;};
 
-        # Python for the Triton kernels, from nixpkgs rather than a venv: the
-        # interpreter pyo3 embeds and the harness that checks the kernels
-        # against the torch reference. Verified: torch 2.13.0 (cu12.9) plus
-        # triton 3.7.1, and the kernel selftest passes on it unchanged.
+        # Python for the kernel toolchain, from nixpkgs rather than a venv: the
+        # harness that compiles the committed cubins (`aot.py`) and checks the
+        # kernels against the torch reference (`selftest.py --interp`). It is a
+        # build-time tool only: the engine launches the cubins over the CUDA
+        # driver API and never starts an interpreter (decision 30). Verified:
+        # torch 2.13.0 (cu12.9) plus triton 3.7.1, and the kernel selftest
+        # passes on it unchanged.
         #
         # No CUDA override is needed and none exists to write: `torch` takes
         # `cudaSupport`, which defaults to config.cudaSupport, which defaults to
@@ -72,17 +75,17 @@
         # conversion therefore keeps using FreeToken/.venv (decision 35).
         #
         # `import triton` does not pull torch in (verified on 3.7.1 as well as
-        # the venv's 3.6), which is what lets the engine's kernel path drop torch
-        # and keep exactly one libtorch in the process (decision 30). Until then
-        # torch stays in this env for the selftest's reference side.
+        # the venv's 3.6), which is what let the engine's kernel path drop torch
+        # and keep exactly one libtorch in the process (decision 30). Torch stays
+        # in this env for the selftest's reference side.
         pythonEnv = pkgs.python3.withPackages (ps: [
           ps.torch
           ps.triton
         ]);
 
-        # Rust is the production language. Python is used for the one-time
-        # HF -> FTW conversion via FreeToken's `ft checkpoint` and, at runtime, for
-        # the fused Triton kernels (see AGENTS.md).
+        # Rust is the production language, and the only one at runtime. Python
+        # is used for the one-time HF -> FTW conversion via FreeToken's `ft
+        # checkpoint` and for the kernel toolchain (see AGENTS.md).
         basePackages = [
           rustNightly
           pkgs.stdenv.cc
@@ -162,12 +165,6 @@
           LIBTORCH_LIB = "${libtorchCuda}";
           CXX = "${pkgs.stdenv.cc.cc}/bin/c++";
 
-          # pyo3 embeds this interpreter (only with --features triton). Point it
-          # at the nix python so the kernel path never has to touch
-          # FreeToken/.venv's python or its torch: two libtorch in one process is
-          # what breaks the embedded interpreter's CUDA bootstrap (decision 32).
-          PYO3_PYTHON = "${pythonEnv}/bin/python3";
-
           shellHook = ''
             # No RUSTFLAGS here on purpose. The previous
             # `-C link-arg=-mold -C default-lib-fmt=rustls` made every cargo
@@ -183,8 +180,8 @@
             export TRITON_LIBCUDA_PATH=/run/opengl-driver/lib
             # torch from FreeToken/.venv is a manylinux wheel whose RPATH points
             # at paths that do not exist here, so importing it (from the venv's
-            # python OR from the interpreter pyo3 embedded, see decision 25)
-            # dies with "libstdc++.so.6: cannot open shared object file" unless a
+            # python, which is what the kernel toolchain and the FTW conversion
+            # use) dies with "libstdc++.so.6: cannot open shared object file" unless a
             # matching one is on the loader path. Nix never puts it there. Ask the
             # compiler which one it ships and prepend it; the driver mount comes
             # from the jail's gpu combinator and has no store path to name.
@@ -198,22 +195,24 @@
                 export LD_LIBRARY_PATH="$libstdcxx:/run/opengl-driver/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
               fi
             fi
-            # `import ferrum_kernel` has to resolve for both interpreters that run
-            # the kernels: the nix python (PYO3_PYTHON above) and FreeToken/.venv
-            # during the conversion. Prepending the package dir works for both,
+            # `import ferrum_kernel` has to resolve for both pythons that run
+            # kernel work: the nix python (the toolchain) and FreeToken/.venv
+            # (the FTW conversion). Prepending the package dir works for both,
             # it only adds our own module to whatever else is on the path.
             #
-            # The env's own site-packages is on the path too, and it has to be
-            # spelled out: an embedded interpreter takes sys.prefix from the host
-            # binary (the test binary here), not from the python it was built
-            # against, so `import torch` finds nothing without this. Running
-            # `python3` from the env works on its own, embedding does not.
+            # The env's own site-packages is spelled out because running
+            # ``python3`` from the env does not put it on the path: an env's
+            # site-packages is reachable only through that interpreter's own
+            # prefix, which is why the toolchain aliases below call it by name
+            # rather than a bare `python`.
             export PYTHONPATH="$FLAKE_ROOT/python:${pythonEnv}/${pkgs.python3.sitePackages}''${PYTHONPATH:+:$PYTHONPATH}"
             # via bash, not the shebang: the jail has no /usr/bin/env.
             alias ft-gate="bash $FLAKE_ROOT/scripts/run-gate.sh"
             # The kernel self-check on CPU tensors through Triton's interpreter.
-            alias kernel-selftest="''${PYO3_PYTHON} -m ferrum_kernel.selftest --interp"
-            alias kernel-compile-check="''${PYO3_PYTHON} -m ferrum_kernel.compile_check"
+            alias kernel-selftest="''${pythonEnv}/bin/python3 -m ferrum_kernel.selftest --interp"
+            alias kernel-compile-check="''${pythonEnv}/bin/python3 -m ferrum_kernel.compile_check"
+            # Rebuild kernel/*.cubin and kernel/*.ptx from the Triton sources.
+            alias kernel-aot="''${pythonEnv}/bin/python3 -m ferrum_kernel.aot"
           '';
         };
       };
