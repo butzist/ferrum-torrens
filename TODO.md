@@ -40,10 +40,12 @@ allocation, no readback, no synchronization -- what a graph records), and
 over a group, rewrites it with `stage_into` and replays byte for byte equal to
 an uncaptured twin; FreeToken's `engine/graph.py` was the model for the split
 (its own staging is device-side fixed-shape kernels, ours is host-side, so
-staging has to stay outside). Still open inside decision 39: the warmup
-pattern, per-batch-size graphs over a shared mempool, logits inside the graph,
-and the `begin_layer` bank-drop that would reallocate underneath a captured
-per-layer replay graph. After that, M2 (API) proper and the
+staging has to stay outside). Next: decision 39's slice 2, ordered under the
+P1 checklist -- first decide the MoE-in-graph shape (`begin_layer` still drops
+the gate_up/down banks per layer, so no graph may bake those addresses), then
+warmup + one captured decode step together with the pinned batch-metadata
+staging P1, then per-batch-size graphs over a mempool; a replay-vs-uncaptured
+gate per batch size closes it. After that, M2 (API) proper and the
 remaining M3 perf items. Last finished: decision 30 (the pyo3 exit), decision 37
 (the step counter), decision 36 slice 6 (the tower-with-the-kernel gate) and
 decision 39's capture binding plus the MoE stage/launch/collect split. Before that the chat surface, SSE and the cached decode
@@ -458,9 +460,40 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 - [ ] P1 CUDA-graph capture for decode batch sizes `{1,2,4, max_running}` (shared
   mempool, dummy-req padding, logits `[bs, vocab]` inside graph) over the driver
   FFI (decision 39: not "via tch" -- `tch` 0.22 has no capture API), plus the
-  no-inference-during-capture warmup pattern (mirror `engine/graph.py`), and a
-  fix for `begin_layer` dropping the gate_up/down banks on a layer switch, which
-  would reallocate their addresses under a captured per-layer replay graph.
+  no-inference-during-capture warmup pattern (mirror `engine/graph.py`).
+  Slice 1 landed (see the `[x]` above); take the rest in this order:
+  1. **Decide the MoE-in-graph shape first -- it is blocking.** Slice 1 proved
+     the four launches capturable *on their own graph*, but `CudaMoE::begin_layer`
+     still drops and reallocates `gate_up`/`down` per layer, so no graph may
+     bake those addresses today. Candidates: (a) capture the non-MoE forward
+     only and interleave the per-step MoE `launch` graph (slice 1) on the side
+     stream between segments -- no bank pinning needed; (b) a bank layout whose
+     addresses survive every layer, so one graph covers the whole forward --
+     needs the VRAM budget math against `moe_cache_size_slots` and a change to
+     `begin_layer`. Record the choice in section 7 before coding.
+  2. **Warmup + capture one uncaptured step** mirroring `engine/graph.py`: an
+     uncaptured forward first, flush both streams (slice 1's rule), capture on
+     the side stream, sample logits `[bs, vocab]` produced *inside* the graph.
+     This step also needs the next P1 (pinned staging buffers for batch
+     metadata) -- take the two together, since positions / input_mapping /
+     out_loc have to sit at stable addresses for a replay to read them.
+  3. **Per-batch-size executables** for `{1,2,4, max_running}` with dummy-req
+     padding to the captured size; decide the mempool question (driver mempool
+     vs torch's caching allocator reuse) when step 2 shows what actually needs
+     sharing, and record it in section 7.
+  4. **Gate**: a `--ignored` test beside `tests/cuda_graph_moe_smoke.rs` that
+     replays the captured decode step against the uncaptured twin on the real
+     checkpoint for each batch size (argmax equal, logits within the 2e-6 of
+     scale decision 33 used). Keep `cuda_graph_moe_smoke`, cubin smoke,
+     oracle-match and the engine gates green -- and run the five
+     `engine_real_generate` tests **serially**: five model loads in parallel
+     OOMed the 8 GiB device (observed 2026-10-06; the same tests pass one at
+     a time).
+  Contracts from slice 1 that do not change: a `StagedGroup` outlives every
+  graph captured over it, `stage_into` is the only writer between replays, a
+  captured grid pins the batch shape (different shape = error containing
+  "captured"), and capture runs on a flags-0 side stream only -- the legacy
+  stream cannot be captured.
 - [ ] P1 pinned staging buffers for batch metadata (positions / input_mapping /
   out_loc / token_pool / page_table sentinel dummy row).
 
@@ -1167,8 +1200,10 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
       outlive any graph captured over it, and a captured grid pins the batch
       shape (different shape = error containing "captured"). Known hole for
       slice 2: `CudaMoE::begin_layer` drops the `gate_up`/`down` banks on a
-      layer switch, so a per-layer replay graph would bake addresses the next
-      layer frees -- bank addresses must be pinned before that graph exists.
+      layer switch, so a graph spanning layers would bake addresses the next
+      layer frees -- step 1 of slice 2 decides between pinning those addresses
+      and keeping the MoE launches out of the big graph, as slice 1 did. The
+      ordered slice-2 plan lives under the P1 checklist.
 
 ### Config defaults for the RTX 5060 / 8 GB target
 
