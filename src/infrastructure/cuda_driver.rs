@@ -41,6 +41,8 @@ pub type CUmodule = *mut c_void;
 pub type CUfunction = *mut c_void;
 pub type CUcontext = *mut c_void;
 pub type CUstream = *mut c_void;
+pub type CUgraph = *mut c_void;
+pub type CUgraphExec = *mut c_void;
 
 const RTLD_NOW: c_int = 2;
 const RTLD_GLOBAL: c_int = 0x100;
@@ -86,6 +88,15 @@ type MemAllocFn = unsafe extern "C" fn(*mut CUdeviceptr, usize) -> CUresult;
 type MemFreeFn = unsafe extern "C" fn(CUdeviceptr) -> CUresult;
 type MemcpyHtoDFn = unsafe extern "C" fn(CUdeviceptr, *const c_void, usize) -> CUresult;
 type MemcpyDtoHFn = unsafe extern "C" fn(*mut c_void, CUdeviceptr, usize) -> CUresult;
+type StreamCreateFn = unsafe extern "C" fn(*mut CUstream, u32) -> CUresult;
+type StreamDestroyFn = unsafe extern "C" fn(CUstream) -> CUresult;
+type StreamBeginCaptureFn = unsafe extern "C" fn(CUstream, u32) -> CUresult;
+type StreamEndCaptureFn = unsafe extern "C" fn(CUstream, *mut CUgraph) -> CUresult;
+type GraphCreateFn = unsafe extern "C" fn(*mut CUgraph, u32) -> CUresult;
+type GraphDestroyFn = unsafe extern "C" fn(CUgraph) -> CUresult;
+type GraphInstantiateFn = unsafe extern "C" fn(*mut CUgraphExec, CUgraph, *mut c_void, usize) -> CUresult;
+type GraphLaunchFn = unsafe extern "C" fn(CUgraphExec, CUstream) -> CUresult;
+type GraphExecDestroyFn = unsafe extern "C" fn(CUgraphExec) -> CUresult;
 
 struct Fns {
     cu_init: InitFn,
@@ -102,6 +113,15 @@ struct Fns {
     cu_mem_free: MemFreeFn,
     cu_memcpy_htod: MemcpyHtoDFn,
     cu_memcpy_dtoh: MemcpyDtoHFn,
+    cu_stream_create: StreamCreateFn,
+    cu_stream_destroy: StreamDestroyFn,
+    cu_stream_begin_capture: StreamBeginCaptureFn,
+    cu_stream_end_capture: StreamEndCaptureFn,
+    cu_graph_create: GraphCreateFn,
+    cu_graph_destroy: GraphDestroyFn,
+    cu_graph_instantiate: GraphInstantiateFn,
+    cu_graph_launch: GraphLaunchFn,
+    cu_graph_exec_destroy: GraphExecDestroyFn,
 }
 
 /// A loaded `libcuda`, plus whatever context the caller made current.
@@ -178,6 +198,15 @@ impl Driver {
             cu_mem_free: sym!("cuMemFree_v2", MemFreeFn),
             cu_memcpy_htod: sym!("cuMemcpyHtoD_v2", MemcpyHtoDFn),
             cu_memcpy_dtoh: sym!("cuMemcpyDtoH_v2", MemcpyDtoHFn),
+            cu_stream_create: sym!("cuStreamCreate", StreamCreateFn),
+            cu_stream_destroy: sym!("cuStreamDestroy_v2", StreamDestroyFn),
+            cu_stream_begin_capture: sym!("cuStreamBeginCapture_v2", StreamBeginCaptureFn),
+            cu_stream_end_capture: sym!("cuStreamEndCapture", StreamEndCaptureFn),
+            cu_graph_create: sym!("cuGraphCreate", GraphCreateFn),
+            cu_graph_destroy: sym!("cuGraphDestroy", GraphDestroyFn),
+            cu_graph_instantiate: sym!("cuGraphInstantiate", GraphInstantiateFn),
+            cu_graph_launch: sym!("cuGraphLaunch", GraphLaunchFn),
+            cu_graph_exec_destroy: sym!("cuGraphExecDestroy", GraphExecDestroyFn),
         };
         Ok(Self { _lib: lib, fns })
     }
