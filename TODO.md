@@ -26,12 +26,27 @@ feature, no `infrastructure/triton.rs`, no `python_path`/`site_packages` in the
 config, and nothing at runtime imports Python (decision 30, closed by decision
 36). Python is a build-time toolchain now: it authors the kernel in Triton,
 compiles it AOT into the committed `kernel/*.cubin`, and runs the interpreter
-selftest. Next is CUDA-graph capture for decode, which decision 39 says is not
-the `tch` call the plan assumed (no capture API in `tch` 0.22, the legacy stream
-cannot be captured, and the offload staging is data-dependent), so read
-FreeToken's `engine/graph.py` before designing it. After that, M2 (API) proper and the
+selftest. Decision 39's first slice is done: `cuda_driver.rs` binds the
+capture family (`cuStreamBeginCapture`/`cuStreamEndCapture`,
+`cuGraphInstantiateWithFlags`, `cuGraphLaunch`, the graph/stream teardowns and
+`create_stream`) on a flags-0 side stream that keeps legacy ordering against
+torch's stream 0, refusing the legacy stream up front because the driver
+rejects it mid-call. `CudaMoE` is split to match: `stage`/`stage_into` write
+the data-dependent activations, routes and weights into a persistent
+`StagedGroup` outside any capture, `launch` is the four launches only (no
+allocation, no readback, no synchronization -- what a graph records), and
+`collect` reads the reduce back; `grouped_moe` is the three composed. The gate
+`tests/cuda_graph_moe_smoke.rs` (ignored, needs a device) captures `launch`
+over a group, rewrites it with `stage_into` and replays byte for byte equal to
+an uncaptured twin; FreeToken's `engine/graph.py` was the model for the split
+(its own staging is device-side fixed-shape kernels, ours is host-side, so
+staging has to stay outside). Still open inside decision 39: the warmup
+pattern, per-batch-size graphs over a shared mempool, logits inside the graph,
+and the `begin_layer` bank-drop that would reallocate underneath a captured
+per-layer replay graph. After that, M2 (API) proper and the
 remaining M3 perf items. Last finished: decision 30 (the pyo3 exit), decision 37
-(the step counter) and decision 36 slice 6 (the tower-with-the-kernel gate). Before that the chat surface, SSE and the cached decode
+(the step counter), decision 36 slice 6 (the tower-with-the-kernel gate) and
+decision 39's capture binding plus the MoE stage/launch/collect split. Before that the chat surface, SSE and the cached decode
 loop. Incremental KV decode is proved too: chunked prefill + one-token decode
 off the page table agrees with re-feeding the whole prefix on the real checkpoint
 (same argmax at every step, logits within 2e-6 of scale, decision 33), and the
@@ -419,9 +434,33 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
   topk (router), rmsnorm (+Gemma `1+w`), partial rope, paged GQA attention
   (FlashInfer, `fi` semantics), GDN chunked prefill + single-token decode
   (ALGORITHM.md 2.3.1), argmax/top_k/top_p sampling. No CUDA C++ to write.
+- [x] P1 decode CUDA-graph capture, slice 1: driver capture FFI + MoE launch
+  split (2026-10-06, decision 39). `cuda_driver.rs` binds
+  `cuStreamBeginCapture`/`cuStreamEndCapture`, `cuGraphInstantiateWithFlags`
+  (the plain `cuGraphInstantiate` is header-era-versioned with a different
+  signature), `cuGraphLaunch` and the graph/stream teardowns, plus
+  `create_stream`/`destroy_stream` for a flags-0 side stream; `begin_capture`
+  refuses a null/legacy stream before the call, because the driver would
+  reject it mid-capture. Ordering is legacy-stream semantics (flags 0 orders
+  against torch's stream 0 in both directions), so stage (torch H2D) ->
+  launch (side stream) -> collect (D2H) needs no events, at the cost of
+  blocking serialization -- revisit if it shows in the profile. `CudaMoE`
+  splits into `stage` (fresh `StagedGroup`), `stage_into` (same addresses,
+  next step of the same shape; a different batch shape errors containing
+  "captured", because the grid cannot reshape), `launch` (the four driver
+  launches only) and `collect` (D2H); `grouped_moe` = the three, unchanged for
+  callers. The gate is `tests/cuda_graph_moe_smoke.rs`: it also asserts
+  stage/launch/collect equals `grouped_moe`, captures `launch` over a group,
+  `stage_into`s fresh data and replays bitwise equal to an uncaptured twin
+  (and different from step 1). Green 2026-10-06 alongside the scalar-oracle,
+  cubin-smoke and tower gates. A `StagedGroup` must outlive every graph
+  captured over it, and the batch shape is pinned with it.
 - [ ] P1 CUDA-graph capture for decode batch sizes `{1,2,4, max_running}` (shared
-  mempool, dummy-req padding, logits `[bs, vocab]` inside graph) via tch, plus the
-  no-inference-during-capture warmup pattern (mirror `engine/graph.py`).
+  mempool, dummy-req padding, logits `[bs, vocab]` inside graph) over the driver
+  FFI (decision 39: not "via tch" -- `tch` 0.22 has no capture API), plus the
+  no-inference-during-capture warmup pattern (mirror `engine/graph.py`), and a
+  fix for `begin_layer` dropping the gate_up/down banks on a layer switch, which
+  would reallocate their addresses under a captured per-layer replay graph.
 - [ ] P1 pinned staging buffers for batch metadata (positions / input_mapping /
   out_loc / token_pool / page_table sentinel dummy row).
 
@@ -1101,6 +1140,35 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
     So: read how FreeToken splits capture from staging, then settle the stream
     story, then write a binding. Recorded here so the next session does not
     rediscover it from a red test.
+    - **Done, slice 1 (2026-10-06).** The three open questions have answers:
+      (1) *stream story* -- a side stream from `Driver::create_stream` with
+      flags 0 (`CU_STREAM_DEFAULT`), which keeps legacy bidirectional ordering
+      with torch's stream 0, so stage (H2D on stream 0) -> launch (side
+      stream) -> collect (D2H on stream 0) serializes without events; both
+      streams are flushed before `begin_capture` so the capture inherits no
+      cross-stream dependency. The cost is blocking serialization at every
+      stage/launch boundary -- fine for now, revisit if it profiles.
+      (2) *binding* -- `begin_capture`/`end_capture`,
+      `graph_instantiate` (rebound to `cuGraphInstantiateWithFlags`, flags 0;
+      the plain symbol is header-era-versioned), `graph_launch`,
+      `graph_destroy`/`graph_exec_destroy`, `CAPTURE_MODE_GLOBAL`, and the
+      legacy stream refused *before* the call with "begin_capture of the
+      legacy stream". (3) *split* -- mirroring `engine/graph.py`, but one level
+      lower: `CudaMoE::stage`/`stage_into` own every data-dependent write
+      (activations, routes, weights) into a persistent `StagedGroup`, `launch`
+      is exactly the four kernel launches (no allocation, no host readback, no
+      synchronization) and `collect` is the D2H; `grouped_moe` is the three
+      composed, so every existing caller is untouched. FreeToken can stage
+      *inside* the graph because its `ensure_experts`/`copy_missing` are
+      fixed-shape device-side Triton kernels; ours read slabs on the host, so
+      staging stays outside, period. Gate: `tests/cuda_graph_moe_smoke.rs`
+      (green 2026-10-06) proves a replay over `stage_into`-rewritten buffers is
+      byte for byte an uncaptured run. Contract to keep: the `StagedGroup` must
+      outlive any graph captured over it, and a captured grid pins the batch
+      shape (different shape = error containing "captured"). Known hole for
+      slice 2: `CudaMoE::begin_layer` drops the `gate_up`/`down` banks on a
+      layer switch, so a per-layer replay graph would bake addresses the next
+      layer frees -- bank addresses must be pinned before that graph exists.
 
 ### Config defaults for the RTX 5060 / 8 GB target
 

@@ -124,6 +124,27 @@ pub struct CudaMoE {
 unsafe impl Send for CudaMoE {}
 unsafe impl Sync for CudaMoE {}
 
+/// One step's device buffers, kept alive across calls so a CUDA graph can be
+/// captured over their addresses (decision 39): the launches are the graph,
+/// and everything that writes these tensors happens before it. A group must
+/// outlive every graph captured on top of it -- dropping it frees the memory
+/// replay would read -- and the batch shape is pinned with it, because a
+/// captured grid cannot reshape. `stage_into` is the only door into a replay.
+pub struct StagedGroup {
+    tokens: usize,
+    top_k: usize,
+    routes: usize,
+    x: Tensor,
+    slot_t: Tensor,
+    token_t: Tensor,
+    weight_t: Tensor,
+    lut: Tensor,
+    ic1: Tensor,
+    ic2: Tensor,
+    ic3: Tensor,
+    result: Tensor,
+}
+
 impl CudaMoE {
     /// Open the driver, load the committed cubins and check they were built for
     /// `shapes`. Nothing is allocated yet: the banks come with the first layer.
@@ -132,6 +153,16 @@ impl CudaMoE {
         source: Arc<dyn ExpertSlabSource>,
         shapes: ExpertShapes,
         slots: usize,
+    ) -> Result<Self, MoEError> {
+        Self::new_with_stream(device, source, shapes, slots, std::ptr::null_mut())
+    }
+
+    pub fn new_with_stream(
+        device: Device,
+        source: Arc<dyn ExpertSlabSource>,
+        shapes: ExpertShapes,
+        slots: usize,
+        stream: CUstream,
     ) -> Result<Self, MoEError> {
         let Device::Cuda(ordinal) = device else {
             return Err(MoEError::Bad(
@@ -160,11 +191,15 @@ impl CudaMoE {
             shapes,
             slots,
             device,
-            stream: std::ptr::null_mut(),
+            stream,
             layer: None,
             gate_up: None,
             down: None,
         })
+    }
+
+    pub fn stream(&self) -> CUstream {
+        self.stream
     }
 
     pub fn shapes(&self) -> ExpertShapes {
@@ -243,12 +278,11 @@ impl CudaMoE {
         self.down = Some(Banks::new(self.slots, dn_rows, dn_cols, self.device));
     }
 
-    /// The four launches, in order, on the stream and the banks this owns.
-    ///
-    /// Routes arrive as slot ids with `-1` for "not resident", and the GEMV
-    /// handles that branch-free (it reads slot 0 and zeroes the accumulator), so
-    /// nothing is compacted on the host and the reduce stays dense over `top_k`.
-    pub fn grouped_moe(&self, req: &MoEGroup<'_>, out: &mut [f32]) -> Result<(), MoEError> {
+    /// Every check the launches need, before anything is allocated: the
+    /// cubins' shapes and top_k, the batch's shapes, and banks to read. The
+    /// output buffer is checked by `collect`, which knows how many values the
+    /// reduce produces.
+    fn check(&self, req: &MoEGroup<'_>) -> Result<usize, MoEError> {
         let (hidden, inter, top_k) = (self.shapes.hidden, self.shapes.inter, req.top_k);
         if hidden != self.abi.hidden || inter != self.abi.inter {
             return Err(MoEError::Bad(format!(
@@ -269,12 +303,8 @@ impl CudaMoE {
             )));
         }
         let tokens = req.x.len() / hidden;
-        if tokens == 0 || out.len() < tokens * hidden {
-            return Err(MoEError::Bad(format!(
-                "grouped_moe: {tokens} tokens want {} outputs, got {}",
-                tokens * hidden,
-                out.len()
-            )));
+        if tokens == 0 {
+            return Err(MoEError::Bad("grouped_moe: a step with no tokens".into()));
         }
         let routes = tokens * top_k;
         if req.routes.len() != routes || req.weights.len() < routes {
@@ -284,49 +314,111 @@ impl CudaMoE {
                 req.weights.len()
             )));
         }
-        let gu = self
-            .gate_up
-            .as_ref()
-            .ok_or_else(|| MoEError::Bad("grouped_moe before any expert was staged".into()))?;
-        let dn = self
-            .down
-            .as_ref()
-            .ok_or_else(|| MoEError::Bad("grouped_moe before any expert was staged".into()))?;
+        if self.gate_up.is_none() || self.down.is_none() {
+            return Err(MoEError::Bad(
+                "grouped_moe before any expert was staged".into(),
+            ));
+        }
+        Ok(tokens)
+    }
+
+    /// Validate `req` and write everything the launches read into a fresh set
+    /// of device tensors. This is the data-dependent half of a step: the
+    /// activations, the routes and the weights arrive from the host here, and
+    /// no capture ever sees any of it (decision 39).
+    pub fn stage(&self, req: &MoEGroup<'_>) -> Result<StagedGroup, MoEError> {
+        let tokens = self.check(req)?;
+        let (hidden, inter, top_k) = (self.shapes.hidden, self.shapes.inter, req.top_k);
+        let routes = tokens * top_k;
         let (route_token, route_slot) = route_lists(req.routes, tokens, top_k)?;
 
         // Activations go over as bf16, which is what the cubins were specialized
         // for. The route weights stay f32: the down GEMV applies them as f32.
         let dev = self.device;
-        let x = bf16_tensor(req.x, &[tokens as i64, hidden as i64], dev);
-        let slot_t = Tensor::from_slice(&route_slot).to(dev.to_tch());
-        let token_t = Tensor::from_slice(&route_token).to(dev.to_tch());
-        let weight_t = f32_tensor(&req.weights[..routes], &[routes as i64], dev);
-        let lut = f32_tensor(&E2M1, &[E2M1.len() as i64], dev);
         let bf16 = (tch::Kind::BFloat16, dev.to_tch());
-        let ic1 = Tensor::empty([routes as i64, (2 * inter) as i64], bf16);
-        let ic2 = Tensor::empty([routes as i64, inter as i64], bf16);
-        let ic3 = Tensor::empty([routes as i64, hidden as i64], bf16);
-        let result = Tensor::empty([tokens as i64, hidden as i64], bf16);
+        Ok(StagedGroup {
+            tokens,
+            top_k,
+            routes,
+            x: bf16_tensor(req.x, &[tokens as i64, hidden as i64], dev),
+            slot_t: Tensor::from_slice(&route_slot).to(dev.to_tch()),
+            token_t: Tensor::from_slice(&route_token).to(dev.to_tch()),
+            weight_t: f32_tensor(&req.weights[..routes], &[routes as i64], dev),
+            lut: f32_tensor(&E2M1, &[E2M1.len() as i64], dev),
+            ic1: Tensor::empty([routes as i64, (2 * inter) as i64], bf16),
+            ic2: Tensor::empty([routes as i64, inter as i64], bf16),
+            ic3: Tensor::empty([routes as i64, hidden as i64], bf16),
+            result: Tensor::empty([tokens as i64, hidden as i64], bf16),
+        })
+    }
+
+    /// Rewrite an existing group for the next step of the same shape, keeping
+    /// every tensor address: the launches a captured graph holds still point
+    /// at these buffers, so this is what makes a replay read new data. A
+    /// different batch shape is an error, because the captured grid cannot
+    /// follow it.
+    pub fn stage_into(&self, req: &MoEGroup<'_>, g: &mut StagedGroup) -> Result<(), MoEError> {
+        let tokens = self.check(req)?;
+        if tokens != g.tokens || req.top_k != g.top_k {
+            return Err(MoEError::Bad(format!(
+                "stage_into: the captured group holds {} tokens x top_k {},                  the step is {tokens} x top_k {}",
+                g.tokens, g.top_k, req.top_k
+            )));
+        }
+        let (route_token, route_slot) = route_lists(req.routes, tokens, req.top_k)?;
+        let dev = self.device;
+        g.x.copy_(&bf16_tensor(
+            req.x,
+            &[tokens as i64, self.shapes.hidden as i64],
+            dev,
+        ));
+        g.slot_t.copy_(&Tensor::from_slice(&route_slot));
+        g.token_t.copy_(&Tensor::from_slice(&route_token));
+        g.weight_t.copy_(&f32_tensor(
+            &req.weights[..g.routes],
+            &[g.routes as i64],
+            dev,
+        ));
+        Ok(())
+    }
+
+    /// The four launches, in order, on `self.stream` and the banks this owns:
+    /// no allocation, no host readback, no synchronization -- only what a
+    /// CUDA-graph capture can record (decision 39).
+    ///
+    /// Routes arrive as slot ids with `-1` for "not resident", and the GEMV
+    /// handles that branch-free (it reads slot 0 and zeroes the accumulator), so
+    /// nothing is compacted on the host and the reduce stays dense over `top_k`.
+    pub fn launch(&self, g: &StagedGroup) -> Result<(), MoEError> {
+        let gu = self
+            .gate_up
+            .as_ref()
+            .ok_or_else(|| MoEError::Bad("launch before any expert was staged".into()))?;
+        let dn = self
+            .down
+            .as_ref()
+            .ok_or_else(|| MoEError::Bad("launch before any expert was staged".into()))?;
+        let (tokens, routes) = (g.tokens, g.routes);
 
         let ptr = |t: &Tensor| t.data_ptr() as u64;
         let args = MoEArgs {
             tokens,
             routes,
-            x: ptr(&x),
+            x: ptr(&g.x),
             gu_packed: ptr(&gu.packed),
             gu_scale: ptr(&gu.scale),
             gu_global: ptr(&gu.global),
             dn_packed: ptr(&dn.packed),
             dn_scale: ptr(&dn.scale),
             dn_global: ptr(&dn.global),
-            route_slot: ptr(&slot_t),
-            route_token: ptr(&token_t),
-            route_weight: ptr(&weight_t),
-            lut: ptr(&lut),
-            ic1: ptr(&ic1),
-            ic2: ptr(&ic2),
-            ic3: ptr(&ic3),
-            out: ptr(&result),
+            route_slot: ptr(&g.slot_t),
+            route_token: ptr(&g.token_t),
+            route_weight: ptr(&g.weight_t),
+            lut: ptr(&g.lut),
+            ic1: ptr(&g.ic1),
+            ic2: ptr(&g.ic2),
+            ic3: ptr(&g.ic3),
+            out: ptr(&g.result),
         };
         let stream = self.stream;
         for (name, rows, pack) in [
@@ -355,17 +447,31 @@ impl CudaMoE {
             let mut params = pack.kernel_params().map_err(bad_abi)?;
             // SAFETY: every pointer in `args` is a live libtorch allocation in
             // the context made current at construction, `pack` was built from
-            // this kernel's manifest entry, and `stream` is the same default
-            // stream torch enqueued the staging copies on.
+            // this kernel's manifest entry, and `stream` is the stream this
+            // adapter was built for (the capture stream when one is used).
             unsafe {
                 self.kernels
                     .launch(kernel, grid(rows, kernel), &mut params, stream)
                     .map_err(driver)?;
             }
         }
-        // The port's output is host memory, so the reduce has to be done. The
-        // readback is a copy on the same stream, which is what orders it.
-        let values = to_f32_vec(&result);
+        Ok(())
+    }
+
+    /// The reduce's output back to the host. The readback is a copy on torch's
+    /// stream, and the side stream this adapter can hold keeps the legacy
+    /// stream's ordering, so it waits behind whatever `launch` queued.
+    pub fn collect(&self, g: &StagedGroup, out: &mut [f32]) -> Result<(), MoEError> {
+        let (tokens, hidden) = (g.tokens, self.shapes.hidden);
+        if out.len() < tokens * hidden {
+            return Err(MoEError::Bad(format!(
+                "collect: {tokens} tokens want {} outputs, got {}",
+                tokens * hidden,
+                out.len()
+            )));
+        }
+        // The port's output is host memory, so the reduce has to be done.
+        let values = to_f32_vec(&g.result);
         if values.len() < tokens * hidden {
             return Err(MoEError::Bad(format!(
                 "the reduce produced {} values for {tokens} tokens",
@@ -374,6 +480,15 @@ impl CudaMoE {
         }
         out[..tokens * hidden].copy_from_slice(&values[..tokens * hidden]);
         Ok(())
+    }
+
+    /// The port's whole step over fresh buffers: `stage` + `launch` +
+    /// `collect`. The three stay separate so a capture can hold one
+    /// `StagedGroup` alive and replay only the launches (decision 39).
+    pub fn grouped_moe(&self, req: &MoEGroup<'_>, out: &mut [f32]) -> Result<(), MoEError> {
+        let g = self.stage(req)?;
+        self.launch(&g)?;
+        self.collect(&g, out)
     }
 }
 

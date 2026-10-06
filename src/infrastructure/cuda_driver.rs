@@ -47,6 +47,11 @@ pub type CUgraphExec = *mut c_void;
 const RTLD_NOW: c_int = 2;
 const RTLD_GLOBAL: c_int = 0x100;
 
+/// `CU_STREAM_CAPTURE_MODE_GLOBAL`: capture records every launch on the stream
+/// and forbids the cross-stream synchronization that would make the graph's
+/// boundaries ambiguous.
+pub const CAPTURE_MODE_GLOBAL: u32 = 0;
+
 /// `libcuda.so.1` is the SONAME every NVIDIA driver ships under, and the stub
 /// `libcuda.so` only exists with the toolkit installed. The devshell puts the
 /// driver's own mount first on `LD_LIBRARY_PATH`.
@@ -92,9 +97,8 @@ type StreamCreateFn = unsafe extern "C" fn(*mut CUstream, u32) -> CUresult;
 type StreamDestroyFn = unsafe extern "C" fn(CUstream) -> CUresult;
 type StreamBeginCaptureFn = unsafe extern "C" fn(CUstream, u32) -> CUresult;
 type StreamEndCaptureFn = unsafe extern "C" fn(CUstream, *mut CUgraph) -> CUresult;
-type GraphCreateFn = unsafe extern "C" fn(*mut CUgraph, u32) -> CUresult;
 type GraphDestroyFn = unsafe extern "C" fn(CUgraph) -> CUresult;
-type GraphInstantiateFn = unsafe extern "C" fn(*mut CUgraphExec, CUgraph, *mut c_void, usize) -> CUresult;
+type GraphInstantiateFn = unsafe extern "C" fn(*mut CUgraphExec, CUgraph, u64) -> CUresult;
 type GraphLaunchFn = unsafe extern "C" fn(CUgraphExec, CUstream) -> CUresult;
 type GraphExecDestroyFn = unsafe extern "C" fn(CUgraphExec) -> CUresult;
 
@@ -117,7 +121,6 @@ struct Fns {
     cu_stream_destroy: StreamDestroyFn,
     cu_stream_begin_capture: StreamBeginCaptureFn,
     cu_stream_end_capture: StreamEndCaptureFn,
-    cu_graph_create: GraphCreateFn,
     cu_graph_destroy: GraphDestroyFn,
     cu_graph_instantiate: GraphInstantiateFn,
     cu_graph_launch: GraphLaunchFn,
@@ -202,9 +205,11 @@ impl Driver {
             cu_stream_destroy: sym!("cuStreamDestroy_v2", StreamDestroyFn),
             cu_stream_begin_capture: sym!("cuStreamBeginCapture_v2", StreamBeginCaptureFn),
             cu_stream_end_capture: sym!("cuStreamEndCapture", StreamEndCaptureFn),
-            cu_graph_create: sym!("cuGraphCreate", GraphCreateFn),
             cu_graph_destroy: sym!("cuGraphDestroy", GraphDestroyFn),
-            cu_graph_instantiate: sym!("cuGraphInstantiate", GraphInstantiateFn),
+            // `cuGraphInstantiateWithFlags` is the unambiguous 3-argument
+            // spelling: the plain `cuGraphInstantiate` name is versioned by
+            // header era and its current alias is a different signature.
+            cu_graph_instantiate: sym!("cuGraphInstantiateWithFlags", GraphInstantiateFn),
             cu_graph_launch: sym!("cuGraphLaunch", GraphLaunchFn),
             cu_graph_exec_destroy: sym!("cuGraphExecDestroy", GraphExecDestroyFn),
         };
@@ -341,6 +346,124 @@ impl Driver {
     pub unsafe fn synchronize(&self, stream: CUstream) -> Result<(), CudaError> {
         // SAFETY: the caller guarantees `stream` belongs to the current context.
         self.check(unsafe { (self.fns.cu_stream_synchronize)(stream) })
+    }
+
+    /// Create a non-legacy CUDA stream in the current context.
+    ///
+    /// Flags are 0 (`CU_STREAM_DEFAULT`), so the stream keeps the legacy
+    /// stream's implicit ordering: work enqueued here waits for stream-0 work
+    /// (libtorch's staging) and stream-0 work waits for this stream's, which is
+    /// what lets a captured replay read buffers libtorch wrote without an
+    /// explicit event.
+    ///
+    /// # Safety
+    /// The caller must have a CUDA context current; the returned stream
+    /// belongs to that context and must be destroyed with `destroy_stream`.
+    pub unsafe fn create_stream(&self) -> Result<CUstream, CudaError> {
+        let mut stream: CUstream = std::ptr::null_mut();
+        // SAFETY: `stream` is a valid out pointer; 0 flags create a regular stream.
+        self.check(unsafe { (self.fns.cu_stream_create)(&raw mut stream, 0) })?;
+        Ok(stream)
+    }
+
+    /// Destroy a stream created by `create_stream`.
+    ///
+    /// # Safety
+    /// `stream` must be a valid stream in the current context and not currently
+    /// being used by ongoing work. Passing null is allowed by CUDA but we treat
+    /// it as an error to avoid silent no-ops.
+    pub unsafe fn destroy_stream(&self, stream: CUstream) -> Result<(), CudaError> {
+        if stream.is_null() {
+            return Err(CudaError::Driver("destroy_stream called with null".into()));
+        }
+        // SAFETY: `stream` is owned by the caller and belongs to current context.
+        self.check(unsafe { (self.fns.cu_stream_destroy)(stream) })
+    }
+
+    /// Record everything launched on `stream` into a graph instead of running
+    /// it, until `end_capture`. Work already queued elsewhere must be flushed
+    /// first (decision 39): a capture stream with legacy-sync semantics that
+    /// meets outstanding stream-0 work has a cross-stream dependency capture
+    /// cannot record.
+    ///
+    /// # Safety
+    /// `stream` must be a non-legacy stream of the current context and not
+    /// already capturing; between this call and `end_capture` nothing may
+    /// synchronize `stream` or enqueue work on it from another thread.
+    pub unsafe fn begin_capture(&self, stream: CUstream, mode: u32) -> Result<(), CudaError> {
+        if stream.is_null() {
+            return Err(CudaError::Driver(
+                "begin_capture of the legacy stream".into(),
+            ));
+        }
+        // SAFETY: the caller guarantees a live, non-capturing side stream.
+        self.check(unsafe { (self.fns.cu_stream_begin_capture)(stream, mode) })
+    }
+
+    /// Stop the capture and hand back the recorded graph. The stream returns to
+    /// normal, so queued graph work still has to be synchronized before the
+    /// staged buffers the graph reads are rewritten.
+    ///
+    /// # Safety
+    /// `stream` must be capturing (paired with `begin_capture` on this thread).
+    pub unsafe fn end_capture(&self, stream: CUstream) -> Result<CUgraph, CudaError> {
+        let mut graph: CUgraph = std::ptr::null_mut();
+        // SAFETY: `graph` is a live out slot; the caller owns the capture.
+        self.check(unsafe { (self.fns.cu_stream_end_capture)(stream, &raw mut graph) })?;
+        Ok(graph)
+    }
+
+    /// Instantiate a captured graph into something launchable. The instance
+    /// owns its own memory; the source graph can be destroyed afterwards.
+    ///
+    /// # Safety
+    /// `graph` must be a live graph of the current context.
+    pub unsafe fn graph_instantiate(&self, graph: CUgraph) -> Result<CUgraphExec, CudaError> {
+        let mut exec: CUgraphExec = std::ptr::null_mut();
+        // SAFETY: `exec` is a live out slot; flags 0 is the plain instantiation.
+        self.check(unsafe { (self.fns.cu_graph_instantiate)(&raw mut exec, graph, 0) })?;
+        Ok(exec)
+    }
+
+    /// Launch a captured instance on `stream`.
+    ///
+    /// # Safety
+    /// `exec` must be a live instance and `stream` a stream of the current
+    /// context (or null); the device buffers the graph reads must still hold
+    /// the addresses and the data its capture saw.
+    pub unsafe fn graph_launch(
+        &self,
+        exec: CUgraphExec,
+        stream: CUstream,
+    ) -> Result<(), CudaError> {
+        // SAFETY: the caller's contract is this method's contract.
+        self.check(unsafe { (self.fns.cu_graph_launch)(exec, stream) })
+    }
+
+    /// Drop a captured graph (its instance is independent once instantiated).
+    ///
+    /// # Safety
+    /// `graph` must be a live graph with no in-flight capture.
+    pub unsafe fn graph_destroy(&self, graph: CUgraph) -> Result<(), CudaError> {
+        if graph.is_null() {
+            return Err(CudaError::Driver("graph_destroy called with null".into()));
+        }
+        // SAFETY: the caller guarantees a live graph handle.
+        self.check(unsafe { (self.fns.cu_graph_destroy)(graph) })
+    }
+
+    /// Drop an instantiated graph, freeing the memory it replayed from.
+    ///
+    /// # Safety
+    /// `exec` must be a live instance with no launch in flight.
+    pub unsafe fn graph_exec_destroy(&self, exec: CUgraphExec) -> Result<(), CudaError> {
+        if exec.is_null() {
+            return Err(CudaError::Driver(
+                "graph_exec_destroy called with null".into(),
+            ));
+        }
+        // SAFETY: the caller guarantees a live instance handle.
+        self.check(unsafe { (self.fns.cu_graph_exec_destroy)(exec) })
     }
 
     /// A device allocation, freed on drop. Used by the tests and by the slot
@@ -619,5 +742,58 @@ mod tests {
         };
         let r = driver.check(100);
         assert!(matches!(r, Err(CudaError::NoDevice)), "{r:?}");
+    }
+
+    /// `cuStreamBeginCapture` refuses the legacy stream (decision 39), and the
+    /// refusal has to come from us before the call: the whole stream story
+    /// hangs on capture needing a real side stream, and a null stream that
+    /// silently reached the driver would blur where the rule is enforced.
+    #[test]
+    fn the_legacy_stream_is_refused_as_a_capture_target() {
+        let Ok(driver) = Driver::open() else {
+            eprintln!("no libcuda on this box, skipping");
+            return;
+        };
+        // SAFETY: null names the legacy stream, which `begin_capture` rejects
+        // without touching the driver at all.
+        let err = unsafe { driver.begin_capture(std::ptr::null_mut(), CAPTURE_MODE_GLOBAL) }
+            .expect_err("the legacy stream cannot be captured");
+        assert!(err.to_string().contains("legacy stream"), "{err}");
+    }
+
+    /// The full capture round trip on a real side stream: create, begin, end,
+    /// instantiate, launch, synchronize, destroy. The graph is empty on
+    /// purpose -- the four MoE launches need staged banks, which the gated
+    /// harness provides -- so what this proves is the FFI plumbing itself,
+    /// every step, on a device. Skips (loudly) without libcuda or a device.
+    #[test]
+    fn a_side_stream_round_trips_through_capture() {
+        let Ok(driver) = Driver::open() else {
+            eprintln!("no libcuda on this box, skipping");
+            return;
+        };
+        if driver.init().is_err() || driver.device_count().unwrap_or(0) == 0 {
+            eprintln!("no CUDA device, skipping");
+            return;
+        }
+        driver.attach_primary_context(0).expect("primary context");
+        // SAFETY: the context is current on this thread as of the line above
+        // and the stream is created here, so it is ours to destroy.
+        let stream = unsafe { driver.create_stream() }.expect("side stream");
+        assert!(
+            !stream.is_null(),
+            "a side stream must not be the legacy stream"
+        );
+        // Nothing is queued on the legacy stream, so capture inherits no
+        // cross-stream dependency (decision 39's stream story).
+        unsafe { driver.synchronize(std::ptr::null_mut()) }.expect("legacy sync");
+        unsafe { driver.begin_capture(stream, CAPTURE_MODE_GLOBAL) }.expect("begin capture");
+        let graph = unsafe { driver.end_capture(stream) }.expect("end capture");
+        let exec = unsafe { driver.graph_instantiate(graph) }.expect("instantiate");
+        unsafe { driver.graph_launch(exec, stream) }.expect("launch");
+        unsafe { driver.synchronize(stream) }.expect("sync");
+        unsafe { driver.graph_exec_destroy(exec) }.expect("destroy exec");
+        unsafe { driver.graph_destroy(graph) }.expect("destroy graph");
+        unsafe { driver.destroy_stream(stream) }.expect("destroy stream");
     }
 }
