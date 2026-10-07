@@ -40,13 +40,24 @@ allocation, no readback, no synchronization -- what a graph records), and
 over a group, rewrites it with `stage_into` and replays byte for byte equal to
 an uncaptured twin; FreeToken's `engine/graph.py` was the model for the split
 (its own staging is device-side fixed-shape kernels, ours is host-side, so
-staging has to stay outside). Next: decision 39's slice 2, ordered under the
-P1 checklist -- first decide the MoE-in-graph shape (`begin_layer` still drops
-the gate_up/down banks per layer, so no graph may bake those addresses), then
-warmup + one captured decode step together with the pinned batch-metadata
-staging P1, then per-batch-size graphs over a mempool; a replay-vs-uncaptured
-gate per batch size closes it. After that, M2 (API) proper and the
-remaining M3 perf items. Last finished: decision 30 (the pyo3 exit), decision 37
+staging has to stay outside). Decision 40 is recorded (slice 2, step 1): the
+decode graph is one executable per batch size over the whole forward with the
+MoE launches inside it -- candidate (b) -- and (a) is rejected because both
+candidates need resident dense weights before anything is capturable. That
+prerequisite is done (decision 41): every text-tower projection, the embedding
+and `lm_head` widen once at load into 4.51 GiB of resident bf16 (2.62
+projections + 0.95 embedding + 0.95 head; decision 40's 3.21 GiB estimate was
+low) and `Dense::apply`/`gather` never read the checkpoint again. Every tower
+gate is green again -- oracle and chat (11751 " Paris"), cross-check at the same
+1.72e-6 of logit scale, logit lens, per-step cost, load, incremental decode,
+the kernel token and the scalar reference -- plus the MoE graph replay and the
+three cubin gates. Next: stable `begin_layer` bank addresses plus the flat
+cross-layer slot LRU, then the device-resident MoE hand-off, then the two
+device-side staging kernels FreeToken uses, and only then warmup + one captured
+decode step together with the pinned batch-metadata staging P1, per-batch-size
+graphs over a mempool, and a replay-vs-uncaptured gate per batch size. After
+that, M2 (API) proper and the remaining M3 perf items. Last finished: the P0
+resident dense weights (decision 41), decision 40 (the MoE-in-graph shape), decision 30 (the pyo3 exit), decision 37
 (the step counter), decision 36 slice 6 (the tower-with-the-kernel gate) and
 decision 39's capture binding plus the MoE stage/launch/collect split. Before that the chat surface, SSE and the cached decode
 loop. Incremental KV decode is proved too: chunked prefill + one-token decode
@@ -276,7 +287,7 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 ### Weights / model load
 - [x] P0 `ftw.rs`: parse `freetoken_weight.json` (schema: `format="freetoken_weight"`, `version=1`, `align=4096`, `shards[]` with `file/global_off/nbytes`, `tensors[]` with `name/kind/dtype/shape/global_off/nbytes`).
 - [x] P0 mmap all `freetoken-NNNNN.ftw` shards; resolve per-tensor `global_off -> (shard, offset)` (`MmapFtwReader`: memmap2, `WeightsReader` port, `pieces()` split).
-- [ ] P0 load & cast dense weights to GPU: embeddings, all tensor projections + norms + router (bf16), lm_head. Gemma norms: bake `w+1.0` at load.
+- [x] P0 load & cast dense weights to GPU: embeddings, all tensor projections + norms + router (bf16), lm_head. Gemma norms: bake `w+1.0` at load. (Done, decision 41: one widen at load into 4.51 GiB resident bf16, block-windowed so the host holds one 4096-row window; `lm_head` narrows the resident tensor per `LM_HEAD_BLOCK`, the embedding gathers off it, and neither path reads the checkpoint again -- `a_dense_projection_is_widened_at_load_and_apply_never_reads_again` counts the reads.)
 - [ ] P0 GDN fp32 params (`A_log`, `dt_bias`) kept fp32; biased/linear projections per checkpoint quant.
 - [ ] P0 expert host banks from per-layer FTW entries (`gate_up_packed#L`, `gate_up_scale#L`, `gate_up_global#L`, `down_*#L`) read serially into pinned host buffers; keep a GPU-resident `[L*E]` set for the fp16 global alphas.
 - [ ] P0 precompute partial-Neox rope cos/sin cache on device up to `max_seq_len`.
@@ -462,15 +473,16 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
   FFI (decision 39: not "via tch" -- `tch` 0.22 has no capture API), plus the
   no-inference-during-capture warmup pattern (mirror `engine/graph.py`).
   Slice 1 landed (see the `[x]` above); take the rest in this order:
-  1. **Decide the MoE-in-graph shape first -- it is blocking.** Slice 1 proved
-     the four launches capturable *on their own graph*, but `CudaMoE::begin_layer`
-     still drops and reallocates `gate_up`/`down` per layer, so no graph may
-     bake those addresses today. Candidates: (a) capture the non-MoE forward
-     only and interleave the per-step MoE `launch` graph (slice 1) on the side
-     stream between segments -- no bank pinning needed; (b) a bank layout whose
-     addresses survive every layer, so one graph covers the whole forward --
-     needs the VRAM budget math against `moe_cache_size_slots` and a change to
-     `begin_layer`. Record the choice in section 7 before coding.
+  1. **Decide the MoE-in-graph shape first -- it is blocking.** Done, decision
+     40: one executable per batch size covering the whole forward, MoE launches
+     inside it (candidate (b)); (a) is rejected because its torch segments carry
+     host-side widening too, so both candidates need the same prerequisites and
+     (a) would only be rebuilt into (b). What gates this item now, in order (each
+     with its own gate): (i) the P0 "load & cast dense weights to GPU" box, (ii)
+     stable `begin_layer` bank addresses plus the flat cross-layer slot LRU, (iii)
+     a device-resident MoE hand-off, (iv) the two device-side staging kernels
+     over pinned host banks that let staging be recorded at all. The capture
+     steps below are unchanged.
   2. **Warmup + capture one uncaptured step** mirroring `engine/graph.py`: an
      uncaptured forward first, flush both streams (slice 1's rule), capture on
      the side stream, sample logits `[bs, vocab]` produced *inside* the graph.
@@ -1201,9 +1213,140 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
       shape (different shape = error containing "captured"). Known hole for
       slice 2: `CudaMoE::begin_layer` drops the `gate_up`/`down` banks on a
       layer switch, so a graph spanning layers would bake addresses the next
-      layer frees -- step 1 of slice 2 decides between pinning those addresses
-      and keeping the MoE launches out of the big graph, as slice 1 did. The
-      ordered slice-2 plan lives under the P1 checklist.
+       layer frees -- step 1 of slice 2 decides between pinning those addresses
+       and keeping the MoE launches out of the big graph, as slice 1 did. The
+       ordered slice-2 plan lives under the P1 checklist.
+
+40. **The decode graph is one executable per batch size over the whole forward,
+     MoE launches inside it (candidate (b))** (2026-10-07) -- decision 39 slice
+     2, step 1, measured on the checkpoint the gates load rather than taken from
+     the two candidates as written.
+     - **(a) is rejected.** Its torch segments contain `Dense::apply`, which
+       widens every projection on the host (mmap read, scalar dequant to f32,
+       bf16 upload) on *every* forward. Nothing there has a stable address for a
+       graph to bake, and a captured pageable upload freezes its bytes at
+       capture time, so a replay would multiply by stale weights. Refreshing
+       fixed buffers per step instead of widening per use is what residency is,
+       minus the upload residency gives back for free: (a) and (b) share that
+       prerequisite, (a) keeps 40 per-layer host round trips, and (a) would be
+       rebuilt into (b) afterwards.
+     - **Measured from `freetoken_weight.json` of that checkpoint** (40 layers =
+       10 full-attn + 30 GDN, 40 MoE x 256 experts x 8 routes, expert banks
+       16.93 GiB, one expert = 1.69 MiB):
+        - every forward widens 0.70 GiB of narrow text-tower weights into
+          2.23 GiB of bf16 (projections 1.56, `lm_head` 0.53, shared experts
+          0.13) plus the embedding rows; norms, router and the GDN `A_log` /
+          `dt_bias` are already resident `SharedTensor`s. **Superseded for the
+          widening by decision 41: it happens once, at load; the per-forward
+          widening described here is gone.**
+       - decision 27 drops the banks on every layer switch, so a bs=1 decode
+         step restages 8 routes x 40 layers x 1.69 MiB = 0.53 GiB of misses
+         every step, through `routed_via_port`'s host round trip (D2H of
+         activations/ids/weights, plan, H2D, launch, D2H, H2D).
+     - **Budget, measured once residency landed (decision 41).** Resident text
+       tower incl. `lm_head` is 4.51 GiB bf16 (2.62 projections -- `qkvz` alone
+       is 1.41 over the 10 GDN layers, full-attn `qkv` + `o` 0.51, GDN `o` 0.47,
+       shared experts 0.23 -- + 0.95 embedding + 0.95 head); the 3.21 GiB above
+       was an estimate off `freetoken_weight.json` and was low by 1.3. The flat
+       slot cache is 0.42 GiB at 256 slots and 0.85 GiB at 512. What binds is
+       now the KV pool: `MhaPool` at `KvDType::F32` (what `kv_cache()` returns)
+       is 40960 bytes per token, so the config default
+       `[kv] num_tokens = 131072` alone is 5.0 GiB and 4.51 + 5.0 does not fit
+       the 7.53 GiB device -- decision 33's trigger has fired, bytes are the
+       binding constraint. The gated tests therefore size `kv.num_tokens` to
+       their own workload (8192 for the two-slot load gate, 4096 elsewhere) and
+       the next lever is `kv_cache_dtype = "fp8"` / `KvDType::BFloat16`. At the
+       workload sizes, tower + slot cache + KV + activations fit, which is why
+       the gated tests stay serial. Device VA grew too: a passing `one_token`
+       gate measures VmPeak 42.0 GiB against VmRSS 5.8 GiB, so
+       `run-gated.sh`'s cap goes 26 to 48 (decision 41).
+     - **Prerequisites, in order, each with its own gate** -- this is what the
+       P1 checklist now points at:
+       1. P0 "load & cast dense weights to GPU": widen every text-tower
+          projection, `lm_head` and the embedding once at load, so `Dense::apply`
+          and `Dense::gather` never touch the checkpoint again. **Done,
+          decision 41.**
+       2. Stable bank addresses: allocate `gate_up`/`down` once in `CudaMoE`
+          instead of dropping them in `begin_layer`, and stop the `forget_layer`
+          replay on a layer switch. Every MoE layer shares one slab shape, so
+          only the contents change; `ExpertCache` keeps its flat
+          `layer * E + expert` ids and becomes the cross-layer LRU it already
+          models, which collapses the 0.53 GiB/step restage to steady-state
+          misses.
+       3. Device-resident MoE hand-off: activations, routes and the reduced sum
+          stay on the device across a layer -- no `to_f32_vec` in
+          `routed_via_port`. Any capture needs this, (a) or (b).
+       4. In-graph staging. Layer `l`'s routes are produced *inside* the graph,
+          so the host cannot plan layer `l`'s misses before a single replay.
+          FreeToken does it with fixed-shape device-side kernels over a device
+          alias of pinned host banks (`moe/offload_cache.py`: `ensure_experts` +
+          `fast_index_copy_multi`); port those two into `python/ferrum_kernel/`
+          (the P0 "pinned expert host banks" box is the host half) and mirror
+          the slot tables to the device. The domain semantics do not change:
+          LRU, and `-1` routes for the overflow case.
+       5. Then capture itself, unchanged from the checklist: warmup plus one
+          captured step with the pinned batch-metadata staging P1, per-batch-size
+          executables over a mempool, replay-vs-uncaptured gate per batch size.
+     - Slice-1 contracts do not change: a `StagedGroup` outlives every graph
+       captured over it, `stage_into` is the only writer between replays, a
+       captured grid pins the batch shape, capture runs on the flags-0 side
+       stream only.
+
+41. **Dense weights become resident on the device, and the harness and the KV
+     budget move with them** (2026-10-07) -- decision 40's prerequisite 1.
+     - **Widen once, at load, in windows.** `Loader::dense(name, device)` reads
+       the narrow (NVFP4 for the projections, bf16 for the embedding) tensor out
+       of the FTW in `LOAD_BLOCK_ROWS = 4096` row windows (the index is 4096
+       aligned), accumulates the row scales, and copies each window straight
+       into a resident `[rows, cols]` `BFloat16` device tensor -- the host never
+       holds more than one window (one projection is 32 MiB at 4096 x 2048).
+       `Dense::apply` runs `f32_(x) .matmul(f32_(w).transpose(0,1))` off that
+       resident tensor, `Dense::gather` is an `index_select`, and
+       `lm_head_logits` narrows the resident head in `LM_HEAD_BLOCK = 8192`
+       windows instead of re-reading it. The embedding is a `Dense` too, so a
+       prefill batch gathers its rows instead of pulling them from the mmap.
+     - **The gate for it counts reads, not bytes.** A `CountingReader` around
+       `WeightsReader` serves a `DENSE_FIXTURE` FTW and asserts the load reads
+       (over 0), then that two `apply`s and one `gather` add exactly 0 reads,
+       that the result is bit-repeatable and still matches `forward::fp8_gemm`
+       to 1e-2 of scale (`a_dense_projection_is_widened_at_load_and_apply_never_reads_again`).
+     - **Numerics did not move, deliberately.** `linear` keeps the full bf16 ->
+       f32 device upcast of *both* operands on every call: a resident 4.51 GiB
+       re-converted per matmul is pure bandwidth and is the obvious next
+       optimization, but changing it is the kind of edit that shows up in the
+       oracle gates, so it is left for its own red test. Measured after the
+       change, the scalar-vs-libtorch cross-check is still at 1.72e-6 of logit
+       scale (its historical number), and the oracle, incremental decode,
+       logit-lens, per-step cost, chat, kernel-token and scalar-reference gates
+       are all green.
+     - **Residency makes the KV pool the binding constraint.** `kv_cache()`
+       returns `KvDType::F32`, so `MhaPool` costs 40960 bytes per token and the
+       config default `num_tokens = 131072` is 5.0 GiB on its own; added to the
+       4.51 GiB tower it OOMs the 7.53 GiB device at load time ("7.29 GiB
+       already allocated by PyTorch"). Decision 33's trigger -- bytes, not
+       bandwidth, being what binds -- has fired. Interim: the gated test
+       configs size `[kv] num_tokens` to their own workload (8192 for the
+       two-running-request load gate, 4096 elsewhere) instead of shipping the
+       131072 default into a 7.53 GiB card. Real lever, still unimplemented:
+       `kv_cache_dtype = "fp8"` / `BFloat16`, the P0 line that was waiting for
+       exactly this trigger.
+     - **`scripts/run-gated.sh` had a units bug that made the cap meaningless.**
+       `prlimit --as` takes *bytes* and the script passed KiB, so "26 GiB" was
+       27 MB: every run through that branch died in the loader with
+       `failed to map segment from shared object`, and the script only worked
+       through its `ulimit -v` fallback. Now `--as=$((cap_kb * 1024))`. The
+       default is re-derived from a measured passing run rather than from the
+       old estimate: 48 GiB (`FT_MEM_CAP_GIB`), VmPeak 42.0 GiB and VmRSS
+       5.8 GiB (20.3 GiB FTW mmap + CUDA device VA + libtorch + the resident
+       tower). It still fails loudly if something widens the 16.9 GiB bank
+       image on the host: that is 59 GiB of address space.
+     - **Gates, all serial, all green after the change:** oracle + chat
+       (11751 " Paris"), logit lens, load, incremental decode (308 s, dlogit
+       within 1.4e-6 of scale), per-step cost, scalar-vs-libtorch cross-check,
+       kernel token, scalar reference forward, the MoE graph replay, and the
+       three cubin/ABI gates. One retry on `incremental_decode` after libtorch
+       threw a `c10::ApproximateClock` non-monotonic assert inside `dlopen` --
+       an environmental flake at library load, not the test.
 
 ### Config defaults for the RTX 5060 / 8 GB target
 

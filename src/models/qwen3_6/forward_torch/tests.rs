@@ -399,8 +399,7 @@ fn a_widened_fp8_weight_matmuls_like_the_reference_gemm() {
     let got = to_f32_vec(&linear(
         &up(&x, &[t as i64, cols as i64]),
         &wt,
-        &scale,
-        dev(),
+        Some(&f32_tensor(&scale, &[rows as i64], dev())),
     ));
     close_rel(&got, &want, 1e-2, "widened fp8 matmul");
 }
@@ -438,8 +437,11 @@ fn a_widened_nvfp4_weight_matmuls_like_the_reference_gemm() {
     let got = to_f32_vec(&linear(
         &up(&x, &[t as i64, cols as i64]),
         &wt,
-        &nvfp4_globals(&global, rows),
-        dev(),
+        Some(&f32_tensor(
+            &nvfp4_globals(&global, rows),
+            &[rows as i64],
+            dev(),
+        )),
     ));
     close_rel(&got, &want, 1e-2, "widened nvfp4 matmul");
 
@@ -480,6 +482,137 @@ fn the_lm_head_block_split_is_exact() {
             "block {start}..{end}"
         );
     }
+}
+
+/// A `WeightsReader` over a byte blob that counts the reads it serves, so a
+/// test can prove which path touched the checkpoint.
+struct CountingReader {
+    blob: Vec<u8>,
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+impl CountingReader {
+    fn new(blob: Vec<u8>) -> Self {
+        Self {
+            blob,
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn reads(&self) -> usize {
+        self.reads.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl crate::domain::weights::WeightsReader for CountingReader {
+    fn read_range(&self, off: u64, nbytes: u64, dst: &mut [u8]) -> std::result::Result<(), String> {
+        self.reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (s, e) = (off as usize, (off + nbytes) as usize);
+        if e > self.blob.len() {
+            return Err(format!("range {s}..{e} past {}", self.blob.len()));
+        }
+        dst.copy_from_slice(&self.blob[s..e]);
+        Ok(())
+    }
+}
+
+/// One projection and one embedding, at 4096-aligned offsets like every FTW
+/// index, backed by a blob the test fills with known values.
+const DENSE_FIXTURE: &str = r#"{
+  "format": "freetoken_weight",
+  "version": 1,
+  "align": 4096,
+  "shard_limit": 8589934592,
+  "total_bytes": 12288,
+  "tensors": [
+    {"name": "proj.weight", "kind": "weight", "dtype": "float8_e4m3fn",
+     "shape": [4, 8], "global_off": 0, "nbytes": 32},
+    {"name": "proj.weight_scale", "kind": "weight", "dtype": "float32",
+     "shape": [4], "global_off": 4096, "nbytes": 16},
+    {"name": "embed.weight", "kind": "weight", "dtype": "bfloat16",
+     "shape": [6, 8], "global_off": 8192, "nbytes": 96}
+  ],
+  "shards": [
+    {"file": "freetoken-00000.ftw", "global_off": 0, "nbytes": 12288}
+  ]
+}"#;
+
+/// f32 as the two bf16 bytes `domain::dequant` would read back, so the fixture
+/// and the expectation come from the same rounding.
+fn bf16_bytes(v: f32) -> [u8; 2] {
+    let b = v.to_bits();
+    [(b >> 16) as u8, (b >> 24) as u8]
+}
+
+/// Decision 40's first prerequisite: a projection is widened out of the
+/// checkpoint once, at load, and every later `apply` runs off device memory.
+/// Widening per use streams 0.70 GiB of checkpoint bytes and 2.23 GiB of
+/// uploads per forward, and leaves a capture window with nothing stable to bake.
+#[test]
+fn a_dense_projection_is_widened_at_load_and_apply_never_reads_again() {
+    let (t, rows, cols) = (3usize, 4usize, 8usize);
+    let mut blob = vec![0u8; 12288];
+    // e4m3fn codes at exact values, kept off the two NaN encodings.
+    let packed: Vec<u8> = (0..rows * cols)
+        .map(|i| e4m3_code(0.5 + (i % 4) as f32 * 0.25))
+        .collect();
+    blob[..packed.len()].copy_from_slice(&packed);
+    let scale: Vec<f32> = (0..rows).map(|r| 0.5 + r as f32 * 0.5).collect();
+    for (i, s) in scale.iter().enumerate() {
+        let at = 4096 + i * 4;
+        blob[at..at + 4].copy_from_slice(&s.to_le_bytes());
+    }
+    let embed: Vec<f32> = data(6 * cols, 5);
+    let embed_bytes: Vec<u8> = embed.iter().flat_map(|&v| bf16_bytes(v)).collect();
+    blob[8192..8192 + embed_bytes.len()].copy_from_slice(&embed_bytes);
+
+    let index = crate::infrastructure::ftw::FtwIndex::parse(DENSE_FIXTURE).unwrap();
+    let reader = CountingReader::new(blob);
+    let ld = Loader {
+        index: &index,
+        reader: &reader,
+    };
+
+    let d = ld.dense("proj.weight", dev()).unwrap();
+    let after_load = reader.reads();
+    assert!(after_load > 0, "load must read the checkpoint once");
+
+    let x_host = data(t * cols, 7);
+    let x = up(&x_host, &[t as i64, cols as i64]);
+    let y = d.apply(&x);
+    let again = d.apply(&x);
+    assert_eq!(
+        reader.reads(),
+        after_load,
+        "apply read the checkpoint again"
+    );
+    assert_eq!(y.size(), vec![t as i64, rows as i64]);
+    assert_eq!(
+        to_f32_vec(&y),
+        to_f32_vec(&again),
+        "apply must be repeatable"
+    );
+
+    // The resident bytes still carry the checkpoint's own product.
+    let want = super::super::forward::fp8_gemm(&x_host, &packed, &scale, t, rows, cols);
+    close_rel(&to_f32_vec(&y), &want, 1e-2, "resident fp8 projection");
+
+    // The embedding is resident the same way, and `gather` reads rows off it.
+    let e = ld.dense("embed.weight", dev()).unwrap();
+    let after_embed = reader.reads();
+    let g = e.gather(&[4, 0]);
+    assert_eq!(reader.reads(), after_embed, "gather read the checkpoint");
+    assert_eq!(g.size(), vec![2, cols as i64]);
+    let got = to_f32_vec(&g);
+    let mut want: Vec<f32> = Vec::new();
+    for r in [4usize, 0usize] {
+        want.extend_from_slice(&crate::domain::dequant::bf16_array(
+            &embed_bytes[r * cols * 2..],
+            cols,
+        ));
+    }
+    close(&got, &want, 1e-6, "resident embedding gather");
 }
 
 /// What the engine's MoE port is handed, recorded so the test can check the

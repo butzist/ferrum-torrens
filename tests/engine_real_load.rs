@@ -12,9 +12,12 @@ use ferrum_torrens::application::engine::load_engine;
 const FTW_DIR: &str = ".model-cache/Qwen3.6-35B-A3B-NVFP4.ftw";
 
 fn config() -> ferrum_torrens::config::Config {
+    // 2 running sequences x 4096 tokens of headroom; the 131072-token default
+    // is 5 GiB of f32 KV and does not fit beside the resident tower weights.
     format!(
         "[model]\npath = \"{FTW_DIR}\"\nmax_seq_len = 4096\nmax_output_tokens = 16\n\
-         max_prefill_length = 1024\nmax_running_requests = 2\n\n[moe]\ncache_size_slots = 512\n"
+         max_prefill_length = 1024\nmax_running_requests = 2\n\n\
+         [kv]\nnum_tokens = 8192\n\n[moe]\ncache_size_slots = 512\n"
     )
     .parse()
     .unwrap()

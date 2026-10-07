@@ -7,8 +7,13 @@
 # which Linux does not enforce, and not a cgroup, which the sandbox does not
 # mount) turns "host dies" into "malloc returns null and the test fails".
 #
-# The cap has to clear the 20.3 GiB mapping plus libtorch, hence 26 GiB by
-# default; override with FT_MEM_CAP_GIB.
+# The cap has to clear address space, not resident bytes: RLIMIT_AS counts the
+# 20.3 GiB shard mapping, the CUDA device VA, libtorch's own mappings and the
+# 4.51 GiB of resident tower weights (decision 40). Measured VmPeak on
+# `one_token_prediction_matches_the_oracle` with `--features cuda` is 42 GiB
+# while VmRSS is 5.8 GiB, so the cap is 48 GiB: it still catches an accidental
+# whole-bank widening (16.9 GiB of anonymous growth) without mistaking mapped
+# file and device memory for a leak. Override with FT_MEM_CAP_GIB.
 #
 # Usage: scripts/run-gated.sh [--release] [--features <list>] <test-name> [-- args]
 #   scripts/run-gated.sh --release one_token_prediction_matches_the_oracle
@@ -62,7 +67,7 @@ if [[ -z "$target" ]]; then
   exit 2
 fi
 
-cap_gib="${FT_MEM_CAP_GIB:-26}"
+cap_gib="${FT_MEM_CAP_GIB:-48}"
 cap_kb=$((cap_gib * 1024 * 1024))
 
 cargo_args=("--profile=$profile" --test "$target" --no-run --message-format=json)
@@ -81,7 +86,10 @@ fi
 echo "running $test_name ($target, cap ${cap_gib}G${features:+, features: $features})" >&2
 
 if command -v prlimit >/dev/null 2>&1; then
-  exec prlimit --as="$cap_kb" -- "$bin" "$test_name" --ignored --nocapture "$@"
+  # prlimit --as takes bytes; a bare KiB number here would be read as bytes and
+  # cap the process at ~30 MB, which the dynamic loader fails on before the
+  # test starts.
+  exec prlimit --as="$((cap_kb * 1024))" -- "$bin" "$test_name" --ignored --nocapture "$@"
 fi
 
 (

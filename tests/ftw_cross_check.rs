@@ -37,7 +37,14 @@ fn reader() -> Arc<dyn WeightsReader> {
 /// the inline host path and the comparison is scalar vs libtorch arithmetic
 /// rather than scalar vs kernel.
 fn server_config() -> ferrum_torrens::config::Config {
-    ferrum_torrens::config::Config::from_str("[model]\npath = \".model-cache\"\n").unwrap()
+    // The pool is sized to this prompt's workload: the 131072-token default is
+    // 5 GiB of f32 KV (decision 33) and the resident tower weights (decision
+    // 40) no longer leave room for it on the 8 GB target.
+    ferrum_torrens::config::Config::from_str(
+        "[model]\npath = \".model-cache\"\nmax_seq_len = 4096\nmax_prefill_length = 4096\n\n\
+         [kv]\nnum_tokens = 4096\n",
+    )
+    .unwrap()
 }
 
 fn config() -> serde_json::Value {

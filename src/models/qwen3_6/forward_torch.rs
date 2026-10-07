@@ -10,13 +10,13 @@
 // the oracle at least as closely as the scalar path does.
 //
 // The three narrow formats have no matmul in libtorch on any backend, so they
-// are widened on the host by `domain::dequant` and uploaded:
-//   * FP8 (e4m3 + per-row f32 scale) -> dense bf16, once at load.
-//   * NVFP4 -> dense bf16 for the shared experts (small, once at load).
-//   * NVFP4 routed experts and `lm_head` stay packed on the host and are
-//     widened per use, in expert-sized / vocab-sized blocks. At 21 GB of banks
-//     and a 254 MB head they cannot be resident, and widening them wholesale
-//     would need 2 GB of scratch for a single matmul.
+// are widened on the host by `domain::dequant`. Everything the text tower
+// multiplies more than once is widened *once*, at load, and then lives on the
+// device: every dense projection (2.62 GiB), the embedding (0.95 GiB) and
+// `lm_head` (0.95 GiB), 4.51 GiB of resident bf16 in all. Only the routed
+// expert banks stay packed on the host -- 16.93 GiB across the 40 layers,
+// 1.69 MiB per expert -- and they are widened per use behind the MoE port.
+// Resident addresses are also what a CUDA graph can bake in (decision 40).
 
 use tch::Kind;
 use tch::Tensor;
@@ -46,9 +46,15 @@ pub enum TorchError {
 
 type Result<T> = std::result::Result<T, TorchError>;
 
-/// Vocabulary rows widened per block in the `lm_head` pass. The head is
-/// 248320 x 2048; widening it whole would be 2 GB of scratch, this is 135 MB.
+/// Vocabulary rows per block in the `lm_head` pass. The head is resident, but
+/// `linear` upcasts its operand to f32, so a whole head would be 1.9 GB of
+/// transient; this is 67 MB.
 const LM_HEAD_BLOCK: usize = 8_192;
+
+/// Rows read from the checkpoint per window while a projection is widened into
+/// its resident tensor at load. 4096 rows is 16 MB of bf16 for the widest
+/// weight here, so the host never holds more than one window.
+const LOAD_BLOCK_ROWS: usize = 4_096;
 
 // ---------------------------------------------------------------------------
 // Host-side widening
@@ -164,7 +170,7 @@ impl<'a> Loader<'a> {
 
     /// Describe a dense projection without reading it: the bytes stay in the
     /// checkpoint until `widen` asks for the window it needs.
-    fn dense(&self, name: &str) -> Result<Dense> {
+    fn dense_desc(&self, name: &str) -> Result<DenseDesc> {
         let t = self.desc(name)?;
         let (rows, packed_w) = shape2(name, t)?;
         let (kind, cols) = match t.dtype {
@@ -175,7 +181,7 @@ impl<'a> Loader<'a> {
             DType::Bf16 => (DenseKind::Bf16, packed_w),
             other => return Err(TorchError::Bad("dtype", format!("{name} is {other}"))),
         };
-        Ok(Dense {
+        Ok(DenseDesc {
             name: name.to_string(),
             kind,
             rows,
@@ -201,10 +207,16 @@ impl<'a> Loader<'a> {
     }
 
     /// Widen rows `[r0, r0 + n)` of a dense projection to bf16, with its
-    /// per-row scale held out for after the matmul (see `linear`). Nothing but
-    /// the current window is ever resident, which is what keeps a 20 GB
-    /// checkpoint inside a host-sized address space.
-    fn widen(&self, d: &Dense, r0: usize, n: usize, device: Device) -> Result<(Tensor, Vec<f32>)> {
+    /// per-row scale held out for after the matmul (see `linear`). Only the
+    /// current window is ever resident on the host, which is what keeps a 20 GB
+    /// checkpoint inside a host-sized address space while `dense` walks it.
+    fn widen(
+        &self,
+        d: &DenseDesc,
+        r0: usize,
+        n: usize,
+        device: Device,
+    ) -> Result<(Tensor, Vec<f32>)> {
         let (values, row_scale) = match d.kind {
             DenseKind::Bf16 => (self.bf16_rows(&d.name, r0, n, d.cols)?, Vec::new()),
             DenseKind::Fp8 => {
@@ -258,6 +270,38 @@ impl<'a> Loader<'a> {
             row_scale,
         ))
     }
+
+    /// Widen a whole projection out of the checkpoint and keep it on the
+    /// device. This is the load-time read: `widen` walks it in
+    /// `LOAD_BLOCK_ROWS` windows so the host never holds more than one, and the
+    /// result is written once into a preallocated tensor, which is what makes
+    /// every later `Dense::apply` a device-local operation (decision 40).
+    fn dense(&self, name: &str, device: Device) -> Result<Dense> {
+        let d = self.dense_desc(name)?;
+        let dev = device.to_tch();
+        let w = Tensor::zeros([d.rows as i64, d.cols as i64], (Kind::BFloat16, dev));
+        let mut scale: Option<Vec<f32>> = if d.kind == DenseKind::Bf16 {
+            None
+        } else {
+            Some(Vec::with_capacity(d.rows))
+        };
+        let mut r0 = 0usize;
+        while r0 < d.rows {
+            let n = LOAD_BLOCK_ROWS.min(d.rows - r0);
+            let (block, s) = self.widen(&d, r0, n, device)?;
+            let mut view = w.narrow(0, r0 as i64, n as i64);
+            view.copy_(&block);
+            if let Some(scale) = &mut scale {
+                scale.extend_from_slice(&s);
+            }
+            r0 += n;
+        }
+        Ok(Dense {
+            w: up(w),
+            row_scale: scale.map(|s| up(f32_tensor(&s, &[d.rows as i64], device))),
+            rows: d.rows,
+        })
+    }
 }
 
 fn shape2(name: &str, t: &TensorDesc) -> Result<(usize, usize)> {
@@ -300,17 +344,16 @@ fn rms_norm(x: &Tensor, w: &Tensor, eps: f32) -> Tensor {
 /// per-row scale (an f32 `weight_scale` for FP8, an f16 `_global` for NVFP4) is
 /// held out of the stored weight and applied *after* the matmul, exactly as the
 /// reference's packed gemm does, so nothing is lost and resident bytes stay half
-/// of f32 against the 8 GB target.
+/// of f32 against the 8 GB target. `None` is the bf16 case, which has no scale.
 ///
 /// `w` is `[out, in]` as the checkpoint stores it, so the transpose is a view and
 /// BLAS takes it as a transposed operand rather than copying.
-fn linear(x: &Tensor, w: &Tensor, row_scale: &[f32], device: Device) -> Tensor {
+fn linear(x: &Tensor, w: &Tensor, row_scale: Option<&Tensor>) -> Tensor {
     let y = f32_(x).matmul(&f32_(w).transpose(0, 1));
-    if row_scale.is_empty() {
-        return y;
+    match row_scale {
+        Some(s) => y * s,
+        None => y,
     }
-    let n = row_scale.len() as i64;
-    y * f32_tensor(row_scale, &[n], device)
 }
 
 /// Same trace lines as `forward::trace_vec`, off unless `FT_TRACE=1`.
@@ -655,7 +698,7 @@ impl std::ops::Deref for SharedTensor {
 
 /// How a dense projection is stored, which is also how much of it has to be
 /// widened before it can be multiplied.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 enum DenseKind {
     Bf16,
     Fp8,
@@ -664,34 +707,41 @@ enum DenseKind {
 
 /// A projection described, not loaded: `rows x cols` of `name`, in `[out, in]`
 /// order as the checkpoint stores it. The bytes stay in the checkpoint and
-/// `Loader::widen` pulls the window a matmul needs, so resident bytes never
-/// exceed one projection.
-struct Dense {
+/// `Loader::widen` pulls the window a matmul needs, so a host pass never holds
+/// more than one window.
+struct DenseDesc {
     name: String,
     kind: DenseKind,
     rows: usize,
     cols: usize,
 }
 
+/// A projection widened once and kept on the device: `w` is `[rows, cols]`
+/// bf16, `row_scale` the matching `[rows]` f32 for FP8/NVFP4 and `None` for
+/// bf16. Nothing here touches the checkpoint again, which is both what keeps a
+/// forward off the host and what gives a CUDA graph stable addresses to bake
+/// (decision 40).
+struct Dense {
+    w: SharedTensor,
+    row_scale: Option<SharedTensor>,
+    rows: usize,
+}
+
 impl Dense {
     /// `x @ w.T` with the per-row scale applied after the matmul (see `linear`).
-    fn apply(&self, x: &Tensor, device: Device, ld: &Loader<'_>) -> Result<Tensor> {
-        let (w, row_scale) = ld.widen(self, 0, self.rows, device)?;
-        Ok(linear(x, &w, &row_scale, device))
+    fn apply(&self, x: &Tensor) -> Tensor {
+        linear(x, &self.w, self.row_scale.as_deref())
     }
 
-    /// `[len(rows), cols]` for arbitrary rows, for the embedding lookup where
-    /// only the prompt's tokens are ever needed.
-    fn gather(&self, rows: &[u32], device: Device, ld: &Loader<'_>) -> Result<Tensor> {
-        let mut values = Vec::with_capacity(rows.len() * self.cols);
-        for &r in rows {
-            values.extend_from_slice(&ld.bf16_rows(&self.name, r as usize, 1, self.cols)?);
-        }
-        Ok(bf16_tensor(
-            &values,
-            &[rows.len() as i64, self.cols as i64],
-            device,
-        ))
+    /// `[len(rows), cols]` for arbitrary rows, off the resident weight rather
+    /// than the checkpoint: the embedding only ever needs the prompt's tokens,
+    /// but those are still a device-local gather.
+    fn gather(&self, rows: &[u32]) -> Tensor {
+        let idx: Vec<i64> = rows.iter().map(|&r| r as i64).collect();
+        let index = Tensor::from_slice(&idx)
+            .view([idx.len() as i64])
+            .to_device(self.w.device());
+        self.w.index_select(0, &index)
     }
 }
 
@@ -727,10 +777,10 @@ struct SharedExpert {
     down: Dense,
 }
 
-/// The libtorch Qwen3.5/3.6 MoE text tower: every dense weight resident on the
-/// device, the routed experts and the head still on the host and widened per
-/// use. Implements the same `Model` trait as the scalar reference, so the
-/// engine cannot tell which one it is driving.
+/// The libtorch Qwen3.5/3.6 MoE text tower: every dense weight, the embedding
+/// and the head resident on the device, only the routed expert banks still on
+/// the host and widened per use. Implements the same `Model` trait as the
+/// scalar reference, so the engine cannot tell which one it is driving.
 pub struct TorchQwen3_6 {
     params: ModelParams,
     device: Device,
@@ -762,10 +812,11 @@ struct TorchLayer {
 }
 
 impl TorchQwen3_6 {
-    /// Read the index, keep the checkpoint where it is and hold on to nothing
-    /// but the small per-layer vectors (norms, router, gates). Everything with
-    /// a matrix in it is widened per use, so peak resident bytes are a single
-    /// projection no matter how big the checkpoint is.
+    /// Read the index, widen the whole text tower out of the checkpoint once
+    /// and hold it on the device: 4.51 GiB of bf16 for the projections, the
+    /// embedding and `lm_head`. The checkpoint stays mapped for the routed
+    /// expert banks alone (16.93 GiB), which are widened per use behind the MoE
+    /// port and cannot be resident on an 8 GB device.
     pub fn load(
         params: ModelParams,
         device: Device,
@@ -780,7 +831,7 @@ impl TorchQwen3_6 {
         };
         let h = params.hidden_size;
 
-        let embed = ld.dense("model.embed_tokens.weight")?;
+        let embed = ld.dense("model.embed_tokens.weight", device)?;
         let final_norm = norm_tensor(&ld.bf16_vec("model.norm.weight", h)?, h, device);
 
         let mut layers = Vec::with_capacity(params.num_layers);
@@ -798,8 +849,8 @@ impl TorchQwen3_6 {
             );
             let mixer = if params.layer_types[layer] == LayerType::FullAttention {
                 Mixer::Full(FullAttention {
-                    qkv: ld.dense(&format!("{p}.self_attn.qkv_proj.weight"))?,
-                    o: ld.dense(&format!("{p}.self_attn.o_proj.weight"))?,
+                    qkv: ld.dense(&format!("{p}.self_attn.qkv_proj.weight"), device)?,
+                    o: ld.dense(&format!("{p}.self_attn.o_proj.weight"), device)?,
                     q_norm: norm_tensor(
                         &ld.bf16_vec(&format!("{p}.self_attn.q_norm.weight"), params.head_dim)?,
                         params.head_dim,
@@ -815,8 +866,8 @@ impl TorchQwen3_6 {
                 let conv_dim = 2 * params.linear_num_key_heads * params.linear_key_head_dim
                     + params.linear_num_value_heads * params.linear_value_head_dim;
                 Mixer::Linear(GatedDeltaNet {
-                    qkvz: ld.dense(&format!("{p}.linear_attn.in_proj_qkvz.weight"))?,
-                    o: ld.dense(&format!("{p}.linear_attn.out_proj.weight"))?,
+                    qkvz: ld.dense(&format!("{p}.linear_attn.in_proj_qkvz.weight"), device)?,
+                    o: ld.dense(&format!("{p}.linear_attn.out_proj.weight"), device)?,
                     ba: up(bf16_tensor(
                         &ld.bf16_vec(
                             &format!("{p}.linear_attn.in_proj_ba.weight"),
@@ -870,8 +921,11 @@ impl TorchQwen3_6 {
                 device,
             ));
             let shared = SharedExpert {
-                gate_up: ld.dense(&format!("{p}.mlp.shared_expert.gate_up_proj.weight"))?,
-                down: ld.dense(&format!("{p}.mlp.shared_expert.down_proj.weight"))?,
+                gate_up: ld.dense(
+                    &format!("{p}.mlp.shared_expert.gate_up_proj.weight"),
+                    device,
+                )?,
+                down: ld.dense(&format!("{p}.mlp.shared_expert.down_proj.weight"), device)?,
             };
             layers.push(TorchLayer {
                 input_norm,
@@ -883,7 +937,7 @@ impl TorchQwen3_6 {
             });
         }
 
-        let lm_head = ld.dense("lm_head.weight")?;
+        let lm_head = ld.dense("lm_head.weight", device)?;
         Ok(Self {
             params,
             device,
@@ -898,20 +952,11 @@ impl TorchQwen3_6 {
         })
     }
 
-    fn loader(&self) -> Loader<'_> {
-        Loader {
-            index: &self.index,
-            reader: self.reader.as_ref(),
-        }
-    }
-
     /// Logits for the last token of one contiguous sequence.
     fn run_sequence(&self, ids: &[u32], positions: &[u32]) -> Result<Vec<f32>> {
         let p = &self.params;
-        let dev = self.device;
         let t = ids.len();
-
-        let mut x = self.embed.gather(ids, dev, &self.loader())?;
+        let mut x = self.embed.gather(ids);
         trace_tensor("embed", usize::MAX, &x);
         let mut residual: Option<Tensor> = None;
 
@@ -924,8 +969,8 @@ impl TorchQwen3_6 {
             trace_tensor("xsum", li, &xsum);
             trace_tensor("h1", li, &h1);
             let mixer_out = match &layer.mixer {
-                Mixer::Full(fa) => self.full_attention(fa, &h1, positions)?,
-                Mixer::Linear(gdn) => self.gdn(gdn, &h1)?,
+                Mixer::Full(fa) => self.full_attention(fa, &h1, positions),
+                Mixer::Linear(gdn) => self.gdn(gdn, &h1),
             };
             trace_tensor("attn", li, &mixer_out);
             let sum2 = &mixer_out + &xsum;
@@ -944,7 +989,7 @@ impl TorchQwen3_6 {
         let last = stream.narrow(0, (t - 1) as i64, 1);
         let normed = rms_norm(&last, &self.final_norm, p.rms_norm_eps);
         trace_tensor("final", usize::MAX, &normed);
-        self.lm_head_logits(&normed)
+        Ok(self.lm_head_logits(&normed))
     }
 
     /// The attention projection, up to the point where the two paths diverge:
@@ -956,15 +1001,14 @@ impl TorchQwen3_6 {
         fa: &FullAttention,
         x: &Tensor,
         positions: &[u32],
-    ) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
+    ) -> (Tensor, Tensor, Tensor, Tensor) {
         let p = &self.params;
-        let dev = self.device;
         let hd = p.head_dim as i64;
         let qh = p.num_q_heads as i64;
         let kvh = p.num_kv_heads as i64;
         let qkv_dim = 2 * qh * hd + 2 * kvh * hd;
 
-        let qkv = fa.qkv.apply(x, dev, &self.loader())?;
+        let qkv = fa.qkv.apply(x);
         let qh_dim = qh * hd;
         // FreeToken attention.py:_project: the leading block is
         // `[t, num_q, head_dim*2]` per head, q first then the output gate,
@@ -998,14 +1042,14 @@ impl TorchQwen3_6 {
             positions,
         )
         .reshape([t, kvh, hd]);
-        Ok((q, k, v.reshape([t, kvh, hd]), gate))
+        (q, k, v.reshape([t, kvh, hd]), gate)
     }
 
-    fn full_attention(&self, fa: &FullAttention, x: &Tensor, positions: &[u32]) -> Result<Tensor> {
-        let (q, k, v, gate) = self.project_attention(fa, x, positions)?;
+    fn full_attention(&self, fa: &FullAttention, x: &Tensor, positions: &[u32]) -> Tensor {
+        let (q, k, v, gate) = self.project_attention(fa, x, positions);
         let attn = causal_attention(&q, &k, &v);
         let gated = attn * sigmoid(&gate);
-        fa.o.apply(&gated, self.device, &self.loader())
+        fa.o.apply(&gated)
     }
 
     /// The same layer, but the keys and values of the tokens already in the
@@ -1020,18 +1064,18 @@ impl TorchQwen3_6 {
         positions: &[u32],
         cache: &SequenceCache,
         pool: &MhaPool,
-    ) -> Result<Tensor> {
-        let (q, k, v, gate) = self.project_attention(fa, x, positions)?;
+    ) -> Tensor {
+        let (q, k, v, gate) = self.project_attention(fa, x, positions);
         let t = k.size()[0];
         pool.store(layer, cache.tail(t as usize), &k, &v);
         let (k_all, v_all) = pool.gather(layer, cache.filled());
         let attn = attention_cached(&q, &k_all, &v_all, positions[0] as usize);
         let gated = attn * sigmoid(&gate);
-        fa.o.apply(&gated, self.device, &self.loader())
+        fa.o.apply(&gated)
     }
 
-    fn gdn(&self, gdn: &GatedDeltaNet, x: &Tensor) -> Result<Tensor> {
-        let (layer_idx, q, k, v, g, beta, z) = self.gdn_project(gdn, x)?;
+    fn gdn(&self, gdn: &GatedDeltaNet, x: &Tensor) -> Tensor {
+        let (layer_idx, q, k, v, g, beta, z) = self.gdn_project(gdn, x);
         let p = &self.params;
         let t = x.size()[0];
         let dk = p.linear_key_head_dim as i64;
@@ -1046,9 +1090,9 @@ impl TorchQwen3_6 {
         trace_tensor("gdn.norm", layer_idx, &core_n);
         let out = core_n * z.silu();
         trace_tensor("gdn.pre", layer_idx, &out);
-        let o = gdn.o.apply(&out, self.device, &self.loader())?;
+        let o = gdn.o.apply(&out);
         trace_tensor("gdn.out", layer_idx, &o);
-        Ok(o)
+        o
     }
 
     /// The GDN layer continued from the slot's own conv and recurrent state
@@ -1060,9 +1104,8 @@ impl TorchQwen3_6 {
         x: &Tensor,
         cache: &SequenceCache,
         state: &LinearStateSlabs,
-    ) -> Result<Tensor> {
+    ) -> Tensor {
         let p = &self.params;
-        let dev = self.device;
         let (kb, dk, dv) = (
             p.linear_num_key_heads as i64,
             p.linear_key_head_dim as i64,
@@ -1074,7 +1117,7 @@ impl TorchQwen3_6 {
         let conv_dim = 2 * key_dim + value_dim;
         let t = x.size()[0];
 
-        let qkvz = gdn.qkvz.apply(x, dev, &self.loader())?;
+        let qkvz = gdn.qkvz.apply(x);
         trace_tensor("gdn.qkvz", layer, &qkvz);
         let (conv_in, z) = two(qkvz, [conv_dim, value_dim], 1);
         let ba = f32_(x).matmul(&f32_(&gdn.ba).transpose(0, 1));
@@ -1116,9 +1159,9 @@ impl TorchQwen3_6 {
         let core_n =
             rms_norm(&core.reshape([t, vb, dv]), &gdn.norm, p.rms_norm_eps).reshape([t, value_dim]);
         let out = core_n * z.silu();
-        let o = gdn.o.apply(&out, dev, &self.loader())?;
+        let o = gdn.o.apply(&out);
         trace_tensor("gdn.out", layer, &o);
-        Ok(o)
+        o
     }
 
     /// Everything up to the recurrence: the conv projection (carried, not
@@ -1129,14 +1172,13 @@ impl TorchQwen3_6 {
         &self,
         gdn: &GatedDeltaNet,
         x: &Tensor,
-    ) -> Result<(usize, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)> {
+    ) -> (usize, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor) {
         let layer_idx = self
             .layers
             .iter()
             .position(|l| matches!(&l.mixer, Mixer::Linear(m) if std::ptr::eq(m as *const _, gdn as *const _)))
             .unwrap_or(usize::MAX);
         let p = &self.params;
-        let dev = self.device;
         let kb = p.linear_num_key_heads as i64;
         let vb = p.linear_num_value_heads as i64;
         let dk = p.linear_key_head_dim as i64;
@@ -1146,7 +1188,7 @@ impl TorchQwen3_6 {
         let conv_dim = 2 * key_dim + value_dim;
         let t = x.size()[0];
 
-        let qkvz = gdn.qkvz.apply(x, dev, &self.loader())?;
+        let qkvz = gdn.qkvz.apply(x);
         trace_tensor("gdn.qkvz", layer_idx, &qkvz);
         let (conv_in, z) = two(qkvz, [conv_dim, value_dim], 1);
         // `x @ ba.T`: the projection is stored `[out, in]` like every other one.
@@ -1173,7 +1215,7 @@ impl TorchQwen3_6 {
         let beta = sigmoid(&b);
 
         trace_tensor("gdn.g", layer_idx, &g);
-        Ok((layer_idx, q, k, v, g, beta, z))
+        (layer_idx, q, k, v, g, beta, z)
     }
 
     fn moe(&self, layer_idx: usize, x_post: &Tensor) -> Result<Tensor> {
@@ -1189,11 +1231,11 @@ impl TorchQwen3_6 {
         // shared expert, always routed, gated by its own sigmoid gate
         // `[t, 1]`: one scalar per token, broadcast over the hidden dim.
         let se_gate = f32_(x_post).matmul(&f32_(&layer.shared_gate).transpose(0, 1));
-        let ic1 = layer.shared.gate_up.apply(x_post, dev, &self.loader())?;
+        let ic1 = layer.shared.gate_up.apply(x_post);
         let si = p.shared_expert_intermediate_size as i64;
         let (gate_part, up_part) = two(ic1, [si, si], 1);
         let ic2 = gate_part.silu() * up_part;
-        let se = layer.shared.down.apply(&ic2, dev, &self.loader())? * se_gate.sigmoid();
+        let se = layer.shared.down.apply(&ic2) * se_gate.sigmoid();
 
         // The routing decision is host-side either way: the port hands it to the
         // slot cache, and the inline path indexes the banks with it.
@@ -1262,21 +1304,25 @@ impl TorchQwen3_6 {
         Ok(out * f32_tensor(&dn_g, &[p.hidden_size as i64], dev))
     }
 
-    /// The head is 248320 x 1024; widening it whole is 2 GB of scratch, so it
-    /// goes out in blocks and the block logits are concatenated.
-    fn lm_head_logits(&self, x: &Tensor) -> Result<Vec<f32>> {
-        let ld = self.loader();
+    /// The head is resident, but `linear` upcasts its operand to f32, so the
+    /// pass takes `LM_HEAD_BLOCK` row windows off the resident tensor and the
+    /// block logits are concatenated. Same product either way: `the_lm_head_
+    /// block_split_is_exact` proves a row is identical in any window.
+    fn lm_head_logits(&self, x: &Tensor) -> Vec<f32> {
         let head = &self.lm_head;
         let mut parts: Vec<Tensor> = Vec::new();
         let mut r0 = 0usize;
         while r0 < head.rows {
             let n = LM_HEAD_BLOCK.min(head.rows - r0);
-            let (block, g) = ld.widen(head, r0, n, self.device)?;
+            let block = head.w.narrow(0, r0 as i64, n as i64);
             let y = f32_(x).matmul(&f32_(&block).transpose(0, 1));
-            parts.push(y * f32_tensor(&g, &[n as i64], self.device));
+            parts.push(match head.row_scale.as_deref() {
+                Some(s) => y * s.narrow(0, r0 as i64, n as i64),
+                None => y,
+            });
             r0 += n;
         }
-        Ok(to_f32_vec(&Tensor::cat(&parts, 1)))
+        to_f32_vec(&Tensor::cat(&parts, 1))
     }
 }
 
@@ -1295,11 +1341,10 @@ impl TorchQwen3_6 {
         cache: &SequenceCache,
     ) -> Result<Vec<f32>> {
         let p = &self.params;
-        let dev = self.device;
         let t = ids.len();
         let slab = self.cache.as_ref().expect("no kv cache attached");
 
-        let mut x = self.embed.gather(ids, dev, &self.loader())?;
+        let mut x = self.embed.gather(ids);
         let mut residual: Option<Tensor> = None;
 
         for (li, layer) in self.layers.iter().enumerate() {
@@ -1310,9 +1355,9 @@ impl TorchQwen3_6 {
             let h1 = rms_norm(&xsum, &layer.input_norm, p.rms_norm_eps);
             let mixer_out = match &layer.mixer {
                 Mixer::Full(fa) => {
-                    self.full_attention_cached(li, fa, &h1, positions, cache, slab.mha())?
+                    self.full_attention_cached(li, fa, &h1, positions, cache, slab.mha())
                 }
-                Mixer::Linear(gdn) => self.gdn_cached(li, gdn, &h1, cache, slab.state())?,
+                Mixer::Linear(gdn) => self.gdn_cached(li, gdn, &h1, cache, slab.state()),
             };
             let sum2 = &mixer_out + &xsum;
             let h2 = rms_norm(&sum2, &layer.post_norm, p.rms_norm_eps);
@@ -1326,7 +1371,7 @@ impl TorchQwen3_6 {
         };
         let last = stream.narrow(0, (t - 1) as i64, 1);
         let normed = rms_norm(&last, &self.final_norm, p.rms_norm_eps);
-        self.lm_head_logits(&normed)
+        Ok(self.lm_head_logits(&normed))
     }
 }
 

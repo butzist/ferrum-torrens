@@ -38,9 +38,14 @@ const CHAT_TEMPLATE_ORACLE_IDS: &[u32] = &[
 const CHAT_PIN_FIRST_TOKEN: u32 = 8160;
 
 fn config(max_output_tokens: u32) -> Config {
+    // `[kv] num_tokens` sizes the pool: the default 131072 tokens is 5 GiB of
+    // f32 KV (decision 33), which no longer fits beside the resident tower
+    // weights (decision 40) on the 8 GB target. 4096 is this workload's
+    // `max_seq_len`, so nothing here is ever paged out.
     format!(
         "[model]\npath = \"{FTW_DIR}\"\nmax_seq_len = 4096\nmax_output_tokens = {max_output_tokens}\n\
-         max_prefill_length = 1024\nmax_running_requests = 1\n\n[moe]\ncache_size_slots = 512\n"
+         max_prefill_length = 1024\nmax_running_requests = 1\n\n\
+         [kv]\nnum_tokens = 4096\n\n[moe]\ncache_size_slots = 512\n"
     )
     .parse()
     .unwrap()
