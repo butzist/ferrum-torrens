@@ -51,12 +51,15 @@ low) and `Dense::apply`/`gather` never read the checkpoint again. Every tower
 gate is green again -- oracle and chat (11751 " Paris"), cross-check at the same
 1.72e-6 of logit scale, logit lens, per-step cost, load, incremental decode,
 the kernel token and the scalar reference -- plus the MoE graph replay and the
-three cubin gates. Next: stable `begin_layer` bank addresses plus the flat
-cross-layer slot LRU, then the device-resident MoE hand-off, then the two
+three cubin gates. Prerequisite 2 is done too (decision 42): the device banks
+are allocated once and never dropped, `begin_layer`/`forget_layer` are gone, and
+the flat LRU is cross-layer, so returning to a layer is a hit instead of a full
+re-stage. Next: the device-resident MoE hand-off, then the two
 device-side staging kernels FreeToken uses, and only then warmup + one captured
 decode step together with the pinned batch-metadata staging P1, per-batch-size
 graphs over a mempool, and a replay-vs-uncaptured gate per batch size. After
-that, M2 (API) proper and the remaining M3 perf items. Last finished: the P0
+that, M2 (API) proper and the remaining M3 perf items. Last finished: decision
+42 (stable bank addresses, cross-layer LRU), the P0
 resident dense weights (decision 41), decision 40 (the MoE-in-graph shape), decision 30 (the pyo3 exit), decision 37
 (the step counter), decision 36 slice 6 (the tower-with-the-kernel gate) and
 decision 39's capture binding plus the MoE stage/launch/collect split. Before that the chat surface, SSE and the cached decode
@@ -369,12 +372,15 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
     `MoEError::{Missing, Read}` added for actionable errors. 6 unit tests.
   - [x] the layer orchestration (2026-10-02, `src/application/run_experts.rs`):
     `run_experts(cache, store, gemm, layer, step, out)` validates the step,
-    calls `ExpertSlotStore::begin_layer` and replays a dropped layer into
-    `ExpertCache::forget_layer` BEFORE `ensure_experts` (the ordering decision 27
-    exists to enforce), copies `plan.misses` into their `write_slots`, then hands
-    `plan.rewrites` to `ExpertGemm`. `begin_layer` is the new port method that
-    makes the ordering explicit. 7 unit tests over mocked ports, including the
-    overflow case where the kernel receives `-1` routes.
+    copies `plan.misses` into their `write_slots`, then hands
+    `plan.rewrites` to `ExpertGemm`. (As built, it also called
+    `ExpertSlotStore::begin_layer` and replayed a dropped layer into
+    `ExpertCache::forget_layer` BEFORE `ensure_experts` -- the ordering decision
+    27 existed to enforce; decision 42 removed both, since the banks now hold
+    every layer at once.) The validation and the miss-copy orchestration are
+    unchanged, with the same mocked-port tests minus the two that pinned the
+    forget ordering; the overflow case where the kernel receives `-1` routes is
+    still covered.
   - [x] the `moe_block` swap in `models/qwen3_6/forward_torch.rs` (2026-10-03,
     `2f134e7` era): the inline per-token/per-expert host widening is now the
     fallback. The new path is `domain::expert_kernel::MoEExecutor`, an
@@ -478,8 +484,9 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
      inside it (candidate (b)); (a) is rejected because its torch segments carry
      host-side widening too, so both candidates need the same prerequisites and
      (a) would only be rebuilt into (b). What gates this item now, in order (each
-     with its own gate): (i) the P0 "load & cast dense weights to GPU" box, (ii)
-     stable `begin_layer` bank addresses plus the flat cross-layer slot LRU, (iii)
+     with its own gate): (i) the P0 "load & cast dense weights to GPU" box
+     **done, decision 41**, (ii) stable `begin_layer` bank addresses plus the
+     flat cross-layer slot LRU **done, decision 42**, (iii)
      a device-resident MoE hand-off, (iv) the two device-side staging kernels
      over pinned host banks that let staging be recorded at all. The capture
      steps below are unchanged.
@@ -864,6 +871,10 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
     stale residency and never asks for a copy. Consequence, recorded so it is
     not rediscovered: a decode step over 40 layers re-stages the experts it
     touches once per layer switch, which is the cost of fitting in VRAM at all.
+    **Superseded by decision 42**: the drop-and-replay path is gone. The part
+    that still stands is the sizing argument -- 40 layers x 256 experts is 17 GB
+    and does not fit, so the banks stay slot-sized -- while the switch itself is
+    now just another copy into a slot the flat LRU picked.
 28. **`ExpertSlotStore` is `&self`, and one adapter handle is both ports**
     (2026-10-02) -- the device slot cache is process-wide, not per step, so the
     store port takes `&self` and `Mutex<TritonMoE>` implements `ExpertSlotStore`
@@ -1211,10 +1222,10 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
       byte for byte an uncaptured run. Contract to keep: the `StagedGroup` must
       outlive any graph captured over it, and a captured grid pins the batch
       shape (different shape = error containing "captured"). Known hole for
-      slice 2: `CudaMoE::begin_layer` drops the `gate_up`/`down` banks on a
-      layer switch, so a graph spanning layers would bake addresses the next
-       layer frees -- step 1 of slice 2 decides between pinning those addresses
-       and keeping the MoE launches out of the big graph, as slice 1 did. The
+      slice 2 -- `CudaMoE::begin_layer` used to drop the `gate_up`/`down` banks
+      on a layer switch, so a graph spanning layers would bake addresses the
+      next layer frees -- is closed by decision 42: the banks are allocated once
+      and never move, so the addresses a graph bakes are process-lifetime. The
        ordered slice-2 plan lives under the P1 checklist.
 
 40. **The decode graph is one executable per batch size over the whole forward,
@@ -1272,7 +1283,7 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
           only the contents change; `ExpertCache` keeps its flat
           `layer * E + expert` ids and becomes the cross-layer LRU it already
           models, which collapses the 0.53 GiB/step restage to steady-state
-          misses.
+          misses. **Done, decision 42.**
        3. Device-resident MoE hand-off: activations, routes and the reduced sum
           stay on the device across a layer -- no `to_f32_vec` in
           `routed_via_port`. Any capture needs this, (a) or (b).
@@ -1347,6 +1358,44 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
        three cubin/ABI gates. One retry on `incremental_decode` after libtorch
        threw a `c10::ApproximateClock` non-monotonic assert inside `dlopen` --
        an environmental flake at library load, not the test.
+
+42. **The device slot cache holds every layer, at addresses that never move**
+    (2026-10-07) -- decision 40 prerequisite 2, and the closure of decision 39's
+    "known hole for slice 2".
+    - **What changed.** `CudaMoE` allocates its `gate_up`/`down` banks on the
+      first staging and never drops them. `begin_layer` is gone from `CudaMoE`
+      and from the `ExpertSlotStore` port, and with it the
+      `ExpertCache::forget_layer` replay and the two tests that pinned its
+      ordering. A layer switch is now `load(layer, expert, slot)` overwriting a
+      slot the plan picked. VRAM does not move: the banks were already
+      `slots`-sized in steady state, they just stop being freed and reallocated
+      on every switch.
+    - **Why it is safe.** The flat id space (`layer * num_experts + expert`) was
+      always the domain's model of residency, and the plan is the only thing
+      that decides what a slot holds. The replay existed solely because the
+      device cache tracked one layer while the domain tracked many; they now
+      agree. Domain test `residency_is_cross_layer_so_a_return_is_a_hit`,
+      application test `a_layer_switch_keeps_the_other_layer_resident` (a
+      budget of exactly four `load` calls turns any re-stage into a panic).
+    - **The address half is gated on the device.** `CudaMoE::bank_ptrs` reports
+      the six pointers `launch` feeds the kernels, and
+      `the_bank_addresses_survive_a_layer_switch` stages a layer-0 expert and a
+      layer-17 expert and asserts they are identical. A graph instantiated over
+      a forward bakes those pointers (decision 40), so this is a precondition
+      for capture, not a diagnostic.
+    - **Honest about what it does not buy:** with 256 slots (one layer's
+      experts) a bs=1 decode step still stages ~320 experts across 40 layers,
+      so the 0.53 GiB/step restage does not vanish -- LRU cannot invent reuse
+      the routing does not have, and a shared pool that only just fits one step
+      round-robins anyway. What lands now is the address stability capture
+      needs, no reallocation churn, and hits whenever routing does repeat (the
+      512-slot prefill path is where that starts to pay). The restage itself
+      drops only when staging leaves the host, prerequisites 3 and 4.
+    - **Gates green after the change:** the driver-API-vs-scalar-oracle gate
+      (real slabs, layer 17), the new address gate, the MoE graph replay and
+      `one_token_through_the_kernel_matches_the_oracle` (40 layer switches,
+      " Paris", 23.7 s); `cargo fmt`/`clippy` clean, `cargo test` 233 and
+      `--features cuda` 293.
 
 ### Config defaults for the RTX 5060 / 8 GB target
 

@@ -396,3 +396,38 @@ fn the_committed_cubins_match_the_scalar_oracle_on_real_expert_slabs() {
     }
     println!("PASS");
 }
+
+/// Decision 40 prerequisite 2, the address half of it: a captured graph bakes
+/// the six bank pointers into its nodes, so staging another layer's expert must
+/// overwrite bytes at the same addresses instead of allocating new ones.
+#[test]
+#[ignore = "needs a CUDA device and the converted checkpoint in .model-cache"]
+fn the_bank_addresses_survive_a_layer_switch() {
+    let Some((index, reader)) = open_checkpoint() else {
+        panic!("gate needs the checkpoint in {FTW_DIR}");
+    };
+    let source: Arc<dyn ExpertSlabSource> = Arc::new(FtwBanks::new(reader, index.clone()));
+    let shapes = shapes(&index);
+    let moe = Mutex::new(gate(
+        "driver API + committed cubins",
+        CudaMoE::new(Device::Cuda(0), source, shapes, SLOTS),
+    ));
+    gate("stage layer 0 expert 0", moe.lock().unwrap().load(0, 0, 0));
+    let first = gate(
+        "bank pointers after the first staging",
+        moe.lock().unwrap().bank_ptrs(),
+    );
+    gate(
+        "stage layer 17 expert 7",
+        moe.lock().unwrap().load(LAYER, 7, 1),
+    );
+    let second = gate(
+        "bank pointers after the layer switch",
+        moe.lock().unwrap().bank_ptrs(),
+    );
+    assert_eq!(
+        first, second,
+        "a layer switch must not move the banks a graph would capture"
+    );
+    println!("PASS");
+}

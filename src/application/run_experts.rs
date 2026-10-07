@@ -2,8 +2,10 @@
 // the misses in, then ask the kernel for the grouped GEMM.
 //
 // This is workflow over the domain ports and nothing else -- no CUDA, no mmap,
-// no python -- so it is unit-tested against mocked ports and is where the
-// decision-27 ordering (forget the dropped layer BEFORE planning) is enforced.
+// no python -- so it is unit-tested against mocked ports. The slot machine's ids
+// are flat (`layer * num_experts + expert`) and the device banks hold every
+// layer at once (decision 40 prerequisite 2), so a layer switch needs no
+// invalidation: the plan alone decides what is resident.
 
 use crate::domain::expert_cache::ExpertCache;
 use crate::domain::expert_kernel::{
@@ -135,14 +137,6 @@ pub fn run_experts(
         )));
     }
 
-    // The device cache holds one layer, so a switch invalidates bytes we still
-    // think are resident. Forget them before the plan is computed.
-    if let Some(dropped) = store.begin_layer(layer)?
-        && dropped != layer
-    {
-        cache.forget_layer(dropped);
-    }
-
     let plan = cache.ensure_experts(layer, step.experts);
     for (&expert, &slot) in plan.misses.iter().zip(&plan.write_slots) {
         store.load(layer, expert, slot)?;
@@ -189,10 +183,6 @@ mod tests {
     #[test]
     fn the_executor_rewrites_expert_ids_into_slots_for_the_kernel() {
         let mut store = strict_store(4);
-        store
-            .expect_begin_layer()
-            .withf(|l| *l == 3)
-            .returning(|_| Ok(None));
         store.expect_load().times(2).returning(|_, _, _| Ok(()));
         let seen: Arc<Mutex<Option<SeenKernel>>> = Arc::new(Mutex::new(None));
         let sink = seen.clone();
@@ -228,10 +218,6 @@ mod tests {
     #[test]
     fn the_executor_counts_the_steps_it_ran() {
         let mut store = strict_store(4);
-        store
-            .expect_begin_layer()
-            .withf(|l| *l == 3)
-            .returning(|_| Ok(None));
         store.expect_load().times(2).returning(|_, _, _| Ok(()));
         let mut gemm = MockExpertGemm::new();
         gemm.expect_grouped_moe().times(2).returning(|_, _| Ok(()));
@@ -254,10 +240,6 @@ mod tests {
     #[test]
     fn a_repeated_step_over_one_layer_stages_nothing() {
         let mut store = strict_store(4);
-        store
-            .expect_begin_layer()
-            .withf(|l| *l == 3)
-            .returning(|_| Ok(None));
         store.expect_load().times(2).returning(|_, _, _| Ok(()));
         let mut gemm = MockExpertGemm::new();
         gemm.expect_grouped_moe().times(2).returning(|_, _| Ok(()));
@@ -272,6 +254,57 @@ mod tests {
         // passes if both experts were still resident.
         exec.execute(&request(&experts, &weights, &x), &mut out)
             .unwrap();
+    }
+
+    #[test]
+    fn a_layer_switch_keeps_the_other_layer_resident() {
+        // Decision 40 prerequisite 2: the device banks hold every layer at once
+        // and are never dropped, so switching layers must not invalidate the
+        // residency the slot machine knows about. Four slots, four experts over
+        // two layers: the return to layer 0 is a hit, and the store's budget of
+        // exactly four `load` calls turns any re-stage into a panic.
+        let mut cache = ExpertCache::new(2, 4, 4);
+        let x = [1.0f32; 8];
+        let experts = [1u32, 3, 1, 3];
+        let weights = [0.25f32; 4];
+        let mut out = [0.0f32; 8];
+
+        let mut store = strict_store(4);
+        store.expect_load().times(4).returning(|_, _, _| Ok(()));
+        let mut gemm = MockExpertGemm::new();
+        gemm.expect_grouped_moe().times(3).returning(|_, _| Ok(()));
+
+        run_experts(
+            &mut cache,
+            &store,
+            &gemm,
+            0,
+            &step(&experts, &weights, &x),
+            &mut out,
+        )
+        .unwrap();
+        run_experts(
+            &mut cache,
+            &store,
+            &gemm,
+            1,
+            &step(&experts, &weights, &x),
+            &mut out,
+        )
+        .unwrap();
+        assert!(cache.slot_of(0, 1) >= 0, "layer 0 stayed resident");
+        assert!(cache.slot_of(1, 1) >= 0, "layer 1 is resident too");
+        // Back to layer 0: still resident, so the fourth and last `load` was
+        // spent on layer 1 above and this call stages nothing.
+        run_experts(
+            &mut cache,
+            &store,
+            &gemm,
+            0,
+            &step(&experts, &weights, &x),
+            &mut out,
+        )
+        .unwrap();
     }
 
     /// A malformed request is rejected by the use case without staging
@@ -316,10 +349,6 @@ mod tests {
         let mut store = strict_store(4);
         let mut gemm = MockExpertGemm::new();
         store
-            .expect_begin_layer()
-            .withf(|l| *l == 0)
-            .returning(|_| Ok(None));
-        store
             .expect_load()
             .withf(|layer, expert, _slot| *layer == 0 && (*expert == 1 || *expert == 3))
             .times(2)
@@ -360,10 +389,6 @@ mod tests {
         let mut out = [0.0f32; 8];
 
         let mut store = strict_store(4);
-        store
-            .expect_begin_layer()
-            .withf(|l| *l == 0)
-            .returning(|_| Ok(None));
         store.expect_load().times(2).returning(|_, _, _| Ok(()));
         let mut gemm = MockExpertGemm::new();
         gemm.expect_grouped_moe().times(1).returning(|_, _| Ok(()));
@@ -377,12 +402,8 @@ mod tests {
         )
         .unwrap();
 
-        // Second step, same layer: no begin_layer change, no copies.
-        let mut store = strict_store(4);
-        store
-            .expect_begin_layer()
-            .withf(|l| *l == 0)
-            .returning(|_| Ok(None));
+        // Second step, same layer: nothing changed in the store, no copies.
+        let store = strict_store(4);
         let mut gemm = MockExpertGemm::new();
         gemm.expect_grouped_moe().times(1).returning(|_, _| Ok(()));
         run_experts(
@@ -394,112 +415,6 @@ mod tests {
             &mut out,
         )
         .unwrap();
-    }
-
-    #[test]
-    fn a_dropped_layer_is_forgotten_before_the_plan() {
-        // The device cache moved to layer 1, so layer 0's slots are stale and
-        // must be planned as misses even though `cache` still holds them.
-        let mut cache = ExpertCache::new(2, 4, 4);
-        let x = [1.0f32; 8];
-        let experts = [1u32, 3, 1, 3];
-        let weights = [1.0f32; 4];
-        let mut out = [0.0f32; 8];
-        {
-            let mut store = strict_store(4);
-            store
-                .expect_begin_layer()
-                .withf(|l| *l == 0)
-                .returning(|_| Ok(None));
-            store.expect_load().times(2).returning(|_, _, _| Ok(()));
-            let mut gemm = MockExpertGemm::new();
-            gemm.expect_grouped_moe().times(1).returning(|_, _| Ok(()));
-            run_experts(
-                &mut cache,
-                &store,
-                &gemm,
-                0,
-                &step(&experts, &weights, &x),
-                &mut out,
-            )
-            .unwrap();
-        }
-        assert!(cache.slot_of(0, 1) >= 0);
-
-        let mut store = strict_store(4);
-        store
-            .expect_begin_layer()
-            .withf(|l| *l == 1)
-            .returning(|_| Ok(Some(0)));
-        store
-            .expect_load()
-            .withf(|layer, _, _| *layer == 1)
-            .times(2)
-            .returning(|_, _, _| Ok(()));
-        let mut gemm = MockExpertGemm::new();
-        gemm.expect_grouped_moe().times(1).returning(|_, _| Ok(()));
-        run_experts(
-            &mut cache,
-            &store,
-            &gemm,
-            1,
-            &step(&experts, &weights, &x),
-            &mut out,
-        )
-        .unwrap();
-        // Layer 0 is gone from the machine, layer 1's experts are back in it.
-        assert_eq!(cache.slot_of(0, 1), -1);
-        assert!(cache.slot_of(1, 1) >= 0);
-    }
-
-    #[test]
-    fn forget_happens_before_the_plan_not_after() {
-        // A stricter version of the ordering rule: the load of layer 1's
-        // experts must see layer 0 already cleared, which `sequence` pins down.
-        let mut cache = ExpertCache::new(2, 4, 4);
-        let x = [1.0f32; 8];
-        let experts = [2u32, 2, 2, 2];
-        let weights = [1.0f32; 4];
-        let mut out = [0.0f32; 8];
-        {
-            let mut store = strict_store(4);
-            store
-                .expect_begin_layer()
-                .withf(|l| *l == 0)
-                .returning(|_| Ok(None));
-            store.expect_load().times(1).returning(|_, _, _| Ok(()));
-            let mut gemm = MockExpertGemm::new();
-            gemm.expect_grouped_moe().times(1).returning(|_, _| Ok(()));
-            run_experts(
-                &mut cache,
-                &store,
-                &gemm,
-                0,
-                &step(&experts, &weights, &x),
-                &mut out,
-            )
-            .unwrap();
-        }
-        let mut store = strict_store(4);
-        store
-            .expect_begin_layer()
-            .withf(|l| *l == 1)
-            .returning(|_| Ok(Some(0)));
-        store.expect_load().times(1).returning(|_, _, _| Ok(()));
-        let mut gemm = MockExpertGemm::new();
-        gemm.expect_grouped_moe().times(1).returning(|_, _| Ok(()));
-        run_experts(
-            &mut cache,
-            &store,
-            &gemm,
-            1,
-            &step(&experts, &weights, &x),
-            &mut out,
-        )
-        .unwrap();
-        // Layer 1's expert was planned as a miss, which is only true if layer 0
-        // was forgotten before `ensure_experts` ran.
-        assert!(cache.slot_of(1, 2) >= 0);
     }
 
     #[test]
@@ -552,10 +467,6 @@ mod tests {
         // the kernel must see -1 rather than a slot it cannot read.
         let mut cache = ExpertCache::new(1, 4, 2);
         let mut store = strict_store(2);
-        store
-            .expect_begin_layer()
-            .withf(|l| *l == 0)
-            .returning(|_| Ok(None));
         store.expect_load().times(3).returning(|_, _, _| Ok(()));
         let mut gemm = MockExpertGemm::new();
         let routes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));

@@ -94,7 +94,12 @@ fn stage_bytes(bank: &mut Tensor, slot: usize, bytes: &[u8], len: usize) -> Resu
     Ok(())
 }
 
-/// The device slot cache for one layer, plus the launch path.
+/// The device slot cache, plus the launch path.
+///
+/// The banks are allocated once, on the first staging, and never dropped: a
+/// layer switch overwrites bytes at the same addresses (decision 40
+/// prerequisite 2), which is both what lets one bank serve every layer and what
+/// makes the addresses a captured graph bakes in stay valid.
 ///
 /// The ports are implemented for `Mutex<CudaMoE>`: staging a miss is `&mut self`
 /// (it rewrites banks) while one device cache serves every step, so the engine
@@ -111,7 +116,6 @@ pub struct CudaMoE {
     /// an explicit sync. It is a field because CUDA-graph capture will need a
     /// side stream, and torch's C API exports no `getCurrentCUDAStream` to ask.
     stream: CUstream,
-    layer: Option<usize>,
     gate_up: Option<Banks>,
     down: Option<Banks>,
 }
@@ -147,7 +151,8 @@ pub struct StagedGroup {
 
 impl CudaMoE {
     /// Open the driver, load the committed cubins and check they were built for
-    /// `shapes`. Nothing is allocated yet: the banks come with the first layer.
+    /// `shapes`. Nothing is allocated yet: the banks come with the first miss,
+    /// and stay for the life of the adapter.
     pub fn new(
         device: Device,
         source: Arc<dyn ExpertSlabSource>,
@@ -192,7 +197,6 @@ impl CudaMoE {
             slots,
             device,
             stream,
-            layer: None,
             gate_up: None,
             down: None,
         })
@@ -204,11 +208,6 @@ impl CudaMoE {
 
     pub fn shapes(&self) -> ExpertShapes {
         self.shapes
-    }
-
-    /// The layer whose experts the cache currently holds.
-    pub fn layer(&self) -> Option<usize> {
-        self.layer
     }
 
     pub fn slots(&self) -> usize {
@@ -225,29 +224,41 @@ impl CudaMoE {
         self.slots * self.expert_bytes()
     }
 
-    /// Switch the banks to `layer`, reporting the layer whose bytes were dropped
-    /// (decision 27). The caller replays that into `ExpertCache::forget_layer`
-    /// before planning, so the slots it still believes in are gone exactly when
-    /// the plan is computed.
-    pub fn begin_layer(&mut self, layer: usize) -> Result<Option<usize>, MoEError> {
-        if self.layer == Some(layer) {
-            return Ok(None);
-        }
-        let dropped = self.layer.take();
-        self.gate_up = None;
-        self.down = None;
-        self.layer = Some(layer);
-        Ok(dropped)
+    /// The six device pointers `launch` feeds the kernels. A captured graph
+    /// bakes these into its nodes, so they have to stay where they are for the
+    /// life of the capture -- the banks are allocated once and never dropped
+    /// (decision 40 prerequisite 2). Errs before the first staging, when there
+    /// are no banks to point at yet.
+    pub fn bank_ptrs(&self) -> Result<[u64; 6], MoEError> {
+        let gu = self
+            .gate_up
+            .as_ref()
+            .ok_or_else(|| MoEError::Bad("bank_ptrs before any expert was staged".into()))?;
+        let dn = self
+            .down
+            .as_ref()
+            .ok_or_else(|| MoEError::Bad("bank_ptrs before any expert was staged".into()))?;
+        let ptr = |t: &Tensor| t.data_ptr() as u64;
+        Ok([
+            ptr(&gu.packed),
+            ptr(&gu.scale),
+            ptr(&gu.global),
+            ptr(&dn.packed),
+            ptr(&dn.scale),
+            ptr(&dn.global),
+        ])
     }
 
     /// Pull both slabs of one expert from the source and stage them.
     pub fn load(&mut self, layer: usize, expert: u32, slot: usize) -> Result<(), MoEError> {
-        self.begin_layer(layer)?;
         if slot >= self.slots {
             return Err(MoEError::SlotOutOfRange {
                 slot,
                 capacity: self.slots,
             });
+        }
+        if self.gate_up.is_none() {
+            self.banks_for();
         }
         for part in [Part::GateUp, Part::Down] {
             let slab = self
@@ -256,9 +267,6 @@ impl CudaMoE {
                 .map_err(|e| MoEError::Bad(format!("slab L{layer} E{expert} {part:?}: {e}")))?;
             let (rows, cols) = self.shapes.slab_shape(part);
             check_slab(&slab, rows, cols)?;
-            if self.gate_up.is_none() {
-                self.banks_for();
-            }
             let banks = match part {
                 Part::GateUp => self.gate_up.as_mut().expect("gate_up banks"),
                 Part::Down => self.down.as_mut().expect("down banks"),
@@ -268,6 +276,8 @@ impl CudaMoE {
         Ok(())
     }
 
+    /// Allocate both banks once. Shapes are fixed by the cubins, so a bank built
+    /// here serves every layer for the life of the adapter.
     fn banks_for(&mut self) {
         if self.gate_up.is_some() {
             return;
@@ -529,12 +539,6 @@ fn check_slab(slab: &Slab, rows: usize, cols: usize) -> Result<(), MoEError> {
 /// One `Mutex<CudaMoE>` is both ports, so the plan and the kernel call see the
 /// same banks without the caller juggling borrows.
 impl ExpertSlotStore for Mutex<CudaMoE> {
-    fn begin_layer(&self, layer: usize) -> Result<Option<usize>, MoEError> {
-        self.lock()
-            .map_err(|_| MoEError::Bad("cuda slot cache poisoned".into()))?
-            .begin_layer(layer)
-    }
-
     fn load(&self, layer: usize, expert: u32, slot: usize) -> Result<(), MoEError> {
         self.lock()
             .map_err(|_| MoEError::Bad("cuda slot cache poisoned".into()))?
