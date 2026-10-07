@@ -9,7 +9,8 @@
 
 use crate::domain::expert_cache::ExpertCache;
 use crate::domain::expert_kernel::{
-    ExpertGemm, ExpertSlotStore, MoEError, MoEExecutor, MoEGroup, MoERequest,
+    ExpertGemm, ExpertSlotStore, MoEDeviceGroup, MoEDeviceRequest, MoEError, MoEExecutor, MoEGroup,
+    MoETensor,
 };
 use std::sync::{
     Arc, Mutex,
@@ -68,23 +69,19 @@ impl MoEExecutor for CachedExperts {
         self.steps()
     }
 
-    fn execute<'a>(&self, req: &MoERequest<'a>, out: &mut [f32]) -> Result<(), MoEError> {
+    fn execute_device<'a>(
+        &self,
+        req: &MoEDeviceRequest<'a>,
+        out: &mut dyn MoETensor,
+    ) -> Result<(), MoEError> {
         // Counted before the work, so a step the kernel refuses still shows up:
         // the count is evidence that the port was reached, not that it succeeded.
         self.steps.fetch_add(1, Ordering::Relaxed);
-        run_experts(
+        run_experts_device(
             &mut self.locked(),
             self.store.as_ref(),
             self.gemm.as_ref(),
-            req.layer,
-            &ExpertStep {
-                hidden: req.hidden,
-                inter: req.inter,
-                top_k: req.top_k,
-                x: req.x,
-                experts: req.experts,
-                weights: req.weights,
-            },
+            req,
             out,
         )
     }
@@ -128,6 +125,88 @@ pub fn run_experts(
             step.top_k
         )));
     }
+    let routes = stage_and_route(cache, store, layer, step.experts)?;
+    gemm.grouped_moe(
+        &MoEGroup {
+            hidden: step.hidden,
+            inter: step.inter,
+            x: step.x,
+            top_k: step.top_k,
+            routes: &routes,
+            weights: step.weights,
+        },
+        out,
+    )
+}
+
+/// One routed layer step with the activations, the weights and the output
+/// still in their device buffers (decision 43). Only the routes leave the
+/// device, because the plan is computed here -- prerequisite 4 moves that too.
+///
+/// `out` receives `tokens * hidden` f32, and the slot rewrites happen exactly
+/// as they do on the host path: nothing about the residency changes with the
+/// hand-off.
+pub fn run_experts_device(
+    cache: &mut ExpertCache,
+    store: &dyn ExpertSlotStore,
+    gemm: &dyn ExpertGemm,
+    step: &MoEDeviceRequest<'_>,
+    out: &mut dyn MoETensor,
+) -> Result<(), MoEError> {
+    let (hidden, top_k) = (step.hidden, step.top_k);
+    let (x_len, expert_count, weight_count) =
+        (step.x.numel(), step.experts.numel(), step.weights.numel());
+    if hidden == 0 || top_k == 0 || x_len == 0 || !x_len.is_multiple_of(hidden) {
+        return Err(MoEError::Bad(format!(
+            "device expert step: hidden {hidden} top_k {top_k} x {x_len}"
+        )));
+    }
+    let tokens = x_len / hidden;
+    if expert_count != tokens * top_k || weight_count != tokens * top_k {
+        return Err(MoEError::Bad(format!(
+            "device expert step: {expert_count} experts and {weight_count} weights \
+             for {tokens} tokens x top_k {top_k}"
+        )));
+    }
+    if out.numel() < tokens * hidden {
+        return Err(MoEError::Bad(format!(
+            "device expert step: {} outputs for {tokens} tokens x hidden {hidden}",
+            out.numel()
+        )));
+    }
+
+    // The one crossing this hand-off still makes: the router's dense ids, read
+    // once so the residency plan can be computed on the host.
+    let experts: Vec<u32> = step
+        .experts
+        .to_host_f32()?
+        .into_iter()
+        .map(|e| e as u32)
+        .collect();
+    let routes = stage_and_route(cache, store, step.layer, &experts)?;
+    gemm.grouped_moe_dev(
+        &MoEDeviceGroup {
+            hidden: step.hidden,
+            inter: step.inter,
+            top_k: step.top_k,
+            x: step.x,
+            routes: &routes,
+            weights: step.weights,
+        },
+        out,
+    )
+}
+
+/// The part of a step that is identical whichever way the data is handed over:
+/// reject a cache smaller than the adapter's banks, plan the residency, stage
+/// the misses and hand back the slot routes the kernel reads (`-1` for an
+/// expert the cache could not hold).
+fn stage_and_route(
+    cache: &mut ExpertCache,
+    store: &dyn ExpertSlotStore,
+    layer: usize,
+    experts: &[u32],
+) -> Result<Vec<i32>, MoEError> {
     let slots = store.slots();
     if cache.cache_size() < slots {
         return Err(MoEError::Bad(format!(
@@ -136,41 +215,101 @@ pub fn run_experts(
             slots
         )));
     }
-
-    let plan = cache.ensure_experts(layer, step.experts);
+    let plan = cache.ensure_experts(layer, experts);
     for (&expert, &slot) in plan.misses.iter().zip(&plan.write_slots) {
         store.load(layer, expert, slot)?;
     }
-
-    gemm.grouped_moe(
-        &MoEGroup {
-            hidden: step.hidden,
-            inter: step.inter,
-            x: step.x,
-            top_k: step.top_k,
-            routes: &plan.rewrites,
-            weights: step.weights,
-        },
-        out,
-    )
+    Ok(plan.rewrites)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::domain::expert_kernel::{
-        MoEExecutor, MoERequest, MockExpertGemm, MockExpertSlotStore,
+        MoEDeviceRequest, MoETensor, MockExpertGemm, MockExpertSlotStore,
     };
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     /// Routes plus the three shapes the kernel was handed.
     type SeenKernel = (Vec<i32>, usize, usize, usize);
 
-    fn request<'a>(experts: &'a [u32], weights: &'a [f32], x: &'a [f32]) -> MoERequest<'a> {
-        MoERequest {
-            layer: 3,
+    /// A host buffer behind the domain's opaque device port. These tests run
+    /// with nothing on a device at all, and the read counter is how they prove
+    /// which buffers the step really touched: the plan reads the routes once and
+    /// never the activations or the weights.
+    struct Buf {
+        vals: Vec<f32>,
+        reads: AtomicUsize,
+    }
+
+    impl Buf {
+        fn new(vals: Vec<f32>) -> Self {
+            Self {
+                vals,
+                reads: AtomicUsize::new(0),
+            }
+        }
+
+        fn zeros(len: usize) -> Self {
+            Self::new(vec![0.0; len])
+        }
+
+        fn reads(&self) -> usize {
+            self.reads.load(Ordering::Relaxed)
+        }
+
+        /// The address a port sees, so a test can tell the buffer itself from a
+        /// copy of it without borrowing the local into a `'static` closure.
+        fn addr(&self) -> usize {
+            let fat: *const dyn MoETensor = self;
+            fat as *const () as usize
+        }
+    }
+
+    impl MoETensor for Buf {
+        fn numel(&self) -> usize {
+            self.vals.len()
+        }
+
+        fn to_host_f32(&self) -> Result<Vec<f32>, MoEError> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            Ok(self.vals.clone())
+        }
+
+        fn set_host_f32(&mut self, values: &[f32]) -> Result<(), MoEError> {
+            if values.len() != self.vals.len() {
+                return Err(MoEError::Bad(format!(
+                    "{} values for a {}-element buffer",
+                    values.len(),
+                    self.vals.len()
+                )));
+            }
+            self.vals.copy_from_slice(values);
+            Ok(())
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+    }
+
+    /// The shapes every request in this module uses: two tokens, hidden 4,
+    /// inter 4, top_k 2.
+    fn device_request<'a>(
+        layer: usize,
+        x: &'a Buf,
+        experts: &'a Buf,
+        weights: &'a Buf,
+    ) -> MoEDeviceRequest<'a> {
+        MoEDeviceRequest {
+            layer,
             hidden: 4,
-            inter: 2,
+            inter: 4,
             top_k: 2,
             x,
             experts,
@@ -178,28 +317,43 @@ mod tests {
         }
     }
 
+    fn step_buffers() -> (Buf, Buf, Buf, Buf) {
+        (
+            Buf::new(vec![1.0f32; 8]),
+            Buf::new(vec![6.0, 1.0, 6.0, 1.0]),
+            Buf::new(vec![0.25f32; 4]),
+            Buf::zeros(8),
+        )
+    }
+
     /// The port the tower sees: expert ids go in, slot ids reach the kernel and
-    /// the kernel's output comes back in `out`.
+    /// the kernel's output comes back in `out`. The activations are handed over
+    /// as the very buffer the tower passed in -- no host view of them anywhere,
+    /// which is decision 43's whole point.
     #[test]
     fn the_executor_rewrites_expert_ids_into_slots_for_the_kernel() {
         let mut store = strict_store(4);
         store.expect_load().times(2).returning(|_, _, _| Ok(()));
         let seen: Arc<Mutex<Option<SeenKernel>>> = Arc::new(Mutex::new(None));
         let sink = seen.clone();
+        let (x, experts, weights, mut out) = step_buffers();
+        let x_addr = x.addr();
+        let w_addr = weights.addr();
         let mut gemm = MockExpertGemm::new();
-        gemm.expect_grouped_moe().returning(move |req, out| {
+        gemm.expect_grouped_moe_dev().returning(move |req, out| {
+            assert_eq!(
+                req.x as *const dyn MoETensor as *const () as usize, x_addr,
+                "the activations crossed as the tower's own buffer, not a copy"
+            );
+            assert_eq!(
+                req.weights as *const dyn MoETensor as *const () as usize, w_addr,
+                "the weights crossed as the tower's own buffer too"
+            );
             *sink.lock().unwrap() = Some((req.routes.to_vec(), req.hidden, req.inter, req.top_k));
-            for (i, o) in out.iter_mut().enumerate() {
-                *o = req.weights[i / req.hidden] * 2.0;
-            }
-            Ok(())
+            out.set_host_f32(&vec![0.5f32; out.numel()])
         });
         let exec = CachedExperts::new(Arc::new(store), Arc::new(gemm), 4, 8, 4);
-        let x = [1.0f32; 8];
-        let experts = [6u32, 1, 6, 1];
-        let weights = [0.25f32; 4];
-        let mut out = [0.0f32; 8];
-        exec.execute(&request(&experts, &weights, &x), &mut out)
+        exec.execute_device(&device_request(3, &x, &experts, &weights), &mut out)
             .unwrap();
 
         // The kernel is told slots, not expert ids, and it keeps the shapes.
@@ -208,8 +362,13 @@ mod tests {
         assert!(routes.iter().all(|s| *s >= 0 && *s < 4));
         assert_ne!(routes[0], 6);
         assert_eq!(routes[0], routes[2]);
-        assert_eq!((hidden, inter, top_k), (4, 2, 2));
-        assert_eq!(out, [0.5f32; 8]);
+        assert_eq!((hidden, inter, top_k), (4, 4, 2));
+        assert_eq!(out.vals, vec![0.5f32; 8]);
+        // The plan read the routes once; the activations and the weights were
+        // never asked for a host view.
+        assert_eq!(experts.reads(), 1, "the routes are read exactly once");
+        assert_eq!(x.reads(), 0, "the activations stayed on the device");
+        assert_eq!(weights.reads(), 0, "the weights stayed on the device");
     }
 
     /// The executor counts the steps it ran, which is the only way a caller can
@@ -220,17 +379,16 @@ mod tests {
         let mut store = strict_store(4);
         store.expect_load().times(2).returning(|_, _, _| Ok(()));
         let mut gemm = MockExpertGemm::new();
-        gemm.expect_grouped_moe().times(2).returning(|_, _| Ok(()));
+        gemm.expect_grouped_moe_dev()
+            .times(2)
+            .returning(|_, _| Ok(()));
         let exec = CachedExperts::new(Arc::new(store), Arc::new(gemm), 4, 8, 4);
         assert_eq!(exec.steps(), 0, "nothing has run yet");
 
-        let x = [1.0f32; 8];
-        let experts = [6u32, 1, 6, 1];
-        let weights = [0.25f32; 4];
-        let mut out = [0.0f32; 8];
-        exec.execute(&request(&experts, &weights, &x), &mut out)
+        let (x, experts, weights, mut out) = step_buffers();
+        exec.execute_device(&device_request(3, &x, &experts, &weights), &mut out)
             .unwrap();
-        exec.execute(&request(&experts, &weights, &x), &mut out)
+        exec.execute_device(&device_request(3, &x, &experts, &weights), &mut out)
             .unwrap();
         assert_eq!(exec.steps(), 2);
     }
@@ -242,17 +400,16 @@ mod tests {
         let mut store = strict_store(4);
         store.expect_load().times(2).returning(|_, _, _| Ok(()));
         let mut gemm = MockExpertGemm::new();
-        gemm.expect_grouped_moe().times(2).returning(|_, _| Ok(()));
+        gemm.expect_grouped_moe_dev()
+            .times(2)
+            .returning(|_, _| Ok(()));
         let exec = CachedExperts::new(Arc::new(store), Arc::new(gemm), 4, 8, 4);
-        let x = [1.0f32; 8];
-        let experts = [6u32, 1, 6, 1];
-        let weights = [0.25f32; 4];
-        let mut out = [0.0f32; 8];
-        exec.execute(&request(&experts, &weights, &x), &mut out)
+        let (x, experts, weights, mut out) = step_buffers();
+        exec.execute_device(&device_request(3, &x, &experts, &weights), &mut out)
             .unwrap();
         // `store` allows no further `load` calls, so this second step only
         // passes if both experts were still resident.
-        exec.execute(&request(&experts, &weights, &x), &mut out)
+        exec.execute_device(&device_request(3, &x, &experts, &weights), &mut out)
             .unwrap();
     }
 
@@ -314,14 +471,32 @@ mod tests {
         let store = strict_store(4);
         let gemm = MockExpertGemm::new();
         let exec = CachedExperts::new(Arc::new(store), Arc::new(gemm), 4, 8, 4);
-        let x = [1.0f32; 8];
-        let experts = [6u32, 1];
-        let weights = [0.25f32; 4];
-        let mut out = [0.0f32; 8];
+        let x = Buf::new(vec![1.0f32; 8]);
+        let experts = Buf::new(vec![6.0, 1.0]);
+        let weights = Buf::new(vec![0.25f32; 4]);
+        let mut out = Buf::zeros(8);
         assert!(matches!(
-            exec.execute(&request(&experts, &weights, &x), &mut out),
+            exec.execute_device(&device_request(3, &x, &experts, &weights), &mut out),
             Err(MoEError::Bad(_))
         ));
+    }
+
+    /// The device hand-off rejects the batch the host one rejects, and it does
+    /// so on element counts rather than on a host view of the buffers.
+    #[test]
+    fn a_device_step_whose_activations_do_not_divide_never_reaches_the_adapter() {
+        let store = strict_store(4);
+        let gemm = MockExpertGemm::new();
+        let exec = CachedExperts::new(Arc::new(store), Arc::new(gemm), 4, 8, 4);
+        let x = Buf::new(vec![1.0f32; 7]);
+        let experts = Buf::new(vec![6.0, 1.0, 6.0, 1.0]);
+        let weights = Buf::new(vec![0.25f32; 4]);
+        let mut out = Buf::zeros(8);
+        assert!(matches!(
+            exec.execute_device(&device_request(3, &x, &experts, &weights), &mut out),
+            Err(MoEError::Bad(_))
+        ));
+        assert_eq!(x.reads(), 0, "a rejected step reads nothing at all");
     }
 
     /// A store that answers exactly the calls the test expects and fails on

@@ -210,6 +210,73 @@ pub fn to_f32_vec(t: &tch::Tensor) -> Vec<f32> {
     out
 }
 
+/// A libtorch tensor behind the domain's opaque device-buffer port: the only
+/// concrete `MoETensor` the serving path has, and the type the MoE adapter
+/// downcasts back to in order to copy out of or into one (decision 43).
+///
+/// `tch::Tensor` is `Send` but not `Sync`. The port borrows one of these for
+/// the duration of a single `&self` call on a shared executor, which is the
+/// sharing `SharedTensor` documents in the forward: libtorch is thread-safe,
+/// and no two threads hold the same tensor while the port does.
+#[cfg(feature = "cuda")]
+pub struct DevTensor(pub tch::Tensor);
+
+#[cfg(feature = "cuda")]
+unsafe impl Sync for DevTensor {}
+
+#[cfg(feature = "cuda")]
+impl DevTensor {
+    /// Host values as a device buffer: how a caller that still has its numbers
+    /// in host memory enters the device hand-off.
+    pub fn from_f32(data: &[f32], shape: &[i64], device: Device) -> Self {
+        Self(f32_tensor(data, shape, device))
+    }
+
+    /// An f32 buffer of `shape`, which is how a tower makes room for the routed
+    /// sum it is about to ask for.
+    pub fn zeros(shape: &[i64], device: Device) -> Self {
+        Self(tch::Tensor::zeros(
+            shape,
+            (tch::Kind::Float, device.to_tch()),
+        ))
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl crate::domain::expert_kernel::MoETensor for DevTensor {
+    fn numel(&self) -> usize {
+        self.0.numel()
+    }
+
+    fn to_host_f32(&self) -> Result<Vec<f32>, crate::domain::expert_kernel::MoEError> {
+        Ok(to_f32_vec(&self.0))
+    }
+
+    fn set_host_f32(
+        &mut self,
+        values: &[f32],
+    ) -> Result<(), crate::domain::expert_kernel::MoEError> {
+        if values.len() != self.0.numel() {
+            return Err(crate::domain::expert_kernel::MoEError::Bad(format!(
+                "{} values for a {}-element device buffer",
+                values.len(),
+                self.0.numel()
+            )));
+        }
+        let host = tch::Tensor::from_slice(values).reshape(self.0.size());
+        self.0.copy_(&host.to(self.0.device()));
+        Ok(())
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,6 +417,26 @@ mod tests {
         let t = f32_tensor(&[1.0, 2.0, 3.0], &[3], d);
         assert_eq!(t.dim(), 1);
         assert_eq!(to_f32_vec(&t), vec![1.0, 2.0, 3.0]);
+    }
+
+    /// The buffer the MoE port hands across: host values in, the same values
+    /// back, and a write that refuses the wrong length rather than truncating.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn dev_tensor_round_trips_values_through_the_device() {
+        use crate::domain::expert_kernel::{MoEError, MoETensor};
+
+        let d = here();
+        let mut t = DevTensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[2, 2], d);
+        assert_eq!(t.numel(), 4);
+        assert_eq!(t.to_host_f32().unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
+        t.set_host_f32(&[9.0, 8.0, 7.0, 6.0]).unwrap();
+        assert_eq!(to_f32_vec(&t.0), vec![9.0, 8.0, 7.0, 6.0]);
+        assert!(matches!(t.set_host_f32(&[1.0]), Err(MoEError::Bad(_))));
+
+        let zeros = DevTensor::zeros(&[2, 3], d);
+        assert_eq!(zeros.numel(), 6);
+        assert_eq!(to_f32_vec(&zeros.0), vec![0.0; 6]);
     }
 
     #[cfg(feature = "cuda")]

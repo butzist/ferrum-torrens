@@ -22,15 +22,29 @@ use std::sync::{Arc, Mutex};
 use tch::Tensor;
 
 use crate::domain::expert_kernel::{
-    ExpertGemm, ExpertShapes, ExpertSlabSource, ExpertSlotStore, MoEError, MoEGroup, Part, Slab,
-    route_lists,
+    ExpertGemm, ExpertShapes, ExpertSlabSource, ExpertSlotStore, MoEDeviceGroup, MoEError,
+    MoEGroup, MoETensor, Part, Slab, route_lists,
 };
 use crate::infrastructure::cuda_driver::{CUstream, CudaError, CudaKernels, Driver};
 use crate::infrastructure::kernel_abi::{
     Abi, GEMV_DOWN, GEMV_GATE_UP, MoEArgs, SILU_MUL, SUM_REDUCE, gemv_down_args, gemv_gate_up_args,
     grid, silu_mul_args, sum_reduce_args,
 };
-use crate::infrastructure::torch::{Device, bf16_tensor, f32_tensor, to_f32_vec};
+use crate::infrastructure::torch::{DevTensor, Device, bf16_tensor, f32_tensor, to_f32_vec};
+
+/// The concrete buffer behind a port handle. The adapter is the one place
+/// allowed to know what a `MoETensor` is made of, so every copy it makes goes
+/// through here.
+fn device_tensor<'a>(t: &'a dyn MoETensor, what: &str) -> Result<&'a tch::Tensor, MoEError> {
+    t.as_any()
+        .downcast_ref::<DevTensor>()
+        .map(|d| &d.0)
+        .ok_or_else(|| {
+            MoEError::Bad(format!(
+                "the device MoE hand-off was handed {what} that is not a device tensor"
+            ))
+        })
+}
 
 /// e2m1 magnitudes by nibble, the decode table the GEMV indexes. The low nibble
 /// is the magnitude and the high bit the sign, which is why the negatives follow.
@@ -291,9 +305,16 @@ impl CudaMoE {
     /// Every check the launches need, before anything is allocated: the
     /// cubins' shapes and top_k, the batch's shapes, and banks to read. The
     /// output buffer is checked by `collect`, which knows how many values the
-    /// reduce produces.
-    fn check(&self, req: &MoEGroup<'_>) -> Result<usize, MoEError> {
-        let (hidden, inter, top_k) = (self.shapes.hidden, self.shapes.inter, req.top_k);
+    /// reduce produces. Written against element counts so the host and the
+    /// device hand-offs run the same checks (decision 43).
+    fn check_batch(
+        &self,
+        top_k: usize,
+        x_numel: usize,
+        route_count: usize,
+        weights_len: usize,
+    ) -> Result<usize, MoEError> {
+        let (hidden, inter) = (self.shapes.hidden, self.shapes.inter);
         if hidden != self.abi.hidden || inter != self.abi.inter {
             return Err(MoEError::Bad(format!(
                 "the committed cubins are for hidden {} inter {}, not {hidden}x{inter}",
@@ -306,22 +327,17 @@ impl CudaMoE {
                 self.abi.top_k
             )));
         }
-        if hidden == 0 || !req.x.len().is_multiple_of(hidden) {
+        if hidden == 0 || x_numel == 0 || !x_numel.is_multiple_of(hidden) {
             return Err(MoEError::Bad(format!(
-                "grouped_moe: {} activations for hidden {hidden}",
-                req.x.len()
+                "grouped_moe: {x_numel} activations for hidden {hidden}"
             )));
         }
-        let tokens = req.x.len() / hidden;
-        if tokens == 0 {
-            return Err(MoEError::Bad("grouped_moe: a step with no tokens".into()));
-        }
+        let tokens = x_numel / hidden;
         let routes = tokens * top_k;
-        if req.routes.len() != routes || req.weights.len() < routes {
+        if route_count != routes || weights_len < routes {
             return Err(MoEError::Bad(format!(
-                "grouped_moe: {} routes and {} weights for {tokens} tokens x top_k {top_k}",
-                req.routes.len(),
-                req.weights.len()
+                "grouped_moe: {route_count} routes and {weights_len} weights \
+                 for {tokens} tokens x top_k {top_k}"
             )));
         }
         if self.gate_up.is_none() || self.down.is_none() {
@@ -330,6 +346,19 @@ impl CudaMoE {
             ));
         }
         Ok(tokens)
+    }
+
+    fn check(&self, req: &MoEGroup<'_>) -> Result<usize, MoEError> {
+        self.check_batch(req.top_k, req.x.len(), req.routes.len(), req.weights.len())
+    }
+
+    fn check_dev(&self, req: &MoEDeviceGroup<'_>) -> Result<usize, MoEError> {
+        self.check_batch(
+            req.top_k,
+            req.x.numel(),
+            req.routes.len(),
+            req.weights.numel(),
+        )
     }
 
     /// Validate `req` and write everything the launches read into a fresh set
@@ -360,6 +389,46 @@ impl CudaMoE {
             ic3: Tensor::empty([routes as i64, hidden as i64], bf16),
             result: Tensor::empty([tokens as i64, hidden as i64], bf16),
         })
+    }
+
+    /// The same fresh group, with the activations and the weights arriving
+    /// from buffers that are already on the device (decision 43). Only the
+    /// plan's routes still come from the host: slot ids have to exist in host
+    /// memory before they can be uploaded, and prerequisite 4 is what moves
+    /// that off the host too.
+    pub fn stage_dev(&self, req: &MoEDeviceGroup<'_>) -> Result<StagedGroup, MoEError> {
+        let tokens = self.check_dev(req)?;
+        let (hidden, inter, top_k) = (self.shapes.hidden, self.shapes.inter, req.top_k);
+        let routes = tokens * top_k;
+        let (route_token, route_slot) = route_lists(req.routes, tokens, top_k)?;
+        let x = device_tensor(req.x, "the activations")?;
+        let w = device_tensor(req.weights, "the weights")?;
+
+        let dev = self.device;
+        let bf16 = (tch::Kind::BFloat16, dev.to_tch());
+        let mut g = StagedGroup {
+            tokens,
+            top_k,
+            routes,
+            x: Tensor::zeros([tokens as i64, hidden as i64], bf16),
+            slot_t: Tensor::from_slice(&route_slot).to(dev.to_tch()),
+            token_t: Tensor::from_slice(&route_token).to(dev.to_tch()),
+            weight_t: Tensor::zeros([routes as i64], (tch::Kind::Float, dev.to_tch())),
+            lut: f32_tensor(&E2M1, &[E2M1.len() as i64], dev),
+            ic1: Tensor::empty([routes as i64, (2 * inter) as i64], bf16),
+            ic2: Tensor::empty([routes as i64, inter as i64], bf16),
+            ic3: Tensor::empty([routes as i64, hidden as i64], bf16),
+            result: Tensor::empty([tokens as i64, hidden as i64], bf16),
+        };
+        // Device to device, narrowing to bf16 on the way in -- the conversion
+        // the host path makes during its upload, made here instead.
+        g.x.copy_(
+            &x.reshape([tokens as i64, hidden as i64])
+                .to_kind(tch::Kind::BFloat16),
+        );
+        g.weight_t
+            .copy_(&w.reshape([-1]).narrow(0, 0, routes as i64));
+        Ok(g)
     }
 
     /// Rewrite an existing group for the next step of the same shape, keeping
@@ -480,7 +549,7 @@ impl CudaMoE {
                 out.len()
             )));
         }
-        // The port's output is host memory, so the reduce has to be done.
+        // The host path's output is host memory, so the reduce has to be done.
         let values = to_f32_vec(&g.result);
         if values.len() < tokens * hidden {
             return Err(MoEError::Bad(format!(
@@ -492,6 +561,30 @@ impl CudaMoE {
         Ok(())
     }
 
+    /// The reduce's output into the caller's own device buffer, device to
+    /// device: the readback the host path makes never happens on the device
+    /// hand-off (decision 43). The copy widens the bf16 reduce to f32, the same
+    /// widening the host readback does.
+    pub fn collect_dev(&self, g: &StagedGroup, out: &mut dyn MoETensor) -> Result<(), MoEError> {
+        let (tokens, hidden) = (g.tokens, self.shapes.hidden);
+        let t = out
+            .as_any_mut()
+            .downcast_mut::<DevTensor>()
+            .ok_or_else(|| {
+                MoEError::Bad(
+                    "the device MoE hand-off needs a device tensor for the routed sum".into(),
+                )
+            })?;
+        if t.0.size() != [tokens as i64, hidden as i64] {
+            return Err(MoEError::Bad(format!(
+                "collect_dev: the routed sum is {:?}, wanted [{tokens}, {hidden}]",
+                t.0.size()
+            )));
+        }
+        t.0.copy_(&g.result);
+        Ok(())
+    }
+
     /// The port's whole step over fresh buffers: `stage` + `launch` +
     /// `collect`. The three stay separate so a capture can hold one
     /// `StagedGroup` alive and replay only the launches (decision 39).
@@ -499,6 +592,20 @@ impl CudaMoE {
         let g = self.stage(req)?;
         self.launch(&g)?;
         self.collect(&g, out)
+    }
+
+    /// The device hand-off's whole step: `stage_dev` + `launch` +
+    /// `collect_dev`. Same three pieces as the host path, so the capture
+    /// contract is the same on both (decision 39), with only the staging's
+    /// inputs having moved onto the device (decision 43).
+    pub fn grouped_moe_dev(
+        &self,
+        req: &MoEDeviceGroup<'_>,
+        out: &mut dyn MoETensor,
+    ) -> Result<(), MoEError> {
+        let g = self.stage_dev(req)?;
+        self.launch(&g)?;
+        self.collect_dev(&g, out)
     }
 }
 
@@ -555,6 +662,16 @@ impl ExpertGemm for Mutex<CudaMoE> {
         self.lock()
             .map_err(|_| MoEError::Bad("cuda slot cache poisoned".into()))?
             .grouped_moe(req, out)
+    }
+
+    fn grouped_moe_dev<'a>(
+        &self,
+        req: &MoEDeviceGroup<'a>,
+        out: &mut dyn MoETensor,
+    ) -> Result<(), MoEError> {
+        self.lock()
+            .map_err(|_| MoEError::Bad("cuda slot cache poisoned".into()))?
+            .grouped_moe_dev(req, out)
     }
 }
 

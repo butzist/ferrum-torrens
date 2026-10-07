@@ -54,11 +54,16 @@ the kernel token and the scalar reference -- plus the MoE graph replay and the
 three cubin gates. Prerequisite 2 is done too (decision 42): the device banks
 are allocated once and never dropped, `begin_layer`/`forget_layer` are gone, and
 the flat LRU is cross-layer, so returning to a layer is a hit instead of a full
-re-stage. Next: the device-resident MoE hand-off, then the two
+re-stage. Prerequisite 3 is done too (decision 43): the layer boundary is a
+device hand-off -- `routed_via_port` no longer converts a tensor to talk to the
+port (`MoEExecutor::execute_device` over the `MoETensor` port), so the
+activations, the ids and the weights stay on the device and the routed sum
+comes back as one. Next: the two
 device-side staging kernels FreeToken uses, and only then warmup + one captured
 decode step together with the pinned batch-metadata staging P1, per-batch-size
 graphs over a mempool, and a replay-vs-uncaptured gate per batch size. After
 that, M2 (API) proper and the remaining M3 perf items. Last finished: decision
+43 (the device-resident MoE hand-off), decision
 42 (stable bank addresses, cross-layer LRU), the P0
 resident dense weights (decision 41), decision 40 (the MoE-in-graph shape), decision 30 (the pyo3 exit), decision 37
 (the step counter), decision 36 slice 6 (the tower-with-the-kernel gate) and
@@ -487,7 +492,8 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
      with its own gate): (i) the P0 "load & cast dense weights to GPU" box
      **done, decision 41**, (ii) stable `begin_layer` bank addresses plus the
      flat cross-layer slot LRU **done, decision 42**, (iii)
-     a device-resident MoE hand-off, (iv) the two device-side staging kernels
+     a device-resident MoE hand-off **done, decision 43**, (iv) the two
+     device-side staging kernels
      over pinned host banks that let staging be recorded at all. The capture
      steps below are unchanged.
   2. **Warmup + capture one uncaptured step** mirroring `engine/graph.py`: an
@@ -1286,7 +1292,8 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
           misses. **Done, decision 42.**
        3. Device-resident MoE hand-off: activations, routes and the reduced sum
           stay on the device across a layer -- no `to_f32_vec` in
-          `routed_via_port`. Any capture needs this, (a) or (b).
+          `routed_via_port`. Any capture needs this, (a) or (b). **Done,
+          decision 43.**
        4. In-graph staging. Layer `l`'s routes are produced *inside* the graph,
           so the host cannot plan layer `l`'s misses before a single replay.
           FreeToken does it with fixed-shape device-side kernels over a device
@@ -1390,12 +1397,58 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
       round-robins anyway. What lands now is the address stability capture
       needs, no reallocation churn, and hits whenever routing does repeat (the
       512-slot prefill path is where that starts to pay). The restage itself
-      drops only when staging leaves the host, prerequisites 3 and 4.
+      drops only when staging leaves the host, prerequisite 4 (decision 43
+      moved the layer boundary, not the slab uploads).
     - **Gates green after the change:** the driver-API-vs-scalar-oracle gate
       (real slabs, layer 17), the new address gate, the MoE graph replay and
       `one_token_through_the_kernel_matches_the_oracle` (40 layer switches,
       " Paris", 23.7 s); `cargo fmt`/`clippy` clean, `cargo test` 233 and
       `--features cuda` 293.
+
+43. **A layer boundary is a device hand-off, not a host round trip**
+    (2026-10-07) -- decision 40 prerequisite 3, the closure of
+    `routed_via_port`'s `to_f32_vec`.
+    - **What changed.** `MoEExecutor::execute` -- `&[f32]` in, `&mut [f32]`
+      out -- is replaced by `execute_device(&MoEDeviceRequest, &mut dyn
+      MoETensor)`; `MoERequest` is gone. `MoETensor` is the domain port over an
+      opaque buffer (`numel`, `to_host_f32`, `set_host_f32`, `as_any`,
+      `as_any_mut`). It is deliberately **not** `mockall::automock`: the
+      generated `Box<dyn Any>` expectation is not `Sync`, so every boundary it
+      replaces is mocked with a test double instead (`Buf` in
+      `run_experts`, a `RecordingMoE` that reads the device buffer through
+      `to_host_f32` in the tower tests). `infrastructure::torch::DevTensor` is
+      the one concrete implementation: a `tch::Tensor` behind the port with a
+      hand-written `Sync`, `#[cfg(feature = "cuda")]` like every other tensor
+      type in the crate, and `from_f32`/`zeros` constructors so gates never
+      have to name `tch` themselves. On the application side
+      `run_experts_device` shares `stage_and_route` with `run_experts`, so the
+      plan cannot drift between the two paths.
+    - **What still crosses the host, honestly.** The plan. The dense expert
+      ids are read exactly once through `to_host_f32` to pick slots, and the
+      slot ids ride up as an `i32` slice; that is measured, not assumed
+      (`experts.reads() == 1`, `x.reads() == 0`, `weights.reads() == 0`).
+      Prerequisite 4 -- FreeToken's `ensure_experts` +
+      `fast_index_copy_multi` over pinned host banks, mirrored to the device --
+      is what removes the ids and the misses from the host. Until then a layer
+      boundary is a few hundred elements round-tripping, not a tensor.
+    - **No arithmetic moved.** `stage_dev` writes the same `StagedGroup`
+      `stage` does (activations narrowed f32 to bf16, weights copied f32,
+      routes from `route_lists`), and `collect_dev` copies the bf16 reduce into
+      the caller's own device tensor, widening to f32 exactly as `collect`'s
+      readback does. The host path (`run_experts`, `MoEGroup`, `grouped_moe`,
+      `collect`, `stage_into`) is untouched and still what the oracle gate and
+      the graph smoke gate exercise -- it is the reference the cubins were
+      qualified against, and it stays the oracle the device path is checked
+      against.
+    - **Gate:** `the_device_handoff_agrees_with_the_host_handoff` runs the
+      same layer-17 step through `run_experts` and through `execute_device` on
+      the real checkpoint and asserts the two outputs are **equal**, not
+      close. Rerun green beside it: the bank-address gate, the
+      cubin-vs-scalar-oracle gate (`3.31e-3` of the route terms), the MoE
+      graph replay and `one_token_through_the_kernel_matches_the_oracle`
+      (" Paris", 23.6 s).
+    - **Tests:** `cargo test` 234, `--features cuda` 294, `fmt`/`clippy` clean
+      with and without the feature.
 
 ### Config defaults for the RTX 5060 / 8 GB target
 

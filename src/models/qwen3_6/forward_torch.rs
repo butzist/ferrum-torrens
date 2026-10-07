@@ -22,13 +22,13 @@ use tch::Kind;
 use tch::Tensor;
 
 use crate::domain::dequant::{bf16_array, e4m3_values, nvfp4_block, nvfp4_expert, nvfp4_globals};
-use crate::domain::expert_kernel::{MoEError, MoEExecutor, MoERequest};
+use crate::domain::expert_kernel::{MoEDeviceRequest, MoEError, MoEExecutor};
 use crate::domain::kvcache::{CachedModel, KvCache, KvcacheError, SequenceCache};
 use crate::domain::model::{ForwardInput, LayerType, Model, ModelParams};
 use crate::domain::weights::{DType, TensorDesc, TensorKind, WeightsReader};
 use crate::infrastructure::ftw::FtwIndex;
 use crate::infrastructure::kvcache_dev::{DeviceCache, LinearStateSlabs, MhaPool};
-use crate::infrastructure::torch::{Device, bf16_tensor, f32_tensor, to_f32_vec};
+use crate::infrastructure::torch::{DevTensor, Device, bf16_tensor, f32_tensor, to_f32_vec};
 
 #[derive(Debug, thiserror::Error)]
 pub enum TorchError {
@@ -610,8 +610,10 @@ fn topk_renorm(probs: &Tensor, k: i64) -> (Tensor, Tensor) {
 ///
 /// The router hands over dense expert ids, not slot ids: the port owns the slot
 /// cache, so it plans residency, stages the misses and launches the grouped
-/// GEMM. Everything crosses to the host once per layer, which is the same
-/// hand-off the inline path makes.
+/// GEMM. The hand-off itself is device-resident (decision 43): the activations,
+/// the ids and the weights go over as the buffers they already are and the
+/// routed sum comes back as one, so crossing a layer boundary costs no host
+/// round trip and nothing here converts a tensor to talk to the port.
 fn routed_via_port(
     port: &dyn MoEExecutor,
     layer_idx: usize,
@@ -623,23 +625,15 @@ fn routed_via_port(
 ) -> Result<Tensor> {
     let (hidden, inter, top_k) = (p.hidden_size, p.moe_intermediate_size, p.top_k);
     let tokens = x_post.size()[0] as usize;
-    let x = to_f32_vec(x_post);
-    // `topk` returns f32 holding exact small integers.
-    let experts: Vec<u32> = to_f32_vec(ids).into_iter().map(|e| e as u32).collect();
-    let w = to_f32_vec(weights);
-    if experts.len() != tokens * top_k || w.len() != tokens * top_k {
-        return Err(TorchError::Bad(
-            "routing",
-            format!(
-                "{} experts and {} weights for {tokens} tokens",
-                experts.len(),
-                w.len()
-            ),
-        ));
-    }
-    let mut out = vec![0.0f32; tokens * hidden];
-    port.execute(
-        &MoERequest {
+    let x = DevTensor(x_post.shallow_clone());
+    let experts = DevTensor(ids.shallow_clone());
+    let w = DevTensor(weights.shallow_clone());
+    let mut out = DevTensor(Tensor::zeros(
+        [tokens as i64, hidden as i64],
+        (Kind::Float, dev.to_tch()),
+    ));
+    port.execute_device(
+        &MoEDeviceRequest {
             layer: layer_idx,
             hidden,
             inter,
@@ -650,7 +644,7 @@ fn routed_via_port(
         },
         &mut out,
     )?;
-    Ok(f32_tensor(&out, &[tokens as i64, hidden as i64], dev))
+    Ok(out.0)
 }
 
 // ---------------------------------------------------------------------------

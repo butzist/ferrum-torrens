@@ -20,15 +20,17 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use ferrum_torrens::application::run_experts::{ExpertStep, run_experts};
+use ferrum_torrens::application::run_experts::{CachedExperts, ExpertStep, run_experts};
 use ferrum_torrens::domain::expert_cache::ExpertCache;
 use ferrum_torrens::domain::expert_kernel::ExpertShapes;
-use ferrum_torrens::domain::expert_kernel::{ExpertSlabSource, HostBanks, MoEGroup, Part, Slab};
+use ferrum_torrens::domain::expert_kernel::{
+    ExpertSlabSource, HostBanks, MoEDeviceRequest, MoEExecutor, MoEGroup, Part, Slab,
+};
 use ferrum_torrens::domain::weights::WeightsReader;
 use ferrum_torrens::infrastructure::banks::FtwBanks;
 use ferrum_torrens::infrastructure::cuda_moe::CudaMoE;
 use ferrum_torrens::infrastructure::ftw::{FtwIndex, MmapFtwReader};
-use ferrum_torrens::infrastructure::torch::Device;
+use ferrum_torrens::infrastructure::torch::{DevTensor, Device, to_f32_vec};
 
 const FTW_DIR: &str = ".model-cache/Qwen3.6-35B-A3B-NVFP4.ftw";
 const LAYER: usize = 17;
@@ -428,6 +430,76 @@ fn the_bank_addresses_survive_a_layer_switch() {
     assert_eq!(
         first, second,
         "a layer switch must not move the banks a graph would capture"
+    );
+    println!("PASS");
+}
+
+/// Decision 43, prerequisite 3's gate: the same step through the host hand-off
+/// and through the device one must be byte for byte the same result, so moving
+/// the layer boundary onto the device changes no arithmetic. The host path is
+/// still the reference the cubins were qualified against; the device path is
+/// the one every tower now takes.
+#[test]
+#[ignore = "needs a CUDA device and the converted checkpoint in .model-cache"]
+fn the_device_handoff_agrees_with_the_host_handoff() {
+    let Some((index, reader)) = open_checkpoint() else {
+        panic!("gate needs the checkpoint in {FTW_DIR}");
+    };
+    let source: Arc<dyn ExpertSlabSource> = Arc::new(FtwBanks::new(reader, index.clone()));
+    let case = plan(&index, &*source);
+    let (hidden, inter) = (case.shapes.hidden, case.shapes.inter);
+    let moe = Arc::new(Mutex::new(gate(
+        "driver API + committed cubins",
+        CudaMoE::new(Device::Cuda(0), source, case.shapes, SLOTS),
+    )));
+
+    // The host hand-off, exactly as decision 36 left it.
+    let mut host_cache = ExpertCache::new(LAYER + 1, SLOTS, SLOTS);
+    let mut host_out = vec![0.0f32; TOKENS * hidden];
+    {
+        let ports = moe.as_ref();
+        gate(
+            "run_experts through the driver-API adapter",
+            run_experts(
+                &mut host_cache,
+                ports,
+                ports,
+                LAYER,
+                &case.step(),
+                &mut host_out,
+            ),
+        );
+    }
+
+    // The device hand-off: the same four buffers, wrapped instead of copied.
+    let dev = Device::Cuda(0);
+    let shape = [TOKENS as i64, hidden as i64];
+    let route_shape = [TOKENS as i64, TOP_K as i64];
+    let ids: Vec<f32> = case.routed.iter().map(|&e| e as f32).collect();
+    let x = DevTensor::from_f32(&case.x, &shape, dev);
+    let experts = DevTensor::from_f32(&ids, &route_shape, dev);
+    let weights = DevTensor::from_f32(&case.weights, &route_shape, dev);
+    let mut out = DevTensor::zeros(&shape, dev);
+    let exec = CachedExperts::new(moe.clone(), moe, LAYER + 1, SLOTS, SLOTS);
+    gate(
+        "execute_device through the driver-API adapter",
+        exec.execute_device(
+            &MoEDeviceRequest {
+                layer: LAYER,
+                hidden,
+                inter,
+                top_k: TOP_K,
+                x: &x,
+                experts: &experts,
+                weights: &weights,
+            },
+            &mut out,
+        ),
+    );
+    let device_out = to_f32_vec(&out.0);
+    assert_eq!(
+        device_out, host_out,
+        "the device hand-off must be byte for byte the host one"
     );
     println!("PASS");
 }

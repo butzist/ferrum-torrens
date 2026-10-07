@@ -128,31 +128,90 @@ pub fn route_lists(
 #[cfg_attr(test, mockall::automock)]
 pub trait ExpertGemm: Send + Sync {
     fn grouped_moe<'a>(&self, req: &MoEGroup<'a>, out: &mut [f32]) -> Result<(), MoEError>;
+
+    /// The same grouped MoE with the activations, the weights and the output
+    /// kept on the device (decision 43). Only `routes` is a host slice: the
+    /// plan is still computed here, and prerequisite 4 moves it.
+    fn grouped_moe_dev<'a>(
+        &self,
+        req: &MoEDeviceGroup<'a>,
+        out: &mut dyn MoETensor,
+    ) -> Result<(), MoEError>;
 }
 
-/// One routed-expert layer step the way a tower hands it over: the router's
-/// dense expert ids, the top-k weights and the post-norm activations, all on
-/// the host. Slot ids deliberately do not appear here -- only the executor
-/// knows what is resident, so rewriting routes to slots is part of answering
-/// this request rather than something the arch has to do. The output is a
-/// separate `&mut`, as in `ExpertGemm`, so nothing can alias it.
-pub struct MoERequest<'a> {
+/// An opaque buffer of device memory handed across the MoE ports: the tower's
+/// activations, the router's ids and weights, the routed sum. The domain counts
+/// elements and -- while the residency plan is still computed on the host --
+/// asks for a host view of the routes; it never learns the representation, and
+/// a tower on the device never converts anything itself to cross this boundary
+/// (decision 43).
+///
+/// No automock: a mock of `as_any` would have to hand back a reference it owns,
+/// and mockall's `Box<dyn Any>` expectation is not `Sync`. The tests use small
+/// host-backed doubles instead.
+pub trait MoETensor: Send + Sync {
+    /// Elements the buffer holds, the way a host slice reports its length.
+    fn numel(&self) -> usize;
+
+    /// A host view, element-major. Only the routes are read this way, for the
+    /// plan; activations and weights are not, which is what keeps them on the
+    /// device.
+    fn to_host_f32(&self) -> Result<Vec<f32>, MoEError>;
+
+    /// Write `values` into the buffer from the host. The device adapter copies
+    /// device to device instead and never calls this; it is how a host-side
+    /// stand-in for the kernel answers.
+    fn set_host_f32(&mut self, values: &[f32]) -> Result<(), MoEError>;
+
+    /// The adapter downcasts to its own tensor type to copy out of or into a
+    /// buffer, so the domain never has to describe a device tensor beyond
+    /// counting its elements.
+    fn as_any(&self) -> &dyn std::any::Any;
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
+}
+
+/// One routed-expert layer step, device-resident: the router's dense expert ids,
+/// the top-k weights and the post-norm activations, every one of them a buffer
+/// the adapter owns. Slot ids still deliberately do not appear here -- the
+/// executor rewrites them behind this request. The output is a separate `&mut`,
+/// as in `ExpertGemm`, so nothing can alias it.
+pub struct MoEDeviceRequest<'a> {
     pub layer: usize,
     pub hidden: usize,
     pub inter: usize,
     pub top_k: usize,
-    pub x: &'a [f32],
-    pub experts: &'a [u32],
-    pub weights: &'a [f32],
+    pub x: &'a dyn MoETensor,
+    pub experts: &'a dyn MoETensor,
+    pub weights: &'a dyn MoETensor,
+}
+
+/// The device half of [`MoEGroup`]: activations and weights stay in their
+/// buffers, while `routes` is the plan's own host output (`-1` for a slot that
+/// is not resident).
+pub struct MoEDeviceGroup<'a> {
+    pub hidden: usize,
+    pub inter: usize,
+    pub top_k: usize,
+    pub x: &'a dyn MoETensor,
+    pub routes: &'a [i32],
+    pub weights: &'a dyn MoETensor,
 }
 
 /// The engine's MoE port: one call per routed layer per step. Arch-agnostic on
 /// purpose. The offload cache and the grouped GEMM are core engine obligations
 /// shared by every supported model, so an arch forward only hands over its
 /// routing decision and never widens an expert slab itself.
+///
+/// The hand-off is device-resident (decision 43): a tower whose activations
+/// already live on the device hands the port its buffers and gets the routed
+/// sum back as one, so nothing crosses to the host at the layer boundary.
 #[cfg_attr(test, mockall::automock)]
 pub trait MoEExecutor: Send + Sync {
-    fn execute<'a>(&self, req: &MoERequest<'a>, out: &mut [f32]) -> Result<(), MoEError>;
+    fn execute_device<'a>(
+        &self,
+        req: &MoEDeviceRequest<'a>,
+        out: &mut dyn MoETensor,
+    ) -> Result<(), MoEError>;
 
     /// How many steps this executor has run since it was built. A forward that
     /// widens routed experts on the host answers with the same logits as one

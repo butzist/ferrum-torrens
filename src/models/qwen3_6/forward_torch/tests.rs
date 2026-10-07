@@ -6,6 +6,7 @@
 
 use super::*;
 use crate::domain::dequant::{e4m3_values, nvfp4_block, nvfp4_globals};
+use crate::domain::expert_kernel::MoETensor;
 
 /// Deterministic pseudo-random f32 data; no `rand` dependency in the tree.
 fn data(n: usize, seed: u32) -> Vec<f32> {
@@ -617,8 +618,18 @@ fn a_dense_projection_is_widened_at_load_and_apply_never_reads_again() {
 
 /// What the engine's MoE port is handed, recorded so the test can check the
 /// router's own decision survives the trip: layer, shapes, activations, dense
-/// expert ids and weights.
-type SeenRoute = (usize, usize, usize, usize, Vec<f32>, Vec<u32>, Vec<f32>);
+/// expert ids and weights. The three addresses are the port's own buffers, so a
+/// test can tell a hand-off from a copy that quietly went through the host.
+type SeenRoute = (
+    usize,
+    usize,
+    usize,
+    usize,
+    Vec<f32>,
+    Vec<u32>,
+    Vec<f32>,
+    [usize; 3],
+);
 
 struct RecordingMoE {
     seen: std::sync::Mutex<Option<SeenRoute>>,
@@ -631,34 +642,56 @@ impl MoEExecutor for RecordingMoE {
         self.steps.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    fn execute<'a>(
+    fn execute_device<'a>(
         &self,
-        req: &MoERequest<'a>,
-        out: &mut [f32],
+        req: &MoEDeviceRequest<'a>,
+        out: &mut dyn MoETensor,
     ) -> std::result::Result<(), MoEError> {
         if self.fail {
             return Err(MoEError::Bad("planned refusal".into()));
         }
         self.steps
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // The stand-in does what a host-side kernel would: it asks for the
+        // values, which is exactly what the production adapter must never make
+        // the tower do.
+        let x = req.x.to_host_f32()?;
+        let experts: Vec<u32> = req
+            .experts
+            .to_host_f32()?
+            .into_iter()
+            .map(|e| e as u32)
+            .collect();
+        let w = req.weights.to_host_f32()?;
+        let addr = |t: &dyn MoETensor| {
+            t.as_any()
+                .downcast_ref::<DevTensor>()
+                .map(|d| d.0.data_ptr() as usize)
+        };
         *self.seen.lock().unwrap() = Some((
             req.layer,
             req.hidden,
             req.inter,
             req.top_k,
-            req.x.to_vec(),
-            req.experts.to_vec(),
-            req.weights.to_vec(),
+            x.clone(),
+            experts,
+            w.clone(),
+            [
+                addr(req.x).expect("x is a device tensor"),
+                addr(req.experts).expect("experts is a device tensor"),
+                addr(req.weights).expect("weights is a device tensor"),
+            ],
         ));
         // Stand in for the grouped GEMM: every route's weight lands in the sum.
-        let tokens = req.x.len() / req.hidden;
+        let tokens = x.len() / req.hidden;
+        let mut values = vec![0.0f32; tokens * req.hidden];
         for t in 0..tokens {
-            let w: f32 = (0..req.top_k).map(|j| req.weights[t * req.top_k + j]).sum();
+            let sum: f32 = (0..req.top_k).map(|j| w[t * req.top_k + j]).sum();
             for h in 0..req.hidden {
-                out[t * req.hidden + h] = w * 3.0;
+                values[t * req.hidden + h] = sum * 3.0;
             }
         }
-        Ok(())
+        out.set_host_f32(&values)
     }
 }
 
@@ -701,10 +734,10 @@ fn the_moe_port_receives_the_routers_decision_and_answers_with_the_routed_sum() 
         fail: false,
         steps: std::sync::atomic::AtomicU64::new(0),
     };
-    let got =
-        routed_via_port(&exec, 4, &up(&x, &[2, 3]), &ids, &weights, &params(), dev()).unwrap();
+    let x_post = up(&x, &[2, 3]);
+    let got = routed_via_port(&exec, 4, &x_post, &ids, &weights, &params(), dev()).unwrap();
 
-    let (layer, hidden, inter, top_k, xr, experts, w) = exec
+    let (layer, hidden, inter, top_k, xr, experts, w, addrs) = exec
         .seen
         .lock()
         .unwrap()
@@ -715,6 +748,24 @@ fn the_moe_port_receives_the_routers_decision_and_answers_with_the_routed_sum() 
     // Dense expert ids, in the router's `tokens x top_k` order, not slot ids.
     assert_eq!(experts, vec![5, 1, 2, 7]);
     close(&w, &[0.25, 0.75, 0.5, 0.25], 0.0, "weights");
+    // Decision 43: the port was handed the router's own device buffers, so the
+    // activations and the routes never crossed to the host in the arch. (The
+    // stand-in reads them itself, which is its business, not the tower's.)
+    assert_eq!(
+        addrs[0],
+        x_post.data_ptr() as usize,
+        "x was copied out of the device"
+    );
+    assert_eq!(
+        addrs[1],
+        ids.data_ptr() as usize,
+        "the ids were copied out of the device"
+    );
+    assert_eq!(
+        addrs[2],
+        weights.data_ptr() as usize,
+        "the weights were copied out of the device"
+    );
     close(
         &to_f32_vec(&got),
         &[3.0, 3.0, 3.0, 2.25, 2.25, 2.25],
