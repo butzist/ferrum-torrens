@@ -22,13 +22,16 @@ use std::sync::{Arc, Mutex};
 use tch::Tensor;
 
 use crate::domain::expert_kernel::{
-    ExpertGemm, ExpertShapes, ExpertSlabSource, ExpertSlotStore, MoEDeviceGroup, MoEError,
-    MoEGroup, MoETensor, Part, Slab, route_lists,
+    BANKS, ExpertGemm, ExpertShapes, ExpertSlabSource, ExpertSlotStore, MoEDeviceGroup, MoEError,
+    MoEGroup, MoETensor, Part, PinnedBankSource, Slab, route_lists,
 };
-use crate::infrastructure::cuda_driver::{CUstream, CudaError, CudaKernels, Driver};
+use crate::infrastructure::cuda_driver::{
+    CUstream, CudaError, CudaKernels, Driver, StagingKernels,
+};
 use crate::infrastructure::kernel_abi::{
-    Abi, GEMV_DOWN, GEMV_GATE_UP, MoEArgs, SILU_MUL, SUM_REDUCE, gemv_down_args, gemv_gate_up_args,
-    grid, silu_mul_args, sum_reduce_args,
+    Abi, CopyArgs, GEMV_DOWN, GEMV_GATE_UP, INDEX_COPY, LRU_ENSURE, LruArgs, MoEArgs, SILU_MUL,
+    SUM_REDUCE, StagingAbi, gemv_down_args, gemv_gate_up_args, grid, index_copy_args,
+    lru_ensure_args, silu_mul_args, sum_reduce_args,
 };
 use crate::infrastructure::torch::{DevTensor, Device, bf16_tensor, f32_tensor, to_f32_vec};
 
@@ -121,6 +124,8 @@ fn stage_bytes(bank: &mut Tensor, slot: usize, bytes: &[u8], len: usize) -> Resu
 pub struct CudaMoE {
     kernels: CudaKernels,
     abi: Abi,
+    staging_abi: StagingAbi,
+    staging: StagingKernels,
     source: Arc<dyn ExpertSlabSource>,
     shapes: ExpertShapes,
     slots: usize,
@@ -132,6 +137,9 @@ pub struct CudaMoE {
     stream: CUstream,
     gate_up: Option<Banks>,
     down: Option<Banks>,
+    /// The device slot tables and pinned-bank plan, present once
+    /// `enable_device_staging` has run.
+    device_staging: Option<DeviceStaging>,
 }
 
 // SAFETY: the fields are libtorch tensors, Arcs, plain data, and driver handles
@@ -161,6 +169,33 @@ pub struct StagedGroup {
     ic2: Tensor,
     ic3: Tensor,
     result: Tensor,
+}
+
+/// The device-resident half of the offload cache: the LRU tables `lru_ensure`
+/// reads and writes, the miss plan `index_copy` follows, and the six device
+/// pointer arrays the copy needs. Allocated once when device staging is enabled
+/// and, like the banks, never moved -- a captured graph bakes every one of these
+/// addresses (decision 40 prerequisite 4).
+///
+/// `src_ptrs` is one `[6]` array per layer, because the copy kernel reads
+/// layer-local `src_idx` rows (the reference's per-layer host banks). The pinned
+/// source is flat across layers (decision 47), so layer `l`'s window starts at
+/// `addr + l * experts * row_bytes`; the offset is a constant of the capture and
+/// needs no per-step update.
+struct DeviceStaging {
+    layers: usize,
+    experts: usize,
+    plan_cap: usize,
+    slot_for_id: Tensor,
+    id_of_slot: Tensor,
+    usage: Tensor,
+    step: Tensor,
+    misses: Tensor,
+    slots_out: Tensor,
+    num: Tensor,
+    dst_ptrs: Tensor,
+    feat_bytes: Tensor,
+    src_ptrs: Vec<Tensor>,
 }
 
 impl CudaMoE {
@@ -202,10 +237,15 @@ impl CudaMoE {
         lib.attach_primary_context(ordinal as i32).map_err(driver)?;
         let abi = Abi::committed().map_err(bad_abi)?;
         check_shapes(&shapes, &abi)?;
-        let kernels = CudaKernels::load(Arc::new(lib), abi.clone()).map_err(driver)?;
+        let staging_abi = StagingAbi::committed().map_err(bad_abi)?;
+        let lib = Arc::new(lib);
+        let kernels = CudaKernels::load(Arc::clone(&lib), abi.clone()).map_err(driver)?;
+        let staging = StagingKernels::load(lib, staging_abi.clone()).map_err(driver)?;
         Ok(Self {
             kernels,
             abi,
+            staging_abi,
+            staging,
             source,
             shapes,
             slots,
@@ -213,6 +253,7 @@ impl CudaMoE {
             stream,
             gate_up: None,
             down: None,
+            device_staging: None,
         })
     }
 
@@ -300,6 +341,164 @@ impl CudaMoE {
         let (dn_rows, dn_cols) = self.shapes.slab_shape(Part::Down);
         self.gate_up = Some(Banks::new(self.slots, gu_rows, gu_cols, self.device));
         self.down = Some(Banks::new(self.slots, dn_rows, dn_cols, self.device));
+    }
+
+    /// Allocate the device slot tables and the per-layer source-pointer arrays,
+    /// then the pinned host banks are the source the copy kernel reads.
+    ///
+    /// The banks are allocated here too, so `dst_ptrs` already points where a
+    /// capture will bake it. The constexprs are checked against the shapes: a
+    /// plan that cannot fit `BLOCK_K`, or a slot count past `BLOCK_C`, would
+    /// silently produce a wrong plan, so both are refused.
+    pub fn enable_device_staging(
+        &mut self,
+        pinned: &dyn PinnedBankSource,
+        layers: usize,
+        experts: usize,
+    ) -> Result<(), MoEError> {
+        if layers == 0 || experts == 0 {
+            return Err(MoEError::Bad(
+                "device staging needs at least one layer and one expert".into(),
+            ));
+        }
+        let lru = self.staging_abi.kernel(LRU_ENSURE).map_err(bad_abi)?;
+        let block_c = lru.constexpr("BLOCK_C").map_err(bad_abi)? as usize;
+        if self.slots > block_c {
+            return Err(MoEError::Bad(format!(
+                "device staging bakes BLOCK_C {block_c}, but the cache holds {} slots",
+                self.slots
+            )));
+        }
+        self.banks_for();
+        let banks = pinned.banks()?;
+        if banks.len() != BANKS.len() {
+            return Err(MoEError::Bad("pinned source must report six banks".into()));
+        }
+        let rows = layers * experts;
+        let feat: Vec<i64> = BANKS
+            .iter()
+            .map(|b| self.shapes.bank_row_bytes(*b) as i64)
+            .collect();
+        for (i, bank) in BANKS.iter().enumerate() {
+            let want = self.shapes.bank_row_bytes(*bank);
+            if banks[i].row_bytes != want || banks[i].rows != rows {
+                return Err(MoEError::Bad(format!(
+                    "pinned bank {i} is {} rows of {} bytes, want {rows} of {want}",
+                    banks[i].rows, banks[i].row_bytes
+                )));
+            }
+        }
+        let src_ptrs = (0..layers)
+            .map(|layer| {
+                let ptrs: Vec<i64> = BANKS
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| {
+                        (banks[i].addr + (layer * experts * banks[i].row_bytes) as u64) as i64
+                    })
+                    .collect();
+                Tensor::from_slice(&ptrs).to(self.device.to_tch())
+            })
+            .collect();
+        let dst: Vec<i64> = self.bank_ptrs()?.iter().map(|p| *p as i64).collect();
+
+        let dev = self.device.to_tch();
+        let int = (tch::Kind::Int, dev);
+        let long = (tch::Kind::Int64, dev);
+        let table = |n: usize, v: i32| Tensor::from_slice(&vec![v; n]).to(dev);
+        self.device_staging = Some(DeviceStaging {
+            layers,
+            experts,
+            plan_cap: self.slots,
+            slot_for_id: table(rows, -1),
+            id_of_slot: table(self.slots, -1),
+            usage: Tensor::zeros([self.slots as i64], long),
+            step: Tensor::zeros([1], long),
+            misses: Tensor::zeros([self.slots as i64], int),
+            slots_out: Tensor::zeros([self.slots as i64], int),
+            num: Tensor::zeros([1], long),
+            dst_ptrs: Tensor::from_slice(&dst).to(dev),
+            feat_bytes: Tensor::from_slice(&feat).to(dev),
+            src_ptrs,
+        });
+        Ok(())
+    }
+
+    /// `lru_ensure`: rewrite `experts` in place from layer-local ids to slots and
+    /// emit this step's `(miss, slot)` plan. `experts` must be an int32 device
+    /// tensor; the kernel owns the rewrite so the host never sees the ids.
+    pub fn ensure_experts(&mut self, layer: usize, experts: &Tensor) -> Result<(), MoEError> {
+        let routes = experts.numel();
+        let lru = self.staging_abi.kernel(LRU_ENSURE).map_err(bad_abi)?;
+        let block_k = lru.constexpr("BLOCK_K").map_err(bad_abi)? as usize;
+        if routes == 0 || routes > block_k {
+            return Err(MoEError::Bad(format!(
+                "lru_ensure bakes BLOCK_K {block_k}, but this step routes {routes}"
+            )));
+        }
+        let st = self
+            .device_staging
+            .as_ref()
+            .ok_or_else(|| MoEError::Bad("device staging is not enabled".into()))?;
+        if layer >= st.layers {
+            return Err(MoEError::Bad(format!(
+                "layer {layer} past the {} the staging holds",
+                st.layers
+            )));
+        }
+        let ptr = |t: &Tensor| t.data_ptr() as u64;
+        let args = LruArgs {
+            experts: experts.data_ptr() as u64,
+            slot_for_id: ptr(&st.slot_for_id),
+            id_of_slot: ptr(&st.id_of_slot),
+            usage: ptr(&st.usage),
+            step: ptr(&st.step),
+            misses: ptr(&st.misses),
+            slots: ptr(&st.slots_out),
+            num: ptr(&st.num),
+            routes: routes as u32,
+            num_cached: st.plan_cap as u32,
+            id_base: (layer * st.experts) as u32,
+        };
+        let mut params = lru_ensure_args(&self.staging_abi, &args)
+            .map_err(bad_abi)?
+            .kernel_params()
+            .map_err(bad_abi)?;
+        // SAFETY: every pointer in `args` is a live libtorch allocation in the
+        // context made current at construction, `params` was built from this
+        // kernel's manifest entry, and `stream` is this adapter's stream.
+        unsafe { self.staging.launch(lru, &mut params, self.stream) }.map_err(driver)
+    }
+
+    /// `index_copy`: copy the plan's missed rows from the layer's pinned host
+    /// banks into the device slot banks. Reads the plan `ensure_experts` wrote on
+    /// the device, so it is data-independent.
+    pub fn copy_missing(&mut self, layer: usize) -> Result<(), MoEError> {
+        let copy = self.staging_abi.kernel(INDEX_COPY).map_err(bad_abi)?;
+        let st = self
+            .device_staging
+            .as_ref()
+            .ok_or_else(|| MoEError::Bad("device staging is not enabled".into()))?;
+        let src = st
+            .src_ptrs
+            .get(layer)
+            .ok_or_else(|| MoEError::Bad(format!("layer {layer} past the pinned source plan")))?;
+        let ptr = |t: &Tensor| t.data_ptr() as u64;
+        let args = CopyArgs {
+            dst_ptrs: ptr(&st.dst_ptrs),
+            src_ptrs: ptr(src),
+            feat_bytes: ptr(&st.feat_bytes),
+            dst_idx: ptr(&st.slots_out),
+            src_idx: ptr(&st.misses),
+            num: ptr(&st.num),
+        };
+        let mut params = index_copy_args(&self.staging_abi, &args)
+            .map_err(bad_abi)?
+            .kernel_params()
+            .map_err(bad_abi)?;
+        // SAFETY: as `ensure_experts`: every pointer is a live allocation and
+        // `params` matches this kernel's manifest entry.
+        unsafe { self.staging.launch(copy, &mut params, self.stream) }.map_err(driver)
     }
 
     /// Every check the launches need, before anything is allocated: the

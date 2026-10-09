@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
-use crate::infrastructure::kernel_abi::{Abi, Kernel};
+use crate::infrastructure::kernel_abi::{Abi, Kernel, StagingAbi, StagingKernel};
 
 #[derive(Debug, Error)]
 pub enum CudaError {
@@ -644,11 +644,8 @@ impl FunctionTable {
         self.0.push((name, f));
     }
 
-    fn get(&self, kernel: &Kernel) -> Option<CUfunction> {
-        self.0
-            .iter()
-            .find(|(name, _)| *name == kernel.name)
-            .map(|(_, f)| *f)
+    fn get(&self, name: &str) -> Option<CUfunction> {
+        self.0.iter().find(|(n, _)| *n == name).map(|(_, f)| *f)
     }
 }
 
@@ -701,7 +698,7 @@ impl CudaKernels {
 
     pub fn function(&self, kernel: &Kernel) -> Result<CUfunction, CudaError> {
         for (_, table) in &self.loaded {
-            if let Some(f) = table.get(kernel) {
+            if let Some(f) = table.get(kernel.name) {
                 return Ok(f);
             }
         }
@@ -747,6 +744,85 @@ impl CudaKernels {
     }
 }
 
+/// The committed staging cubins (`lru_ensure`, `index_copy`), loaded and ready
+/// to launch. Separate from `CudaKernels` because they are a separate ABI
+/// (decision 46): fixed grids, their own constexprs, no `n`/`block` tile.
+pub struct StagingKernels {
+    driver: Arc<Driver>,
+    abi: StagingAbi,
+    loaded: Vec<(CUmodule, FunctionTable)>,
+}
+
+impl StagingKernels {
+    /// Load every staging kernel from the committed cubins. The driver is
+    /// shared with the grouped kernels so there is one handle per process.
+    pub fn load(driver: Arc<Driver>, abi: StagingAbi) -> Result<Self, CudaError> {
+        let mut loaded = Vec::new();
+        for name in StagingAbi::kernel_names() {
+            let image = crate::infrastructure::kernel_abi::staging_cubin(name)
+                .map_err(|e| CudaError::Driver(format!("cubin: {e}")))?;
+            let module = driver.load_module(image)?;
+            let kernel = abi
+                .kernel(name)
+                .map_err(|e| CudaError::Driver(format!("staging abi: {e}")))?;
+            // SAFETY: `module` was just loaded by `driver`, whose context is
+            // current on this thread.
+            let f = unsafe { driver.function(module, &kernel.entry)? };
+            let mut table = FunctionTable::default();
+            table.push(kernel.name, f);
+            loaded.push((module, table));
+        }
+        Ok(Self {
+            driver,
+            abi,
+            loaded,
+        })
+    }
+
+    pub fn abi(&self) -> &StagingAbi {
+        &self.abi
+    }
+
+    fn function(&self, kernel: &StagingKernel) -> Result<CUfunction, CudaError> {
+        for (_, table) in &self.loaded {
+            if let Some(f) = table.get(kernel.name) {
+                return Ok(f);
+            }
+        }
+        Err(CudaError::Driver(format!(
+            "no loaded function for {}",
+            kernel.name
+        )))
+    }
+
+    /// Launch a staging kernel with its own fixed grid and block shape.
+    ///
+    /// # Safety
+    /// `stream` must belong to the context that is current on this thread, and
+    /// `params` must be the `kernel_abi` pack for this same kernel.
+    pub unsafe fn launch(
+        &self,
+        kernel: &StagingKernel,
+        params: &mut [*mut c_void],
+        stream: CUstream,
+    ) -> Result<(), CudaError> {
+        let f = self.function(kernel)?;
+        // SAFETY: `f` came from this type's own `load`, so it is live in the
+        // driver's current context, and the grid/block come from the cubin's own
+        // manifest entry.
+        unsafe {
+            self.driver.launch(
+                f,
+                (kernel.grid[0], kernel.grid[1], kernel.grid[2]),
+                (kernel.block_threads(), 1, 1),
+                kernel.shared,
+                stream,
+                params,
+            )
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -764,8 +840,8 @@ mod tests {
             table.push(name, (i + 1) as CUfunction);
         }
 
-        let gate_up = table.get(abi.kernel(GEMV_GATE_UP).unwrap());
-        let down = table.get(abi.kernel(GEMV_DOWN).unwrap());
+        let gate_up = table.get(GEMV_GATE_UP);
+        let down = table.get(GEMV_DOWN);
         assert!(gate_up.is_some() && down.is_some());
         assert_ne!(
             gate_up,
@@ -775,22 +851,11 @@ mod tests {
         );
 
         for name in Abi::kernel_names() {
-            let kernel = abi.kernel(name).unwrap();
-            let handle = table.get(kernel).expect(name);
+            let handle = table.get(name).expect(name);
             assert!(!handle.is_null(), "{name} resolved to a null handle");
         }
 
-        let unknown = Kernel {
-            name: "no_such_kernel",
-            entry: abi.kernel(GEMV_DOWN).unwrap().entry.clone(),
-            args: Vec::new(),
-            scratch_params: 0,
-            num_warps: 1,
-            shared: 0,
-            n: 1,
-            block: 1,
-        };
-        assert!(table.get(&unknown).is_none());
+        assert!(table.get("no_such_kernel").is_none());
     }
 
     /// The riskiest part of the FFI is a symbol name that does not exist, and the
