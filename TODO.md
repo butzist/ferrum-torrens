@@ -65,9 +65,13 @@ mirrors `ExpertCache`) and `index_copy_multi` (fused multi-bank copy), both
 fixed-shape, interpreter-tested against the Python oracle, and sm_120
 compile-clean. Next: register them AOT (they are not in the committed manifest
 yet), add the P0 pinned expert host banks, mirror the slot tables to the device,
-and wire `CudaMoE` to drive them. AOT registration is blocked (decision 45): a
-fresh `aot.py` build does not reproduce the committed gemv artifacts, so running
-it would churn the GPU-qualified cubins. Only then warmup + one captured
+and wire `CudaMoE` to drive them. AOT registration is unblocked: decision 45 was
+a false positive (the gemv bytes differ only by the toolchain's `/nix/store`
+path baked into debug info), and `aot.py --check` normalizes store paths, so a
+fresh build reproduces the committed set. The kernel toolchain is hermetic in
+the devShell too: the flake pins numpy and wires `TRITON_PTXAS_*` (commit
+`93b1bdf`), so `kernel-selftest`/`kernel-compile-check`/`kernel-aot` need no
+venv and no hand-exported env. Only then warmup + one captured
 decode step together with the pinned batch-metadata staging P1, per-batch-size
 graphs over a mempool, and a replay-vs-uncaptured gate per batch size. After
 that, M2 (API) proper and the remaining M3 perf items. Last finished: decision
@@ -1312,8 +1316,9 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
           `python/ferrum_kernel/offload.py` (decision 44) and interpreter-gated
           against the Python oracle. **Kernels done; wiring not.** Still to do:
           register them in `signatures.py`/`aot.py` and regenerate
-          `kernel/*.cubin` + `manifest.json` -- blocked on decision 45, which
-          makes a blind `aot.py` run churn the gemv cubins; add the P0 pinned expert host banks
+          `kernel/*.cubin` + `manifest.json` (decision 45 resolved: `aot.py
+          --check` ignores toolchain store paths now, so a rebuild reproduces
+          the committed gemv set); add the P0 pinned expert host banks
           (the host half) and the device slot-table mirror; drive them from
           `CudaMoE` so the ids and the misses never touch the host. The domain
           semantics do not change: LRU, and `-1` routes for the overflow case.
@@ -1520,37 +1525,34 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
       lines / 288 KB cubin, index_copy 3027 / 210 KB). The gated device gates
       are still to be rerun when the wiring lands.
 
-45. **The committed AOT set is not reproducible for the gemv kernels**
-    (2026-10-09) -- blocker for decision 40 prerequisite 4.
+45. **The committed AOT set is not reproducible for the gemv kernels -- a
+    toolchain store-path artifact, not a kernel change** (2026-10-09; resolved
+    same day). Blocker was decision 40 prerequisite 4.
     - **What.** `python -m ferrum_kernel.aot --check` (nixpkgs python 3.14 env,
       triton 3.7.1, the flake's CUDA 12.9 `ptxas`, the same `supported_fp8_dtypes`
-      the AOT build sets) reports `kernel/gemv_gate_up.{cubin,ptx}` and
-      `kernel/gemv_down.{cubin,ptx}` STALE: `silu_mul` and `sum_reduce`
-      reproduce byte for byte, the two NVFP4 gemv builds do not. Reproduced on
-      the parent commit `34982bd` in a clean `git worktree`, so it predates the
-      staging-kernel port and is not an import side effect of decision 44.
-    - **Why it blocks.** `aot.py` rebuilds every kernel and writes them all, and
-      its `--check` compares the whole set. Registering the two staging kernels
-      (so the Rust ABI can launch them) therefore requires running `aot.py`,
-      which would overwrite the gemv cubins/PTX that the real-hardware gates
-      were qualified against, with a build that is not known to be the original
-      one. AGENTS.md says not to touch `kernel/*` unless the kernel itself
-      changes; this is an environment mismatch, not a kernel change.
-    - **Suspect.** The gemv PTX differs, and PTX is emitted by libtriton before
-      `ptxas`, so the mismatch is in the triton build (or in an option the
-      committed build set) rather than in the substituted assembler. The
-      committed manifest records `"triton": "3.7.1"`, the same version the nix
-      env reports.
-    - **Options for the next session.** (a) find and pin the exact libtriton
-      build the committed PTX came from (a flake-lock revision lookup), then
-      `aot.py` reproduces everything and registration is a normal edit;
-      (b) teach `aot.py` to build and merge only a named subset, leaving the
-      existing artifacts untouched, and commit the two staging cubins alongside.
-      (b) is a toolchain change and should be an explicit decision, not a
-      side effect.
-    - **Unaffected.** Nothing currently on the serving path changes: the
-      committed four cubins are untouched, `cargo test` is green, and the
-      staging kernels are CPU-gated (interpreter + sm_120 compile check) only.
+      the AOT build sets) reported `kernel/gemv_gate_up.{cubin,ptx}` and
+      `kernel/gemv_down.{cubin,ptx}` STALE while `silu_mul`/`sum_reduce`
+      reproduced byte for byte. Reproduced on the parent commit `34982bd` in a
+      clean worktree, so it predates the staging-kernel port.
+    - **Root cause.** Triton bakes absolute source paths into the PTX `.file`
+      directives and the cubin debug info, including the nix store path of the
+      python env it ran in. The committed set was built in a
+      `...-python3-3.14.7-env` closure with store hash `m5frb6...`; the box's
+      current closure is `dmnxr5...`. Same triton version, same codegen, same
+      cubin length and real code bytes -- only the embedded store path differs,
+      so a *rebuilt* closure looked like a kernel edit. Confirmed by normalizing
+      the store path: all four kernels then compare equal, and there is no
+      flake-lock/triton bump to chase (the lock never moved).
+    - **Fix.** `aot.py` now normalizes `/nix/store/<hash>-<name>` to a placeholder
+      on both sides of the `stale()` comparison, over bytes so it covers both the
+      cubin debug info and the PTX. A real kernel edit still fails the check,
+      because the comparison keys on code, not on where the toolchain lives.
+      `aot.py --check` is green again and no committed artifact was rewritten.
+    - **Follow-up.** Registering the decision-44 staging kernels in
+      `signatures.py`/`aot.py` and rebuilding is now a normal edit; the gemv
+      cubins reproduce, so the GPU-qualified set is not churned. The `kernel-aot`
+      devShell alias is self-contained because the flake pins numpy and wires
+      `TRITON_PTXAS_*` (commit `93b1bdf`).
 
 ### Config defaults for the RTX 5060 / 8 GB target
 

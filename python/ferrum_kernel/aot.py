@@ -95,6 +95,19 @@ KERNELS: dict[str, dict] = {
     },
 }
 
+# Triton bakes absolute source paths into the PTX `.file` directives and the
+# cubin debug info -- including the nix store path of the python env it ran in.
+# A rebuilt-but-identical closure gets a different store hash, so two builds of
+# the same kernel differ in those bytes even though the codegen is identical.
+# Normalize store paths away before comparing, or `--check` would call a healthy
+# set stale on any box whose toolchain closure was rebuilt (TODO.md decision 45).
+_STORE_PATH = re.compile(rb"/nix/store/[a-z0-9]{32}-[^/\x00]+")
+
+
+def _norm(blob: bytes) -> bytes:
+    return _STORE_PATH.sub(b"/nix/store/<store>", blob)
+
+
 # `.param .u64 .ptr .global .align 1 f_param_0`: the arg kind is the type, the
 # pointer-ness is the address space, and the name is triton positional. Only the
 # kind matters to a launcher, so record that.
@@ -215,11 +228,11 @@ def stale(art: Artifacts) -> list[pathlib.Path]:
         for suffix, fresh in (("cubin", cubin), ("ptx", art.ptxs[name].encode())):
             path = OUT_DIR / f"{name}.{suffix}"
             have = path.read_bytes() if path.exists() else b""
-            if have != fresh:
+            if _norm(have) != _norm(fresh):
                 out.append(path)
     manifest = OUT_DIR / "manifest.json"
     have = manifest.read_bytes() if manifest.exists() else b""
-    if have != art.manifest.encode():
+    if _norm(have) != _norm(art.manifest.encode()):
         out.append(manifest)
     return out
 
