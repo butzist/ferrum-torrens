@@ -81,6 +81,10 @@
         pythonEnv = pkgs.python3.withPackages (ps: [
           ps.torch
           ps.triton
+          # triton's interpreter (the `--interp` selftest) and torch's dtype
+          # interop import numpy; it is a real toolchain dependency, so it is
+          # pinned here instead of failing at run time.
+          ps.numpy
         ]);
 
         # Rust is the production language, and the only one at runtime. Python
@@ -178,10 +182,18 @@
             # skip the ldconfig probe; point it at the driver mount, where the
             # jail puts libcuda.so.1. Same directory as below.
             export TRITON_LIBCUDA_PATH=/run/opengl-driver/lib
+            # sm_100+/sm_120 codegen wants a `ptxas-blackwell`; nixpkgs' triton
+            # ships no bundled assembler and the wheel's manylinux `ptxas` has no
+            # working ELF interpreter here, so point triton at the cudatoolkit's
+            # ptxas (CUDA 12.9 assembles sm_120). Without this, `kernel-aot` and
+            # `kernel-compile-check` die with "Cannot find ptxas-blackwell" and
+            # only work behind a hand-exported env.
+            export TRITON_PTXAS_PATH="${pkgs.cudatoolkit}/bin/ptxas"
+            export TRITON_PTXAS_BLACKWELL_PATH="${pkgs.cudatoolkit}/bin/ptxas"
             # torch from FreeToken/.venv is a manylinux wheel whose RPATH points
             # at paths that do not exist here, so importing it (from the venv's
-            # python, which is what the kernel toolchain and the FTW conversion
-            # use) dies with "libstdc++.so.6: cannot open shared object file" unless a
+            # python, which only the FTW conversion uses) dies with
+            # "libstdc++.so.6: cannot open shared object file" unless a
             # matching one is on the loader path. Nix never puts it there. Ask the
             # compiler which one it ships and prepend it; the driver mount comes
             # from the jail's gpu combinator and has no store path to name.

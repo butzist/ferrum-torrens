@@ -135,18 +135,27 @@ Instructions for AI coding agents working in this repository.
   cannot run them; hand them to a devshell run. Run a gated test with
   `... -- --ignored --nocapture 2>&1 | tee log`: cargo captures a failing test's
   panic text on stderr, so a plain `| tee` log reads as an empty failure.
-- Kernel work has a CPU inner loop, no GPU needed (TODO.md decision 31):
-  `PYTHONPATH=python FreeToken/.venv/bin/python -m ferrum_kernel.selftest --interp`
-  runs the real Triton kernels through triton's interpreter on CPU tensors and
-  compares them against the torch reference, and
-  `... -m ferrum_kernel.compile_check` checks they still compile for sm_120.
-  Both need the loader path above on `LD_LIBRARY_PATH`, and the devShell runs
-  them through the `kernel-selftest` and `kernel-compile-check` aliases. Use
-  `--interp` before running the gated
+- Kernel work has a CPU inner loop, no GPU needed (TODO.md decision 31), and it
+  is **hermetic in the devShell**. The flake's `pythonEnv` is torch + triton +
+  numpy, and its `shellHook` wires triton to the cudatoolkit's `ptxas`
+  (`TRITON_PTXAS_PATH` / `TRITON_PTXAS_BLACKWELL_PATH`): nixpkgs' triton ships no
+  sm_120 assembler and the wheel's manylinux `ptxas` has no working ELF
+  interpreter here. Use the aliases, which need no hand-exported env beyond the
+  devShell itself:
+  - `kernel-selftest` = `python -m ferrum_kernel.selftest --interp` -- runs the
+    real Triton kernels through triton's interpreter on CPU tensors and compares
+    them against the torch reference.
+  - `kernel-compile-check` = `python -m ferrum_kernel.compile_check` -- checks
+    they still compile for sm_120.
+  - `kernel-aot` = `python -m ferrum_kernel.aot` -- rebuilds `kernel/*.cubin` and
+    `kernel/*.ptx`. Those artifacts are committed, so only touch them when the
+    kernel itself changes, and note that a full rebuild currently churns the
+    gemv artifacts (TODO.md decision 45).
+  Do **not** run the kernel toolchain out of `FreeToken/.venv`: that environment
+  is only for the FTW conversion (decision 35) and carries a different
+  torch/triton. Use `--interp` before running the gated
   `tests/cuda_moe_matches_reference.rs`, which is the real-hardware gate for the
-  same kernels. `kernel-aot` rebuilds `kernel/*.cubin` and `kernel/*.ptx` from the
-  Triton sources; those artifacts are committed, so only touch them when the
-  kernel itself changes.
+  same kernels.
 
 ## Commits
 
