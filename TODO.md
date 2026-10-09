@@ -65,7 +65,9 @@ mirrors `ExpertCache`) and `index_copy_multi` (fused multi-bank copy), both
 fixed-shape, interpreter-tested against the Python oracle, and sm_120
 compile-clean. Next: register them AOT (they are not in the committed manifest
 yet), add the P0 pinned expert host banks, mirror the slot tables to the device,
-and wire `CudaMoE` to drive them -- and only then warmup + one captured
+and wire `CudaMoE` to drive them. AOT registration is blocked (decision 45): a
+fresh `aot.py` build does not reproduce the committed gemv artifacts, so running
+it would churn the GPU-qualified cubins. Only then warmup + one captured
 decode step together with the pinned batch-metadata staging P1, per-batch-size
 graphs over a mempool, and a replay-vs-uncaptured gate per batch size. After
 that, M2 (API) proper and the remaining M3 perf items. Last finished: decision
@@ -1310,7 +1312,8 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
           `python/ferrum_kernel/offload.py` (decision 44) and interpreter-gated
           against the Python oracle. **Kernels done; wiring not.** Still to do:
           register them in `signatures.py`/`aot.py` and regenerate
-          `kernel/*.cubin` + `manifest.json`; add the P0 pinned expert host banks
+          `kernel/*.cubin` + `manifest.json` -- blocked on decision 45, which
+          makes a blind `aot.py` run churn the gemv cubins; add the P0 pinned expert host banks
           (the host half) and the device slot-table mirror; drive them from
           `CudaMoE` so the ids and the misses never touch the host. The domain
           semantics do not change: LRU, and `-1` routes for the overflow case.
@@ -1516,6 +1519,38 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
       PASS (8 LRU cases + copy); `compile_check.py` PASS (lru_ensure 6169 PTX
       lines / 288 KB cubin, index_copy 3027 / 210 KB). The gated device gates
       are still to be rerun when the wiring lands.
+
+45. **The committed AOT set is not reproducible for the gemv kernels**
+    (2026-10-09) -- blocker for decision 40 prerequisite 4.
+    - **What.** `python -m ferrum_kernel.aot --check` (nixpkgs python 3.14 env,
+      triton 3.7.1, the flake's CUDA 12.9 `ptxas`, the same `supported_fp8_dtypes`
+      the AOT build sets) reports `kernel/gemv_gate_up.{cubin,ptx}` and
+      `kernel/gemv_down.{cubin,ptx}` STALE: `silu_mul` and `sum_reduce`
+      reproduce byte for byte, the two NVFP4 gemv builds do not. Reproduced on
+      the parent commit `34982bd` in a clean `git worktree`, so it predates the
+      staging-kernel port and is not an import side effect of decision 44.
+    - **Why it blocks.** `aot.py` rebuilds every kernel and writes them all, and
+      its `--check` compares the whole set. Registering the two staging kernels
+      (so the Rust ABI can launch them) therefore requires running `aot.py`,
+      which would overwrite the gemv cubins/PTX that the real-hardware gates
+      were qualified against, with a build that is not known to be the original
+      one. AGENTS.md says not to touch `kernel/*` unless the kernel itself
+      changes; this is an environment mismatch, not a kernel change.
+    - **Suspect.** The gemv PTX differs, and PTX is emitted by libtriton before
+      `ptxas`, so the mismatch is in the triton build (or in an option the
+      committed build set) rather than in the substituted assembler. The
+      committed manifest records `"triton": "3.7.1"`, the same version the nix
+      env reports.
+    - **Options for the next session.** (a) find and pin the exact libtriton
+      build the committed PTX came from (a flake-lock revision lookup), then
+      `aot.py` reproduces everything and registration is a normal edit;
+      (b) teach `aot.py` to build and merge only a named subset, leaving the
+      existing artifacts untouched, and commit the two staging cubins alongside.
+      (b) is a toolchain change and should be an explicit decision, not a
+      side effect.
+    - **Unaffected.** Nothing currently on the serving path changes: the
+      committed four cubins are untouched, `cargo test` is green, and the
+      staging kernels are CPU-gated (interpreter + sm_120 compile check) only.
 
 ### Config defaults for the RTX 5060 / 8 GB target
 
