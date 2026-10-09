@@ -13,6 +13,7 @@ baked into the cubin rather than passed at launch.
 from __future__ import annotations
 
 from .nvfp4_moe import DECODE_BLOCK_KB, DECODE_BLOCK_N
+from .offload import COPY_BLOCK_BYTES, COPY_GROUPS, USAGE_MAX
 
 # One hidden size and one intermediate size in a serving checkpoint; both are
 # constexpr trip counts, so the committed cubins are shape-specialized and the
@@ -89,6 +90,43 @@ def reduce(dtype: str = SERVING_DTYPE) -> dict:
     }
 
 
+def lru_ensure() -> dict:
+    """Device LRU admission (TODO.md decision 40 prerequisite 4)."""
+    return {
+        "experts_ptr": "*i32",
+        "slot_for_id_ptr": "*i32",
+        "id_of_slot_ptr": "*i32",
+        "usage_ptr": "*i64",
+        "step_ptr": "*i64",
+        "misses_ptr": "*i32",
+        "slots_ptr": "*i32",
+        "num_ptr": "*i64",
+        "K": "i32",
+        "num_cached": "i32",
+        "id_base": "i32",
+        "BLOCK_K": "constexpr",
+        "BLOCK_C": "constexpr",
+        "SLOT_BITS": "constexpr",
+        "USAGE_MAX": "constexpr",
+    }
+
+
+def index_copy() -> dict:
+    """Fused multi-bank host->slot copy (TODO.md decision 40 prerequisite 4)."""
+    return {
+        "dst_ptrs": "*i64",
+        "src_ptrs": "*i64",
+        "feat_bytes": "*i64",
+        "dst_idx": "*i32",
+        "src_idx": "*i32",
+        "num_ptr": "*i64",
+        "NUM_BANKS": "constexpr",
+        "GROUPS": "constexpr",
+        "STEPS": "constexpr",
+        "BLOCK_BYTES": "constexpr",
+    }
+
+
 def gate_up_constexprs() -> dict:
     """`x[token] @ gate_up^T`, one row per route, no route weight applied."""
     return {
@@ -117,3 +155,30 @@ def silu_constexprs() -> dict:
 
 def reduce_constexprs() -> dict:
     return {"top_k": SERVING_TOP_K, "BLOCK_N": DECODE_BLOCK_N}
+
+
+# One decode step's routed set: batch*top_k. The staging pair is only captured
+# on the decode path, so this is the pinned `BLOCK_K`. `BLOCK_C` is the slot
+# cache ceiling and `SLOT_BITS` its log2; both land in the manifest (decision
+# 40 prerequisite 4).
+SERVING_BLOCK_K = 128
+SERVING_CACHE_SLOTS = 512
+SERVING_BLOCK_C = 512
+
+
+def lru_constexprs() -> dict:
+    return {
+        "BLOCK_K": SERVING_BLOCK_K,
+        "BLOCK_C": SERVING_BLOCK_C,
+        "SLOT_BITS": SERVING_BLOCK_C.bit_length() - 1,
+        "USAGE_MAX": USAGE_MAX,
+    }
+
+
+def index_copy_constexprs(num_banks: int = 6, steps: int = 64) -> dict:
+    return {
+        "NUM_BANKS": num_banks,
+        "GROUPS": COPY_GROUPS,
+        "STEPS": steps,
+        "BLOCK_BYTES": COPY_BLOCK_BYTES,
+    }

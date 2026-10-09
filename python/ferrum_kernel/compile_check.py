@@ -32,7 +32,11 @@ from .nvfp4_moe import (
     _silu_mul_kernel,
     _sum_reduce_kernel,
 )
+from .offload import _ensure_experts_kernel, _index_copy_multi_kernel
 from .signatures import gemv as _gemv_sig
+from .signatures import index_copy as _index_copy_sig
+from .signatures import index_copy_constexprs, lru_constexprs
+from .signatures import lru_ensure as _lru_sig
 from .signatures import reduce as _reduce_sig
 from .signatures import silu as _silu_sig
 
@@ -88,6 +92,17 @@ def main() -> int:
     except Exception as e:  # noqa: BLE001
         failures += 1
         print(f"sum_reduce FAILED: {type(e).__name__}: {str(e)[:200]}")
+    # The staging pair from TODO.md decision 40 prerequisite 4.
+    try:
+        check("lru_ensure", _ensure_experts_kernel, _lru_sig(), lru_constexprs())
+    except Exception as e:  # noqa: BLE001
+        failures += 1
+        print(f"lru_ensure FAILED: {type(e).__name__}: {str(e)[:200]}")
+    try:
+        check("index_copy", _index_copy_multi_kernel, _index_copy_sig(), index_copy_constexprs())
+    except Exception as e:  # noqa: BLE001
+        failures += 1
+        print(f"index_copy FAILED: {type(e).__name__}: {str(e)[:200]}")
     print("FAIL" if failures else "PASS")
     return 1 if failures else 0
 

@@ -58,11 +58,18 @@ re-stage. Prerequisite 3 is done too (decision 43): the layer boundary is a
 device hand-off -- `routed_via_port` no longer converts a tensor to talk to the
 port (`MoEExecutor::execute_device` over the `MoETensor` port), so the
 activations, the ids and the weights stay on the device and the routed sum
-comes back as one. Next: the two
-device-side staging kernels FreeToken uses, and only then warmup + one captured
+comes back as one. The two
+device-side staging kernels FreeToken uses are ported to
+`python/ferrum_kernel/offload.py` (decision 44): `ensure_experts` (device LRU,
+mirrors `ExpertCache`) and `index_copy_multi` (fused multi-bank copy), both
+fixed-shape, interpreter-tested against the Python oracle, and sm_120
+compile-clean. Next: register them AOT (they are not in the committed manifest
+yet), add the P0 pinned expert host banks, mirror the slot tables to the device,
+and wire `CudaMoE` to drive them -- and only then warmup + one captured
 decode step together with the pinned batch-metadata staging P1, per-batch-size
 graphs over a mempool, and a replay-vs-uncaptured gate per batch size. After
 that, M2 (API) proper and the remaining M3 perf items. Last finished: decision
+44 (the device-side staging-kernel port), decision
 43 (the device-resident MoE hand-off), decision
 42 (stable bank addresses, cross-layer LRU), the P0
 resident dense weights (decision 41), decision 40 (the MoE-in-graph shape), decision 30 (the pyo3 exit), decision 37
@@ -538,6 +545,7 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 ### MoE offload cache
 - [x] P0 flat id space `layer*num_experts + expert`; tables `slot_for_id[L*E]` (-1 free), `id_of_slot[C]`, `usage[C]` step clock. (`domain/expert_cache.rs`)
 - [x] P0 `ensure_experts` (LRU): rewrite routed ids -> slot ids in place; emit miss list; LRU victim = argmin(usage) with same-step owner protection (an expert used earlier in this step may not be evicted).
+- [x] P0 device-side staging kernels ported to `python/ferrum_kernel/offload.py` (`ensure_experts` LRU + `index_copy_multi` fused multi-bank copy, fixed-shape, decision 44); Python oracle compared in `selftest.py --interp`, sm_120 compile check green. Remaining prerequisite-4 work: AOT registration, the Rust pinned-host-bank/device-slot-table mirror, and `CudaMoE` wiring.
 - [ ] P0 `copy_missing`: fused copy of all banks' missed rows on the compute stream (serial per step). Moves up next: the Triton adapter needs a device slot cache to read from (M3 kernel part 2, decision 24).
 - [ ] P0 prefill: `materialize_layer` per-layer full stream; `prefill_overlap` two-buffer (copy stream + ready/release events, layer+1 prefetch) guarded by `cache_size >= 2*E`.
 - [x] P0 `cache_size_slots` explicit from config; floor `>= num_experts`. (floor enforced in `application::engine::load_engine`)
@@ -1298,10 +1306,14 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
           so the host cannot plan layer `l`'s misses before a single replay.
           FreeToken does it with fixed-shape device-side kernels over a device
           alias of pinned host banks (`moe/offload_cache.py`: `ensure_experts` +
-          `fast_index_copy_multi`); port those two into `python/ferrum_kernel/`
-          (the P0 "pinned expert host banks" box is the host half) and mirror
-          the slot tables to the device. The domain semantics do not change:
-          LRU, and `-1` routes for the overflow case.
+          `fast_index_copy_multi`); both are ported to
+          `python/ferrum_kernel/offload.py` (decision 44) and interpreter-gated
+          against the Python oracle. **Kernels done; wiring not.** Still to do:
+          register them in `signatures.py`/`aot.py` and regenerate
+          `kernel/*.cubin` + `manifest.json`; add the P0 pinned expert host banks
+          (the host half) and the device slot-table mirror; drive them from
+          `CudaMoE` so the ids and the misses never touch the host. The domain
+          semantics do not change: LRU, and `-1` routes for the overflow case.
        5. Then capture itself, unchanged from the checklist: warmup plus one
           captured step with the pinned batch-metadata staging P1, per-batch-size
           executables over a mempool, replay-vs-uncaptured gate per batch size.
@@ -1449,6 +1461,61 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
       (" Paris", 23.6 s).
     - **Tests:** `cargo test` 234, `--features cuda` 294, `fmt`/`clippy` clean
       with and without the feature.
+
+44. **The staging kernels are ported before the AOT/manifest wiring**
+    (2026-10-09) -- decision 40 prerequisite 4, kernel half.
+    - **What changed.** `python/ferrum_kernel/offload.py` now authors the two
+      device kernels FreeToken uses: `_ensure_experts_kernel` (LRU admission) and
+      `_index_copy_multi_kernel` (fused multi-bank host->slot copy), with
+      `ensure_experts`/`index_copy_multi` launchers and Python references that
+      mirror `domain::expert_cache::ExpertCache` term for term. `signatures.py`
+      gains `lru_ensure`/`index_copy` + their constexpr pins, `compile_check.py`
+      compiles both for sm_120, and `selftest.py --interp` adds an
+      `offload` block that replays the `expert_cache.rs` unit cases through the
+      kernel and asserts the rewritten routes, the miss/slot plan, the tables
+      and the step all match the Python oracle. They are **not** in the AOT
+      manifest yet and nothing in the engine calls them; AOT registration, the
+      pinned host banks and the device slot-table mirror are the next slice.
+    - **Fixed shape by construction.** A captured launch cannot have a grid or
+      argument list that depends on the data, so the LRU kernel's only
+      per-step-varying inputs are `K` and the device-resident `num_missing`;
+      `BLOCK_K`/`BLOCK_C` are constexpr, the plan cap is `cache_size`, and the
+      copy kernel derives `STEPS` at launch from the plan cap and the largest
+      bank. Both are single-CTA/small-grid and read back nothing.
+    - **Victim selection is a sort, not a loop.** `ExpertCache::pick_victim` is a
+      sequential `argmin(usage, slot)` that then claims the slot. Because
+      `(usage, slot)` is packed into a distinct int64
+      (`usage << SLOT_BITS | slot`) and slots touched this step are pushed to a
+      sentinel, the sequence of argmins is exactly the ascending sort, so one
+      `tl.sort` replaces a dynamic install loop. The sentinel must satisfy
+      `USAGE_MAX << SLOT_BITS < 2**63` or the shifted key wraps negative and a
+      step-touched slot sorts first -- caught on the box, now `USAGE_MAX = 2**55-1`.
+    - **Rewrites come from the final table.** FreeToken's `_seq` rewrites from
+      the victim chosen at install time; `ExpertCache` rewrites from
+      `slot_for_id` after every install. The two differ only when the same step
+      evicts an expert it just installed, which needs `cache_size < num_experts`
+      -- below the engine floor and unreachable on the supported path. The
+      kernel gathers the final table so it matches the Rust oracle exactly, not
+      just in-regime.
+    - **`id_of_slot` holds flat ids.** The tables are shared across layers, so a
+      victim may hold another layer's expert; `id_of_slot` is `layer*E+expert`
+      and is used directly to clear `slot_for_id`. The miss list stays
+      layer-local because that is what the FTW bank reader indexes.
+    - **Interpreter constraints the kernels had to respect.** Triton's
+      interpreter rejects Python `range`/`tl.range` with tensor bounds
+      (decision 26), so the copy kernel uses a constexpr `STEPS` loop with
+      runtime masks instead of a device-length loop; scalar address arguments
+      must be cast with `.to(tl.pointer_type(tl.uint8))`; and the loop is
+      `tl.range`, not `tl.static_range` -- the latter unrolled 64 steps into a
+      12.5 MB cubin, the former is 210 KB.
+    - **Pins (provisional).** `SERVING_BLOCK_K = 128`, `SERVING_CACHE_SLOTS =
+      512`, `SLOT_BITS = 9`. These are compile-check values until the AOT slice
+      lands; the config default is 256 slots and the batch size is not frozen
+      yet.
+    - **Tests:** `cargo test` 234, `fmt`/`clippy` clean; `selftest.py --interp`
+      PASS (8 LRU cases + copy); `compile_check.py` PASS (lru_ensure 6169 PTX
+      lines / 288 KB cubin, index_copy 3027 / 210 KB). The gated device gates
+      are still to be rerun when the wiring lands.
 
 ### Config defaults for the RTX 5060 / 8 GB target
 

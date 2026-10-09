@@ -19,6 +19,7 @@ import sys
 
 import torch
 
+from . import offload as off
 from .nvfp4_moe import _check_constexprs, grouped_moe, require_native_e4m3
 
 E4M1_LUT = torch.tensor(
@@ -98,6 +99,96 @@ def random_case(device: str, tokens: int = 3, hidden: int = 64, inter: int = 32,
     return x, gu, dn, slot, token, weight
 
 
+def _offload_case(device: torch.device, num_layers: int, num_experts: int, cache_size: int, calls) -> None:
+    """Run the kernel and the Python oracle over the same call sequence and
+    compare every output the Rust `ExpertCache` test asserts on."""
+    slot_for_id = torch.full((num_layers * num_experts,), -1, dtype=torch.int32, device=device)
+    id_of_slot = torch.full((cache_size,), -1, dtype=torch.int32, device=device)
+    usage = torch.zeros((cache_size,), dtype=torch.int64, device=device)
+    step = torch.zeros((), dtype=torch.int64, device=device)
+
+    ref_slot = slot_for_id.tolist()
+    ref_ids = id_of_slot.tolist()
+    ref_use = usage.tolist()
+    ref_step = 0
+    for layer, routed in calls:
+        experts = torch.tensor(routed, dtype=torch.int32, device=device)
+        num = torch.zeros((1,), dtype=torch.int64, device=device)
+        misses = torch.zeros((cache_size,), dtype=torch.int32, device=device)
+        slots = torch.zeros((cache_size,), dtype=torch.int32, device=device)
+        id_base = layer * num_experts
+        off.ensure_experts(experts, slot_for_id, id_of_slot, usage, step, num, misses, slots, id_base, cache_size)
+        ref_step, ref_misses, ref_slots, ref_rewrites = off.ensure_experts_reference(
+            list(routed), ref_slot, ref_ids, ref_use, ref_step, id_base
+        )
+        n = int(num[0])
+        assert experts.tolist() == ref_rewrites, (experts.tolist(), ref_rewrites)
+        assert n == len(ref_misses), (n, ref_misses)
+        assert misses.tolist()[:n] == ref_misses, (misses.tolist()[:n], ref_misses)
+        assert slots.tolist()[:n] == ref_slots, (slots.tolist()[:n], ref_slots)
+        assert slot_for_id.tolist() == ref_slot
+        assert id_of_slot.tolist() == ref_ids
+        assert usage.tolist() == ref_use
+        assert int(step) == ref_step
+
+
+def check_offload(device: torch.device) -> int:
+    """Mirror the `domain::expert_cache` unit tests through the device kernel."""
+    cases = [
+        ("fill-lowest", 2, 4, 8, [(0, [2, 0])]),
+        ("hits-noop", 1, 4, 8, [(0, [1, 3]), (0, [3, 1, 3])]),
+        ("floor-no-miss", 1, 6, 6, [(0, [0, 1, 2, 3, 4, 5]), (0, [5, 2, 0])]),
+        ("lru-victim", 1, 8, 6, [(0, [0, 1, 2, 3, 4, 5]), (0, [5, 0]), (0, [6])]),
+        ("same-step", 1, 8, 6, [(0, [0, 1, 2, 3, 4, 5]), (0, [0, 1]), (0, [6, 7])]),
+        ("flat-ids", 2, 4, 8, [(0, [0]), (1, [0, 0]), (1, [1, 2, 3])]),
+        ("cross-layer", 3, 4, 4, [(0, [1, 3]), (1, [0, 2]), (0, [1, 3]), (2, [0])]),
+        ("duplicates", 1, 4, 8, [(0, [2, 2, 2])]),
+    ]
+    failures = 0
+    for name, layers, experts, slots, calls in cases:
+        try:
+            _offload_case(device, layers, experts, slots, calls)
+            print(f"offload lru {name}: ok")
+        except AssertionError as e:
+            failures += 1
+            print(f"offload lru {name}: FAIL {e}", file=sys.stderr)
+
+    # Fused multi-bank copy: three banks of different row widths, a permutation
+    # of rows, driven entirely by the device-resident count.
+    g = torch.Generator().manual_seed(1)
+    dst_rows, src_rows, dst_ptrs, src_ptrs, feats = [], [], [], [], []
+    for b in range(3):
+        feat = 64 * (b + 1)
+        feats.append(feat)
+        src = torch.randint(0, 256, (6, feat), generator=g, dtype=torch.uint8, device=device)
+        dst = torch.zeros((8, feat), dtype=torch.uint8, device=device)
+        src_rows.append(src)
+        dst_rows.append(dst)
+        src_ptrs.append(src.data_ptr())
+        dst_ptrs.append(dst.data_ptr())
+    src_idx = torch.tensor([5, 0, 3], dtype=torch.int32, device=device)
+    dst_idx = torch.tensor([1, 6, 2], dtype=torch.int32, device=device)
+    num = torch.tensor([3], dtype=torch.int64, device=device)
+    off.index_copy_multi(
+        torch.tensor(dst_ptrs, dtype=torch.int64, device=device),
+        torch.tensor(src_ptrs, dtype=torch.int64, device=device),
+        torch.tensor(feats, dtype=torch.int64, device=device),
+        dst_idx,
+        src_idx,
+        num,
+        plan_cap=8,
+    )
+    ok = all(
+        torch.equal(dst[dst_idx[i]], src[src_idx[i]])
+        for dst, src in zip(dst_rows, src_rows)
+        for i in range(3)
+    )
+    print("offload copy: " + ("ok" if ok else "FAIL"))
+    if not ok:
+        failures += 1
+    return failures
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--device", default="cpu")
@@ -154,6 +245,13 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
     if args.device == "cpu" and not args.interp_child:
         print("no cuda device requested: kernel comparison skipped")
+        print("PASS")
+        return 0
+
+    offload_failures = check_offload(torch.device(args.device))
+    if offload_failures:
+        print("FAIL", file=sys.stderr)
+        return 1
     print("PASS")
     return 0
 
