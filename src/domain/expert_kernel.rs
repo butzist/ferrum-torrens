@@ -29,6 +29,76 @@ pub enum Part {
     Down,
 }
 
+/// The three NVFP4 fields of one expert half, in the order the copy kernel and
+/// the FTW index spell them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Field {
+    Packed,
+    Scale,
+    Global,
+}
+
+/// The six expert-bank families of the offload cache. This order is a
+/// cross-adapter contract: `index_copy`'s `src_ptrs`/`dst_ptrs` and
+/// `CudaMoE::bank_ptrs` both index it, and the copy cubin bakes `NUM_BANKS = 6`
+/// at compile time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bank {
+    GateUpPacked,
+    GateUpScale,
+    GateUpGlobal,
+    DownPacked,
+    DownScale,
+    DownGlobal,
+}
+
+/// Every bank, in the order the copy kernel and the device cache index them:
+/// gate_up then down, packed/scale/global within each.
+pub const BANKS: [Bank; 6] = [
+    Bank::GateUpPacked,
+    Bank::GateUpScale,
+    Bank::GateUpGlobal,
+    Bank::DownPacked,
+    Bank::DownScale,
+    Bank::DownGlobal,
+];
+
+impl Bank {
+    pub fn part(self) -> Part {
+        match self {
+            Bank::GateUpPacked | Bank::GateUpScale | Bank::GateUpGlobal => Part::GateUp,
+            Bank::DownPacked | Bank::DownScale | Bank::DownGlobal => Part::Down,
+        }
+    }
+
+    pub fn field(self) -> Field {
+        match self {
+            Bank::GateUpPacked | Bank::DownPacked => Field::Packed,
+            Bank::GateUpScale | Bank::DownScale => Field::Scale,
+            Bank::GateUpGlobal | Bank::DownGlobal => Field::Global,
+        }
+    }
+}
+
+/// One page-locked host bank, as the copy kernel sees it: `addr` is the
+/// device-visible base (the allocation is mapped into device space), `row_bytes`
+/// the pitch between experts, and `rows` every expert of every layer the source
+/// holds. `src_idx` is therefore a flat `layer * experts + expert`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PinnedBank {
+    pub addr: u64,
+    pub row_bytes: usize,
+    pub rows: usize,
+}
+
+/// The pinned host side of the offload cache: the six device-visible bank
+/// regions the copy kernel reads a miss from. Filled once from the FTW
+/// checkpoint and kept for the life of the engine, so a captured graph's copy
+/// node always reads the same addresses (decision 40 prerequisite 4).
+pub trait PinnedBankSource: Send + Sync {
+    fn banks(&self) -> Result<[PinnedBank; BANKS.len()], MoEError>;
+}
+
 /// One expert slab's bytes, already sliced to that expert's rows (decision 23
 /// layouts): `packed [rows, cols/2]` u8 with the low nibble holding the even
 /// k, `scale [rows, cols/16]` e4m3fn, `global [rows]` f16.
@@ -97,6 +167,19 @@ impl ExpertShapes {
         match part {
             Part::GateUp => (self.gate_up_rows(), self.hidden),
             Part::Down => (self.hidden, self.inter),
+        }
+    }
+
+    /// Bytes of one expert's row in `bank`, the copy kernel's `feat_bytes` and
+    /// the pitch the device banks are written at. The three NVFP4 fields pack
+    /// differently: `packed` holds two k per byte, `scale` one e4m3 per 16, and
+    /// `global` one f16 per row.
+    pub fn bank_row_bytes(self, bank: Bank) -> usize {
+        let (rows, cols) = self.slab_shape(bank.part());
+        match bank.field() {
+            Field::Packed => rows * cols / 2,
+            Field::Scale => rows * cols / 16,
+            Field::Global => rows * 2,
         }
     }
 }
@@ -439,6 +522,36 @@ mod tests {
         let s = ExpertShapes::new(1024, 512).unwrap();
         assert_eq!(s.slab_shape(Part::GateUp), (1024, 1024));
         assert_eq!(s.slab_shape(Part::Down), (1024, 512));
+    }
+
+    #[test]
+    fn the_bank_order_covers_both_parts_and_all_three_fields() {
+        assert_eq!(
+            BANKS.map(|b| (b.part(), b.field())),
+            [
+                (Part::GateUp, Field::Packed),
+                (Part::GateUp, Field::Scale),
+                (Part::GateUp, Field::Global),
+                (Part::Down, Field::Packed),
+                (Part::Down, Field::Scale),
+                (Part::Down, Field::Global),
+            ]
+        );
+    }
+
+    #[test]
+    fn bank_row_bytes_matches_the_nvfp4_field_packing() {
+        let s = ExpertShapes::new(2048, 512).unwrap();
+        // gate_up is [2*inter=1024, hidden=2048], down is [hidden=2048, inter=512].
+        assert_eq!(s.bank_row_bytes(Bank::GateUpPacked), 1024 * 2048 / 2);
+        assert_eq!(s.bank_row_bytes(Bank::GateUpScale), 1024 * 2048 / 16);
+        assert_eq!(s.bank_row_bytes(Bank::GateUpGlobal), 1024 * 2);
+        assert_eq!(s.bank_row_bytes(Bank::DownPacked), 2048 * 512 / 2);
+        assert_eq!(s.bank_row_bytes(Bank::DownScale), 2048 * 512 / 16);
+        assert_eq!(s.bank_row_bytes(Bank::DownGlobal), 2048 * 2);
+        // The FTW `gate_up_packed#L*` bank is [experts, 1024, 1024]: one expert
+        // row is 1 MiB, the number the copy's STEPS was derived from.
+        assert_eq!(s.bank_row_bytes(Bank::GateUpPacked), 1024 * 1024);
     }
 
     const H: usize = 16;

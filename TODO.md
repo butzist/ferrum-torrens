@@ -66,8 +66,10 @@ fixed-shape, interpreter-tested against the Python oracle, and sm_120
 compile-clean. They are now AOT-registered in their own manifest section (decision
 46): `kernel/lru_ensure.*` and `kernel/index_copy.*` are committed and the Rust
 `StagingAbi` parses them, builds their argument packs and knows their fixed
-grids. Next: add the P0 pinned expert host banks, mirror the slot tables to the
-device, and wire `CudaMoE` to drive them. Decision 45 is resolved: it was a
+grids. The P0 pinned expert host banks are in place (decision 47): a page-locked,
+device-mapped region per bank holding every expert of every layer, filled once
+from the FTW banks. Next: mirror the slot tables to the device and wire
+`CudaMoE` to drive the staging kernels over those banks. Decision 45 is resolved: it was a
 false positive (the gemv bytes differ only by the toolchain's `/nix/store` path
 baked into debug info), `aot.py --check` normalizes store paths, and `write` only
 touches genuinely changed artifacts, so the committed gemv/silu/sum_reduce cubins
@@ -78,6 +80,7 @@ hand-exported env. Only then warmup + one captured
 decode step together with the pinned batch-metadata staging P1, per-batch-size
 graphs over a mempool, and a replay-vs-uncaptured gate per batch size. After
 that, M2 (API) proper and the remaining M3 perf items. Last finished: decision
+47 (the pinned expert host banks), decision
 46 (the staging manifest section + Rust `StagingAbi`), decision
 44 (the device-side staging-kernel port), decision
 43 (the device-resident MoE hand-off), decision
@@ -314,7 +317,7 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 - [x] P0 mmap all `freetoken-NNNNN.ftw` shards; resolve per-tensor `global_off -> (shard, offset)` (`MmapFtwReader`: memmap2, `WeightsReader` port, `pieces()` split).
 - [x] P0 load & cast dense weights to GPU: embeddings, all tensor projections + norms + router (bf16), lm_head. Gemma norms: bake `w+1.0` at load. (Done, decision 41: one widen at load into 4.51 GiB resident bf16, block-windowed so the host holds one 4096-row window; `lm_head` narrows the resident tensor per `LM_HEAD_BLOCK`, the embedding gathers off it, and neither path reads the checkpoint again -- `a_dense_projection_is_widened_at_load_and_apply_never_reads_again` counts the reads.)
 - [ ] P0 GDN fp32 params (`A_log`, `dt_bias`) kept fp32; biased/linear projections per checkpoint quant.
-- [ ] P0 expert host banks from per-layer FTW entries (`gate_up_packed#L`, `gate_up_scale#L`, `gate_up_global#L`, `down_*#L`) read serially into pinned host buffers; keep a GPU-resident `[L*E]` set for the fp16 global alphas.
+- [ ] P0 expert host banks from per-layer FTW entries (`gate_up_packed#L`, `gate_up_scale#L`, `gate_up_global#L`, `down_*#L`) read serially into pinned host buffers; keep a GPU-resident `[L*E]` set for the fp16 global alphas. The pinned host side is done (decision 47): `FtwPinnedBanks` allocates one device-mapped page-locked region per bank and fills every layer via `read_bank_layer`; the GPU-resident `[L*E]` alpha set is still open.
 - [ ] P0 precompute partial-Neox rope cos/sin cache on device up to `max_seq_len`.
 - [ ] P1 load dense weights via the 4096-aligned O_DIRECT-friendly path (preadv) to cut startup, or rely on mmap page-in; decide.
 
@@ -510,8 +513,10 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
      **done, decision 41**, (ii) stable `begin_layer` bank addresses plus the
      flat cross-layer slot LRU **done, decision 42**, (iii)
      a device-resident MoE hand-off **done, decision 43**, (iv) the two
-     device-side staging kernels
-     over pinned host banks that let staging be recorded at all. The capture
+     device-side staging kernels **ported, decision 44; AOT-registered, decision
+     46** over pinned host banks **allocated and filled, decision 47**, leaving
+     only the device slot-table mirror and `CudaMoE` wiring before staging can be
+     recorded. The capture
      steps below are unchanged.
   2. **Warmup + capture one uncaptured step** mirroring `engine/graph.py`: an
      uncaptured forward first, flush both streams (slice 1's rule), capture on
@@ -555,7 +560,7 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 ### MoE offload cache
 - [x] P0 flat id space `layer*num_experts + expert`; tables `slot_for_id[L*E]` (-1 free), `id_of_slot[C]`, `usage[C]` step clock. (`domain/expert_cache.rs`)
 - [x] P0 `ensure_experts` (LRU): rewrite routed ids -> slot ids in place; emit miss list; LRU victim = argmin(usage) with same-step owner protection (an expert used earlier in this step may not be evicted).
-- [x] P0 device-side staging kernels ported to `python/ferrum_kernel/offload.py` (`ensure_experts` LRU + `index_copy_multi` fused multi-bank copy, fixed-shape, decision 44); Python oracle compared in `selftest.py --interp`, sm_120 compile check green. Remaining prerequisite-4 work: AOT registration, the Rust pinned-host-bank/device-slot-table mirror, and `CudaMoE` wiring.
+- [x] P0 device-side staging kernels ported to `python/ferrum_kernel/offload.py` (`ensure_experts` LRU + `index_copy_multi` fused multi-bank copy, fixed-shape, decision 44); Python oracle compared in `selftest.py --interp`, sm_120 compile check green. AOT registration is done (decision 46) and the pinned host banks are done (decision 47); remaining prerequisite-4 work: the device slot-table mirror and `CudaMoE` wiring.
 - [ ] P0 `copy_missing`: fused copy of all banks' missed rows on the compute stream (serial per step). Moves up next: the Triton adapter needs a device slot cache to read from (M3 kernel part 2, decision 24).
 - [ ] P0 prefill: `materialize_layer` per-layer full stream; `prefill_overlap` two-buffer (copy stream + ready/release events, layer+1 prefetch) guarded by `cache_size >= 2*E`.
 - [x] P0 `cache_size_slots` explicit from config; floor `>= num_experts`. (floor enforced in `application::engine::load_engine`)
@@ -1582,6 +1587,32 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
       and the new `staging` section in `kernel/manifest.json`. Rust coverage is
       CPU-only (`kernel_abi` tests re-derive the arg list from the committed
       PTX); the launch itself still needs the device wiring below.
+
+47. **The pinned expert host banks are one device-mapped region per bank, filled
+    once** (2026-10-09). The copy kernel reads its misses out of page-locked host
+    memory, so the banks must sit at stable device-visible addresses for the life
+    of the engine. `cuda_driver` gains the pinned FFI (`cuMemHostAlloc` with
+    `CU_MEMHOSTALLOC_DEVICEMAP`, `cuMemHostGetDevicePointer_v2`, `cuMemFreeHost`)
+    behind an RAII `PinnedBuf` that owns an `Arc<Driver>` -- a bank outlives the
+    call that made it, so the borrow-based `DeviceBuf` shape does not fit -- and
+    `Driver::alloc_pinned` returns one. `FtwPinnedBanks` allocates six regions,
+    one per `Bank` in the order `index_copy`'s `src_ptrs` and `CudaMoE::bank_ptrs`
+    share, sized `layers * experts * ExpertShapes::bank_row_bytes`, and fills
+    every layer via `read_bank_layer`, which re-derives the pitch from the shape
+    so a repacked checkpoint fails before any bytes reach the device. `src_idx`
+    for a miss is the flat `layer * experts + expert`.
+    - The domain owns the vocabulary (`Bank`, `BANKS`, `Field`,
+      `ExpertShapes::bank_row_bytes`, `PinnedBank`, the `PinnedBankSource` port);
+      CUDA stays in the adapter, and the fill path (`read_bank_layer`) is CPU
+      unit-tested with a mock reader.
+    - Verified on the sandbox device: `a_pinned_buffer_has_a_readable_device_alias`
+      reads a filled pinned buffer back through its device alias via
+      `cuMemcpyDtoH`, and `pinned_banks_load_fills_every_bank_from_the_index`
+      loads all six. Both skip loudly without libcuda/a device.
+    - The GPU-resident `[L*E]` fp16 global-alpha set from the checklist is *not*
+      part of this: the globals still live only in the pinned host banks.
+    - Still open: the device slot-table mirror and wiring `CudaMoE` to launch
+      `lru_ensure`/`index_copy` over these banks.
 
 ### Config defaults for the RTX 5060 / 8 GB target
 

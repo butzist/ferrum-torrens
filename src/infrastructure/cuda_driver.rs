@@ -52,6 +52,10 @@ const RTLD_GLOBAL: c_int = 0x100;
 /// boundaries ambiguous.
 pub const CAPTURE_MODE_GLOBAL: u32 = 0;
 
+/// `CU_MEMHOSTALLOC_DEVICEMAP`: map the page-locked host allocation into the
+/// device address space, which is what gives a pinned buffer a `CUdeviceptr`.
+pub const MEMHOSTALLOC_DEVICEMAP: u32 = 0x02;
+
 /// `libcuda.so.1` is the SONAME every NVIDIA driver ships under, and the stub
 /// `libcuda.so` only exists with the toolkit installed. The devshell puts the
 /// driver's own mount first on `LD_LIBRARY_PATH`.
@@ -93,6 +97,10 @@ type MemAllocFn = unsafe extern "C" fn(*mut CUdeviceptr, usize) -> CUresult;
 type MemFreeFn = unsafe extern "C" fn(CUdeviceptr) -> CUresult;
 type MemcpyHtoDFn = unsafe extern "C" fn(CUdeviceptr, *const c_void, usize) -> CUresult;
 type MemcpyDtoHFn = unsafe extern "C" fn(*mut c_void, CUdeviceptr, usize) -> CUresult;
+type MemHostAllocFn = unsafe extern "C" fn(*mut *mut c_void, usize, u32) -> CUresult;
+type MemHostGetDevicePointerFn =
+    unsafe extern "C" fn(*mut CUdeviceptr, *mut c_void, u32) -> CUresult;
+type MemFreeHostFn = unsafe extern "C" fn(*mut c_void) -> CUresult;
 type StreamCreateFn = unsafe extern "C" fn(*mut CUstream, u32) -> CUresult;
 type StreamDestroyFn = unsafe extern "C" fn(CUstream) -> CUresult;
 type StreamBeginCaptureFn = unsafe extern "C" fn(CUstream, u32) -> CUresult;
@@ -117,6 +125,9 @@ struct Fns {
     cu_mem_free: MemFreeFn,
     cu_memcpy_htod: MemcpyHtoDFn,
     cu_memcpy_dtoh: MemcpyDtoHFn,
+    cu_mem_host_alloc: MemHostAllocFn,
+    cu_mem_host_get_device_pointer: MemHostGetDevicePointerFn,
+    cu_mem_free_host: MemFreeHostFn,
     cu_stream_create: StreamCreateFn,
     cu_stream_destroy: StreamDestroyFn,
     cu_stream_begin_capture: StreamBeginCaptureFn,
@@ -201,6 +212,15 @@ impl Driver {
             cu_mem_free: sym!("cuMemFree_v2", MemFreeFn),
             cu_memcpy_htod: sym!("cuMemcpyHtoD_v2", MemcpyHtoDFn),
             cu_memcpy_dtoh: sym!("cuMemcpyDtoH_v2", MemcpyDtoHFn),
+            // The host allocation is mapped into the device address space
+            // (`CU_MEMHOSTALLOC_DEVICEMAP`), so the copy kernel can read the
+            // pinned expert banks directly.
+            cu_mem_host_alloc: sym!("cuMemHostAlloc", MemHostAllocFn),
+            cu_mem_host_get_device_pointer: sym!(
+                "cuMemHostGetDevicePointer_v2",
+                MemHostGetDevicePointerFn
+            ),
+            cu_mem_free_host: sym!("cuMemFreeHost", MemFreeHostFn),
             cu_stream_create: sym!("cuStreamCreate", StreamCreateFn),
             cu_stream_destroy: sym!("cuStreamDestroy_v2", StreamDestroyFn),
             cu_stream_begin_capture: sym!("cuStreamBeginCapture_v2", StreamBeginCaptureFn),
@@ -479,6 +499,37 @@ impl Driver {
         })
     }
 
+    /// A page-locked host allocation with a device-visible alias, freed on drop.
+    /// The MoE offload cache fills these from the FTW checkpoint once and the
+    /// copy kernel DMA-reads out of them forever, so the owner keeps the driver
+    /// alive for as long as any bank lives.
+    pub fn alloc_pinned(self: &Arc<Self>, bytes: usize) -> Result<PinnedBuf, CudaError> {
+        let mut host: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `host` is a live slot; `DEVICEMAP` is what makes the buffer
+        // reachable from the device at all.
+        self.check(unsafe {
+            (self.fns.cu_mem_host_alloc)(&raw mut host, bytes, MEMHOSTALLOC_DEVICEMAP)
+        })?;
+        let mut ptr: CUdeviceptr = 0;
+        // SAFETY: `host` is the live allocation from the call above and `ptr` is
+        // a live slot. The device pointer is only valid while `host` lives,
+        // which `PinnedBuf` enforces.
+        match self
+            .check(unsafe { (self.fns.cu_mem_host_get_device_pointer)(&raw mut ptr, host, 0) })
+        {
+            Ok(()) => Ok(PinnedBuf {
+                driver: Arc::clone(self),
+                host,
+                ptr,
+                bytes,
+            }),
+            Err(e) => {
+                let _ = self.check(unsafe { (self.fns.cu_mem_free_host)(host) });
+                Err(e)
+            }
+        }
+    }
+
     /// # Safety
     /// `dst` must be a live device address with room for `src.len()` bytes.
     pub unsafe fn copy_h2d(&self, dst: CUdeviceptr, src: &[u8]) -> Result<(), CudaError> {
@@ -525,6 +576,55 @@ impl DeviceBuf<'_> {
 
     pub fn is_empty(&self) -> bool {
         self.bytes == 0
+    }
+}
+
+/// Owns a page-locked host allocation and its device-visible alias. Dropping
+/// frees it; the device pointer is only valid while this lives, so whoever hands
+/// it to the device must keep the buffer alive. Unlike `DeviceBuf` this holds an
+/// `Arc<Driver>`, because a pinned bank outlives the call that made it.
+pub struct PinnedBuf {
+    driver: Arc<Driver>,
+    host: *mut c_void,
+    pub ptr: CUdeviceptr,
+    bytes: usize,
+}
+
+// SAFETY: the allocation is a plain byte region the driver mapped into device
+// space, so touching it from another thread is ordinary host memory access, and
+// the `Arc<Driver>` behind it is thread-safe.
+unsafe impl Send for PinnedBuf {}
+unsafe impl Sync for PinnedBuf {}
+
+impl Drop for PinnedBuf {
+    fn drop(&mut self) {
+        // A failure here means the driver is already gone; there is nothing
+        // useful to do about it in a destructor.
+        let _ = self
+            .driver
+            .check(unsafe { (self.driver.fns.cu_mem_free_host)(self.host) });
+    }
+}
+
+impl PinnedBuf {
+    pub fn len(&self) -> usize {
+        self.bytes
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes == 0
+    }
+
+    /// The host view the FTW reader fills.
+    pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: `host` is this struct's live allocation of `bytes`.
+        unsafe { std::slice::from_raw_parts(self.host.cast(), self.bytes) }
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: `host` is this struct's live allocation of `bytes`, and
+        // `&mut self` rules out another live slice into it.
+        unsafe { std::slice::from_raw_parts_mut(self.host.cast(), self.bytes) }
     }
 }
 
@@ -795,5 +895,36 @@ mod tests {
         unsafe { driver.graph_exec_destroy(exec) }.expect("destroy exec");
         unsafe { driver.graph_destroy(graph) }.expect("destroy graph");
         unsafe { driver.destroy_stream(stream) }.expect("destroy stream");
+    }
+
+    /// The pinned host banks are the source side of the copy kernel, which
+    /// reaches them through their device alias, so that alias has to be a real,
+    /// readable `CUdeviceptr`. Filling from the host and reading back through
+    /// `cuMemcpyDtoH` at the device address only succeeds if `DEVICEMAP` mapped
+    /// it. Skips (loudly) without libcuda or a device.
+    #[test]
+    fn a_pinned_buffer_has_a_readable_device_alias() {
+        let Ok(driver) = Driver::open() else {
+            eprintln!("no libcuda on this box, skipping");
+            return;
+        };
+        if driver.init().is_err() || driver.device_count().unwrap_or(0) == 0 {
+            eprintln!("no CUDA device, skipping");
+            return;
+        }
+        driver.attach_primary_context(0).expect("primary context");
+        let driver = Arc::new(driver);
+        let mut buf = driver.alloc_pinned(4096).expect("pinned allocation");
+        assert_eq!(buf.len(), 4096);
+        assert!(!buf.is_empty());
+        for (i, b) in buf.as_mut_slice().iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        assert_ne!(buf.ptr, 0, "the alias must be a real device address");
+        let mut out = vec![0u8; 4096];
+        // SAFETY: `buf.ptr` aliases the live 4096-byte pinned allocation and
+        // `out` has room for exactly that many bytes.
+        unsafe { driver.copy_d2h(&mut out, buf.ptr) }.expect("read through the alias");
+        assert_eq!(out, buf.as_slice());
     }
 }
