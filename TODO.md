@@ -1,6 +1,6 @@
 # FerrumTorrens -- FreeToken MVP port to Rust: TODO
 
-Status: M2 (API) current, M3 kernel work started out of order. Decision 36 is
+Status: M2 (API) current; M3 prerequisite 4 (device staging: lru_ensure + index_copy + pinned banks + wiring) complete. Decision 36 is
 done end to end: the serving path is Python-free. The sm_120 cubins are
 committed under `kernel/` with an ABI manifest, `infrastructure/kernel_abi.rs`
 packs the launch arguments and checks them against the committed PTX,
@@ -10,7 +10,10 @@ libtorch device tensors, so `kernel.triton=true` now means the driver adapter,
 not an embedded interpreter. Both gated GPU gates are green: the cubin smoke
 test and `tests/cuda_moe_matches_reference.rs`, which matches the scalar oracle
 on the real checkpoint at `3.31e-3` of the route terms (four bf16 rounding
-sites). Ports and the kernel sources:
+sites); device staging (lru_ensure + index_copy) over pinned banks with device
+slot tables is wired (`StagingAbi` + `StagingKernels` + `CudaMoE`), and the
+gated GPU tests (`cuda_moe_matches_reference`, `cuda_graph_moe_smoke`) pass.
+Ports and the kernel sources:
 `domain::expert_kernel` (ports + scalar oracle),
 `python/ferrum_kernel/nvfp4_moe.py` (PTX-clean for sm_120, still the authoring
 language), `infrastructure/cuda_moe.rs` (feature `cuda`: device slot cache,
@@ -1611,8 +1614,8 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
       loads all six. Both skip loudly without libcuda/a device.
     - The GPU-resident `[L*E]` fp16 global-alpha set from the checklist is *not*
       part of this: the globals still live only in the pinned host banks.
-    - Still open: the device slot-table mirror and wiring `CudaMoE` to launch
-      `lru_ensure`/`index_copy` over these banks.
+    - Done: device slot-table mirror and `CudaMoE` wiring to launch
+      `lru_ensure`/`index_copy` are in place; gated GPU tests (`cuda_moe_matches_reference`, `cuda_graph_moe_smoke`) pass.
 
 ### Config defaults for the RTX 5060 / 8 GB target
 
