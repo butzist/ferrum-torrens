@@ -117,48 +117,75 @@ pub const GEMV_DOWN: &str = "gemv_down";
 pub const SILU_MUL: &str = "silu_mul";
 pub const SUM_REDUCE: &str = "sum_reduce";
 
+/// Validate one manifest kernel's parameter list, returning the declared
+/// argument kinds (the trailing scratch pointers stripped).
+///
+/// The grouped-MoE and staging sections describe the same triton launch
+/// contract, so a malformed entry has to fail the same way in either.
+fn parse_args(
+    name: &str,
+    params: &[Param],
+    scratch_params: usize,
+    declared_len: usize,
+    global_scratch: u32,
+    profile_scratch: u32,
+) -> Result<Vec<ArgKind>, MoEError> {
+    let mut args = Vec::with_capacity(params.len());
+    for param in params {
+        let kind = ArgKind::parse(&param.kind).ok_or_else(|| {
+            MoEError::Bad(format!("kernel {name}: unknown param kind {}", param.kind))
+        })?;
+        if param.index != args.len() {
+            return Err(MoEError::Bad(format!(
+                "kernel {name}: param {} is out of order",
+                param.index
+            )));
+        }
+        args.push(kind);
+    }
+    if scratch_params > args.len() {
+        return Err(MoEError::Bad(format!(
+            "kernel {name}: {scratch_params} scratch params for {} parameters",
+            args.len()
+        )));
+    }
+    // The scratch pointers are pointers whatever the manifest says, and they
+    // are not arguments the caller supplies.
+    let tail = args.split_off(args.len() - scratch_params);
+    if tail.iter().any(|k| *k != ArgKind::Ptr) {
+        return Err(MoEError::Bad(format!(
+            "kernel {name}: scratch params are not all pointers"
+        )));
+    }
+    if params.len() != declared_len + scratch_params {
+        return Err(MoEError::Bad(format!(
+            "kernel {name}: {} params for {declared_len} declared args and {scratch_params} scratch",
+            params.len()
+        )));
+    }
+    if global_scratch != 0 || profile_scratch != 0 {
+        return Err(MoEError::Bad(format!(
+            "kernel {name}: scratch sizes {global_scratch}/{profile_scratch} need a real \
+             allocation, which the driver-API launcher does not do yet"
+        )));
+    }
+    Ok(args)
+}
+
 impl Abi {
     pub fn parse(json: &str) -> Result<Self, MoEError> {
         let m: Manifest = serde_json::from_str(json)
             .map_err(|e| MoEError::Bad(format!("kernel manifest: {e}")))?;
         let mut kernels = BTreeMap::new();
         for (name, entry) in m.kernels {
-            let mut args = Vec::with_capacity(entry.params.len());
-            for param in &entry.params {
-                let kind = ArgKind::parse(&param.kind).ok_or_else(|| {
-                    MoEError::Bad(format!("kernel {name}: unknown param kind {}", param.kind))
-                })?;
-                if param.index != args.len() {
-                    return Err(MoEError::Bad(format!(
-                        "kernel {name}: param {} is out of order",
-                        param.index
-                    )));
-                }
-                args.push(kind);
-            }
-            // The scratch pointers are pointers whatever the manifest says, and
-            // they are not arguments the caller supplies.
-            let tail = args.split_off(args.len() - entry.scratch_params);
-            if tail.iter().any(|k| *k != ArgKind::Ptr) {
-                return Err(MoEError::Bad(format!(
-                    "kernel {name}: scratch params are not all pointers"
-                )));
-            }
-            if entry.params.len() != entry.declared_args.len() + entry.scratch_params {
-                return Err(MoEError::Bad(format!(
-                    "kernel {name}: {} params for {} declared args and {} scratch",
-                    entry.params.len(),
-                    entry.declared_args.len(),
-                    entry.scratch_params
-                )));
-            }
-            if entry.global_scratch_size != 0 || entry.profile_scratch_size != 0 {
-                return Err(MoEError::Bad(format!(
-                    "kernel {name}: scratch sizes {}/{} need a real allocation, \
-                     which the driver-API launcher does not do yet",
-                    entry.global_scratch_size, entry.profile_scratch_size
-                )));
-            }
+            let args = parse_args(
+                &name,
+                &entry.params,
+                entry.scratch_params,
+                entry.declared_args.len(),
+                entry.global_scratch_size,
+                entry.profile_scratch_size,
+            )?;
             let name: &'static str = NAMES
                 .iter()
                 .copied()
@@ -227,6 +254,153 @@ pub fn cubin(name: &str) -> Result<&'static [u8], MoEError> {
         SUM_REDUCE => include_bytes!("../../kernel/sum_reduce.cubin"),
         other => return Err(MoEError::Bad(format!("no committed cubin for {other}"))),
     })
+}
+
+/// The staging kernels `CudaMoE` launches around the grouped passes, in order.
+pub const LRU_ENSURE: &str = "lru_ensure";
+pub const INDEX_COPY: &str = "index_copy";
+
+const STAGING_NAMES: [&str; 2] = [LRU_ENSURE, INDEX_COPY];
+
+#[derive(Debug, Deserialize)]
+struct StagingEntry {
+    entry: String,
+    params: Vec<Param>,
+    declared_args: Vec<String>,
+    scratch_params: usize,
+    num_warps: u32,
+    shared: u32,
+    global_scratch_size: u32,
+    profile_scratch_size: u32,
+    /// The fixed launch shape. Both staging kernels are data-independent, so
+    /// the grid is a constant of the cubin, not a function of the route count.
+    grid: [u32; 3],
+    /// The constexprs baked into the cubin, by name. All staging constexprs are
+    /// non-negative counts, so `u64` is the natural type.
+    constexprs: BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StagingManifest {
+    staging: BTreeMap<String, StagingEntry>,
+}
+
+/// One staging kernel as its launcher sees it.
+#[derive(Debug, Clone)]
+pub struct StagingKernel {
+    pub name: &'static str,
+    pub entry: String,
+    pub args: Vec<ArgKind>,
+    pub scratch_params: usize,
+    pub num_warps: u32,
+    pub shared: u32,
+    pub grid: [u32; 3],
+    constexprs: BTreeMap<String, u64>,
+}
+
+impl StagingKernel {
+    /// Threads per block: one warp per `num_warps`, NVIDIA warp size 32.
+    pub fn block_threads(&self) -> u32 {
+        self.num_warps * 32
+    }
+
+    /// A constexpr baked into the cubin, by name. The launcher reads the plan
+    /// cap and cache ceiling from here so it cannot drift from the build.
+    pub fn constexpr(&self, name: &str) -> Result<u64, MoEError> {
+        self.constexprs
+            .get(name)
+            .copied()
+            .ok_or_else(|| MoEError::Bad(format!("kernel {}: no constexpr {name}", self.name)))
+    }
+}
+
+/// The committed staging kernels, parsed from the manifest's `staging` section.
+///
+/// Separate from `Abi`: the staging pair is not part of `grouped_moe`, it runs
+/// on its own streams with a fixed grid, and keeping the two contracts apart
+/// means a generic-Abi change cannot silently alter a staging launch.
+#[derive(Debug, Clone)]
+pub struct StagingAbi {
+    kernels: BTreeMap<&'static str, StagingKernel>,
+}
+
+impl StagingAbi {
+    pub fn parse(json: &str) -> Result<Self, MoEError> {
+        let m: StagingManifest = serde_json::from_str(json)
+            .map_err(|e| MoEError::Bad(format!("kernel manifest: {e}")))?;
+        let mut kernels = BTreeMap::new();
+        for (name, entry) in m.staging {
+            let args = parse_args(
+                &name,
+                &entry.params,
+                entry.scratch_params,
+                entry.declared_args.len(),
+                entry.global_scratch_size,
+                entry.profile_scratch_size,
+            )?;
+            let name: &'static str = STAGING_NAMES
+                .iter()
+                .copied()
+                .find(|n| *n == name)
+                .ok_or_else(|| MoEError::Bad(format!("unknown staging kernel {name}")))?;
+            kernels.insert(
+                name,
+                StagingKernel {
+                    name,
+                    entry: entry.entry,
+                    args,
+                    scratch_params: entry.scratch_params,
+                    num_warps: entry.num_warps,
+                    shared: entry.shared,
+                    grid: entry.grid,
+                    constexprs: entry.constexprs,
+                },
+            );
+        }
+        for name in STAGING_NAMES {
+            if !kernels.contains_key(name) {
+                return Err(MoEError::Bad(format!(
+                    "manifest is missing staging kernel {name}"
+                )));
+            }
+        }
+        Ok(Self { kernels })
+    }
+
+    /// The manifest as committed.
+    pub fn committed() -> Result<Self, MoEError> {
+        Self::parse(MANIFEST_JSON)
+    }
+
+    /// The staging kernel names, in launch order.
+    pub fn kernel_names() -> &'static [&'static str] {
+        &STAGING_NAMES
+    }
+
+    pub fn kernel(&self, name: &str) -> Result<&StagingKernel, MoEError> {
+        self.kernels
+            .get(name)
+            .ok_or_else(|| MoEError::Bad(format!("no committed staging kernel {name}")))
+    }
+}
+
+/// The staging cubin bytes, by name.
+pub fn staging_cubin(name: &str) -> Result<&'static [u8], MoEError> {
+    Ok(match name {
+        LRU_ENSURE => include_bytes!("../../kernel/lru_ensure.cubin"),
+        INDEX_COPY => include_bytes!("../../kernel/index_copy.cubin"),
+        other => return Err(MoEError::Bad(format!("no committed cubin for {other}"))),
+    })
+}
+
+/// The committed staging PTX, by name. Only the ABI tests read this.
+#[cfg(test)]
+fn staging_ptx(name: &str) -> &'static str {
+    match name {
+        LRU_ENSURE => include_str!("../../kernel/lru_ensure.ptx"),
+        INDEX_COPY => include_str!("../../kernel/index_copy.ptx"),
+        other => panic!("no committed ptx for {other}"),
+    }
 }
 
 /// The committed PTX, by name. Only the ABI tests read this.
@@ -310,17 +484,26 @@ pub struct ArgPack {
 }
 
 impl ArgPack {
-    /// Sized for `kernel`, with the trailing scratch pointers already zeroed.
-    pub fn for_kernel(kernel: &Kernel) -> Self {
+    fn with_args(args: &[ArgKind], scratch_params: usize) -> Self {
         let mut pack = Self {
-            kinds: kernel.args.clone(),
-            declared: kernel.args.len(),
-            slots: vec![0; kernel.args.len() + kernel.scratch_params],
+            kinds: args.to_vec(),
+            declared: args.len(),
+            slots: vec![0; args.len() + scratch_params],
             next: 0,
         };
         pack.kinds
-            .extend(std::iter::repeat_n(ArgKind::Ptr, kernel.scratch_params));
+            .extend(std::iter::repeat_n(ArgKind::Ptr, scratch_params));
         pack
+    }
+
+    /// Sized for `kernel`, with the trailing scratch pointers already zeroed.
+    pub fn for_kernel(kernel: &Kernel) -> Self {
+        Self::with_args(&kernel.args, kernel.scratch_params)
+    }
+
+    /// Sized for a staging `kernel`, scratch pointers already zeroed.
+    pub fn for_staging(kernel: &StagingKernel) -> Self {
+        Self::with_args(&kernel.args, kernel.scratch_params)
     }
 
     /// Append the next argument. The kind is checked against the manifest so a
@@ -513,6 +696,69 @@ pub fn sum_reduce_args(abi: &Abi, a: &MoEArgs) -> Result<ArgPack, MoEError> {
     p.u32(1)?;
     p.u64(hidden as u64)?;
     p.u32(1)?;
+    Ok(p)
+}
+
+/// Device addresses and counts for the LRU admission kernel. Every buffer is a
+/// raw address the caller owns; `routes` is the number of routed ids this step
+/// (`<= BLOCK_K`), `num_cached` the slot ceiling and `id_base` the layer offset.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LruArgs {
+    pub experts: u64,
+    pub slot_for_id: u64,
+    pub id_of_slot: u64,
+    pub usage: u64,
+    pub step: u64,
+    pub misses: u64,
+    pub slots: u64,
+    pub num: u64,
+    pub routes: u32,
+    pub num_cached: u32,
+    pub id_base: u32,
+}
+
+/// Device addresses for the fused multi-bank copy. `dst_ptrs`/`src_ptrs` are
+/// device arrays of per-bank base addresses and `feat_bytes` the per-bank row
+/// size; `num` is the device plan count.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CopyArgs {
+    pub dst_ptrs: u64,
+    pub src_ptrs: u64,
+    pub feat_bytes: u64,
+    pub dst_idx: u64,
+    pub src_idx: u64,
+    pub num: u64,
+}
+
+/// The LRU admission launch: rewrites `experts` to slots in place and emits the
+/// `(miss, slot)` plan the copy follows.
+pub fn lru_ensure_args(abi: &StagingAbi, a: &LruArgs) -> Result<ArgPack, MoEError> {
+    let k = abi.kernel(LRU_ENSURE)?;
+    let mut p = ArgPack::for_staging(k);
+    p.ptr(a.experts)?;
+    p.ptr(a.slot_for_id)?;
+    p.ptr(a.id_of_slot)?;
+    p.ptr(a.usage)?;
+    p.ptr(a.step)?;
+    p.ptr(a.misses)?;
+    p.ptr(a.slots)?;
+    p.ptr(a.num)?;
+    p.u32(a.routes)?;
+    p.u32(a.num_cached)?;
+    p.u32(a.id_base)?;
+    Ok(p)
+}
+
+/// The fused host->slot copy launch, one program per (bank, group).
+pub fn index_copy_args(abi: &StagingAbi, a: &CopyArgs) -> Result<ArgPack, MoEError> {
+    let k = abi.kernel(INDEX_COPY)?;
+    let mut p = ArgPack::for_staging(k);
+    p.ptr(a.dst_ptrs)?;
+    p.ptr(a.src_ptrs)?;
+    p.ptr(a.feat_bytes)?;
+    p.ptr(a.dst_idx)?;
+    p.ptr(a.src_idx)?;
+    p.ptr(a.num)?;
     Ok(p)
 }
 
@@ -722,5 +968,120 @@ mod tests {
             (routes as u32, 2, 1)
         );
         assert_eq!(grid(abi.top_k, abi.kernel(SUM_REDUCE).unwrap()), (8, 16, 1));
+    }
+
+    #[test]
+    fn the_staging_manifest_lists_the_two_launches() {
+        let abi = StagingAbi::committed().expect("the committed manifest must parse");
+        for name in STAGING_NAMES {
+            assert!(abi.kernel(name).is_ok(), "{name} missing");
+        }
+        let lru = abi.kernel(LRU_ENSURE).unwrap();
+        assert_eq!(lru.grid, [1, 1, 1]);
+        assert_eq!(lru.block_threads(), 128);
+        assert_eq!(lru.constexpr("BLOCK_K").unwrap(), 128);
+        assert_eq!(lru.constexpr("BLOCK_C").unwrap(), 512);
+        let copy = abi.kernel(INDEX_COPY).unwrap();
+        assert_eq!(copy.grid, [6, 128, 1]);
+        assert_eq!(copy.block_threads(), 128);
+        assert_eq!(copy.constexpr("NUM_BANKS").unwrap(), 6);
+        assert_eq!(copy.constexpr("GROUPS").unwrap(), 128);
+        // A `BLOCK_K`-route plan of the 1 MiB `gate_up_packed` row.
+        assert_eq!(copy.constexpr("STEPS").unwrap(), 128);
+    }
+
+    #[test]
+    fn the_staging_manifest_agrees_with_the_committed_ptx() {
+        let abi = StagingAbi::committed().unwrap();
+        for name in STAGING_NAMES {
+            let kernel = abi.kernel(name).unwrap();
+            let from_ptx = ptx_entry_args(staging_ptx(name));
+            let mut want = kernel.args.clone();
+            want.extend(std::iter::repeat_n(ArgKind::Ptr, kernel.scratch_params));
+            assert_eq!(
+                from_ptx, want,
+                "{name}: manifest does not match the PTX entry"
+            );
+            assert!(!from_ptx.is_empty());
+        }
+    }
+
+    #[test]
+    fn every_staging_argument_builder_matches_its_kernel_signature() {
+        let abi = StagingAbi::committed().unwrap();
+        let lru = LruArgs {
+            experts: 0x1000,
+            slot_for_id: 0x2000,
+            id_of_slot: 0x3000,
+            usage: 0x4000,
+            step: 0x5000,
+            misses: 0x6000,
+            slots: 0x7000,
+            num: 0x8000,
+            routes: 32,
+            num_cached: 512,
+            id_base: 2048,
+        };
+        let copy = CopyArgs {
+            dst_ptrs: 0x1000,
+            src_ptrs: 0x2000,
+            feat_bytes: 0x3000,
+            dst_idx: 0x4000,
+            src_idx: 0x5000,
+            num: 0x6000,
+        };
+        let built = [
+            (LRU_ENSURE, lru_ensure_args(&abi, &lru)),
+            (INDEX_COPY, index_copy_args(&abi, &copy)),
+        ];
+        for (name, pack) in built {
+            let pack = pack.unwrap_or_else(|e| panic!("{name}: {e}"));
+            let kernel = abi.kernel(name).unwrap();
+            let params = pack
+                .kernel_params()
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(
+                params.len(),
+                kernel.args.len() + kernel.scratch_params,
+                "{name}"
+            );
+            for slot in &pack.slots()[kernel.args.len()..] {
+                assert_eq!(*slot, 0, "{name}: scratch slot is not null");
+            }
+        }
+    }
+
+    #[test]
+    fn a_manifest_with_an_unknown_staging_kernel_is_rejected() {
+        let mut v: serde_json::Value = serde_json::from_str(MANIFEST_JSON).unwrap();
+        let copy = v["staging"]
+            .as_object_mut()
+            .unwrap()
+            .remove(INDEX_COPY)
+            .unwrap();
+        v["staging"]["copy_sideways"] = copy;
+        let err = StagingAbi::parse(&v.to_string()).unwrap_err().to_string();
+        assert!(
+            err.contains("unknown staging kernel copy_sideways"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_manifest_missing_a_staging_kernel_is_rejected() {
+        let mut v: serde_json::Value = serde_json::from_str(MANIFEST_JSON).unwrap();
+        v["staging"].as_object_mut().unwrap().remove(LRU_ENSURE);
+        let err = StagingAbi::parse(&v.to_string()).unwrap_err().to_string();
+        assert!(err.contains("missing staging kernel lru_ensure"), "{err}");
+    }
+
+    /// The grouped section must still parse unchanged next to the new staging
+    /// section, and the two must not see each other's kernels.
+    #[test]
+    fn the_two_sections_are_disjoint() {
+        let abi = abi();
+        assert!(abi.kernel(LRU_ENSURE).is_err());
+        let staging = StagingAbi::committed().unwrap();
+        assert!(staging.kernel(GEMV_GATE_UP).is_err());
     }
 }

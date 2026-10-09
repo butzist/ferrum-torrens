@@ -2,6 +2,13 @@
   "kernels": {
     "gemv_down": {
       "block": 128,
+      "constexprs": {
+        "A_ROW_IS_ROUTE": true,
+        "BLOCK_KB": 64,
+        "BLOCK_N": 128,
+        "K_BYTES": 256,
+        "MUL_WEIGHT": true
+      },
       "declared_args": [
         "a_ptr",
         "packed_ptr",
@@ -139,6 +146,13 @@
     },
     "gemv_gate_up": {
       "block": 128,
+      "constexprs": {
+        "A_ROW_IS_ROUTE": false,
+        "BLOCK_KB": 64,
+        "BLOCK_N": 128,
+        "K_BYTES": 1024,
+        "MUL_WEIGHT": false
+      },
       "declared_args": [
         "a_ptr",
         "packed_ptr",
@@ -276,6 +290,9 @@
     },
     "silu_mul": {
       "block": 256,
+      "constexprs": {
+        "BLOCK_I": 256
+      },
       "declared_args": [
         "ic1_ptr",
         "ic2_ptr",
@@ -333,6 +350,10 @@
     },
     "sum_reduce": {
       "block": 128,
+      "constexprs": {
+        "BLOCK_N": 128,
+        "top_k": 8
+      },
       "declared_args": [
         "ic3_ptr",
         "out_ptr",
@@ -394,6 +415,155 @@
     "hidden": 2048,
     "inter": 512,
     "top_k": 8
+  },
+  "staging": {
+    "index_copy": {
+      "constexprs": {
+        "BLOCK_BYTES": 8192,
+        "GROUPS": 128,
+        "NUM_BANKS": 6,
+        "STEPS": 128
+      },
+      "declared_args": [
+        "dst_ptrs",
+        "src_ptrs",
+        "feat_bytes",
+        "dst_idx",
+        "src_idx",
+        "num_ptr"
+      ],
+      "entry": "_index_copy_multi_kernel",
+      "global_scratch_size": 0,
+      "grid": [
+        6,
+        128,
+        1
+      ],
+      "num_warps": 4,
+      "params": [
+        {
+          "index": 0,
+          "kind": "ptr"
+        },
+        {
+          "index": 1,
+          "kind": "ptr"
+        },
+        {
+          "index": 2,
+          "kind": "ptr"
+        },
+        {
+          "index": 3,
+          "kind": "ptr"
+        },
+        {
+          "index": 4,
+          "kind": "ptr"
+        },
+        {
+          "index": 5,
+          "kind": "ptr"
+        },
+        {
+          "index": 6,
+          "kind": "ptr"
+        },
+        {
+          "index": 7,
+          "kind": "ptr"
+        }
+      ],
+      "profile_scratch_size": 0,
+      "scratch_params": 2,
+      "shared": 0
+    },
+    "lru_ensure": {
+      "constexprs": {
+        "BLOCK_C": 512,
+        "BLOCK_K": 128,
+        "SLOT_BITS": 9,
+        "USAGE_MAX": 36028797018963967
+      },
+      "declared_args": [
+        "experts_ptr",
+        "slot_for_id_ptr",
+        "id_of_slot_ptr",
+        "usage_ptr",
+        "step_ptr",
+        "misses_ptr",
+        "slots_ptr",
+        "num_ptr",
+        "K",
+        "num_cached",
+        "id_base"
+      ],
+      "entry": "_ensure_experts_kernel",
+      "global_scratch_size": 0,
+      "grid": [
+        1,
+        1,
+        1
+      ],
+      "num_warps": 4,
+      "params": [
+        {
+          "index": 0,
+          "kind": "ptr"
+        },
+        {
+          "index": 1,
+          "kind": "ptr"
+        },
+        {
+          "index": 2,
+          "kind": "ptr"
+        },
+        {
+          "index": 3,
+          "kind": "ptr"
+        },
+        {
+          "index": 4,
+          "kind": "ptr"
+        },
+        {
+          "index": 5,
+          "kind": "ptr"
+        },
+        {
+          "index": 6,
+          "kind": "ptr"
+        },
+        {
+          "index": 7,
+          "kind": "ptr"
+        },
+        {
+          "index": 8,
+          "kind": "u32"
+        },
+        {
+          "index": 9,
+          "kind": "u32"
+        },
+        {
+          "index": 10,
+          "kind": "u32"
+        },
+        {
+          "index": 11,
+          "kind": "ptr"
+        },
+        {
+          "index": 12,
+          "kind": "ptr"
+        }
+      ],
+      "profile_scratch_size": 0,
+      "scratch_params": 2,
+      "shared": 4096
+    }
   },
   "target": {
     "arch": "sm_120",

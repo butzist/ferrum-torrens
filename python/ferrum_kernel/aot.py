@@ -40,6 +40,7 @@ from .nvfp4_moe import (
     _silu_mul_kernel,
     _sum_reduce_kernel,
 )
+from .offload import COPY_GROUPS, _ensure_experts_kernel, _index_copy_multi_kernel
 
 # The silu kernel's tile is derived from the intermediate size at launch
 # (`min(next_power_of_2(inter), 256)`), so the AOT build pins the serving value.
@@ -48,10 +49,15 @@ from .signatures import (
     SERVING_DTYPE,
     SERVING_HIDDEN,
     SERVING_INTER,
+    SERVING_NUM_BANKS,
     SERVING_TOP_K,
     down_constexprs,
     gate_up_constexprs,
     gemv,
+    index_copy,
+    index_copy_constexprs,
+    lru_constexprs,
+    lru_ensure,
     reduce,
     reduce_constexprs,
     silu,
@@ -92,6 +98,26 @@ KERNELS: dict[str, dict] = {
         "constexprs": reduce_constexprs(),
         "n": SERVING_HIDDEN,
         "block": DECODE_BLOCK_N,
+    },
+}
+
+# The staging pair (TODO.md decision 40 prerequisite 4). It is not part of
+# `grouped_moe`: it runs on its own streams around the grouped launches and has
+# its own launcher, so it lives in a separate manifest section (`staging`) with
+# a `grid` launch shape instead of the grouped `n`/`block` column tile. LRU is a
+# single program; the copy is one program per (bank, group).
+STAGING_KERNELS: dict[str, dict] = {
+    "lru_ensure": {
+        "fn": _ensure_experts_kernel,
+        "signature": lru_ensure(),
+        "constexprs": lru_constexprs(),
+        "grid": [1, 1, 1],
+    },
+    "index_copy": {
+        "fn": _index_copy_multi_kernel,
+        "signature": index_copy(),
+        "constexprs": index_copy_constexprs(),
+        "grid": [SERVING_NUM_BANKS, COPY_GROUPS, 1],
     },
 }
 
@@ -149,7 +175,7 @@ def _compile_one(spec: dict) -> dict:
         raise SystemExit(f"{len(params)} PTX params for {len(declared)} declared args")
     # triton appends scratch pointers after the declared args; record how many so
     # the launcher can pass the nulls they expect.
-    return {
+    built = {
         "ptx": kern.asm["ptx"],
         "cubin": kern.asm["cubin"],
         "entry": re.search(r"\.visible \.entry\s+(\w+)", kern.asm["ptx"]).group(1),
@@ -160,11 +186,19 @@ def _compile_one(spec: dict) -> dict:
         "shared": kern.metadata.shared,
         "global_scratch_size": kern.metadata.global_scratch_size,
         "profile_scratch_size": kern.metadata.profile_scratch_size,
-        "n": spec["n"],
+        # The constexprs baked into this cubin. Recording them lets the launcher
+        # cross-check a value that a recompile would move, and pins the staging
+        # shapes the same way `shapes` pins the grouped ones.
+        "constexprs": dict(spec["constexprs"]),
+    }
+    if "n" in spec:
         # The columns one program covers. A constexpr, so it is baked into the
         # cubin and the launch grid has to use the same number.
-        "block": spec["block"],
-    }
+        built["n"] = spec["n"]
+        built["block"] = spec["block"]
+    if "grid" in spec:
+        built["grid"] = spec["grid"]
+    return built
 
 
 @dataclasses.dataclass(frozen=True)
@@ -187,32 +221,47 @@ def emit() -> Artifacts:
             "top_k": SERVING_TOP_K,
             "dtype": SERVING_DTYPE,
         },
-        "kernels": {},
     }
     cubins: dict[str, bytes] = {}
     ptxs: dict[str, str] = {}
-    for name, spec in KERNELS.items():
-        print(f"compiling {name} ...", flush=True)
-        built = _compile_one(spec)
-        cubins[name] = built.pop("cubin")
-        ptxs[name] = built.pop("ptx")
-        manifest["kernels"][name] = built
-        print(f"  {name}: {built['entry']}, {len(built['params'])} params, "
-              f"{built['scratch_params']} scratch, {built['num_warps']} warps, "
-              f"{built['shared']} shared")
+    for section, specs in (("kernels", KERNELS), ("staging", STAGING_KERNELS)):
+        manifest[section] = {}
+        for name, spec in specs.items():
+            print(f"compiling {name} ...", flush=True)
+            built = _compile_one(spec)
+            cubins[name] = built.pop("cubin")
+            ptxs[name] = built.pop("ptx")
+            manifest[section][name] = built
+            print(f"  {name}: {built['entry']}, {len(built['params'])} params, "
+                  f"{built['scratch_params']} scratch, {built['num_warps']} warps, "
+                  f"{built['shared']} shared")
     text = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
     return Artifacts(cubins=cubins, ptxs=ptxs, manifest=text)
 
 
 def write(art: Artifacts) -> list[pathlib.Path]:
+    """Write every artifact whose store-path-normalized bytes changed.
+
+    A rebuild on a different toolchain closure differs only in the `/nix/store`
+    paths triton bakes into the debug info. Leaving those artifacts as committed
+    means registering a new kernel cannot churn the cubins the GPU gates were
+    qualified against (TODO.md decision 45); a real codegen change still writes.
+    """
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     written = []
     for name, cubin in art.cubins.items():
-        (OUT_DIR / f"{name}.cubin").write_bytes(cubin)
-        (OUT_DIR / f"{name}.ptx").write_text(art.ptxs[name])
-        written += [OUT_DIR / f"{name}.cubin", OUT_DIR / f"{name}.ptx"]
-    (OUT_DIR / "manifest.json").write_text(art.manifest)
-    written.append(OUT_DIR / "manifest.json")
+        for suffix, fresh in (("cubin", cubin), ("ptx", art.ptxs[name].encode())):
+            path = OUT_DIR / f"{name}.{suffix}"
+            have = path.read_bytes() if path.exists() else b""
+            if _norm(have) == _norm(fresh):
+                continue
+            path.write_bytes(fresh)
+            written.append(path)
+    manifest = OUT_DIR / "manifest.json"
+    have = manifest.read_bytes() if manifest.exists() else b""
+    if _norm(have) != _norm(art.manifest.encode()):
+        manifest.write_text(art.manifest)
+        written.append(manifest)
     return written
 
 

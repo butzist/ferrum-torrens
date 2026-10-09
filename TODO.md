@@ -63,18 +63,22 @@ device-side staging kernels FreeToken uses are ported to
 `python/ferrum_kernel/offload.py` (decision 44): `ensure_experts` (device LRU,
 mirrors `ExpertCache`) and `index_copy_multi` (fused multi-bank copy), both
 fixed-shape, interpreter-tested against the Python oracle, and sm_120
-compile-clean. Next: register them AOT (they are not in the committed manifest
-yet), add the P0 pinned expert host banks, mirror the slot tables to the device,
-and wire `CudaMoE` to drive them. AOT registration is unblocked: decision 45 was
-a false positive (the gemv bytes differ only by the toolchain's `/nix/store`
-path baked into debug info), and `aot.py --check` normalizes store paths, so a
-fresh build reproduces the committed set. The kernel toolchain is hermetic in
-the devShell too: the flake pins numpy and wires `TRITON_PTXAS_*` (commit
-`93b1bdf`), so `kernel-selftest`/`kernel-compile-check`/`kernel-aot` need no
-venv and no hand-exported env. Only then warmup + one captured
+compile-clean. They are now AOT-registered in their own manifest section (decision
+46): `kernel/lru_ensure.*` and `kernel/index_copy.*` are committed and the Rust
+`StagingAbi` parses them, builds their argument packs and knows their fixed
+grids. Next: add the P0 pinned expert host banks, mirror the slot tables to the
+device, and wire `CudaMoE` to drive them. Decision 45 is resolved: it was a
+false positive (the gemv bytes differ only by the toolchain's `/nix/store` path
+baked into debug info), `aot.py --check` normalizes store paths, and `write` only
+touches genuinely changed artifacts, so the committed gemv/silu/sum_reduce cubins
+were untouched by this registration. The kernel toolchain is hermetic in the
+devShell too: the flake pins numpy and wires `TRITON_PTXAS_*` (commit `93b1bdf`),
+so `kernel-selftest`/`kernel-compile-check`/`kernel-aot` need no venv and no
+hand-exported env. Only then warmup + one captured
 decode step together with the pinned batch-metadata staging P1, per-batch-size
 graphs over a mempool, and a replay-vs-uncaptured gate per batch size. After
 that, M2 (API) proper and the remaining M3 perf items. Last finished: decision
+46 (the staging manifest section + Rust `StagingAbi`), decision
 44 (the device-side staging-kernel port), decision
 43 (the device-resident MoE hand-off), decision
 42 (stable bank addresses, cross-layer LRU), the P0
@@ -1314,11 +1318,11 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
           alias of pinned host banks (`moe/offload_cache.py`: `ensure_experts` +
           `fast_index_copy_multi`); both are ported to
           `python/ferrum_kernel/offload.py` (decision 44) and interpreter-gated
-          against the Python oracle. **Kernels done; wiring not.** Still to do:
-          register them in `signatures.py`/`aot.py` and regenerate
-          `kernel/*.cubin` + `manifest.json` (decision 45 resolved: `aot.py
-          --check` ignores toolchain store paths now, so a rebuild reproduces
-          the committed gemv set); add the P0 pinned expert host banks
+          against the Python oracle. **Registered (decision 46) and
+          interpreter-gated; not yet wired.** Committed AOT:
+          `kernel/lru_ensure.*` + `kernel/index_copy.*` in the manifest's
+          `staging` section, parsed by the Rust `StagingAbi`. Still to do:
+          add the P0 pinned expert host banks
           (the host half) and the device slot-table mirror; drive them from
           `CudaMoE` so the ids and the misses never touch the host. The domain
           semantics do not change: LRU, and `-1` routes for the overflow case.
@@ -1553,6 +1557,31 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
       cubins reproduce, so the GPU-qualified set is not churned. The `kernel-aot`
       devShell alias is self-contained because the flake pins numpy and wires
       `TRITON_PTXAS_*` (commit `93b1bdf`).
+
+46. **The staging kernels get their own manifest section and Rust ABI**
+    (2026-10-09). `lru_ensure` and `index_copy` are not `grouped_moe` launches:
+    they run on their own streams around the grouped passes, have a fixed grid,
+    and are not described by the grouped `n`/`block` column tile. Rather than
+    loosen `Abi`'s "exactly the four launches" contract, AOT emits a second
+    manifest section `staging` carrying a `grid` and the baked `constexprs`, and
+    Rust has a separate `StagingAbi`/`StagingKernel` with its own arg builders
+    (`lru_ensure_args`, `index_copy_args`) and `staging_cubin`. Shared manifest
+    validation moved to `parse_args`, so both sections reject a malformed entry
+    the same way; the two sections are disjoint (`Abi` rejects a staging name and
+    vice versa, tested).
+    - `index_copy`'s `STEPS` is derived, not guessed: a `BLOCK_K`=128 route plan
+      copying the largest bank row (`gate_up_packed#L*` = [num_experts, 1024,
+      1024] = 1 MiB/expert) needs `ceil(128 * 1 MiB / (GROUPS*BLOCK_BYTES)) =
+      128`, i.e. `SERVING_COPY_STEPS = copy_steps(SERVING_BLOCK_K,
+      SERVING_MAX_FEAT_BYTES)`. The earlier placeholder of 64 would have
+      silently under-copied half of a full plan.
+    - `aot.py`'s `--check` normalizes `/nix/store` paths and `write` touches only
+      genuinely changed artifacts, so registering the pair left the committed
+      gemv/silu/sum_reduce cubins byte-identical (decision 45).
+    - Committed: `kernel/lru_ensure.{cubin,ptx}`, `kernel/index_copy.{cubin,ptx}`
+      and the new `staging` section in `kernel/manifest.json`. Rust coverage is
+      CPU-only (`kernel_abi` tests re-derive the arg list from the committed
+      PTX); the launch itself still needs the device wiring below.
 
 ### Config defaults for the RTX 5060 / 8 GB target
 
