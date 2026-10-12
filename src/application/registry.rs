@@ -124,7 +124,7 @@ fn moe_port(
 ) -> Result<Option<Arc<dyn MoEExecutor>>, RegistryError> {
     use crate::application::run_experts::CachedExperts;
     use crate::domain::expert_kernel::ExpertShapes;
-    use crate::infrastructure::banks::FtwBanks;
+    use crate::infrastructure::banks::{FtwBanks, FtwPinnedBanks};
     use crate::infrastructure::cuda_moe::CudaMoE;
 
     if !config.kernel.triton {
@@ -135,16 +135,32 @@ fn moe_port(
         .map_err(|e| build_err(e.to_string()))?;
     // One `Mutex<CudaMoE>` is both ports: the store stages into it and the gemm
     // reads the same device banks.
-    let moe = Arc::new(std::sync::Mutex::new(
-        CudaMoE::new(
-            device,
-            Arc::new(FtwBanks::new(reader, index)),
-            shapes,
-            config.moe.cache_size_slots,
-        )
-        .map_err(|e| build_err(e.to_string()))?,
-    ));
-    Ok(Some(Arc::new(CachedExperts::new(
+    let mut adapter = CudaMoE::new(
+        device,
+        Arc::new(FtwBanks::new(reader.clone(), index.clone())),
+        shapes,
+        config.moe.cache_size_slots,
+    )
+    .map_err(|e| build_err(e.to_string()))?;
+    // Decision 40 prerequisite 4: a page-locked copy of every expert bank that
+    // the device LRU reads its misses from, so the plan never crosses to the
+    // host. Loaded once and owned by the adapter, because a captured graph
+    // bakes its device aliases in.
+    let driver = adapter.driver();
+    let pinned = FtwPinnedBanks::load(
+        &driver,
+        &reader,
+        &index,
+        shapes,
+        params.num_layers,
+        params.num_experts,
+    )
+    .map_err(|e| build_err(e.to_string()))?;
+    adapter
+        .enable_device_staging(Box::new(pinned), params.num_layers, params.num_experts)
+        .map_err(|e| build_err(e.to_string()))?;
+    let moe = Arc::new(std::sync::Mutex::new(adapter));
+    Ok(Some(Arc::new(CachedExperts::with_device_staging(
         moe.clone(),
         moe,
         params.num_layers,

@@ -696,6 +696,12 @@ impl CudaKernels {
         &self.abi
     }
 
+    /// The shared driver handle, so a sibling allocation (the pinned banks) uses
+    /// the same context these kernels launch in.
+    pub fn driver(&self) -> Arc<Driver> {
+        Arc::clone(&self.driver)
+    }
+
     pub fn function(&self, kernel: &Kernel) -> Result<CUfunction, CudaError> {
         for (_, table) in &self.loaded {
             if let Some(f) = table.get(kernel.name) {

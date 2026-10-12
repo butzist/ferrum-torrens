@@ -14,7 +14,7 @@ use crate::domain::expert_kernel::{
 };
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 /// The engine's `MoEExecutor`: the same three pieces `run_experts` takes, held
@@ -27,6 +27,17 @@ pub struct CachedExperts {
     store: Arc<dyn ExpertSlotStore>,
     gemm: Arc<dyn ExpertGemm>,
     steps: AtomicU64,
+    /// Whether the adapter has device staging and this executor should prefer
+    /// it. Off for the host plan, which is the only path until the registry
+    /// wires the pinned banks in.
+    staged: bool,
+    /// Which path the last device step took, so a switch can cold-start the
+    /// path being entered. The two residency states are independent views of
+    /// the same device banks, so neither may read the other's mapping.
+    on_staged: AtomicBool,
+    num_layers: usize,
+    num_experts: usize,
+    cache_size: usize,
 }
 
 impl CachedExperts {
@@ -37,18 +48,47 @@ impl CachedExperts {
         num_experts: usize,
         cache_size: usize,
     ) -> Self {
+        Self::build(store, gemm, num_layers, num_experts, cache_size, false)
+    }
+
+    /// The host-plan executor unless the adapter reports device staging. The
+    /// registry uses this once the pinned banks are loaded, so a step whose
+    /// routes fit `staged_route_cap` never reads the router's ids on the host.
+    pub fn with_device_staging(
+        store: Arc<dyn ExpertSlotStore>,
+        gemm: Arc<dyn ExpertGemm>,
+        num_layers: usize,
+        num_experts: usize,
+        cache_size: usize,
+    ) -> Self {
+        Self::build(store, gemm, num_layers, num_experts, cache_size, true)
+    }
+
+    fn build(
+        store: Arc<dyn ExpertSlotStore>,
+        gemm: Arc<dyn ExpertGemm>,
+        num_layers: usize,
+        num_experts: usize,
+        cache_size: usize,
+        staged: bool,
+    ) -> Self {
         Self {
             cache: Mutex::new(ExpertCache::new(num_layers, num_experts, cache_size)),
             store,
             gemm,
             steps: AtomicU64::new(0),
+            staged,
+            on_staged: AtomicBool::new(false),
+            num_layers,
+            num_experts,
+            cache_size,
         }
     }
 
     /// Slots the machine can hand out. A step's plan needs this to be at least
     /// the adapter's bank size, which `run_experts` checks.
     pub fn cache_size(&self) -> usize {
-        self.locked().cache_size()
+        self.cache_size
     }
 
     /// Steps this executor has run, counted at the port so a caller can prove
@@ -77,6 +117,33 @@ impl MoEExecutor for CachedExperts {
         // Counted before the work, so a step the kernel refuses still shows up:
         // the count is evidence that the port was reached, not that it succeeded.
         self.steps.fetch_add(1, Ordering::Relaxed);
+        let tokens = check_device_step(req)?;
+        if out.numel() < tokens * req.hidden {
+            return Err(MoEError::Bad(format!(
+                "device expert step: {} outputs for {tokens} tokens x hidden {}",
+                out.numel(),
+                req.hidden
+            )));
+        }
+        let routes = tokens * req.top_k;
+
+        // The staged path owns the plan on the device, so it is preferred for
+        // any step the committed `lru_ensure` can fit. Entering it cold-starts
+        // the slot machine: the device tables are the truth there, and the
+        // host plan's mapping is stale against them.
+        if self.staged && routes > 0 && routes <= self.gemm.staged_route_cap() {
+            if !self.on_staged.swap(true, Ordering::AcqRel) {
+                *self.locked() =
+                    ExpertCache::new(self.num_layers, self.num_experts, self.cache_size);
+            }
+            return self.gemm.grouped_moe_staged(req, out);
+        }
+
+        // Host plan. Entering it has to drop the device table, whose slots the
+        // plan is about to overwrite at its own choosing.
+        if self.on_staged.swap(false, Ordering::AcqRel) {
+            self.gemm.reset_staging()?;
+        }
         run_experts_device(
             &mut self.locked(),
             self.store.as_ref(),
@@ -139,20 +206,10 @@ pub fn run_experts(
     )
 }
 
-/// One routed layer step with the activations, the weights and the output
-/// still in their device buffers (decision 43). Only the routes leave the
-/// device, because the plan is computed here -- prerequisite 4 moves that too.
-///
-/// `out` receives `tokens * hidden` f32, and the slot rewrites happen exactly
-/// as they do on the host path: nothing about the residency changes with the
-/// hand-off.
-pub fn run_experts_device(
-    cache: &mut ExpertCache,
-    store: &dyn ExpertSlotStore,
-    gemm: &dyn ExpertGemm,
-    step: &MoEDeviceRequest<'_>,
-    out: &mut dyn MoETensor,
-) -> Result<(), MoEError> {
+/// Reject a device step whose buffers do not divide into a dense batch and
+/// report the token count. Element counts only: a rejected step reads nothing,
+/// which is what keeps the validation identical on both hand-offs.
+fn check_device_step(step: &MoEDeviceRequest<'_>) -> Result<usize, MoEError> {
     let (hidden, top_k) = (step.hidden, step.top_k);
     let (x_len, expert_count, weight_count) =
         (step.x.numel(), step.experts.numel(), step.weights.numel());
@@ -168,6 +225,25 @@ pub fn run_experts_device(
              for {tokens} tokens x top_k {top_k}"
         )));
     }
+    Ok(tokens)
+}
+
+/// One routed layer step with the activations, the weights and the output
+/// still in their device buffers (decision 43). Only the routes leave the
+/// device, because the plan is computed here -- prerequisite 4 moves that too.
+///
+/// `out` receives `tokens * hidden` f32, and the slot rewrites happen exactly
+/// as they do on the host path: nothing about the residency changes with the
+/// hand-off.
+pub fn run_experts_device(
+    cache: &mut ExpertCache,
+    store: &dyn ExpertSlotStore,
+    gemm: &dyn ExpertGemm,
+    step: &MoEDeviceRequest<'_>,
+    out: &mut dyn MoETensor,
+) -> Result<(), MoEError> {
+    let hidden = step.hidden;
+    let tokens = check_device_step(step)?;
     if out.numel() < tokens * hidden {
         return Err(MoEError::Bad(format!(
             "device expert step: {} outputs for {tokens} tokens x hidden {hidden}",
@@ -409,6 +485,80 @@ mod tests {
             .unwrap();
         // `store` allows no further `load` calls, so this second step only
         // passes if both experts were still resident.
+        exec.execute_device(&device_request(3, &x, &experts, &weights), &mut out)
+            .unwrap();
+    }
+
+    /// With device staging on, a step that fits the cap never reads the router's
+    /// ids on the host: the adapter's `lru_ensure` rewrites them on the device.
+    /// The store is never asked to stage either, because the kernel copied the
+    /// misses itself.
+    #[test]
+    fn a_staged_step_keeps_the_router_ids_on_the_device() {
+        let store = strict_store(4);
+        let mut gemm = MockExpertGemm::new();
+        gemm.expect_staged_route_cap().return_const(128usize);
+        gemm.expect_grouped_moe_staged()
+            .times(1)
+            .returning(|_, out| out.set_host_f32(&vec![0.5f32; out.numel()]));
+        let exec = CachedExperts::with_device_staging(Arc::new(store), Arc::new(gemm), 4, 8, 4);
+        let (x, experts, weights, mut out) = step_buffers();
+        exec.execute_device(&device_request(3, &x, &experts, &weights), &mut out)
+            .unwrap();
+        assert_eq!(experts.reads(), 0, "the ids stayed on the device");
+        assert_eq!(x.reads(), 0);
+        assert_eq!(weights.reads(), 0);
+        assert_eq!(out.vals, vec![0.5f32; 8]);
+    }
+
+    /// A step past the cubin's route cap falls back to the host plan, which
+    /// reads the ids once and stages the misses through the store.
+    #[test]
+    fn a_step_past_the_route_cap_falls_back_to_the_host_plan() {
+        let mut store = strict_store(4);
+        store.expect_load().times(2).returning(|_, _, _| Ok(()));
+        let mut gemm = MockExpertGemm::new();
+        gemm.expect_staged_route_cap().return_const(2usize);
+        gemm.expect_grouped_moe_dev()
+            .times(1)
+            .returning(|_, _| Ok(()));
+        let exec = CachedExperts::with_device_staging(Arc::new(store), Arc::new(gemm), 4, 8, 4);
+        let (x, experts, weights, mut out) = step_buffers();
+        exec.execute_device(&device_request(3, &x, &experts, &weights), &mut out)
+            .unwrap();
+        assert_eq!(experts.reads(), 1, "the host plan read the ids once");
+    }
+
+    /// The two paths keep independent residency over the same banks, so entering
+    /// the host plan after a staged step has to empty the device LRU. Without
+    /// the reset the plan's writes would land at slots a stale table still maps.
+    #[test]
+    fn leaving_the_staged_path_resets_the_device_lru() {
+        let mut store = strict_store(4);
+        store.expect_load().times(2).returning(|_, _, _| Ok(()));
+        let mut gemm = MockExpertGemm::new();
+        // First step fits the cap (staged); the second reports no staging, so it
+        // takes the host plan.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        gemm.expect_staged_route_cap().returning(move || {
+            if c.fetch_add(1, Ordering::Relaxed) == 0 {
+                128
+            } else {
+                0
+            }
+        });
+        gemm.expect_grouped_moe_staged()
+            .times(1)
+            .returning(|_, _| Ok(()));
+        gemm.expect_grouped_moe_dev()
+            .times(1)
+            .returning(|_, _| Ok(()));
+        gemm.expect_reset_staging().times(1).return_const(Ok(()));
+        let exec = CachedExperts::with_device_staging(Arc::new(store), Arc::new(gemm), 4, 8, 4);
+        let (x, experts, weights, mut out) = step_buffers();
+        exec.execute_device(&device_request(3, &x, &experts, &weights), &mut out)
+            .unwrap();
         exec.execute_device(&device_request(3, &x, &experts, &weights), &mut out)
             .unwrap();
     }

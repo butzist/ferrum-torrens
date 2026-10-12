@@ -220,6 +220,29 @@ pub trait ExpertGemm: Send + Sync {
         req: &MoEDeviceGroup<'a>,
         out: &mut dyn MoETensor,
     ) -> Result<(), MoEError>;
+
+    /// The device-resident hand-off of decision 40 prerequisite 4: the adapter
+    /// rewrites the router's dense ids to slot ids with `lru_ensure` and copies
+    /// the misses in with `index_copy`, both on the device, so nothing about the
+    /// residency plan crosses to the host. `req.experts` is the router's dense
+    /// `[tokens, top_k]` ids; the adapter works on its own device copy.
+    fn grouped_moe_staged<'a>(
+        &self,
+        req: &MoEDeviceRequest<'a>,
+        out: &mut dyn MoETensor,
+    ) -> Result<(), MoEError>;
+
+    /// The largest `tokens * top_k` one `grouped_moe_staged` step can take, or
+    /// zero when this adapter has no device staging. The committed `lru_ensure`
+    /// bakes this bound, so the executor reports it and falls back to the host
+    /// plan for a step past it rather than launching a kernel that cannot fit.
+    fn staged_route_cap(&self) -> usize;
+
+    /// Drop the device LRU's residency. The host plan writes the same device
+    /// banks at slots the device table would still map, so entering the host
+    /// path after the staged one has to invalidate the table first. A no-op when
+    /// device staging is off.
+    fn reset_staging(&self) -> Result<(), MoEError>;
 }
 
 /// An opaque buffer of device memory handed across the MoE ports: the tower's

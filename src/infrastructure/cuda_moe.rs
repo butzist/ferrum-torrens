@@ -22,8 +22,8 @@ use std::sync::{Arc, Mutex};
 use tch::Tensor;
 
 use crate::domain::expert_kernel::{
-    BANKS, ExpertGemm, ExpertShapes, ExpertSlabSource, ExpertSlotStore, MoEDeviceGroup, MoEError,
-    MoEGroup, MoETensor, Part, PinnedBankSource, Slab, route_lists,
+    BANKS, ExpertGemm, ExpertShapes, ExpertSlabSource, ExpertSlotStore, MoEDeviceGroup,
+    MoEDeviceRequest, MoEError, MoEGroup, MoETensor, Part, PinnedBankSource, Slab, route_lists,
 };
 use crate::infrastructure::cuda_driver::{
     CUstream, CudaError, CudaKernels, Driver, StagingKernels,
@@ -140,6 +140,10 @@ pub struct CudaMoE {
     /// The device slot tables and pinned-bank plan, present once
     /// `enable_device_staging` has run.
     device_staging: Option<DeviceStaging>,
+    /// The pinned host banks the copy kernel reads. Owned here because a
+    /// captured graph bakes their device aliases in and they must outlive every
+    /// replay (decision 40 prerequisite 4).
+    pinned: Option<Box<dyn PinnedBankSource>>,
 }
 
 // SAFETY: the fields are libtorch tensors, Arcs, plain data, and driver handles
@@ -254,11 +258,18 @@ impl CudaMoE {
             gate_up: None,
             down: None,
             device_staging: None,
+            pinned: None,
         })
     }
 
     pub fn stream(&self) -> CUstream {
         self.stream
+    }
+
+    /// The process-wide driver handle, so the composition root can build the
+    /// pinned banks on the same context the adapter launches in.
+    pub fn driver(&self) -> Arc<Driver> {
+        self.kernels.driver()
     }
 
     pub fn shapes(&self) -> ExpertShapes {
@@ -352,7 +363,7 @@ impl CudaMoE {
     /// silently produce a wrong plan, so both are refused.
     pub fn enable_device_staging(
         &mut self,
-        pinned: &dyn PinnedBankSource,
+        pinned: Box<dyn PinnedBankSource>,
         layers: usize,
         experts: usize,
     ) -> Result<(), MoEError> {
@@ -421,6 +432,45 @@ impl CudaMoE {
             feat_bytes: Tensor::from_slice(&feat).to(dev),
             src_ptrs,
         });
+        self.pinned = Some(pinned);
+        Ok(())
+    }
+
+    /// The `lru_ensure` route cap, or zero when device staging is off. The
+    /// cubin bakes it, so this is the executor's answer for whether a step fits
+    /// the staged path.
+    pub fn staged_route_cap(&self) -> usize {
+        if self.device_staging.is_none() {
+            return 0;
+        }
+        self.staging_abi
+            .kernel(LRU_ENSURE)
+            .ok()
+            .and_then(|k| k.constexpr("BLOCK_K").ok())
+            .map(|v| v as usize)
+            .unwrap_or(0)
+    }
+
+    /// Empty the device LRU: every id maps to `-1`, no slot is resident and the
+    /// clock resets. The host plan writes the same banks at slots of its own
+    /// choosing, so this is what keeps a stale table from reading them.
+    pub fn reset_staging(&mut self) -> Result<(), MoEError> {
+        let Some(st) = self.device_staging.as_mut() else {
+            return Ok(());
+        };
+        let dev = self.device.to_tch();
+        let neg = |n: usize| Tensor::from_slice(&vec![-1i32; n]).to(dev);
+        let zero = |n: usize| Tensor::from_slice(&vec![0i64; n]).to(dev);
+        let n = st.slot_for_id.numel();
+        st.slot_for_id.copy_(&neg(n));
+        let n = st.id_of_slot.numel();
+        st.id_of_slot.copy_(&neg(n));
+        let n = st.usage.numel();
+        st.usage.copy_(&zero(n));
+        let n = st.step.numel();
+        st.step.copy_(&zero(n));
+        let n = st.num.numel();
+        st.num.copy_(&zero(n));
         Ok(())
     }
 
@@ -597,12 +647,36 @@ impl CudaMoE {
     /// that off the host too.
     pub fn stage_dev(&self, req: &MoEDeviceGroup<'_>) -> Result<StagedGroup, MoEError> {
         let tokens = self.check_dev(req)?;
-        let (hidden, inter, top_k) = (self.shapes.hidden, self.shapes.inter, req.top_k);
-        let routes = tokens * top_k;
+        let top_k = req.top_k;
         let (route_token, route_slot) = route_lists(req.routes, tokens, top_k)?;
-        let x = device_tensor(req.x, "the activations")?;
-        let w = device_tensor(req.weights, "the weights")?;
+        let dev = self.device.to_tch();
+        self.group_with_slots(
+            req.x,
+            req.weights,
+            Tensor::from_slice(&route_slot).to(dev),
+            Tensor::from_slice(&route_token).to(dev),
+            tokens,
+            top_k,
+        )
+    }
 
+    /// Assemble a step's device buffers from activations and weights that are
+    /// already on the device, with the route lists supplied as device tensors:
+    /// the host path builds them from `route_lists`, the staged path from the
+    /// kernel's own rewrite.
+    fn group_with_slots(
+        &self,
+        x: &dyn MoETensor,
+        weights: &dyn MoETensor,
+        slot_t: Tensor,
+        token_t: Tensor,
+        tokens: usize,
+        top_k: usize,
+    ) -> Result<StagedGroup, MoEError> {
+        let (hidden, inter) = (self.shapes.hidden, self.shapes.inter);
+        let routes = tokens * top_k;
+        let x = device_tensor(x, "the activations")?;
+        let w = device_tensor(weights, "the weights")?;
         let dev = self.device;
         let bf16 = (tch::Kind::BFloat16, dev.to_tch());
         let mut g = StagedGroup {
@@ -610,8 +684,8 @@ impl CudaMoE {
             top_k,
             routes,
             x: Tensor::zeros([tokens as i64, hidden as i64], bf16),
-            slot_t: Tensor::from_slice(&route_slot).to(dev.to_tch()),
-            token_t: Tensor::from_slice(&route_token).to(dev.to_tch()),
+            slot_t,
+            token_t,
             weight_t: Tensor::zeros([routes as i64], (tch::Kind::Float, dev.to_tch())),
             lut: f32_tensor(&E2M1, &[E2M1.len() as i64], dev),
             ic1: Tensor::empty([routes as i64, (2 * inter) as i64], bf16),
@@ -806,6 +880,44 @@ impl CudaMoE {
         self.launch(&g)?;
         self.collect_dev(&g, out)
     }
+
+    /// The whole step with the plan on the device: rewrite the router's ids into
+    /// slots (`lru_ensure`), copy the misses (`index_copy`), then the same three
+    /// pieces as the other hand-offs (decision 40 prerequisite 4). The ids never
+    /// cross to the host, so a capture sees only data-independent launches.
+    pub fn grouped_moe_staged(
+        &mut self,
+        req: &MoEDeviceRequest<'_>,
+        out: &mut dyn MoETensor,
+    ) -> Result<(), MoEError> {
+        let tokens = self.check_batch(
+            req.top_k,
+            req.x.numel(),
+            req.experts.numel(),
+            req.weights.numel(),
+        )?;
+        let top_k = req.top_k;
+        let routes = tokens * top_k;
+        // The kernel rewrites this copy in place; narrowing to int32 makes a
+        // fresh buffer, so the router's own `[tokens, top_k]` ids are untouched.
+        let ids = device_tensor(req.experts, "the expert ids")?;
+        let slots = ids
+            .reshape([routes as i64])
+            .to_kind(tch::Kind::Int)
+            .contiguous();
+        self.ensure_experts(req.layer, &slots)?;
+        self.copy_missing(req.layer)?;
+
+        let dev = self.device.to_tch();
+        let token_t = Tensor::arange(tokens as i64, (tch::Kind::Int, dev))
+            .unsqueeze(1)
+            .expand([tokens as i64, top_k as i64], false)
+            .contiguous()
+            .reshape([routes as i64]);
+        let g = self.group_with_slots(req.x, req.weights, slots, token_t, tokens, top_k)?;
+        self.launch(&g)?;
+        self.collect_dev(&g, out)
+    }
 }
 
 /// Packed plus scales plus globals for one expert's two slabs.
@@ -871,6 +983,26 @@ impl ExpertGemm for Mutex<CudaMoE> {
         self.lock()
             .map_err(|_| MoEError::Bad("cuda slot cache poisoned".into()))?
             .grouped_moe_dev(req, out)
+    }
+
+    fn grouped_moe_staged<'a>(
+        &self,
+        req: &MoEDeviceRequest<'a>,
+        out: &mut dyn MoETensor,
+    ) -> Result<(), MoEError> {
+        self.lock()
+            .map_err(|_| MoEError::Bad("cuda slot cache poisoned".into()))?
+            .grouped_moe_staged(req, out)
+    }
+
+    fn staged_route_cap(&self) -> usize {
+        self.lock().map(|m| m.staged_route_cap()).unwrap_or(0)
+    }
+
+    fn reset_staging(&self) -> Result<(), MoEError> {
+        self.lock()
+            .map_err(|_| MoEError::Bad("cuda slot cache poisoned".into()))?
+            .reset_staging()
     }
 }
 

@@ -71,8 +71,13 @@ compile-clean. They are now AOT-registered in their own manifest section (decisi
 `StagingAbi` parses them, builds their argument packs and knows their fixed
 grids. The P0 pinned expert host banks are in place (decision 47): a page-locked,
 device-mapped region per bank holding every expert of every layer, filled once
-from the FTW banks. Next: mirror the slot tables to the device and wire
-`CudaMoE` to drive the staging kernels over those banks. Decision 45 is resolved: it was a
+from the FTW banks. Device staging is now wired end to end (decision 48): the
+device slot-table mirror is allocated with the pinned banks, `CudaMoE` drives
+`lru_ensure`/`index_copy` in `grouped_moe_staged`, and `CachedExperts` prefers
+that path whenever a step's routes fit the cubin's `BLOCK_K` (host plan past it).
+Decision 40 prerequisite 4 is therefore complete. Next: P1 pinned batch-metadata
+staging (positions / input_mapping / out_loc / token_pool / page_table), the
+warmup and one captured decode step, then per-batch-size graphs. Decision 45 is resolved: it was a
 false positive (the gemv bytes differ only by the toolchain's `/nix/store` path
 baked into debug info), `aot.py --check` normalizes store paths, and `write` only
 touches genuinely changed artifacts, so the committed gemv/silu/sum_reduce cubins
@@ -83,6 +88,7 @@ hand-exported env. Only then warmup + one captured
 decode step together with the pinned batch-metadata staging P1, per-batch-size
 graphs over a mempool, and a replay-vs-uncaptured gate per batch size. After
 that, M2 (API) proper and the remaining M3 perf items. Last finished: decision
+48 (device staging wiring + path-transition reset), decision
 47 (the pinned expert host banks), decision
 46 (the staging manifest section + Rust `StagingAbi`), decision
 44 (the device-side staging-kernel port), decision
@@ -516,11 +522,11 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
      **done, decision 41**, (ii) stable `begin_layer` bank addresses plus the
      flat cross-layer slot LRU **done, decision 42**, (iii)
      a device-resident MoE hand-off **done, decision 43**, (iv) the two
-     device-side staging kernels **ported, decision 44; AOT-registered, decision
-     46** over pinned host banks **allocated and filled, decision 47**, leaving
-     only the device slot-table mirror and `CudaMoE` wiring before staging can be
-     recorded. The capture
-     steps below are unchanged.
+      device-side staging kernels **ported, decision 44; AOT-registered, decision
+      46** over pinned host banks **allocated and filled, decision 47**, and the
+      device slot-table mirror plus `CudaMoE` wiring **done, decision 48**, so
+      staging is now driven from the adapter. The capture
+      steps below are unchanged.
   2. **Warmup + capture one uncaptured step** mirroring `engine/graph.py`: an
      uncaptured forward first, flush both streams (slice 1's rule), capture on
      the side stream, sample logits `[bs, vocab]` produced *inside* the graph.
@@ -563,8 +569,8 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 ### MoE offload cache
 - [x] P0 flat id space `layer*num_experts + expert`; tables `slot_for_id[L*E]` (-1 free), `id_of_slot[C]`, `usage[C]` step clock. (`domain/expert_cache.rs`)
 - [x] P0 `ensure_experts` (LRU): rewrite routed ids -> slot ids in place; emit miss list; LRU victim = argmin(usage) with same-step owner protection (an expert used earlier in this step may not be evicted).
-- [x] P0 device-side staging kernels ported to `python/ferrum_kernel/offload.py` (`ensure_experts` LRU + `index_copy_multi` fused multi-bank copy, fixed-shape, decision 44); Python oracle compared in `selftest.py --interp`, sm_120 compile check green. AOT registration is done (decision 46) and the pinned host banks are done (decision 47); remaining prerequisite-4 work: the device slot-table mirror and `CudaMoE` wiring.
-- [ ] P0 `copy_missing`: fused copy of all banks' missed rows on the compute stream (serial per step). Moves up next: the Triton adapter needs a device slot cache to read from (M3 kernel part 2, decision 24).
+- [x] P0 device-side staging kernels ported to `python/ferrum_kernel/offload.py` (`ensure_experts` LRU + `index_copy_multi` fused multi-bank copy, fixed-shape, decision 44); Python oracle compared in `selftest.py --interp`, sm_120 compile check green. AOT registration is done (decision 46), the pinned host banks are done (decision 47), and the device slot-table mirror plus `CudaMoE` wiring are done (decision 48).
+- [x] P0 `copy_missing`: fused copy of all banks' missed rows on the compute stream (serial per step). `CudaMoE::grouped_moe_staged` drives `lru_ensure` then `index_copy` over the pinned banks, and `CachedExperts` prefers it for any step that fits the cubin's route cap (decision 48).
 - [ ] P0 prefill: `materialize_layer` per-layer full stream; `prefill_overlap` two-buffer (copy stream + ready/release events, layer+1 prefetch) guarded by `cache_size >= 2*E`.
 - [x] P0 `cache_size_slots` explicit from config; floor `>= num_experts`. (floor enforced in `application::engine::load_engine`)
 - [ ] P0 prefill double-buffer and decode path must not clobber each other (begin_prefill fence).
@@ -1616,6 +1622,42 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
       part of this: the globals still live only in the pinned host banks.
     - Done: device slot-table mirror and `CudaMoE` wiring to launch
       `lru_ensure`/`index_copy` are in place; gated GPU tests (`cuda_moe_matches_reference`, `cuda_graph_moe_smoke`) pass.
+
+48. **Device staging is wired into the executor, with a path-transition reset**
+    (2026-10-09) -- decision 40 prerequisite 4, engine half.
+    - **What changed.** `CudaMoE::enable_device_staging` now takes ownership of
+      the `Box<dyn PinnedBankSource>` (a captured graph bakes its aliases in, so
+      it must outlive every replay) and gains `staged_route_cap` (the committed
+      `lru_ensure` `BLOCK_K`, or 0 when staging is off), `reset_staging` and
+      `grouped_moe_staged` (rewrite ids with `lru_ensure`, copy misses with
+      `index_copy`, then the shared `group_with_slots`/`launch`/`collect_dev`).
+      The port `ExpertGemm` widens by the matching three methods; `CudaKernels`
+      and `CudaMoE` expose `driver()` so the composition root builds the pinned
+      banks on the same context.
+    - **Path selection.** `CachedExperts::with_device_staging` prefers the staged
+      path for any `tokens * top_k <= staged_route_cap()` step and falls back to
+      the host plan past it. The cap matters: the committed `lru_ensure` bakes
+      `BLOCK_K = 128`, so decode (bounded by `max_running_requests * top_k`) fits
+      while a `max_prefill_length = 1024` prefill (8192 routes) does not. Prefill
+      therefore keeps the host plan until the prefill-overlap slice lands.
+    - **Two independent residency states.** The domain `ExpertCache` and the
+      device LRU are separate maps over the same device banks, so mixing the two
+      paths would read bank slots through the other map. On every path
+      transition the entered path is cold-started: entering staged recreates the
+      `ExpertCache`, entering the host plan calls `reset_staging()` (ids `-1`,
+      usage/step/num zero, in place so addresses stay put). Leaving and returning
+      to a path is therefore safe, at the cost of one cold step after each
+      prefill/decode switch -- acceptable until prefill overlap removes the
+      switch. If prefill and decode must stay warm together, the fix is to drive
+      the host plan from the same device tables rather than to weaken this.
+    - **Composition root.** `registry::moe_port` builds `FtwPinnedBanks` from the
+      reader/index and enables staging before wrapping the adapter, so
+      `kernel.triton = true` now routes through the device LRU end to end.
+    - **Tests.** CPU-only mock tests pin the path choice: a staged step reads no
+      ids on the host, a step past the cap takes the host plan, and leaving the
+      staged path calls `reset_staging` once. The staged numeric path is covered
+      by the existing gated `cuda_moe_matches_reference` /
+      `cuda_graph_moe_smoke` (devshell), which remain the real-hardware gate.
 
 ### Config defaults for the RTX 5060 / 8 GB target
 
