@@ -485,6 +485,49 @@ fn the_lm_head_block_split_is_exact() {
     }
 }
 
+#[test]
+fn lm_head_logits_into_matches_the_host_pass() {
+    // The device-writing tail must produce exactly what the host-vec pass did:
+    // same block loop, same product, just landed in the caller's buffer.
+    let (rows, cols) = (40, 32);
+    let w = data(rows * cols, 41);
+    let x = data(cols, 42);
+    let head = Dense {
+        w: super::up(f32_tensor(&w, &[rows as i64, cols as i64], dev())),
+        row_scale: None,
+        rows,
+    };
+    let xt = up(&x, &[1, cols as i64]);
+    let want = to_f32_vec(&f32_(&xt).matmul(&f32_(&head.w).transpose(0, 1)));
+
+    let out = Tensor::zeros([rows as i64], (Kind::Float, dev().to_tch()));
+    lm_head_logits_into(&head, &xt, &out);
+    close(&to_f32_vec(&out), &want, 1e-4, "lm_head_logits_into");
+}
+
+#[test]
+fn lm_head_logits_into_applies_the_row_scale() {
+    let (rows, cols) = (40, 32);
+    let w = data(rows * cols, 43);
+    let scale = data(rows, 44);
+    let x = data(cols, 45);
+    let head = Dense {
+        w: super::up(f32_tensor(&w, &[rows as i64, cols as i64], dev())),
+        row_scale: Some(super::up(f32_tensor(&scale, &[rows as i64], dev()))),
+        rows,
+    };
+    let xt = up(&x, &[1, cols as i64]);
+    let want: Vec<f32> = to_f32_vec(&f32_(&xt).matmul(&f32_(&head.w).transpose(0, 1)))
+        .iter()
+        .zip(scale.iter())
+        .map(|(a, b)| a * b)
+        .collect();
+
+    let out = Tensor::zeros([rows as i64], (Kind::Float, dev().to_tch()));
+    lm_head_logits_into(&head, &xt, &out);
+    close(&to_f32_vec(&out), &want, 1e-4, "lm_head_logits_into scale");
+}
+
 /// A `WeightsReader` over a byte blob that counts the reads it serves, so a
 /// test can prove which path touched the checkpoint.
 struct CountingReader {

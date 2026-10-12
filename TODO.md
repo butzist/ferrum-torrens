@@ -1,6 +1,6 @@
 # FerrumTorrens -- FreeToken MVP port to Rust: TODO
 
-Status: M2 (API) current; M3 prerequisite 4 (device staging: lru_ensure + index_copy + pinned banks + wiring) complete, and decision 40's capture work advances: decision 49 gives the fixed-address `DecodeBuffers` batch-metadata staging, and decision 50 settles the mempool -- torch's graph pool behind a tiny C++ bridge, with `tests/cuda_graph_torch_probe.rs` green on the device. Remaining: wire the decode step to the buffers and capture one real decode step. Decision 36 is
+Status: M2 (API) current; M3 prerequisite 4 (device staging: lru_ensure + index_copy + pinned banks + wiring) complete, and decision 40's capture work advances: decision 49 gives the fixed-address `DecodeBuffers` batch-metadata staging, decision 50 settles the mempool -- torch's graph pool behind a tiny C++ bridge, with `tests/cuda_graph_torch_probe.rs` green on the device -- and the forward's output tail is now a device-logits step (`forward_cached_into`, no host round-trip). Remaining: stage the decode step's inputs off the buffers, make the attention gather fixed-length, and capture one real decode step. Decision 36 is
 done end to end: the serving path is Python-free. The sm_120 cubins are
 committed under `kernel/` with an ABI manifest, `infrastructure/kernel_abi.rs`
 packs the launch arguments and checks them against the committed PTX,
@@ -548,9 +548,13 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
      mempool question is settled (decision 50): torch's own graph pool, reached
      through a small C++ bridge, and `tests/cuda_graph_torch_probe.rs` proves a
      captured torch op replays equal to the uncaptured twin on the device.
-     Remaining: make the forward a device-logits step with no host sync inside
-     (write into `DecodeBuffers.logits`), and the bounded proof captures one
-     real decode step at a small fixed context.
+     Remaining: the forward's tail is now a device-logits step
+     (`TorchQwen3_6::forward_cached_into` writes the `lm_head` block pass into
+     a caller-owned device buffer, no host round-trip; `forward_cached` wraps
+     it with a read-back). Still to do: stage the step's inputs
+     (ids/positions/state slots) off `DecodeBuffers` and make the attention
+     gather fixed-length, then the bounded proof captures one real decode step
+     at a small fixed context.
   3. **Per-batch-size executables** for `{1,2,4, max_running}` with dummy-req
      padding to the captured size; the mempool is decided (decision 50: the
      torch graph pool, one per captured batch size), so this lands the shared
@@ -1744,13 +1748,40 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
       that the graph reads the fixed input addresses. The MoE launch capture was
       already proven by `cuda_graph_moe_smoke`; the two now share one stream, so
       a whole-forward graph records both.
-    - **Still open.** The forward must become a device-logits step (no host sync
-      inside, writing `DecodeBuffers.logits`) before a real decode step can be
-      captured, and the attention gather over `cache.filled()` is host-length,
-      so the serving-efficient captured step still wants the paged-attention
-      path. The next slice is the bounded proof: capture one real decode step at
-      a small fixed context, leaving the flashinfer/paged-attention swap as its
-      own M3 item.
+    - **Still open.** The forward's output tail is now device-local:
+      `TorchQwen3_6::forward_cached_into` writes the `lm_head` block pass into a
+      caller-owned `[vocab]` device buffer (the shape `DecodeBuffers.logits`
+      wants) with no host round-trip, and `forward_cached` is that same pass
+      wrapped with a host read-back; the `lm_head_logits_into` core is unit
+      tested and the gated incremental-decode test stays green. What remains for
+      a real captured step: stage the step's inputs (ids/positions/state slots)
+      off `DecodeBuffers` instead of host slices, and make the attention gather
+      fixed-length -- the current `cache.filled()` gather is host-length, so the
+      serving-efficient captured step still wants the paged-attention path. The
+      next slice is the bounded proof: capture one real decode step at a small
+      fixed context, leaving the flashinfer/paged-attention swap as its own M3
+      item.
+
+51. **The cached forward's output tail is device-local** (2026-10-12) --
+    decision 49's "make the forward a device-logits step", output half.
+    - **What changed.** `forward_cached` no longer returns the `lm_head` result
+      built on the host. It delegates to `TorchQwen3_6::forward_cached_into`,
+      which runs the same tower and writes the last token's logits into a
+      caller-owned `[vocab]` device tensor via the new `lm_head_logits_into`
+      core (the `LM_HEAD_BLOCK` row-window pass, each block `copy_`-ed into the
+      buffer at its offset). `forward_cached` is the same pass wrapped with a
+      `to_f32_vec` read-back, so the host `Vec<f32>` contract and every caller
+      are unchanged.
+    - **Why.** A captured step cannot contain a host round-trip. This removes
+      the one at the output boundary and gives `DecodeBuffers.logits` a
+      producer that writes straight into a fixed device address.
+    - **Coverage.** Two CPU-side op tests pin `lm_head_logits_into` (plain and
+      with the per-row scale) against the host product; the gated
+      `kvcache_incremental_decode` stays green, proving the refactor is
+      arithmetic-identical on the real checkpoint.
+    - **Still open.** The step's inputs (ids/positions/state slots) and the
+      `cache.filled()` attention gather are still host-shaped; those are the
+      next slice before a whole decode step can be captured.
 
 ### Config defaults for the RTX 5060 / 8 GB target
 

@@ -352,8 +352,9 @@ sequenceDiagram
   M->>P: execute_device(activations, ids, weights)
   P->>K: lru_ensure + index_copy + grouped GEMM
   K-->>M: routed sum (device)
-  M->>M: shared expert + add; final norm; lm_head
-  M-->>Eng: logits for the last token
+  M->>M: shared expert + add; final norm
+  M->>M: lm_head block pass -> out buffer (device, no host round-trip)
+  M-->>Eng: forward_cached reads out back; forward_cached_into leaves it device-local
 ```
 
 ### 3.5 MoE offload `[core]` (prefill overlap `[TODO]`)
@@ -532,9 +533,10 @@ flowchart TB
     B2["cuda_moe split\nstage / launch / collect\n(launch is capture-safe)"]
     B3["cuda_graph + shim\ntorch current stream + graph pool"]
     DB["decode_buffers\nfixed-address batch metadata"]
+    B4["device-logits tail\nforward_cached_into writes the\nlm_head pass into a device buffer"]
   end
   subgraph Next["[TODO]"]
-    N1["device-logits forward\n(no host sync inside)"]
+    N1["device-staged inputs\nids/positions/slots off DecodeBuffers\n+ fixed-length attention gather"]
     N2["warmup + capture one real\ndecode step on the side stream"]
     N3["per-batch-size executables\n{1,2,4,max_running} + replay gate"]
   end
@@ -569,7 +571,12 @@ sequenceDiagram
 Contracts already fixed: capture runs only on a flags-0 side stream (never the
 legacy stream); a `StagedGroup` and the pinned banks must outlive every graph
 captured over them; a captured grid pins the batch shape; `stage_into` is the
-only writer between replays.
+only writer between replays. The forward's tail is already capture-shaped:
+`TorchQwen3_6::forward_cached_into` writes the `lm_head` block pass straight
+into a caller-owned device logits buffer with no host round-trip, and
+`forward_cached` is the same pass wrapped with a host read-back. The remaining
+host touchpoints are the step's inputs (ids/positions/state slots) and the
+variable-length `cache.filled()` attention gather.
 
 ---
 

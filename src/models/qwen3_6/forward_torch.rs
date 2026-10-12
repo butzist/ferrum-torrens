@@ -1304,19 +1304,30 @@ impl TorchQwen3_6 {
     /// block_split_is_exact` proves a row is identical in any window.
     fn lm_head_logits(&self, x: &Tensor) -> Vec<f32> {
         let head = &self.lm_head;
-        let mut parts: Vec<Tensor> = Vec::new();
-        let mut r0 = 0usize;
-        while r0 < head.rows {
-            let n = LM_HEAD_BLOCK.min(head.rows - r0);
-            let block = head.w.narrow(0, r0 as i64, n as i64);
-            let y = f32_(x).matmul(&f32_(&block).transpose(0, 1));
-            parts.push(match head.row_scale.as_deref() {
-                Some(s) => y * s.narrow(0, r0 as i64, n as i64),
-                None => y,
-            });
-            r0 += n;
-        }
-        to_f32_vec(&Tensor::cat(&parts, 1))
+        let out = Tensor::zeros([head.rows as i64], (Kind::Float, self.device.to_tch()));
+        lm_head_logits_into(head, x, &out);
+        to_f32_vec(&out)
+    }
+}
+
+/// `lm_head(x)` for one token, written into `out` (`[rows]`, f32) instead of
+/// returned as a host vector. Widening `LM_HEAD_BLOCK` rows at a time bounds the
+/// f32 scratch, and writing straight into the caller's device buffer is what
+/// makes the tail of a decode step free of a host round-trip (decision 49).
+fn lm_head_logits_into(head: &Dense, x: &Tensor, out: &Tensor) {
+    debug_assert_eq!(out.size(), vec![head.rows as i64]);
+    let mut r0 = 0usize;
+    while r0 < head.rows {
+        let n = LM_HEAD_BLOCK.min(head.rows - r0);
+        let block = head.w.narrow(0, r0 as i64, n as i64);
+        let y = f32_(x).matmul(&f32_(&block).transpose(0, 1));
+        let y = match head.row_scale.as_deref() {
+            Some(s) => y * s.narrow(0, r0 as i64, n as i64),
+            None => y,
+        };
+        out.narrow(0, r0 as i64, n as i64)
+            .copy_(&f32_(&y).squeeze_dim(0));
+        r0 += n;
     }
 }
 
@@ -1327,13 +1338,15 @@ impl TorchQwen3_6 {
     ///
     /// `cache` must already be grown by `ids.len()` and hold exactly one
     /// sequence; `positions` are absolute, so `positions[0]` is how much of the
-    /// prefix is already there.
-    fn run_sequence_cached(
+    /// prefix is already there. The last token's logits are written into `out`
+    /// (`[vocab]`, on this model's device) instead of returned on the host.
+    fn run_sequence_cached_into(
         &self,
         ids: &[u32],
         positions: &[u32],
         cache: &SequenceCache,
-    ) -> Result<Vec<f32>> {
+        out: &Tensor,
+    ) -> Result<()> {
         let p = &self.params;
         let t = ids.len();
         let slab = self.cache.as_ref().expect("no kv cache attached");
@@ -1365,7 +1378,8 @@ impl TorchQwen3_6 {
         };
         let last = stream.narrow(0, (t - 1) as i64, 1);
         let normed = rms_norm(&last, &self.final_norm, p.rms_norm_eps);
-        Ok(self.lm_head_logits(&normed))
+        lm_head_logits_into(&self.lm_head, &normed, out);
+        Ok(())
     }
 }
 
@@ -1407,6 +1421,27 @@ impl CachedModel for TorchQwen3_6 {
         input: &ForwardInput,
         cache: &mut SequenceCache,
     ) -> std::result::Result<Vec<f32>, KvcacheError> {
+        let out = Tensor::zeros(
+            [self.lm_head.rows as i64],
+            (Kind::Float, self.device.to_tch()),
+        );
+        self.forward_cached_into(input, cache, &out)?;
+        Ok(to_f32_vec(&out))
+    }
+}
+
+impl TorchQwen3_6 {
+    /// `forward_cached`, but the last token's logits are written into `out`
+    /// (`[vocab]`, f32, on this model's device) instead of returned as a host
+    /// vector. `out` must live on the model's device. This is the capture-safe
+    /// tail decision 49 calls for; `forward_cached` wraps it and reads `out`
+    /// back. Everything ahead of `out` is unchanged.
+    pub fn forward_cached_into(
+        &self,
+        input: &ForwardInput,
+        cache: &mut SequenceCache,
+        out: &Tensor,
+    ) -> std::result::Result<(), KvcacheError> {
         let n = input.input_ids.len();
         let start = input.positions[0] as usize;
         if input.answers != vec![n - 1] {
@@ -1425,7 +1460,7 @@ impl CachedModel for TorchQwen3_6 {
                 why: "this model was loaded without a kv cache".to_string(),
             });
         }
-        self.run_sequence_cached(&input.input_ids, &input.positions, cache)
+        self.run_sequence_cached_into(&input.input_ids, &input.positions, cache, out)
             .map_err(|e| KvcacheError::MisalignedCache { why: e.to_string() })
     }
 }
