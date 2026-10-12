@@ -1,6 +1,6 @@
 # FerrumTorrens -- FreeToken MVP port to Rust: TODO
 
-Status: M2 (API) current; M3 prerequisite 4 (device staging: lru_ensure + index_copy + pinned banks + wiring) complete, and decision 40's capture work advances: decision 49 gives the fixed-address `DecodeBuffers` batch-metadata staging, decision 50 settles the mempool -- torch's graph pool behind a tiny C++ bridge, with `tests/cuda_graph_torch_probe.rs` green on the device -- and the forward's output tail is now a device-logits step (`forward_cached_into`, no host round-trip). The decode step's inputs are now staged off the buffers (decision 54: `forward_decode_into`; only device tensors address the cache). Remaining: make the attention gather a fixed-length window, prove the device path against a re-fed forward on the real checkpoint, and capture one real decode step. Decision 36 is
+Status: M2 (API) current; M3 prerequisite 4 (device staging: lru_ensure + index_copy + pinned banks + wiring) complete, and decision 40's capture work advances: decision 49 gives the fixed-address `DecodeBuffers` batch-metadata staging, decision 50 settles the mempool -- torch's graph pool behind a tiny C++ bridge, with `tests/cuda_graph_torch_probe.rs` green on the device -- and the forward's output tail is now a device-logits step (`forward_cached_into`, no host round-trip). The decode step's inputs are now staged off the buffers (decision 54: `forward_decode_into`; only device tensors address the cache), attention gathers a fixed-length padded window (decision 55), and the gated `tests/device_decode_matches_refeed.rs` proves the device path equals the re-fed host forward at ~1e-6 on the real checkpoint. Remaining: pull the MoE staging split out of the captured path, then capture one real decode step. Decision 36 is
 done end to end: the serving path is Python-free. The sm_120 cubins are
 committed under `kernel/` with an ABI manifest, `infrastructure/kernel_abi.rs`
 packs the launch arguments and checks them against the committed PTX,
@@ -551,10 +551,13 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
      Remaining: the forward's tail is now a device-logits step
      (`TorchQwen3_6::forward_cached_into` writes the `lm_head` block pass into
      a caller-owned device buffer, no host round-trip; `forward_cached` wraps
-     it with a read-back). Still to do: stage the step's inputs
-     (ids/positions/state slots) off `DecodeBuffers` and make the attention
-     gather fixed-length, then the bounded proof captures one real decode step
-     at a small fixed context.
+     it with a read-back). The step's inputs are now staged off `DecodeBuffers`
+     (decision 54) and the attention gather is a fixed-length padded window
+     (decision 55), with the gated `tests/device_decode_matches_refeed.rs`
+     proving the device path equals the re-fed host forward on the real
+     checkpoint. Still to do: pull the MoE staging split out of the captured
+     path, then the bounded proof captures one real decode step at a small fixed
+     context.
   3. **Per-batch-size executables** for `{1,2,4, max_running}` with dummy-req
      padding to the captured size; the mempool is decided (decision 50: the
      torch graph pool, one per captured batch size), so this lands the shared
@@ -575,9 +578,10 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 - [ ] P1 pinned staging buffers for batch metadata (positions / input_mapping /
   out_loc / token_pool / page_table sentinel dummy row). The fixed-address
   `DecodeBuffers` (input_ids/positions/state_slots/out_locs + `[max_bs, vocab]`
-  logits, with sentinel padding) are in place (decision 49), and the forward now
-  reads them (`forward_decode_into`, decision 54); allocation from the engine and
-  the fixed-length KV window are the remaining wiring.
+  logits, with sentinel padding, and a fixed-length KV window, decision 55) are in
+  place (decision 49), and the forward now reads them (`forward_decode_into`,
+  decision 54); allocation from the engine (not just the test) is the remaining
+  wiring.
 
 ### Superseded by libtorch (decision 2) -- do not implement
 - [ ] ~~fused add+rmsnorm~~ (libtorch: `add` + `rms_norm`).
@@ -1826,7 +1830,7 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
       embedding by device rows. A new `CacheAccess` enum selects host
       (`SequenceCache`) or device (`out_locs` / `kv_locs` / `slots`) addressing,
       and the single `run_tower` both arms drive keeps them from drifting.
-      `TorchQwen3_6::forward_decode_into(bufs, kv_locs)` runs one decode step off
+      `TorchQwen3_6::forward_decode_into(bufs)` runs one decode step off
       `DecodeBuffers`.
     - **Why.** A captured step bakes addresses and may not read a host value: the
       token, rope position, GDN state slot and KV store location all have to come
@@ -1838,7 +1842,32 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
       `CacheAccess::Host`). 320 lib tests green.
     - **Still open.** The attention gather is still host-length; the next slice
       makes it a fixed-length padded window and proves the device path equal to a
-      re-fed forward on the real checkpoint before any graph is captured.
+      re-fed forward on the real checkpoint before any graph is captured. (Now
+      done: decision 55.)
+
+55. **The device decode gathers a fixed-length padded KV window** (2026-10-12)
+    - **What changed.** The device decode path addresses attention with a fixed
+      `[max_bs, window]` i32 location window (`DecodeBuffers::kv_locs`), not a
+      per-step-length gather. `DecodeBuffers::new(max_bs, vocab, window, device)`
+      sizes it; `stage_window(row, locs)` writes one request's pool locations
+      head-aligned and pads the tail to `window`. The window carries only *valid*
+      pool indices: padding is location 0, never a sentinel, because the gather
+      is an `index_select` and libtorch's CUDA kernel asserts
+      (`indexSelectSmallIndex: srcIndex < srcSelectDimSize failed`) on an
+      out-of-range index. The lagging slots are dropped by the step-position
+      mask, so their value does not matter. `forward_decode_into` takes only
+      `bufs` and reads `bufs.kv_locs_row(0)`.
+    - **Why.** A captured graph bakes shapes and addresses, so the attention
+      gather must be the same shape and the same source address every step
+      (decision 40).
+    - **Coverage.** CPU tests for the window (`the_kv_window_starts_zeroed`,
+      `stage_window_aligns_the_locations_and_pads_the_tail`,
+      `a_window_longer_than_the_buffer_is_refused`); the gated
+      `tests/device_decode_matches_refeed.rs` runs three device decode steps
+      against the re-fed host forward on the real checkpoint and reports
+      max|dlogit|/scale ~1e-6 (well under the 1e-3 gate). 323 lib tests green.
+    - **Still open.** The window is a dense per-request gather, not yet paged or
+      flashinfer-backed; that swap is its own M3 item.
 
 ### Config defaults for the RTX 5060 / 8 GB target
 

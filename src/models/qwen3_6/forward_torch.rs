@@ -1587,23 +1587,23 @@ impl TorchQwen3_6 {
     }
 
     /// One captured decode step's forward: the token id, rope position, GDN
-    /// state slot and K/V store location all come off `bufs`, the K/V read
-    /// window off `kv_locs`, and the logits go back to `bufs`. Nothing here
-    /// touches a host value, which is what lets the whole step be captured into
-    /// a graph (decision 51).
+    /// state slot, K/V store location and attention window all come off `bufs`,
+    /// and the logits go back to `bufs`. Nothing here touches a host value,
+    /// which is what lets the whole step be captured into a graph (decision 51).
     ///
-    /// `kv_locs` is `[n]` i32/int64 pool locations: the request's full attention
-    /// window, the row's own `out_loc` last. It is a caller-owned buffer for the
-    /// same reason `bufs` is: a replay reads it in place.
-    pub fn forward_decode_into(&self, bufs: &DecodeBuffers, kv_locs: &Tensor) -> Result<()> {
+    /// The attention window is `bufs.kv_locs_row(0)`, the row's fixed-length
+    /// `[window]` pool locations. A captured step reads it in place, so it must
+    /// be staged (`DecodeBuffers::stage_window`) before every replay.
+    pub fn forward_decode_into(&self, bufs: &DecodeBuffers) -> Result<()> {
         let ids = bufs.input_ids().narrow(0, 0, 1);
         let pos = bufs.positions().narrow(0, 0, 1);
         let out_locs = bufs.out_locs().narrow(0, 0, 1);
         let slots = bufs.state_slots().narrow(0, 0, 1);
+        let kv_locs = bufs.kv_locs_row(0);
         let logits = bufs.logits().select(0, 0);
         let access = CacheAccess::Device {
             out_locs: &out_locs,
-            kv_locs,
+            kv_locs: &kv_locs,
             slots: &slots,
         };
         self.run_tower(&ids, &pos, &access, &logits)

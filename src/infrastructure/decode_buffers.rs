@@ -57,27 +57,34 @@ pub enum DecodeBufferError {
     PaddedUnderRows { rows: usize, padded: usize },
     #[error("padding to {padded} is over the {max} the buffers hold")]
     PaddedOverCapacity { padded: usize, max: usize },
+    #[error("kv window of {locs} locations is over the {window} the buffer holds")]
+    WindowOverCapacity { locs: usize, window: usize },
 }
 
 /// The device tensors one captured decode step reads and writes, allocated once
-/// at `[max_bs]` (plus `[max_bs, vocab]` for the logits) and staged in place.
+/// at `[max_bs]` (plus `[max_bs, vocab]` for the logits and `[max_bs, window]`
+/// for the KV window) and staged in place.
 pub struct DecodeBuffers {
     input_ids: Tensor,
     positions: Tensor,
     state_slots: Tensor,
     out_locs: Tensor,
+    kv_locs: Tensor,
     logits: Tensor,
     max_bs: usize,
     vocab: usize,
+    window: usize,
     device: Device,
 }
 
 impl DecodeBuffers {
     /// Allocate the whole set at the captured batch size. The logits are the one
     /// large buffer: `max_bs * vocab * 4` bytes, which is what a decode graph
-    /// writes and the sampler reads back.
-    pub fn new(max_bs: usize, vocab: usize, device: Device) -> Self {
-        assert!(max_bs > 0 && vocab > 0);
+    /// writes and the sampler reads back. `window` is the fixed number of pool
+    /// locations a step gathers over; it must cover the largest context the
+    /// captured step will ever serve, because a graph pins the gather length.
+    pub fn new(max_bs: usize, vocab: usize, window: usize, device: Device) -> Self {
+        assert!(max_bs > 0 && vocab > 0 && window > 0);
         let i32_dev = (Kind::Int, device.to_tch());
         let f32_dev = (Kind::Float, device.to_tch());
         Self {
@@ -85,9 +92,16 @@ impl DecodeBuffers {
             positions: Tensor::zeros([max_bs as i64], i32_dev),
             state_slots: Tensor::zeros([max_bs as i64], i32_dev),
             out_locs: Tensor::zeros([max_bs as i64], i32_dev),
+            // Every window entry starts at pool location 0. The padding value is
+            // irrelevant to the arithmetic -- the device mask drops every entry
+            // past the step's position -- but it must be a *valid* pool index,
+            // because the gather is an `index_select` and libtorch's CUDA kernel
+            // asserts on an out-of-range index.
+            kv_locs: Tensor::zeros([max_bs as i64, window as i64], i32_dev),
             logits: Tensor::zeros([max_bs as i64, vocab as i64], f32_dev),
             max_bs,
             vocab,
+            window,
             device,
         }
     }
@@ -98,6 +112,12 @@ impl DecodeBuffers {
 
     pub fn vocab(&self) -> usize {
         self.vocab
+    }
+
+    /// The fixed attention window length: how many pool locations a gathered
+    /// step reads, padding sentinel included.
+    pub fn window(&self) -> usize {
+        self.window
     }
 
     pub fn device(&self) -> Device {
@@ -122,6 +142,19 @@ impl DecodeBuffers {
     /// The staged KV pool location per row, `[max_bs]` i32.
     pub fn out_locs(&self) -> &Tensor {
         &self.out_locs
+    }
+
+    /// The staged attention windows, `[max_bs, window]` i32. Each row is the pool
+    /// locations attention gathers over, head-aligned and padded to the captured
+    /// window length, so a graph reads a fixed address and shape.
+    pub fn kv_locs(&self) -> &Tensor {
+        &self.kv_locs
+    }
+
+    /// One row's window, `[window]`, the tensor a decode gather reads.
+    pub fn kv_locs_row(&self, row: usize) -> Tensor {
+        assert!(row < self.max_bs, "kv_locs_row past the captured batch");
+        self.kv_locs.select(0, row as i64)
     }
 
     /// The logits `[max_bs, vocab]` f32 the step writes into, and the sampler
@@ -191,6 +224,39 @@ impl DecodeBuffers {
         self.stage(&full)
     }
 
+    /// Stage one row's KV window: `locs` are the request's pool locations in
+    /// token order, written head-aligned and padded to the captured window length
+    /// with location 0. The whole row is rewritten every step, so a shorter
+    /// window than the last step cannot leave a stale location in the tail.
+    ///
+    /// The padding value does not matter to the arithmetic -- the device mask
+    /// drops every position past the step's own -- but it must be a *valid* pool
+    /// index, because the gather is an `index_select` and libtorch's CUDA kernel
+    /// asserts on an out-of-range index. Location 0 always exists.
+    pub fn stage_window(&self, row: usize, locs: &[u32]) -> Result<(), DecodeBufferError> {
+        assert!(row < self.max_bs, "stage_window past the captured batch");
+        if locs.len() > self.window {
+            return Err(DecodeBufferError::WindowOverCapacity {
+                locs: locs.len(),
+                window: self.window,
+            });
+        }
+        let mut host: Vec<i32> = locs
+            .iter()
+            .map(|v| {
+                debug_assert!(
+                    *v != u32::MAX,
+                    "a token location is never the sentinel page"
+                );
+                if *v == u32::MAX { 0 } else { *v as i32 }
+            })
+            .collect();
+        host.resize(self.window, 0);
+        let src = Tensor::from_slice(&host).to_device(self.kv_locs.device());
+        self.kv_locs.select(0, row as i64).copy_(&src);
+        Ok(())
+    }
+
     /// Copy `values` into the head of an i32 buffer, as a device H2D. The values
     /// are already the row's `u32` narrowed to the kernel's `i32`; the sentinel
     /// `u32::MAX` is the only one that does not round-trip, by design.
@@ -236,7 +302,7 @@ mod tests {
 
     #[test]
     fn buffers_start_zeroed_with_the_asked_shape() {
-        let b = DecodeBuffers::new(4, 8, auto_device());
+        let b = DecodeBuffers::new(4, 8, 16, auto_device());
         assert_eq!(b.max_bs(), 4);
         assert_eq!(b.vocab(), 8);
         assert_eq!(b.input_ids().size(), vec![4]);
@@ -246,7 +312,7 @@ mod tests {
 
     #[test]
     fn staging_a_step_writes_every_row() {
-        let b = DecodeBuffers::new(4, 8, auto_device());
+        let b = DecodeBuffers::new(4, 8, 16, auto_device());
         b.stage(&[row(0), row(1)]).unwrap();
         assert_eq!(i32_vec(b.input_ids())[..2], [100, 101]);
         assert_eq!(i32_vec(b.positions())[..2], [7, 8]);
@@ -256,7 +322,7 @@ mod tests {
 
     #[test]
     fn staging_more_rows_than_capacity_is_refused() {
-        let b = DecodeBuffers::new(2, 8, auto_device());
+        let b = DecodeBuffers::new(2, 8, 16, auto_device());
         assert_eq!(
             b.stage(&[row(0), row(1), row(2)]),
             Err(DecodeBufferError::TooManyRows { rows: 3, max: 2 })
@@ -265,7 +331,7 @@ mod tests {
 
     #[test]
     fn padding_fills_the_tail_with_sentinel_rows() {
-        let b = DecodeBuffers::new(4, 8, auto_device());
+        let b = DecodeBuffers::new(4, 8, 16, auto_device());
         b.stage_padded(&[row(0), row(1)], 4).unwrap();
         assert_eq!(i32_vec(b.input_ids())[..2], [100, 101]);
         assert_eq!(i32_vec(b.out_locs())[..2], [4096, 4097]);
@@ -279,7 +345,7 @@ mod tests {
 
     #[test]
     fn padding_smaller_than_the_staged_rows_is_refused() {
-        let b = DecodeBuffers::new(4, 8, auto_device());
+        let b = DecodeBuffers::new(4, 8, 16, auto_device());
         assert_eq!(
             b.stage_padded(&[row(0), row(1)], 1),
             Err(DecodeBufferError::PaddedUnderRows { rows: 2, padded: 1 })
@@ -292,7 +358,7 @@ mod tests {
 
     #[test]
     fn a_second_step_overwrites_the_first_in_place() {
-        let b = DecodeBuffers::new(2, 8, auto_device());
+        let b = DecodeBuffers::new(2, 8, 16, auto_device());
         b.stage(&[row(0), row(1)]).unwrap();
         let first = i32_vec(b.input_ids());
         b.stage(&[row(9)]).unwrap();
@@ -306,6 +372,43 @@ mod tests {
             i32_vec(b.input_ids())[1],
             first[1],
             "an unstaged tail row keeps the previous step's value"
+        );
+    }
+
+    #[test]
+    fn the_kv_window_starts_zeroed() {
+        let b = DecodeBuffers::new(1, 8, 4, auto_device());
+        assert_eq!(b.window(), 4);
+        assert_eq!(b.kv_locs().size(), vec![1, 4]);
+        assert_eq!(
+            i32_vec(&b.kv_locs_row(0)),
+            vec![0; 4],
+            "an unstaged window reads as valid location 0, which the mask drops"
+        );
+    }
+
+    #[test]
+    fn stage_window_aligns_the_locations_and_pads_the_tail() {
+        let b = DecodeBuffers::new(2, 8, 4, auto_device());
+        b.stage_window(0, &[7, 8]).unwrap();
+        assert_eq!(
+            i32_vec(&b.kv_locs_row(0)),
+            vec![7, 8, 0, 0],
+            "the window is head-aligned and padded to the captured length"
+        );
+        // A later, shorter step must not leave the previous tail live.
+        b.stage_window(0, &[9]).unwrap();
+        assert_eq!(i32_vec(&b.kv_locs_row(0)), vec![9, 0, 0, 0]);
+        // The other row is untouched.
+        assert_eq!(i32_vec(&b.kv_locs_row(1)), vec![0; 4]);
+    }
+
+    #[test]
+    fn a_window_longer_than_the_buffer_is_refused() {
+        let b = DecodeBuffers::new(1, 8, 2, auto_device());
+        assert_eq!(
+            b.stage_window(0, &[1, 2, 3]),
+            Err(DecodeBufferError::WindowOverCapacity { locs: 3, window: 2 })
         );
     }
 }

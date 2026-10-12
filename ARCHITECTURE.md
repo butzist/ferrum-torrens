@@ -357,6 +357,15 @@ sequenceDiagram
   M-->>Eng: forward_cached reads out back; forward_cached_into leaves it device-local
 ```
 
+Both addressing modes run the same tower. `forward_cached` reads ids, positions
+and the KV window from the host `SequenceCache` (`CacheAccess::Host`) and copies
+the logits back; `forward_decode_into(bufs)` reads them from the device
+`DecodeBuffers` (`CacheAccess::Device`) and leaves the logits device-local. The
+device path gathers attention over a **fixed-length window** (`DecodeBuffers::
+window`, staged per row by `stage_window`): the lagging slots are dropped by the
+step-position mask and carry only a valid pool index, so the gather keeps the
+same shape and addresses every step -- the precondition for a captured graph.
+
 ### 3.5 MoE offload `[core]` (prefill overlap `[TODO]`)
 
 The heart of the port. The engine's MoE obligation is split: the model computes
@@ -523,8 +532,8 @@ runtime is never blocked by GPU work. A client hang-up aborts the run.
 ### 3.9 CUDA-graph decode capture `[partial]`
 
 The goal is one captured executable per decode batch size, over the whole
-forward, with the MoE launches inside it (decision 40). Two pieces are done and
-a third is next.
+forward, with the MoE launches inside it (decision 40). The addressing and
+fixed-window preconditions are now in place; the capture itself is next.
 
 ```mermaid
 flowchart TB
@@ -532,11 +541,12 @@ flowchart TB
     B1["cuda_driver\nstream + graph capture FFI\n(begin/end/instantiate/launch)"]
     B2["cuda_moe split\nstage / launch / collect\n(launch is capture-safe)"]
     B3["cuda_graph + shim\ntorch current stream + graph pool"]
-    DB["decode_buffers\nfixed-address batch metadata"]
+    DB["decode_buffers\nfixed-address batch metadata +\nfixed-length KV window"]
     B4["device-logits tail\nforward_cached_into writes the\nlm_head pass into a device buffer"]
+    B5["device-addressed step\nforward_decode_into reads\nids/positions/slots off buffer\n(gated device == re-fed forward)"]
   end
   subgraph Next["[TODO]"]
-    N1["device-staged inputs\nids/positions/slots off DecodeBuffers\n+ fixed-length attention gather"]
+    N1["MoE staging split\nhost work out of the captured\nrouted path"]
     N2["warmup + capture one real\ndecode step on the side stream"]
     N3["per-batch-size executables\n{1,2,4,max_running} + replay gate"]
   end
@@ -574,9 +584,11 @@ captured over them; a captured grid pins the batch shape; `stage_into` is the
 only writer between replays. The forward's tail is already capture-shaped:
 `TorchQwen3_6::forward_cached_into` writes the `lm_head` block pass straight
 into a caller-owned device logits buffer with no host round-trip, and
-`forward_cached` is the same pass wrapped with a host read-back. The remaining
-host touchpoints are the step's inputs (ids/positions/state slots) and the
-variable-length `cache.filled()` attention gather.
+`forward_decode_into` addresses the same forward entirely from a `DecodeBuffers`
+row (ids, positions, state slots, fixed KV window), so the step reads no host
+memory. What still runs host code inside a would-be capture is the MoE staging
+split (`routed_via_port` / `routed_inline` build a plan before the launch), which
+is the next piece.
 
 ---
 
