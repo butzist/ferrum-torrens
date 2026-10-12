@@ -33,5 +33,8 @@ minijinja = { version = "2.24.0", features = ["serde"] }
 mockall = "0.13"
 tower = { version = "0.5", features = ["util"] }
 
+[build-dependencies]
+cc = "1"
+
 [profile.release]
 lto = "thin"

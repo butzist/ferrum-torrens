@@ -168,6 +168,11 @@
           LIBTORCH_INCLUDE = "${libtorchCuda.dev}";
           LIBTORCH_LIB = "${libtorchCuda}";
           CXX = "${pkgs.stdenv.cc.cc}/bin/c++";
+          # The CUDA toolkit root: the C++ bridge build.rs compiles for the
+          # capture mempool needs `<CUDA_HOME>/include` (cuda_runtime_api.h),
+          # which libtorch's own headers pull in but its `include` dir does not
+          # ship.
+          CUDA_HOME = "${pkgs.cudatoolkit}";
 
           shellHook = ''
             # No RUSTFLAGS here on purpose. The previous

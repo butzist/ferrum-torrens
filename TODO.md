@@ -1,6 +1,6 @@
 # FerrumTorrens -- FreeToken MVP port to Rust: TODO
 
-Status: M2 (API) current; M3 prerequisite 4 (device staging: lru_ensure + index_copy + pinned banks + wiring) complete, and decision 40's capture work has its first slice (decision 49: the fixed-address `DecodeBuffers` batch-metadata staging; wiring it into the forward + the capture gate is next). Decision 36 is
+Status: M2 (API) current; M3 prerequisite 4 (device staging: lru_ensure + index_copy + pinned banks + wiring) complete, and decision 40's capture work advances: decision 49 gives the fixed-address `DecodeBuffers` batch-metadata staging, and decision 50 settles the mempool -- torch's graph pool behind a tiny C++ bridge, with `tests/cuda_graph_torch_probe.rs` green on the device. Remaining: wire the decode step to the buffers and capture one real decode step. Decision 36 is
 done end to end: the serving path is Python-free. The sm_120 cubins are
 committed under `kernel/` with an ABI manifest, `infrastructure/kernel_abi.rs`
 packs the launch arguments and checks them against the committed PTX,
@@ -243,6 +243,7 @@ ferrum-torrens/
       banks.rs                  # per-layer expert host banks (pinned; QuantFormat-driven)
       torch.rs                  # libtorch compute runtime: device, tensors, streams, graphs
       cuda_driver.rs            # hand-rolled libcuda FFI: load cubins, launch, copy
+      cuda_graph.rs             # torch current-stream + graph-mempool bridge for capture
       kernel_abi.rs             # the committed cubin ABI manifest, argument packing
       cuda_moe.rs               # NVFP4 expert GEMV adapter over the driver API (the one kernel)
       kvcache_dev.rs            # mha_pool + gdn state slabs + the DeviceCache port impl
@@ -250,6 +251,9 @@ ferrum-torrens/
       tokenizers_hf.rs          # HF `tokenizers` crate + minijinja chat template
   scripts/
     convert_hf_to_ftw.py        # one-time wrapper over FreeToken `ft checkpoint`
+  shim/
+    c10_graph_shim.cpp          # torch current-stream + graph-pool bridge (cuda feature)
+  build.rs                      # compiles the shim; no-op without the cuda feature
   python/
     ferrum_kernel/               # the one hand-written GPU kernel (decision 24)
       nvfp4_moe.py              #   grouped MoE GEMV + silu-mul + top-k reduce
@@ -261,7 +265,9 @@ Superseded by decision 2 (libtorch): the `build.rs` + `sources/csrc/` nvcc
 fatbin step, `infrastructure/gpu.rs` (cudarc wrapper) and
 `infrastructure/kernels/mod.rs` (FFI to a hand-built `libferrum_kernels`).
 `torch.rs` + `cuda_moe.rs` take their place. `moe_offload.rs` is folded into
-`cuda_moe.rs` + `run_experts.rs`.
+`cuda_moe.rs` + `run_experts.rs`. `build.rs` does return, but only as the
+compiler of decision 50's tiny capture bridge (`shim/c10_graph_shim.cpp`), not
+the fatbin step.
 
 Model boundary contract:
 - `ModelParams` (from FTW `meta` + checkpoint config) is what the engine uses to
@@ -538,11 +544,17 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
      the side stream, sample logits `[bs, vocab]` produced *inside* the graph.
      This step also needs the next P1 (pinned staging buffers for batch
      metadata) -- take the two together, since positions / input_mapping /
-     out_loc have to sit at stable addresses for a replay to read them.
+     out_loc have to sit at stable addresses for a replay to read them. The
+     mempool question is settled (decision 50): torch's own graph pool, reached
+     through a small C++ bridge, and `tests/cuda_graph_torch_probe.rs` proves a
+     captured torch op replays equal to the uncaptured twin on the device.
+     Remaining: make the forward a device-logits step with no host sync inside
+     (write into `DecodeBuffers.logits`), and the bounded proof captures one
+     real decode step at a small fixed context.
   3. **Per-batch-size executables** for `{1,2,4, max_running}` with dummy-req
-     padding to the captured size; decide the mempool question (driver mempool
-     vs torch's caching allocator reuse) when step 2 shows what actually needs
-     sharing, and record it in section 7.
+     padding to the captured size; the mempool is decided (decision 50: the
+     torch graph pool, one per captured batch size), so this lands the shared
+     address space and records what a per-size pool shares in section 7.
   4. **Gate**: a `--ignored` test beside `tests/cuda_graph_moe_smoke.rs` that
      replays the captured decode step against the uncaptured twin on the real
      checkpoint for each batch size (argmax equal, logits within the 2e-6 of
@@ -557,7 +569,10 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
   "captured"), and capture runs on a flags-0 side stream only -- the legacy
   stream cannot be captured.
 - [ ] P1 pinned staging buffers for batch metadata (positions / input_mapping /
-  out_loc / token_pool / page_table sentinel dummy row).
+  out_loc / token_pool / page_table sentinel dummy row). The fixed-address
+  `DecodeBuffers` (input_ids/positions/state_slots/out_locs + `[max_bs, vocab]`
+  logits, with sentinel padding) are in place (decision 49); allocation from the
+  engine and the forward reading them are the remaining wiring.
 
 ### Superseded by libtorch (decision 2) -- do not implement
 - [ ] ~~fused add+rmsnorm~~ (libtorch: `add` + `rms_norm`).
@@ -1693,6 +1708,49 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
       `state_slots`/`out_locs` off these buffers (rope, the attention gather and
       the GDN slot from device tensors), warm up, then capture one decode step on
       the side stream and gate it against the uncaptured twin.
+
+50. **Torch-op capture runs on the driver's side stream inside a private torch
+    graph pool, reached through a tiny C++ bridge** (2026-10-12) -- decision 40
+    step 2, the mempool question.
+    - **Why a bridge at all.** Capture itself is the driver FFI (decision 39),
+      but the ops recorded are torch ops, and `tch` 0.22 exposes neither a way to
+      put the torch runtime's current stream on a stream we created, nor the
+      caching allocator's graph pool. Both are C++ only. `shim/c10_graph_shim.cpp`
+      wraps exactly four things: `c10::cuda::getStreamFromExternal` +
+      `setCurrentCUDAStream`, `at::cuda::graph_pool_handle`,
+      `CUDACachingAllocator::beginAllocateToPool`/`endAllocateToPool`/
+      `releasePool`. `build.rs` compiles it with `cc` only under the `cuda`
+      feature (the CPU build never invokes a C++ compiler), and
+      `infrastructure/cuda_graph.rs` is the safe Rust wrapper
+      (`set_current_stream`, RAII `GraphPool`). Build-time only; no runtime
+      interpreter, no new runtime language.
+    - **Why not a driver mempool.** A `cuMemPool` cannot be installed as the
+      torch caching allocator's pool, and `cudaMalloc` between begin and end
+      capture is illegal, so the pool torch offers for graphs is the only pool a
+      torch-op capture can allocate out of. That is the "torch's caching
+      allocator reuse" side of the question the checklist left open.
+    - **Build wiring.** torch-sys links `torch_cuda`/`torch_cpu`/`c10` but not
+      `c10_cuda`, where `at::cuda`/`c10::cuda` live, so `build.rs` adds
+      `-L$LIBTORCH_LIB/lib -lc10_cuda`. libtorch's headers pull in
+      `cuda_runtime_api.h` but its `include` dir does not ship it, so the toolkit
+      root is needed too: `build.rs` reads `CUDA_HOME` (falling back to
+      `CUDA_PATH`), and the flake now exports `CUDA_HOME = pkgs.cudatoolkit`
+      beside the `LIBTORCH*` roots.
+    - **Gate.** `tests/cuda_graph_torch_probe.rs` (ignored, needs a device) sets
+      the torch current stream to the driver side stream, opens a `GraphPool`,
+      captures a matmul + bias, instantiates, writes new inputs in place,
+      replays, and matches an uncaptured twin. It passes on the sandbox device,
+      which proves both that torch allocations are capturable under the pool and
+      that the graph reads the fixed input addresses. The MoE launch capture was
+      already proven by `cuda_graph_moe_smoke`; the two now share one stream, so
+      a whole-forward graph records both.
+    - **Still open.** The forward must become a device-logits step (no host sync
+      inside, writing `DecodeBuffers.logits`) before a real decode step can be
+      captured, and the attention gather over `cache.filled()` is host-length,
+      so the serving-efficient captured step still wants the paged-attention
+      path. The next slice is the bounded proof: capture one real decode step at
+      a small fixed context, leaving the flashinfer/paged-attention swap as its
+      own M3 item.
 
 ### Config defaults for the RTX 5060 / 8 GB target
 

@@ -443,6 +443,7 @@ name = "ferrum-torrens"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "cc",
  "futures-core",
  "memmap2",
  "minijinja",
