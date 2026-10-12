@@ -1,6 +1,6 @@
 # FerrumTorrens -- FreeToken MVP port to Rust: TODO
 
-Status: M2 (API) current; M3 prerequisite 4 (device staging: lru_ensure + index_copy + pinned banks + wiring) complete. Decision 36 is
+Status: M2 (API) current; M3 prerequisite 4 (device staging: lru_ensure + index_copy + pinned banks + wiring) complete, and decision 40's capture work has its first slice (decision 49: the fixed-address `DecodeBuffers` batch-metadata staging; wiring it into the forward + the capture gate is next). Decision 36 is
 done end to end: the serving path is Python-free. The sm_120 cubins are
 committed under `kernel/` with an ABI manifest, `infrastructure/kernel_abi.rs`
 packs the launch arguments and checks them against the committed PTX,
@@ -77,7 +77,13 @@ device slot-table mirror is allocated with the pinned banks, `CudaMoE` drives
 that path whenever a step's routes fit the cubin's `BLOCK_K` (host plan past it).
 Decision 40 prerequisite 4 is therefore complete. Next: P1 pinned batch-metadata
 staging (positions / input_mapping / out_loc / token_pool / page_table), the
-warmup and one captured decode step, then per-batch-size graphs. Decision 45 is resolved: it was a
+warmup and one captured decode step, then per-batch-size graphs. The staging
+buffers themselves are now in place (`infrastructure/decode_buffers.rs`,
+decision 49): the fixed-address `input_ids`/`positions`/`state_slots`/`out_locs`
+plus the `[max_bs, vocab]` logits a replay overwrites, with sentinel padding.
+What remains of P1 is the forward wiring (engine-owned allocation, the decode
+step reading these instead of host slices) and the capture gate itself.
+Decision 45 is resolved: it was a
 false positive (the gemv bytes differ only by the toolchain's `/nix/store` path
 baked into debug info), `aot.py --check` normalizes store paths, and `write` only
 touches genuinely changed artifacts, so the committed gemv/silu/sum_reduce cubins
@@ -1658,6 +1664,35 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
       staged path calls `reset_staging` once. The staged numeric path is covered
       by the existing gated `cuda_moe_matches_reference` /
       `cuda_graph_moe_smoke` (devshell), which remain the real-hardware gate.
+
+49. **The P1 batch-metadata staging is a typed `DecodeBuffers` of fixed addresses**
+    (2026-10-12) -- decision 40's capture plan, first slice.
+    - **What changed.** `infrastructure/decode_buffers.rs` owns the device
+      tensors one captured decode step reads and writes, allocated once at the
+      batch cap and staged in place: `input_ids`, `positions`, `state_slots` and
+      `out_locs` as i32 `[max_bs]`, and the step's `logits` as f32
+      `[max_bs, vocab]`. This is FreeToken's `GraphCaptureBuffer` set
+      (`engine/graph.py`) cut to this engine: with `page_size = 1` and one token
+      per request per step, its `input_mapping`/`token_pool`/`out_loc` collapse
+      to one token id and one pool location per row, and its per-request
+      `table_idx` is our GDN `state_slots`. `stage` writes a step's rows;
+      `stage_padded` fills the tail to the captured batch size so a replay never
+      reads an undefined row.
+    - **Sentinel.** `DecodeRow::sentinel()` pads with `input_id = position =
+      state_slot = 0` and `SENTINEL_LOC = -1` for the locations. The domain's
+      `SENTINEL_PAGE` is `u32::MAX`, which does not fit the kernels' i32, so the
+      device buffers use an out-of-range negative value of their own; real
+      locations are never negative, so a sentinel can never alias one.
+    - **Scope.** The module is standalone and CPU-tested (cuda feature): shape,
+      staging, in-place overwrite, sentinel padding and the three refusal paths.
+      Allocation and the forward wiring are deliberately *not* in this slice:
+      the buffers belong to the engine (it owns `max_running_requests` and the
+      radix/page tables), not the model's `load`, and the captured-step gate
+      decides the final staging contract.
+    - **Next.** Wire the cached decode step to read `input_ids`/`positions`/
+      `state_slots`/`out_locs` off these buffers (rope, the attention gather and
+      the GDN slot from device tensors), warm up, then capture one decode step on
+      the side stream and gate it against the uncaptured twin.
 
 ### Config defaults for the RTX 5060 / 8 GB target
 
