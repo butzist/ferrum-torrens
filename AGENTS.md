@@ -9,6 +9,9 @@ Instructions for AI coding agents working in this repository.
   schema and the confirmed decisions in section 7.
 - `ALGORITHM.md` is the design reference: exact forward-pass math, the MoE
   offload cache, KV/radix and GDN state algorithms.
+- `ARCHITECTURE.md` is the description of record: the high-level building
+  blocks, the build process, and a static plus dynamic view of each subsystem,
+  with mermaid diagrams.
 - At the start of every session, re-read `TODO.md` in full. It may have been
   updated since your last session. Do not trust stale context.
 
@@ -39,6 +42,23 @@ Instructions for AI coding agents working in this repository.
   registry entry + dispatch from the FTW `meta` arch label.
 - If a new boundary emerges, add its port to the domain and implement it in
   infrastructure. Record it in `TODO.md` section 7 as a decision.
+
+## Architecture documentation (lean, current)
+
+- `ARCHITECTURE.md` is the living description of the code as built. Keep it
+  up to date **in the same change** that alters the architecture: a new
+  port/adapter/module, a changed build path (feature, `build.rs`, the kernel AOT
+  step), a new or moved subsystem boundary, or a new external dependency.
+- Be lean. Document what exists and is wired, plus the one next planned
+  boundary. Do **not** pre-architect unbuilt work; the design space of a future
+  slice belongs in that slice, not here.
+- Mark a module or subsystem that is planned but not implemented as `TODO` using
+  the status legend at the top of `ARCHITECTURE.md` (`[core]` / `[partial]` /
+  `[TODO]`), and describe only its boundary. Never draw a full design for a
+  `[TODO]` piece.
+- When the two disagree, `TODO.md` is the plan of record, `ALGORITHM.md` the
+  algorithm of record, and `ARCHITECTURE.md` the description of record; fix the
+  description to match reality rather than reality to the description.
 
 ## Testing (strict TDD)
 
