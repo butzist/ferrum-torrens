@@ -26,6 +26,7 @@ use crate::domain::expert_kernel::{MoEDeviceRequest, MoEError, MoEExecutor};
 use crate::domain::kvcache::{CachedModel, KvCache, KvcacheError, SequenceCache};
 use crate::domain::model::{ForwardInput, LayerType, Model, ModelParams};
 use crate::domain::weights::{DType, TensorDesc, TensorKind, WeightsReader};
+use crate::infrastructure::decode_buffers::DecodeBuffers;
 use crate::infrastructure::ftw::FtwIndex;
 use crate::infrastructure::kvcache_dev::{DeviceCache, LinearStateSlabs, MhaPool};
 use crate::infrastructure::torch::{DevTensor, Device, bf16_tensor, f32_tensor, to_f32_vec};
@@ -389,19 +390,24 @@ fn softplus(x: &Tensor) -> Tensor {
 /// Partial NeoX rotary embedding over the first `rotary_dim` dims of every head
 /// of a `[t, heads, head_dim]` view. Text-only positions make all mrope axes
 /// equal, so the standard half-rotation over the full rotary span applies.
+///
+/// `positions` is a `[t]` device tensor rather than a host slice (decision 51):
+/// a captured decode step reads the rope position out of its own buffer, so the
+/// angle table is built on the device. The product is done in f64 and rounded
+/// once, exactly as the host table was, so the two agree.
 fn partial_rope(
     x: &Tensor,
     heads: i64,
     head_dim: i64,
     rotary_dim: i64,
     base: f32,
-    positions: &[u32],
+    positions: &Tensor,
 ) -> Tensor {
     if rotary_dim == 0 {
         return x.shallow_clone();
     }
     let half = rotary_dim / 2;
-    let t = positions.len() as i64;
+    let t = positions.size()[0];
     let x3 = x.view([t, heads, head_dim]);
     let (lo, hi, tail) = (
         x3.narrow(2, 0, half),
@@ -413,19 +419,14 @@ fn partial_rope(
     let inv: Vec<f64> = (0..half)
         .map(|i| (base as f64).powf(-2.0 * i as f64 / rotary_dim as f64))
         .collect();
-    let mut ang: Vec<f32> = Vec::with_capacity(t as usize * half as usize);
-    for &p in positions {
-        for &f in &inv {
-            ang.push((p as f64 * f) as f32);
-        }
-    }
-    // The angle table is tiny ([t, rotary_dim/2]) and is cheaper to build on
-    // the host than to keep as a device buffer, but it has to land on whatever
-    // device the activations are already on.
-    let ang_t = Tensor::from_slice(&ang)
-        .reshape([t, half])
-        .to_kind(Kind::Float)
-        .to(x.device());
+    let inv_t = Tensor::from_slice(&inv)
+        .reshape([1, half])
+        .to_device(x.device());
+    let ang_t = positions
+        .reshape([t, 1])
+        .to_kind(Kind::Double)
+        .matmul(&inv_t)
+        .to_kind(Kind::Float);
     let cos = ang_t.cos().unsqueeze(1);
     let sin = ang_t.sin().unsqueeze(1);
 
@@ -515,8 +516,40 @@ fn attention_cached(q: &Tensor, k: &Tensor, v: &Tensor, q_offset: usize) -> Tens
     attn.squeeze_dim(0).transpose(0, 1).reshape([t, qh * hd])
 }
 
-/// Repeat each of `kb` key heads to `vb` value heads, as the reference's
-/// `expand_heads` does before the GDN recurrence.
+/// `attention_cached`, but the visibility mask reads each query's absolute
+/// position from a `[t]` device tensor rather than a fixed host `q_offset`. A
+/// captured decode step has exactly one query, so its position is the only
+/// value the mask needs and it must come off the device (decision 51).
+fn attention_cached_pos(q: &Tensor, k: &Tensor, v: &Tensor, positions: &Tensor) -> Tensor {
+    let [t, qh, hd] = [q.size()[0], q.size()[1], q.size()[2]];
+    let n = k.size()[0];
+    let kv_heads = k.size()[1];
+    let rep = qh / kv_heads;
+    let k = k
+        .unsqueeze(2)
+        .expand([n, kv_heads, rep, hd], true)
+        .reshape([n, qh, hd]);
+    let v = v
+        .unsqueeze(2)
+        .expand([n, kv_heads, rep, hd], true)
+        .reshape([n, qh, hd]);
+    let scale = 1.0 / (hd as f64).sqrt();
+    // Key j is visible to query i iff j <= positions[i].
+    let key = Tensor::arange(n, (Kind::Int64, q.device())).unsqueeze(0);
+    let query = positions.reshape([t, 1]).to_kind(Kind::Int64);
+    let mask = key.le_tensor(&query);
+    let attn = Tensor::scaled_dot_product_attention(
+        &q.transpose(0, 1).unsqueeze(0),
+        &k.transpose(0, 1).unsqueeze(0),
+        &v.transpose(0, 1).unsqueeze(0),
+        Some(&mask),
+        0.0,
+        false,
+        scale,
+        false,
+    );
+    attn.squeeze_dim(0).transpose(0, 1).reshape([t, qh * hd])
+}
 fn expand_heads(x: &Tensor, kb: i64, rep: i64, dim: i64) -> Tensor {
     let t = x.size()[0];
     let out_h = kb * rep;
@@ -736,6 +769,12 @@ impl Dense {
             .view([idx.len() as i64])
             .to_device(self.w.device());
         self.w.index_select(0, &index)
+    }
+
+    /// `gather` for a `[n]` device row index, so a captured decode step reads
+    /// its token out of `DecodeBuffers` rather than a host slice (decision 51).
+    fn gather_dev(&self, rows: &Tensor) -> Tensor {
+        self.w.index_select(0, &rows.to_kind(Kind::Int64))
     }
 }
 
@@ -994,7 +1033,7 @@ impl TorchQwen3_6 {
         &self,
         fa: &FullAttention,
         x: &Tensor,
-        positions: &[u32],
+        positions: &Tensor,
     ) -> (Tensor, Tensor, Tensor, Tensor) {
         let p = &self.params;
         let hd = p.head_dim as i64;
@@ -1040,30 +1079,46 @@ impl TorchQwen3_6 {
     }
 
     fn full_attention(&self, fa: &FullAttention, x: &Tensor, positions: &[u32]) -> Tensor {
-        let (q, k, v, gate) = self.project_attention(fa, x, positions);
+        let pos = index_tensor(positions, x.device());
+        let (q, k, v, gate) = self.project_attention(fa, x, &pos);
         let attn = causal_attention(&q, &k, &v);
         let gated = attn * sigmoid(&gate);
         fa.o.apply(&gated)
     }
 
     /// The same layer, but the keys and values of the tokens already in the
-    /// page table are read back out of the pool instead of recomputed. `q_offset`
-    /// is the absolute position of this chunk's first token, which is both how
-    /// far back attention reaches and where the mask starts.
+    /// page table are read back out of the pool instead of recomputed.
+    ///
+    /// `access` says where the cache lives. A host prefill passes absolute
+    /// positions, which set both how far back attention reaches and where the
+    /// mask starts. A captured decode step instead carries device `[t]` slots:
+    /// `out_locs` is where its new K/V is stored and `kv_locs` the full window
+    /// it reads back, both fixed-address tensors a graph can bake (decision 51).
     fn full_attention_cached(
         &self,
         layer: usize,
         fa: &FullAttention,
         x: &Tensor,
-        positions: &[u32],
-        cache: &SequenceCache,
+        positions: &Tensor,
+        access: &CacheAccess<'_>,
         pool: &MhaPool,
     ) -> Tensor {
         let (q, k, v, gate) = self.project_attention(fa, x, positions);
         let t = k.size()[0];
-        pool.store(layer, cache.tail(t as usize), &k, &v);
-        let (k_all, v_all) = pool.gather(layer, cache.filled());
-        let attn = attention_cached(&q, &k_all, &v_all, positions[0] as usize);
+        let attn = match access {
+            CacheAccess::Host { cache, q_offset } => {
+                pool.store(layer, cache.tail(t as usize), &k, &v);
+                let (k_all, v_all) = pool.gather(layer, cache.filled());
+                attention_cached(&q, &k_all, &v_all, *q_offset)
+            }
+            CacheAccess::Device {
+                out_locs, kv_locs, ..
+            } => {
+                pool.store_at(layer, out_locs, &k, &v);
+                let (k_all, v_all) = pool.gather_at(layer, kv_locs);
+                attention_cached_pos(&q, &k_all, &v_all, positions)
+            }
+        };
         let gated = attn * sigmoid(&gate);
         fa.o.apply(&gated)
     }
@@ -1091,14 +1146,56 @@ impl TorchQwen3_6 {
 
     /// The GDN layer continued from the slot's own conv and recurrent state
     /// rather than from zeros, and with both written back for the next step.
+    /// `access` decides whether those states are addressed by a host slot number
+    /// or a device `[1]` index tensor (decision 51).
     fn gdn_cached(
         &self,
         layer: usize,
         gdn: &GatedDeltaNet,
         x: &Tensor,
-        cache: &SequenceCache,
+        access: &CacheAccess<'_>,
         state: &LinearStateSlabs,
     ) -> Tensor {
+        match access {
+            CacheAccess::Host { cache, .. } => {
+                let slot = cache.state_slot();
+                let (o, conv, rec) = self.gdn_core(
+                    layer,
+                    gdn,
+                    x,
+                    &state.conv_state(slot, layer),
+                    &state.recurrent_state(slot, layer),
+                );
+                state.set_conv_state(slot, layer, conv);
+                state.set_recurrent_state(slot, layer, rec);
+                o
+            }
+            CacheAccess::Device { slots, .. } => {
+                let (o, conv, rec) = self.gdn_core(
+                    layer,
+                    gdn,
+                    x,
+                    &state.conv_state_at(slots, layer),
+                    &state.recurrent_state_at(slots, layer),
+                );
+                state.set_conv_state_at(slots, layer, &conv);
+                state.set_recurrent_state_at(slots, layer, &rec);
+                o
+            }
+        }
+    }
+
+    /// The GDN forward entering from a given conv and recurrent state, returning
+    /// the output plus both states so the caller stores them wherever they live.
+    /// Shared by the host and device cache paths so they cannot drift.
+    fn gdn_core(
+        &self,
+        layer: usize,
+        gdn: &GatedDeltaNet,
+        x: &Tensor,
+        conv_state: &Tensor,
+        recurrent_state: &Tensor,
+    ) -> (Tensor, Tensor, Tensor) {
         let p = &self.params;
         let (kb, dk, dv) = (
             p.linear_num_key_heads as i64,
@@ -1117,15 +1214,13 @@ impl TorchQwen3_6 {
         let ba = f32_(x).matmul(&f32_(&gdn.ba).transpose(0, 1));
         let (b, a) = two(ba, [vb, vb], 1);
 
-        let slot = cache.state_slot();
         let (mixed, conv_out) = conv1d_silu_cached(
             &conv_in,
             &f32_(&gdn.conv),
             conv_dim,
             p.linear_conv_kernel_dim as i64,
-            &state.conv_state(slot, layer),
+            conv_state,
         );
-        state.set_conv_state(slot, layer, conv_out);
         trace_tensor("gdn.conv", layer, &mixed);
         let (qf, kf, vf) = three(mixed, [key_dim, key_dim, value_dim], 1);
         let rep = vb / kb;
@@ -1136,18 +1231,7 @@ impl TorchQwen3_6 {
         let a_log = f32_(&gdn.a_log).exp().neg();
         let g = softplus(&(&a + &f32_(&gdn.dt_bias))) * &a_log;
         let beta = sigmoid(&b);
-        let (core, rec) = gdn_recurrence_cached(
-            &q,
-            &k,
-            &v,
-            &g,
-            &beta,
-            vb,
-            dk,
-            dv,
-            &state.recurrent_state(slot, layer),
-        );
-        state.set_recurrent_state(slot, layer, rec);
+        let (core, rec) = gdn_recurrence_cached(&q, &k, &v, &g, &beta, vb, dk, dv, recurrent_state);
         trace_tensor("gdn.core", layer, &core);
 
         let core_n =
@@ -1155,7 +1239,7 @@ impl TorchQwen3_6 {
         let out = core_n * z.silu();
         let o = gdn.o.apply(&out);
         trace_tensor("gdn.out", layer, &o);
-        o
+        (o, conv_out, rec)
     }
 
     /// Everything up to the recurrence: the conv projection (carried, not
@@ -1347,11 +1431,31 @@ impl TorchQwen3_6 {
         cache: &SequenceCache,
         out: &Tensor,
     ) -> Result<()> {
+        let ids_t = index_tensor(ids, self.device.to_tch());
+        let pos_t = index_tensor(positions, self.device.to_tch());
+        let access = CacheAccess::Host {
+            cache,
+            q_offset: positions[0] as usize,
+        };
+        self.run_tower(&ids_t, &pos_t, &access, out)
+    }
+
+    /// The tower shared by a host prefill chunk and a captured decode step: the
+    /// same ops over the same weights, differing only in where `access` reads
+    /// K/V and GDN state from (decision 51). Keeping it a single pass is what
+    /// stops the two paths from drifting.
+    fn run_tower(
+        &self,
+        ids: &Tensor,
+        positions: &Tensor,
+        access: &CacheAccess<'_>,
+        out: &Tensor,
+    ) -> Result<()> {
         let p = &self.params;
-        let t = ids.len();
+        let t = ids.size()[0];
         let slab = self.cache.as_ref().expect("no kv cache attached");
 
-        let mut x = self.embed.gather(ids);
+        let mut x = self.embed.gather_dev(ids);
         let mut residual: Option<Tensor> = None;
 
         for (li, layer) in self.layers.iter().enumerate() {
@@ -1362,9 +1466,9 @@ impl TorchQwen3_6 {
             let h1 = rms_norm(&xsum, &layer.input_norm, p.rms_norm_eps);
             let mixer_out = match &layer.mixer {
                 Mixer::Full(fa) => {
-                    self.full_attention_cached(li, fa, &h1, positions, cache, slab.mha())
+                    self.full_attention_cached(li, fa, &h1, positions, access, slab.mha())
                 }
-                Mixer::Linear(gdn) => self.gdn_cached(li, gdn, &h1, cache, slab.state()),
+                Mixer::Linear(gdn) => self.gdn_cached(li, gdn, &h1, access, slab.state()),
             };
             let sum2 = &mixer_out + &xsum;
             let h2 = rms_norm(&sum2, &layer.post_norm, p.rms_norm_eps);
@@ -1376,7 +1480,7 @@ impl TorchQwen3_6 {
             Some(r) => &x + &r,
             None => x,
         };
-        let last = stream.narrow(0, (t - 1) as i64, 1);
+        let last = stream.narrow(0, t - 1, 1);
         let normed = rms_norm(&last, &self.final_norm, p.rms_norm_eps);
         lm_head_logits_into(&self.lm_head, &normed, out);
         Ok(())
@@ -1430,6 +1534,24 @@ impl CachedModel for TorchQwen3_6 {
     }
 }
 
+/// Where a cached forward reads and writes its K/V and GDN state.
+///
+/// A host prefill keeps the `SequenceCache` in hand and addresses state with its
+/// slot number. A captured decode step instead carries device index tensors,
+/// because a graph bakes addresses and must never read a host slot (decision
+/// 51). Both arms drive the same `run_tower`.
+enum CacheAccess<'a> {
+    Host {
+        cache: &'a SequenceCache,
+        q_offset: usize,
+    },
+    Device {
+        out_locs: &'a Tensor,
+        kv_locs: &'a Tensor,
+        slots: &'a Tensor,
+    },
+}
+
 impl TorchQwen3_6 {
     /// `forward_cached`, but the last token's logits are written into `out`
     /// (`[vocab]`, f32, on this model's device) instead of returned as a host
@@ -1463,10 +1585,40 @@ impl TorchQwen3_6 {
         self.run_sequence_cached_into(&input.input_ids, &input.positions, cache, out)
             .map_err(|e| KvcacheError::MisalignedCache { why: e.to_string() })
     }
+
+    /// One captured decode step's forward: the token id, rope position, GDN
+    /// state slot and K/V store location all come off `bufs`, the K/V read
+    /// window off `kv_locs`, and the logits go back to `bufs`. Nothing here
+    /// touches a host value, which is what lets the whole step be captured into
+    /// a graph (decision 51).
+    ///
+    /// `kv_locs` is `[n]` i32/int64 pool locations: the request's full attention
+    /// window, the row's own `out_loc` last. It is a caller-owned buffer for the
+    /// same reason `bufs` is: a replay reads it in place.
+    pub fn forward_decode_into(&self, bufs: &DecodeBuffers, kv_locs: &Tensor) -> Result<()> {
+        let ids = bufs.input_ids().narrow(0, 0, 1);
+        let pos = bufs.positions().narrow(0, 0, 1);
+        let out_locs = bufs.out_locs().narrow(0, 0, 1);
+        let slots = bufs.state_slots().narrow(0, 0, 1);
+        let logits = bufs.logits().select(0, 0);
+        let access = CacheAccess::Device {
+            out_locs: &out_locs,
+            kv_locs,
+            slots: &slots,
+        };
+        self.run_tower(&ids, &pos, &access, &logits)
+    }
 }
 
 fn norm_tensor(w: &[f32], n: usize, device: Device) -> SharedTensor {
     up(bf16_tensor(w, &[n as i64], device))
+}
+
+/// A `[n]` i64 index tensor on `device`, for the embedding gather, a rope
+/// position vector, or a pool location vector.
+fn index_tensor(vals: &[u32], device: tch::Device) -> Tensor {
+    let data: Vec<i64> = vals.iter().map(|&v| v as i64).collect();
+    Tensor::from_slice(&data).to(device)
 }
 
 #[cfg(test)]

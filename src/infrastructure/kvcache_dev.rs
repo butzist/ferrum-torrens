@@ -112,34 +112,54 @@ impl MhaPool {
     /// Write this step's `k`/`v` (`[t, kv_heads, head_dim]`) at `locs`.
     pub fn store(&self, layer: usize, locs: &[u32], k: &Tensor, v: &Tensor) {
         let idx = self.index(locs);
+        self.store_indexed(layer, &idx, locs.len(), k, v);
+    }
+
+    /// `store`, but the locations are already a device `[t]` index tensor.
+    ///
+    /// A captured decode step bakes the address of the index tensor, so the
+    /// locations live on the device rather than being rebuilt host-side each
+    /// step (decision 51).
+    pub fn store_at(&self, layer: usize, locs: &Tensor, k: &Tensor, v: &Tensor) {
+        let idx = locs.to_kind(Kind::Int64);
+        self.store_indexed(layer, &idx, locs.numel(), k, v);
+    }
+
+    fn store_indexed(&self, layer: usize, idx: &Tensor, t: usize, k: &Tensor, v: &Tensor) {
         let slab = self.slab(layer);
-        debug_assert_eq!(
-            k.size(),
-            vec![locs.len() as i64, self.kv_heads, self.head_dim]
-        );
-        debug_assert_eq!(
-            v.size(),
-            vec![locs.len() as i64, self.kv_heads, self.head_dim]
-        );
-        for (half, t) in [(0i64, k), (1, v)] {
+        debug_assert_eq!(k.size(), vec![t as i64, self.kv_heads, self.head_dim]);
+        debug_assert_eq!(v.size(), vec![t as i64, self.kv_heads, self.head_dim]);
+        for (half, tt) in [(0i64, k), (1, v)] {
             // `select` hands back a view, so the in-place write lands in the
             // pool's storage rather than in a copy.
             let mut view = self.kv.select(0, half).select(0, slab).shallow_clone();
-            let _ = view.index_copy_(0, &idx, &t.unsqueeze(1).to_kind(self.dtype.kind()));
+            let _ = view.index_copy_(0, idx, &tt.unsqueeze(1).to_kind(self.dtype.kind()));
         }
     }
 
     /// Read the K/V at `locs` back, in the order asked.
     pub fn gather(&self, layer: usize, locs: &[u32]) -> (Tensor, Tensor) {
         let idx = self.index(locs);
-        let slab = |half: i64| -> Tensor {
+        self.gather_indexed(layer, &idx)
+    }
+
+    /// `gather`, but the locations are already a device `[n]` index tensor, so a
+    /// captured step can read a fixed-length window at a fixed address.
+    pub fn gather_at(&self, layer: usize, locs: &Tensor) -> (Tensor, Tensor) {
+        let idx = locs.to_kind(Kind::Int64);
+        self.gather_indexed(layer, &idx)
+    }
+
+    fn gather_indexed(&self, layer: usize, idx: &Tensor) -> (Tensor, Tensor) {
+        let slab = self.slab(layer);
+        let half = |h: i64| -> Tensor {
             self.kv
-                .select(0, half)
-                .select(0, self.slab(layer))
-                .index_select(0, &idx)
+                .select(0, h)
+                .select(0, slab)
+                .index_select(0, idx)
                 .squeeze_dim(1)
         };
-        (slab(0), slab(1))
+        (half(0), half(1))
     }
 
     fn index(&self, locs: &[u32]) -> Tensor {
@@ -251,6 +271,40 @@ impl LinearStateSlabs {
             .select(0, slot as i64)
             .shallow_clone();
         view.copy_(&state.view(&self.recurrent_size()[..]));
+    }
+
+    /// `conv_state`, but the slot is a device `[1]` index tensor: a captured
+    /// decode step reads the slot it was staged rather than a host number
+    /// (decision 51).
+    pub fn conv_state_at(&self, slot: &Tensor, layer: usize) -> Tensor {
+        self.conv
+            .select(0, self.slab(layer))
+            .index_select(0, &slot.to_kind(Kind::Int64))
+            .squeeze_dim(0)
+    }
+
+    /// `set_conv_state`, writing at a device `[1]` slot index.
+    pub fn set_conv_state_at(&self, slot: &Tensor, layer: usize, state: &Tensor) {
+        let mut view = self.conv.select(0, self.slab(layer)).shallow_clone();
+        let cv = self.conv_size();
+        let src = state.view([1i64, cv[0], cv[1]]);
+        let _ = view.index_copy_(0, &slot.to_kind(Kind::Int64), &src);
+    }
+
+    /// `recurrent_state`, but the slot is a device `[1]` index tensor.
+    pub fn recurrent_state_at(&self, slot: &Tensor, layer: usize) -> Tensor {
+        self.recurrent
+            .select(0, self.slab(layer))
+            .index_select(0, &slot.to_kind(Kind::Int64))
+            .squeeze_dim(0)
+    }
+
+    /// `set_recurrent_state`, writing at a device `[1]` slot index.
+    pub fn set_recurrent_state_at(&self, slot: &Tensor, layer: usize, state: &Tensor) {
+        let mut view = self.recurrent.select(0, self.slab(layer)).shallow_clone();
+        let r = self.recurrent_size();
+        let src = state.view([1i64, r[0], r[1], r[2]]);
+        let _ = view.index_copy_(0, &slot.to_kind(Kind::Int64), &src);
     }
 
     /// Zero a whole slot, so a recycled slot cannot leak the previous request's
@@ -638,6 +692,58 @@ mod tests {
                 .iter()
                 .all(|v| *v == 0.0),
             "a recycled slot must not leak the previous request's state"
+        );
+    }
+
+    /// A device index tensor, as a captured step would stage one.
+    fn dev_index(values: &[i64]) -> Tensor {
+        Tensor::from_slice(values).to(auto_device().to_tch())
+    }
+
+    #[test]
+    fn a_device_index_store_and_gather_match_the_host_path() {
+        let pool = MhaPool::new(&params(), 16, KvDType::F32, auto_device());
+        let (k, v) = kv_pair(2, 2, 4, 91);
+        let locs = dev_index(&[5, 2]);
+        pool.store_at(0, &locs, &k, &v);
+        let (gk, gv) = pool.gather_at(0, &locs);
+        assert_eq!(to_f32_vec(&gk), to_f32_vec(&k));
+        assert_eq!(to_f32_vec(&gv), to_f32_vec(&v));
+        // The host accessor reads back the very values the device path wrote.
+        assert_eq!(to_f32_vec(&pool.gather(0, &[5, 2]).0), to_f32_vec(&k));
+    }
+
+    #[test]
+    fn a_device_slot_reads_and_writes_the_same_state_as_the_host_slot() {
+        let s = LinearStateSlabs::new(&params(), 3, auto_device());
+        let slot = dev_index(&[1]);
+        let cv = s.conv_size();
+        let conv = f32_tensor(&data((cv[0] * cv[1]) as usize, 93), &cv[..], auto_device());
+        s.set_conv_state_at(&slot, 1, &conv);
+        assert_eq!(to_f32_vec(&s.conv_state_at(&slot, 1)), to_f32_vec(&conv));
+        assert_eq!(
+            to_f32_vec(&s.conv_state(1, 1)),
+            to_f32_vec(&conv),
+            "the host accessor sees the device write"
+        );
+
+        let rv = s.recurrent_size();
+        let rec = f32_tensor(
+            &data((rv[0] * rv[1] * rv[2]) as usize, 95),
+            &rv[..],
+            auto_device(),
+        );
+        s.set_recurrent_state_at(&slot, 1, &rec);
+        assert_eq!(
+            to_f32_vec(&s.recurrent_state_at(&slot, 1)),
+            to_f32_vec(&rec)
+        );
+        assert_eq!(to_f32_vec(&s.recurrent_state(1, 1)), to_f32_vec(&rec));
+        assert!(
+            to_f32_vec(&s.recurrent_state_at(&dev_index(&[0]), 1))
+                .iter()
+                .all(|v| *v == 0.0),
+            "the device accessor never aliases another slot"
         );
     }
 }

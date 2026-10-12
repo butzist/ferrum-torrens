@@ -117,7 +117,7 @@ fn partial_rope_matches_the_reference() {
         hd as i64,
         rd as i64,
         1e7,
-        &positions,
+        &index_tensor(&positions, dev().to_tch()),
     ));
     close(&got, &want, 1e-4, "partial_rope");
 }
@@ -132,7 +132,7 @@ fn partial_rope_with_no_rotary_dim_is_the_identity() {
         hd as i64,
         0,
         1e7,
-        &[0, 1, 2, 3],
+        &index_tensor(&[0, 1, 2, 3], dev().to_tch()),
     ));
     close(&got, &x, 0.0, "rope(rotary_dim=0)");
 }

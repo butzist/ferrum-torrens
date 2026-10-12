@@ -1,6 +1,6 @@
 # FerrumTorrens -- FreeToken MVP port to Rust: TODO
 
-Status: M2 (API) current; M3 prerequisite 4 (device staging: lru_ensure + index_copy + pinned banks + wiring) complete, and decision 40's capture work advances: decision 49 gives the fixed-address `DecodeBuffers` batch-metadata staging, decision 50 settles the mempool -- torch's graph pool behind a tiny C++ bridge, with `tests/cuda_graph_torch_probe.rs` green on the device -- and the forward's output tail is now a device-logits step (`forward_cached_into`, no host round-trip). Remaining: stage the decode step's inputs off the buffers, make the attention gather fixed-length, and capture one real decode step. Decision 36 is
+Status: M2 (API) current; M3 prerequisite 4 (device staging: lru_ensure + index_copy + pinned banks + wiring) complete, and decision 40's capture work advances: decision 49 gives the fixed-address `DecodeBuffers` batch-metadata staging, decision 50 settles the mempool -- torch's graph pool behind a tiny C++ bridge, with `tests/cuda_graph_torch_probe.rs` green on the device -- and the forward's output tail is now a device-logits step (`forward_cached_into`, no host round-trip). The decode step's inputs are now staged off the buffers (decision 54: `forward_decode_into`; only device tensors address the cache). Remaining: make the attention gather a fixed-length window, prove the device path against a re-fed forward on the real checkpoint, and capture one real decode step. Decision 36 is
 done end to end: the serving path is Python-free. The sm_120 cubins are
 committed under `kernel/` with an ABI manifest, `infrastructure/kernel_abi.rs`
 packs the launch arguments and checks them against the committed PTX,
@@ -575,8 +575,9 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 - [ ] P1 pinned staging buffers for batch metadata (positions / input_mapping /
   out_loc / token_pool / page_table sentinel dummy row). The fixed-address
   `DecodeBuffers` (input_ids/positions/state_slots/out_locs + `[max_bs, vocab]`
-  logits, with sentinel padding) are in place (decision 49); allocation from the
-  engine and the forward reading them are the remaining wiring.
+  logits, with sentinel padding) are in place (decision 49), and the forward now
+  reads them (`forward_decode_into`, decision 54); allocation from the engine and
+  the fixed-length KV window are the remaining wiring.
 
 ### Superseded by libtorch (decision 2) -- do not implement
 - [ ] ~~fused add+rmsnorm~~ (libtorch: `add` + `rms_norm`).
@@ -1813,6 +1814,31 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
     - **Not `env`.** Static `env` values would have to duplicate the devshell's
       shell-computed pieces (`$FLAKE_ROOT`, the libstdc++ dir on `LD_LIBRARY_PATH`)
       and would drift; forwarding keeps one definition, in the devShell.
+
+54. **The cached forward is addressable from device buffers** (2026-10-12) --
+    the input half of the decision-51 "Still open" note.
+    - **What changed.** The cache accessors take device indices: `MhaPool::store_at`
+      / `gather_at` and `LinearStateSlabs::conv_state_at` / `set_conv_state_at` /
+      `recurrent_state_at` / `set_recurrent_state_at` index with a device `[n]` /
+      `[1]` tensor instead of a host slice or slot number. `partial_rope` and
+      `project_attention` take a `[t]` device position tensor, `attention_cached_pos`
+      masks by each query's device position, and `Dense::gather_dev` reads the
+      embedding by device rows. A new `CacheAccess` enum selects host
+      (`SequenceCache`) or device (`out_locs` / `kv_locs` / `slots`) addressing,
+      and the single `run_tower` both arms drive keeps them from drifting.
+      `TorchQwen3_6::forward_decode_into(bufs, kv_locs)` runs one decode step off
+      `DecodeBuffers`.
+    - **Why.** A captured step bakes addresses and may not read a host value: the
+      token, rope position, GDN state slot and KV store location all have to come
+      off fixed-address device tensors (decisions 40, 49).
+    - **Coverage.** New CPU tests for the device index paths
+      (`a_device_index_store_and_gather_match_the_host_path`,
+      `a_device_slot_reads_and_writes_the_same_state_as_the_host_slot`); the host
+      path is unchanged (`forward_cached_into` still wraps `run_tower` with
+      `CacheAccess::Host`). 320 lib tests green.
+    - **Still open.** The attention gather is still host-length; the next slice
+      makes it a fixed-length padded window and proves the device path equal to a
+      re-fed forward on the real checkpoint before any graph is captured.
 
 ### Config defaults for the RTX 5060 / 8 GB target
 
