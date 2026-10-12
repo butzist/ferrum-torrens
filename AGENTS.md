@@ -115,15 +115,19 @@ Instructions for AI coding agents working in this repository.
   (RTX 5060 Mobile 8 GB VRAM, sm_120) and `ALGORITHM.md` section 0.
 - **The sandbox has a working CUDA device** (the driver is at
   `/run/opengl-driver/lib/libcuda.so.1` and `cuInit` succeeds), so the gated GPU
-  tests run here once `LIBTORCH*`, `LD_LIBRARY_PATH` and `CXX` are exported (see
+  tests run here. The agent jail inherits `LIBTORCH*`, `CUDA_HOME`, `CXX`
+  `LD_LIBRARY_PATH`, `PYTHONPATH` and the `TRITON_*` knobs from the devshell
+  (`fwdEnv` in `flake.nix`, jail.nix `try-fwd-env`), so launching the agent from
+  a `nix develop` shell needs no manual export; from elsewhere, export them (see
   below). The compute runtime still auto-detects and falls back to CPU, which is
   what keeps `cargo test --features cuda` meaningful on a box with no device
   (`TODO.md` decision 21). `model.device = "cuda"` forces the GPU. CUDA-graph
   capture is still asked for explicitly rather than discovered by a red test.
 - The FTW checkpoint is served from the Nix store: add it with
-  `nix store add-path <dir> --name qwen3.6-35b-a3b-nvfp4`; the jail binds
-  `/nix/store` read-only, so agents can mmap the converted `.ftw` output turned
-  out into `$FLAKE_ROOT` by the conversion step.
+  `nix store add-path <dir> --name qwen3.6-35b-a3b-nvfp4`. The jail binds only
+  the runtime closure of `basePackages` (decision 52), not the whole `/nix/store`,
+  so the one-time conversion runs in a devshell; agents mmap the converted `.ftw`
+  turned out into the r/w-mounted `$FLAKE_ROOT`, not the store copy.
 - Python venv (flake provides python312 + uv), already installed:
   `cd FreeToken && uv venv --python 3.12 && FREETOKEN_ALLOW_CUDA_MISMATCH=1 uv pip install -e ".[accel]"`.
   Outside the devshell, export the loader path *before* the install too: uv's

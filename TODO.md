@@ -720,9 +720,10 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
    Commits after each sprint/feature when tests + clippy + fmt are green (see
    `AGENTS.md`).
 10. **Checkpoint access** -- the FTW input lives in the Nix store (added via
-    `nix store add-path ... --name qwen3.6-35b-a3b-nvfp4`). The devshell jail binds
-    `/nix/store` read-only so agents can mmap it; the converted `.ftw` output is
-    written into the git-ignored `.model-cache/` dir inside `$FLAKE_ROOT`.
+    `nix store add-path ... --name qwen3.6-35b-a3b-nvfp4`). The jail binds only
+    the runtime closure of its packages (decision 52), so the conversion runs in
+    a devshell and agents read the converted `.ftw` output written into the
+    git-ignored `.model-cache/` dir inside the r/w-mounted `$FLAKE_ROOT`.
     The FreeToken venv is installed (`FreeToken/.venv`, torch 2.11.0+cu130
     wheel). The one-time conversion must run with CUDA device access (the agent
     sandbox gets `cuInit=CUDA_ERROR_NO_DEVICE`); exact command in AGENTS.md.
@@ -1782,6 +1783,36 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
     - **Still open.** The step's inputs (ids/positions/state slots) and the
       `cache.filled()` attention gather are still host-shaped; those are the
       next slice before a whole decode step can be captured.
+
+52. **The jail binds package closures, not the whole Nix store** (2026-10-12) --
+    `flake.nix` no longer adds `(readonly "/nix/store")` to `jailOptions`.
+    - **Why.** The blanket bind made the jail see every host store path, so a
+      host GC of a path the jail did not actually depend on (libtorch) left a
+      dangling bind mount (`cargo` link failures: `unable to find library
+      -lc10_cuda`). jailed-agents' `add-pkg-deps` already binds the runtime
+      closure of `basePackages`, which makes those paths real dependencies of
+      the jail derivation and thus GC-protected while the jail exists.
+    - **What changed.** `libtorchCuda.dev` is added to `basePackages`: its
+      headers are needed for `cargo build --features cuda`, and the `.dev`
+      output is not in the default output's runtime closure, so it would not be
+      bound otherwise.
+    - **Coverage.** The FTW input is still read in a devshell (outside the jail);
+      agents mmap the converted `.ftw` from `$FLAKE_ROOT/.model-cache`, which is
+      r/w-mounted. Nothing at runtime reads a bare `/nix/store` path.
+
+53. **The jail inherits the devshell env it needs** (2026-10-12) -- `jailedOpencode`
+    gets `fwdEnv = [ "LIBTORCH" "LIBTORCH_INCLUDE" "LIBTORCH_LIB" "CUDA_HOME"
+    "CXX" "LD_LIBRARY_PATH" "PYTHONPATH" "TRITON_LIBCUDA_PATH"
+    "TRITON_PTXAS_PATH" "TRITON_PTXAS_BLACKWELL_PATH" ]`.
+    - **Why.** jailed-agents' `try-fwd-env` forwards a variable only if it is set
+      in the invoking shell, so launching the agent from `nix develop` (where the
+      `shellHook`/devShell set all of these) gives `cargo build`/test, the kernel
+      toolchain and triton the same env a hand-export would, with no manual step.
+      Launched from anywhere else, nothing is forwarded and the behavior is
+      unchanged.
+    - **Not `env`.** Static `env` values would have to duplicate the devshell's
+      shell-computed pieces (`$FLAKE_ROOT`, the libstdc++ dir on `LD_LIBRARY_PATH`)
+      and would drift; forwarding keeps one definition, in the devShell.
 
 ### Config defaults for the RTX 5060 / 8 GB target
 

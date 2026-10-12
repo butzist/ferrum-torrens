@@ -111,6 +111,10 @@
           pkgs.uv
           pythonEnv
           libtorchCuda
+          # Headers for `--features cuda` builds. The `.dev` output is not in
+          # the default output's runtime closure, so it must be listed here to
+          # reach the jail (which binds only its packages' closures).
+          libtorchCuda.dev
         ];
 
         cudaDevicePaths = with combinators; [
@@ -122,7 +126,6 @@
           jlib.commonJailOptions
           ++ [
             (readwrite (noescape "\"$FLAKE_ROOT\""))
-            (readonly "/nix/store")
             (readonly "/run/user")
           ]
           # jail.nix `gpu`: ro-binds the PCI GPU dirs in /sys/devices, mounts
@@ -134,6 +137,23 @@
           name = "opencode";
           extraPkgs = basePackages;
           baseJailOptions = jailOptions;
+          # Inherit the devshell's build/runtime env (jail.nix `try-fwd-env`:
+          # forward if set, ignore otherwise). Launching the agent from a
+          # `nix develop` shell then gives it the torch/cuda/python toolchain
+          # env without hand-exporting it; launching elsewhere just leaves it
+          # unset, as before.
+          fwdEnv = [
+            "LIBTORCH"
+            "LIBTORCH_INCLUDE"
+            "LIBTORCH_LIB"
+            "CUDA_HOME"
+            "CXX"
+            "LD_LIBRARY_PATH"
+            "PYTHONPATH"
+            "TRITON_LIBCUDA_PATH"
+            "TRITON_PTXAS_PATH"
+            "TRITON_PTXAS_BLACKWELL_PATH"
+          ];
         };
       in {
         devShells.default = pkgs.mkShell {
