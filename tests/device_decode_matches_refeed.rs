@@ -31,18 +31,17 @@ const FTW_DIR: &str = ".model-cache/Qwen3.6-35B-A3B-NVFP4.ftw";
 const PROMPT: [u32; 7] = [248044, 19593, 48128, 16, 2177, 42, 42];
 const DECODE_STEPS: usize = 3;
 
-fn model() -> (TorchQwen3_6, Arc<DeviceCache>, usize) {
+fn model(num_pages: usize, num_slots: usize) -> (TorchQwen3_6, Arc<DeviceCache>, usize) {
     let device = auto_device();
     let cfg: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(format!("{FTW_DIR}/config.json")).unwrap())
             .unwrap();
     let params = parse_text_config(cfg.get("text_config").unwrap()).unwrap();
     let vocab = params.vocab_size;
-    let num_pages = PROMPT.len() + DECODE_STEPS + 8;
     let cache = Arc::new(DeviceCache::new(
         &params,
         num_pages,
-        4,
+        num_slots,
         KvDType::F32,
         device,
     ));
@@ -131,7 +130,7 @@ fn assert_close(dev: &[f32], whole: &[f32], at: usize) {
 #[test]
 #[ignore = "requires converted checkpoint in .model-cache"]
 fn a_device_decode_step_matches_refeeding_the_whole_prefix() {
-    let (m, cache, vocab) = model();
+    let (m, cache, vocab) = model(PROMPT.len() + DECODE_STEPS + 8, 4);
     // The window has to hold every location a compared step gathers, sentinel
     // padding included; a captured graph would pin exactly this length.
     let window = PROMPT.len() + DECODE_STEPS;
@@ -163,5 +162,112 @@ fn a_device_decode_step_matches_refeeding_the_whole_prefix() {
 
     cache.end(&mut cached);
     assert_eq!(cached.cached(), 0, "ending a request gives its pages back");
+    assert_eq!(cache.available(), cache.num_pages());
+}
+
+/// A batched device step is `N` independent one-token sequences done in
+/// lockstep. It must land on exactly what `N` single-row device steps land on:
+/// the per-row attention window, the per-row GDN state slot and the batched
+/// conv/recurrence are all only correct if row `i` sees nothing of row `j`.
+///
+/// Two identical sets of `ROWS` sequences are prefilled, set A is decoded in one
+/// batched step and set B with `ROWS` single-row steps, and the logits are
+/// compared row by row.
+#[test]
+#[ignore = "requires converted checkpoint in .model-cache"]
+fn a_batched_decode_step_matches_n_single_row_steps() {
+    const ROWS: usize = 3;
+    const L: usize = 3;
+    let (m, cache, vocab) = model(2 * ROWS * (L + 1) + 16, 2 * ROWS + 2);
+    // The window pins the gather length a graph would; it must hold every row's
+    // whole prefix plus the one token this step writes, sentinel padding aside.
+    let window = L + 1;
+    let bufs = DecodeBuffers::new(ROWS, vocab, window, auto_device());
+    let one = DecodeBuffers::new(1, vocab, window, auto_device());
+
+    // In-vocab prompts that differ per row, so a mixed-up row is visible.
+    let prompts: Vec<Vec<u32>> = (0..ROWS)
+        .map(|i| (0..L).map(|j| PROMPT[i + j]).collect())
+        .collect();
+
+    let prefill = |cache: &Arc<DeviceCache>, c: &mut SequenceCache, p: &[u32]| {
+        cache.reserve(c, p.len()).unwrap();
+        m.forward_cached(&input_at(p, 0), c).unwrap();
+    };
+
+    let mut a = Vec::new();
+    let mut b = Vec::new();
+    for p in &prompts {
+        let mut ca = cache.begin();
+        prefill(&cache, &mut ca, p);
+        a.push(ca);
+        let mut cb = cache.begin();
+        prefill(&cache, &mut cb, p);
+        b.push(cb);
+    }
+
+    // Set A: one batched step over all rows.
+    let mut rows = Vec::new();
+    for (i, c) in a.iter_mut().enumerate() {
+        cache.reserve(c, 1).unwrap();
+        rows.push(DecodeRow {
+            input_id: prompts[i][1],
+            position: (c.cached() - 1) as u32,
+            state_slot: c.state_slot(),
+            out_loc: c.tail(1)[0],
+        });
+    }
+    bufs.stage(&rows).unwrap();
+    for (i, c) in a.iter().enumerate() {
+        bufs.stage_window(i, c.filled()).unwrap();
+    }
+    m.forward_decode_into(&bufs).unwrap();
+
+    // Set B: the same step, one row at a time.
+    let mut single = Vec::new();
+    for (i, c) in b.iter_mut().enumerate() {
+        cache.reserve(c, 1).unwrap();
+        one.stage(&[DecodeRow {
+            input_id: prompts[i][1],
+            position: (c.cached() - 1) as u32,
+            state_slot: c.state_slot(),
+            out_loc: c.tail(1)[0],
+        }])
+        .unwrap();
+        one.stage_window(0, c.filled()).unwrap();
+        m.forward_decode_into(&one).unwrap();
+        single.push(to_f32_vec(&one.logits().select(0, 0)));
+    }
+
+    for (i, want) in single.iter().enumerate() {
+        let batched = to_f32_vec(&bufs.logits().select(0, i as i64));
+        assert_eq!(
+            argmax(&batched),
+            argmax(want),
+            "batched row {i} argued with its single-row step"
+        );
+        let scale = want.iter().fold(0.0f32, |acc, v| acc.max(v.abs()));
+        let diff = batched
+            .iter()
+            .zip(want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max)
+            / scale;
+        assert!(
+            diff < 1e-3,
+            "batched row {i} drifted from its single-row step: {diff:.3e} of scale"
+        );
+        eprintln!(
+            "batched row {i}: argmax {} ok, max|dlogit|/scale = {diff:.3e}",
+            argmax(&batched)
+        );
+    }
+
+    for mut c in a {
+        cache.end(&mut c);
+    }
+    for mut c in b {
+        cache.end(&mut c);
+    }
     assert_eq!(cache.available(), cache.num_pages());
 }

@@ -143,11 +143,18 @@ impl MhaPool {
         self.gather_indexed(layer, &idx)
     }
 
-    /// `gather`, but the locations are already a device `[n]` index tensor, so a
-    /// captured step can read a fixed-length window at a fixed address.
-    pub fn gather_at(&self, layer: usize, locs: &Tensor) -> (Tensor, Tensor) {
-        let idx = locs.to_kind(Kind::Int64);
-        self.gather_indexed(layer, &idx)
+    /// Read one fixed-length window per row: `locs` is `[rows, window]` and the
+    /// result is `[rows, window, kv_heads, head_dim]`, so a batched decode
+    /// gathers every request's window in one op (decision 51).
+    pub fn gather_rows(&self, layer: usize, locs: &Tensor) -> (Tensor, Tensor) {
+        let rows = locs.size()[0];
+        let window = locs.size()[1];
+        let idx = locs.to_kind(Kind::Int64).reshape([-1]);
+        let (k, v) = self.gather_indexed(layer, &idx);
+        (
+            k.reshape([rows, window, self.kv_heads, self.head_dim]),
+            v.reshape([rows, window, self.kv_heads, self.head_dim]),
+        )
     }
 
     fn gather_indexed(&self, layer: usize, idx: &Tensor) -> (Tensor, Tensor) {
@@ -273,38 +280,35 @@ impl LinearStateSlabs {
         view.copy_(&state.view(&self.recurrent_size()[..]));
     }
 
-    /// `conv_state`, but the slot is a device `[1]` index tensor: a captured
-    /// decode step reads the slot it was staged rather than a host number
-    /// (decision 51).
-    pub fn conv_state_at(&self, slot: &Tensor, layer: usize) -> Tensor {
+    /// The rows' conv state, `[rows, conv_dim, width]`, addressed by a device
+    /// `[rows]` slot index: a batched decode step reads the slots it staged
+    /// rather than host numbers (decision 51).
+    pub fn conv_state_rows(&self, slots: &Tensor, layer: usize) -> Tensor {
         self.conv
             .select(0, self.slab(layer))
-            .index_select(0, &slot.to_kind(Kind::Int64))
-            .squeeze_dim(0)
+            .index_select(0, &slots.to_kind(Kind::Int64))
     }
 
-    /// `set_conv_state`, writing at a device `[1]` slot index.
-    pub fn set_conv_state_at(&self, slot: &Tensor, layer: usize, state: &Tensor) {
+    /// `set_conv_state` for a device `[rows]` slot index; `state` is
+    /// `[rows, conv_dim, width]`.
+    pub fn set_conv_state_rows(&self, slots: &Tensor, layer: usize, state: &Tensor) {
         let mut view = self.conv.select(0, self.slab(layer)).shallow_clone();
-        let cv = self.conv_size();
-        let src = state.view([1i64, cv[0], cv[1]]);
-        let _ = view.index_copy_(0, &slot.to_kind(Kind::Int64), &src);
+        let _ = view.index_copy_(0, &slots.to_kind(Kind::Int64), &state.to_kind(Kind::Float));
     }
 
-    /// `recurrent_state`, but the slot is a device `[1]` index tensor.
-    pub fn recurrent_state_at(&self, slot: &Tensor, layer: usize) -> Tensor {
+    /// The rows' recurrent state, `[rows, v_heads, k_dim, v_dim]`, addressed by a
+    /// device `[rows]` slot index.
+    pub fn recurrent_state_rows(&self, slots: &Tensor, layer: usize) -> Tensor {
         self.recurrent
             .select(0, self.slab(layer))
-            .index_select(0, &slot.to_kind(Kind::Int64))
-            .squeeze_dim(0)
+            .index_select(0, &slots.to_kind(Kind::Int64))
     }
 
-    /// `set_recurrent_state`, writing at a device `[1]` slot index.
-    pub fn set_recurrent_state_at(&self, slot: &Tensor, layer: usize, state: &Tensor) {
+    /// `set_recurrent_state` for a device `[rows]` slot index; `state` is
+    /// `[rows, v_heads, k_dim, v_dim]`.
+    pub fn set_recurrent_state_rows(&self, slots: &Tensor, layer: usize, state: &Tensor) {
         let mut view = self.recurrent.select(0, self.slab(layer)).shallow_clone();
-        let r = self.recurrent_size();
-        let src = state.view([1i64, r[0], r[1], r[2]]);
-        let _ = view.index_copy_(0, &slot.to_kind(Kind::Int64), &src);
+        let _ = view.index_copy_(0, &slots.to_kind(Kind::Int64), &state.to_kind(Kind::Float));
     }
 
     /// Zero a whole slot, so a recycled slot cannot leak the previous request's
@@ -706,11 +710,28 @@ mod tests {
         let (k, v) = kv_pair(2, 2, 4, 91);
         let locs = dev_index(&[5, 2]);
         pool.store_at(0, &locs, &k, &v);
-        let (gk, gv) = pool.gather_at(0, &locs);
+        let (gk, gv) = pool.gather_rows(0, &locs.reshape([1, 2]));
         assert_eq!(to_f32_vec(&gk), to_f32_vec(&k));
         assert_eq!(to_f32_vec(&gv), to_f32_vec(&v));
         // The host accessor reads back the very values the device path wrote.
         assert_eq!(to_f32_vec(&pool.gather(0, &[5, 2]).0), to_f32_vec(&k));
+    }
+
+    #[test]
+    fn a_batched_gather_reads_each_rows_window_in_order() {
+        let pool = MhaPool::new(&params(), 16, KvDType::F32, auto_device());
+        let (k, v) = kv_pair(4, 2, 4, 97);
+        // Token `r` lands at pool location `r`, so the window can name rows back.
+        pool.store_at(0, &dev_index(&[0, 1, 2, 3]), &k, &v);
+        let windows = dev_index(&[2, 0, 3, 1]).reshape([2, 2]);
+        let (gk, _) = pool.gather_rows(0, &windows);
+        assert_eq!(gk.size(), vec![2, 2, 2, 4]);
+        let flat = to_f32_vec(&gk);
+        let want: Vec<f32> = [2i64, 0, 3, 1]
+            .iter()
+            .flat_map(|&r| to_f32_vec(&k.select(0, r)))
+            .collect();
+        assert_eq!(flat, want, "row 0 then row 1, each window in order");
     }
 
     #[test]
@@ -719,8 +740,11 @@ mod tests {
         let slot = dev_index(&[1]);
         let cv = s.conv_size();
         let conv = f32_tensor(&data((cv[0] * cv[1]) as usize, 93), &cv[..], auto_device());
-        s.set_conv_state_at(&slot, 1, &conv);
-        assert_eq!(to_f32_vec(&s.conv_state_at(&slot, 1)), to_f32_vec(&conv));
+        s.set_conv_state_rows(&slot, 1, &conv.unsqueeze(0));
+        assert_eq!(
+            to_f32_vec(&s.conv_state_rows(&slot, 1).select(0, 0)),
+            to_f32_vec(&conv)
+        );
         assert_eq!(
             to_f32_vec(&s.conv_state(1, 1)),
             to_f32_vec(&conv),
@@ -733,14 +757,14 @@ mod tests {
             &rv[..],
             auto_device(),
         );
-        s.set_recurrent_state_at(&slot, 1, &rec);
+        s.set_recurrent_state_rows(&slot, 1, &rec.unsqueeze(0));
         assert_eq!(
-            to_f32_vec(&s.recurrent_state_at(&slot, 1)),
+            to_f32_vec(&s.recurrent_state_rows(&slot, 1).select(0, 0)),
             to_f32_vec(&rec)
         );
         assert_eq!(to_f32_vec(&s.recurrent_state(1, 1)), to_f32_vec(&rec));
         assert!(
-            to_f32_vec(&s.recurrent_state_at(&dev_index(&[0]), 1))
+            to_f32_vec(&s.recurrent_state_rows(&dev_index(&[0]), 1))
                 .iter()
                 .all(|v| *v == 0.0),
             "the device accessor never aliases another slot"

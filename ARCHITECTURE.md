@@ -581,9 +581,16 @@ sequenceDiagram
 Contracts already fixed: capture runs only on a flags-0 side stream (never the
 legacy stream); a `StagedGroup` and the pinned banks must outlive every graph
 captured over them; a captured grid pins the batch shape; `stage_into` is the
-only writer between replays. The whole step is now capture-shaped. The forward's
-tail is device-local: `TorchQwen3_6::forward_cached_into` writes the `lm_head`
-block pass straight into a caller-owned device logits buffer with no host
+only writer between replays. The whole step is now capture-shaped *and*
+batch-generic: `forward_decode_into` runs every row of `DecodeBuffers`, with the
+`CacheAccess::Device` arms of `full_attention_cached` / `gdn_cached` reading
+batched pool and state accessors (`MhaPool::gather_rows`,
+`LinearStateSlabs::{conv,recurrent}_state_rows`) and additive batched peers
+(`conv1d_silu_step_batch`, `gdn_recurrence_step_batch`, `gdn_core_batch`) beside
+the untouched single-row host helpers; only the tower tail branches (prefill
+normalizes the last token, decode normalizes all rows). The forward's tail is
+device-local: `TorchQwen3_6::forward_cached_into` writes the `lm_head` block pass
+straight into a caller-owned `[rows, vocab]` device logits buffer with no host
 round-trip, and `forward_decode_into` addresses the same forward entirely from a
 `DecodeBuffers` row (ids, positions, state slots, fixed KV window). The
 device-staged MoE port (`routed_via_port` -> `grouped_moe_staged`) reads its

@@ -467,6 +467,34 @@ fn conv1d_silu_cached(
     (out, new_state)
 }
 
+/// The same causal conv, but `n` independent requests take one step each: `x` is
+/// `[n, c]`, `state` is `[n, c, k - 1]`, and both the output and the new state
+/// carry the leading row dim. One depthwise `conv1d` with `groups = n * c`
+/// processes every row with the shared `[c, 1, k]` filter (decision 51).
+fn conv1d_silu_step_batch(
+    x: &Tensor,
+    w: &Tensor,
+    channels: i64,
+    k: i64,
+    state: &Tensor,
+) -> (Tensor, Tensor) {
+    let n = x.size()[0];
+    let xt = f32_(x).unsqueeze(2); // [n, c, 1]
+    let full = Tensor::cat(&[state, &xt], 2); // [n, c, k]
+    let wk = w.repeat([n, 1, 1]); // [n * c, 1, k]
+    let conv = full.reshape([1, n * channels, k]).conv1d(
+        &wk,
+        None::<&Tensor>,
+        [1],
+        [0],
+        [1],
+        n * channels,
+    );
+    let out = conv.silu().reshape([n, channels]);
+    let new_state = full.narrow(2, 1, k - 1);
+    (out, new_state)
+}
+
 /// Causal attention with GQA, one `[t, heads, head_dim]` triple in.
 fn causal_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Tensor {
     attention_cached(q, k, v, 0)
@@ -518,38 +546,44 @@ fn attention_cached(q: &Tensor, k: &Tensor, v: &Tensor, q_offset: usize) -> Tens
 }
 
 /// `attention_cached`, but the visibility mask reads each query's absolute
-/// position from a `[t]` device tensor rather than a fixed host `q_offset`. A
-/// captured decode step has exactly one query, so its position is the only
-/// value the mask needs and it must come off the device (decision 51).
+/// position from a `[t]` device tensor rather than a fixed host `q_offset`, and
+/// each row sees its own fixed-length key window: `q` is `[t, q_heads, hd]`,
+/// `k`/`v` are `[t, window, kv_heads, hd]`. A batched decode step has one query
+/// per row, so its position is the only value the mask needs and it must come
+/// off the device (decision 51).
 fn attention_cached_pos(q: &Tensor, k: &Tensor, v: &Tensor, positions: &Tensor) -> Tensor {
-    let [t, qh, hd] = [q.size()[0], q.size()[1], q.size()[2]];
-    let n = k.size()[0];
-    let kv_heads = k.size()[1];
+    let t = q.size()[0];
+    let qh = q.size()[1];
+    let hd = q.size()[2];
+    let window = k.size()[1];
+    let kv_heads = k.size()[2];
     let rep = qh / kv_heads;
     let k = k
-        .unsqueeze(2)
-        .expand([n, kv_heads, rep, hd], true)
-        .reshape([n, qh, hd]);
+        .unsqueeze(3)
+        .expand([t, window, kv_heads, rep, hd], true)
+        .reshape([t, window, qh, hd]);
     let v = v
-        .unsqueeze(2)
-        .expand([n, kv_heads, rep, hd], true)
-        .reshape([n, qh, hd]);
+        .unsqueeze(3)
+        .expand([t, window, kv_heads, rep, hd], true)
+        .reshape([t, window, qh, hd]);
     let scale = 1.0 / (hd as f64).sqrt();
-    // Key j is visible to query i iff j <= positions[i].
-    let key = Tensor::arange(n, (Kind::Int64, q.device())).unsqueeze(0);
+    // Key j is visible to row i iff j <= positions[i].
+    let key = Tensor::arange(window, (Kind::Int64, q.device())).reshape([1, window]);
     let query = positions.reshape([t, 1]).to_kind(Kind::Int64);
-    let mask = key.le_tensor(&query);
+    // `[t, 1, 1, window]` so it broadcasts over the query heads and the single
+    // query a decode step has per row.
+    let mask = key.le_tensor(&query).unsqueeze(1).unsqueeze(1);
     let attn = Tensor::scaled_dot_product_attention(
-        &q.transpose(0, 1).unsqueeze(0),
-        &k.transpose(0, 1).unsqueeze(0),
-        &v.transpose(0, 1).unsqueeze(0),
+        &q.unsqueeze(2),
+        &k.transpose(1, 2),
+        &v.transpose(1, 2),
         Some(&mask),
         0.0,
         false,
         scale,
         false,
     );
-    attn.squeeze_dim(0).transpose(0, 1).reshape([t, qh * hd])
+    attn.squeeze_dim(2).reshape([t, qh * hd])
 }
 fn expand_heads(x: &Tensor, kb: i64, rep: i64, dim: i64) -> Tensor {
     let t = x.size()[0];
@@ -631,6 +665,50 @@ fn gdn_recurrence_cached(
         outs.push(out);
     }
     (Tensor::stack(&outs, 0), state)
+}
+
+/// `gdn_recurrence_cached` for a batched single step: `q`/`k` are
+/// `[n, hv, dk]`, `v` is `[n, hv, dv]`, `g`/`beta` are `[n, hv]`, and the state
+/// is `[n, hv, dk, dv]`. One step per row, so the whole recurrence is one pass
+/// of vectorized ops rather than a `t`-loop (decision 51).
+fn gdn_recurrence_step_batch(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+    dk: i64,
+    state: &Tensor,
+) -> (Tensor, Tensor) {
+    let scale = 1.0f64 / (dk as f64).sqrt();
+    let qi = f32_(q);
+    let ki = f32_(k);
+    let vi = f32_(v);
+    let q2 = qi
+        .pow_tensor_scalar(2.0)
+        .sum_dim_intlist(-1, true, Kind::Float)
+        .g_add_scalar(1e-6);
+    let k2 = ki
+        .pow_tensor_scalar(2.0)
+        .sum_dim_intlist(-1, true, Kind::Float)
+        .g_add_scalar(1e-6);
+    let qinv = q2.sqrt().reciprocal();
+    let kinv = k2.sqrt().reciprocal();
+    // decay
+    let state = state.shallow_clone() * f32_(g).exp().unsqueeze(-1).unsqueeze(-1);
+    let kiw = ki * kinv;
+    // kv_mem: sum_kk state[n, h, kk, d] * kiw[n, h, kk] -> [n, hv, dv]
+    let kv_mem = (&state * kiw.unsqueeze(-1))
+        .sum_dim_intlist(2, true, Kind::Float)
+        .squeeze_dim(2);
+    let delta = (vi - &kv_mem).unsqueeze(2) * f32_(beta).unsqueeze(-1).unsqueeze(-1);
+    let state = (&state) + kiw.unsqueeze(-1) * delta;
+    let out = ((&state) * qi.unsqueeze(-1))
+        .sum_dim_intlist(2, true, Kind::Float)
+        .squeeze_dim(2)
+        * qinv
+        * scale;
+    (out, state)
 }
 
 fn topk_renorm(probs: &Tensor, k: i64) -> (Tensor, Tensor) {
@@ -1092,9 +1170,10 @@ impl TorchQwen3_6 {
     ///
     /// `access` says where the cache lives. A host prefill passes absolute
     /// positions, which set both how far back attention reaches and where the
-    /// mask starts. A captured decode step instead carries device `[t]` slots:
-    /// `out_locs` is where its new K/V is stored and `kv_locs` the full window
-    /// it reads back, both fixed-address tensors a graph can bake (decision 51).
+    /// mask starts. A batched decode step instead carries device `[rows]`
+    /// tensors: `out_locs` is where each row's new K/V is stored and `kv_locs`
+    /// the per-row `[rows, window]` window it reads back, both fixed-address
+    /// tensors a graph can bake (decision 51).
     fn full_attention_cached(
         &self,
         layer: usize,
@@ -1116,7 +1195,7 @@ impl TorchQwen3_6 {
                 out_locs, kv_locs, ..
             } => {
                 pool.store_at(layer, out_locs, &k, &v);
-                let (k_all, v_all) = pool.gather_at(layer, kv_locs);
+                let (k_all, v_all) = pool.gather_rows(layer, kv_locs);
                 attention_cached_pos(&q, &k_all, &v_all, positions)
             }
         };
@@ -1148,7 +1227,8 @@ impl TorchQwen3_6 {
     /// The GDN layer continued from the slot's own conv and recurrent state
     /// rather than from zeros, and with both written back for the next step.
     /// `access` decides whether those states are addressed by a host slot number
-    /// or a device `[1]` index tensor (decision 51).
+    /// or a device `[rows]` index tensor; a device row is one decode step, so it
+    /// takes the batched core (decision 51).
     fn gdn_cached(
         &self,
         layer: usize,
@@ -1172,15 +1252,15 @@ impl TorchQwen3_6 {
                 o
             }
             CacheAccess::Device { slots, .. } => {
-                let (o, conv, rec) = self.gdn_core(
+                let (o, conv, rec) = self.gdn_core_batch(
                     layer,
                     gdn,
                     x,
-                    &state.conv_state_at(slots, layer),
-                    &state.recurrent_state_at(slots, layer),
+                    &state.conv_state_rows(slots, layer),
+                    &state.recurrent_state_rows(slots, layer),
                 );
-                state.set_conv_state_at(slots, layer, &conv);
-                state.set_recurrent_state_at(slots, layer, &rec);
+                state.set_conv_state_rows(slots, layer, &conv);
+                state.set_recurrent_state_rows(slots, layer, &rec);
                 o
             }
         }
@@ -1237,6 +1317,64 @@ impl TorchQwen3_6 {
 
         let core_n =
             rms_norm(&core.reshape([t, vb, dv]), &gdn.norm, p.rms_norm_eps).reshape([t, value_dim]);
+        let out = core_n * z.silu();
+        let o = gdn.o.apply(&out);
+        trace_tensor("gdn.out", layer, &o);
+        (o, conv_out, rec)
+    }
+
+    /// The batched device counterpart of `gdn_core`: `x` is `[rows, hidden]`,
+    /// `conv_state` is `[rows, conv_dim, k - 1]` and `recurrent_state` is
+    /// `[rows, v_heads, k_dim, v_dim]`. Every op is the same, so the two cannot
+    /// drift but for the conv/recurrence step forms, which the decode gate pins.
+    fn gdn_core_batch(
+        &self,
+        layer: usize,
+        gdn: &GatedDeltaNet,
+        x: &Tensor,
+        conv_state: &Tensor,
+        recurrent_state: &Tensor,
+    ) -> (Tensor, Tensor, Tensor) {
+        let p = &self.params;
+        let (kb, dk, dv) = (
+            p.linear_num_key_heads as i64,
+            p.linear_key_head_dim as i64,
+            p.linear_value_head_dim as i64,
+        );
+        let vb = p.linear_num_value_heads as i64;
+        let key_dim = kb * dk;
+        let value_dim = vb * dv;
+        let conv_dim = 2 * key_dim + value_dim;
+        let n = x.size()[0];
+
+        let qkvz = gdn.qkvz.apply(x);
+        trace_tensor("gdn.qkvz", layer, &qkvz);
+        let (conv_in, z) = two(qkvz, [conv_dim, value_dim], 1);
+        let ba = f32_(x).matmul(&f32_(&gdn.ba).transpose(0, 1));
+        let (b, a) = two(ba, [vb, vb], 1);
+
+        let (mixed, conv_out) = conv1d_silu_step_batch(
+            &conv_in,
+            &f32_(&gdn.conv),
+            conv_dim,
+            p.linear_conv_kernel_dim as i64,
+            conv_state,
+        );
+        trace_tensor("gdn.conv", layer, &mixed);
+        let (qf, kf, vf) = three(mixed, [key_dim, key_dim, value_dim], 1);
+        let rep = vb / kb;
+        let q = expand_heads(&qf.view([n, kb, dk]), kb, rep, dk);
+        let k = expand_heads(&kf.view([n, kb, dk]), kb, rep, dk);
+        let v = vf.view([n, vb, dv]);
+
+        let a_log = f32_(&gdn.a_log).exp().neg();
+        let g = softplus(&(&a + &f32_(&gdn.dt_bias))) * &a_log;
+        let beta = sigmoid(&b);
+        let (core, rec) = gdn_recurrence_step_batch(&q, &k, &v, &g, &beta, dk, recurrent_state);
+        trace_tensor("gdn.core", layer, &core);
+
+        let core_n =
+            rms_norm(&core.reshape([n, vb, dv]), &gdn.norm, p.rms_norm_eps).reshape([n, value_dim]);
         let out = core_n * z.silu();
         let o = gdn.o.apply(&out);
         trace_tensor("gdn.out", layer, &o);
@@ -1389,18 +1527,21 @@ impl TorchQwen3_6 {
     /// block_split_is_exact` proves a row is identical in any window.
     fn lm_head_logits(&self, x: &Tensor) -> Vec<f32> {
         let head = &self.lm_head;
-        let out = Tensor::zeros([head.rows as i64], (Kind::Float, self.device.to_tch()));
+        let out = Tensor::zeros([1, head.rows as i64], (Kind::Float, self.device.to_tch()));
         lm_head_logits_into(head, x, &out);
         to_f32_vec(&out)
     }
 }
 
-/// `lm_head(x)` for one token, written into `out` (`[rows]`, f32) instead of
-/// returned as a host vector. Widening `LM_HEAD_BLOCK` rows at a time bounds the
-/// f32 scratch, and writing straight into the caller's device buffer is what
-/// makes the tail of a decode step free of a host round-trip (decision 49).
+/// `lm_head(x)` written into `out` (`[rows, vocab]`, f32) instead of returned as
+/// a host vector. Every row is one token's logits, so a decode step writes the
+/// whole batch and a prefill writes its single last-token row. Widening
+/// `LM_HEAD_BLOCK` rows at a time bounds the f32 scratch, and writing straight
+/// into the caller's device buffer is what makes the tail of a decode step free
+/// of a host round-trip (decision 49).
 fn lm_head_logits_into(head: &Dense, x: &Tensor, out: &Tensor) {
-    debug_assert_eq!(out.size(), vec![head.rows as i64]);
+    let rows = x.size()[0];
+    debug_assert_eq!(out.size(), vec![rows, head.rows as i64]);
     let mut r0 = 0usize;
     while r0 < head.rows {
         let n = LM_HEAD_BLOCK.min(head.rows - r0);
@@ -1410,8 +1551,7 @@ fn lm_head_logits_into(head: &Dense, x: &Tensor, out: &Tensor) {
             Some(s) => y * s.narrow(0, r0 as i64, n as i64),
             None => y,
         };
-        out.narrow(0, r0 as i64, n as i64)
-            .copy_(&f32_(&y).squeeze_dim(0));
+        out.narrow(1, r0 as i64, n as i64).copy_(&f32_(&y));
         r0 += n;
     }
 }
@@ -1481,9 +1621,19 @@ impl TorchQwen3_6 {
             Some(r) => &x + &r,
             None => x,
         };
-        let last = stream.narrow(0, t - 1, 1);
-        let normed = rms_norm(&last, &self.final_norm, p.rms_norm_eps);
-        lm_head_logits_into(&self.lm_head, &normed, out);
+        // A prefill answers only its last token, so its `[1, hidden]` row is the
+        // tail; a decode step answers every row, and each is that row's next
+        // token. Both write `[rows, vocab]` and the caller reads what it staged.
+        let normed = match access {
+            CacheAccess::Host { .. } => rms_norm(
+                &stream.narrow(0, t - 1, 1),
+                &self.final_norm,
+                p.rms_norm_eps,
+            ),
+            CacheAccess::Device { .. } => rms_norm(&stream, &self.final_norm, p.rms_norm_eps),
+        };
+        let logits = out.reshape([normed.size()[0], self.lm_head.rows as i64]);
+        lm_head_logits_into(&self.lm_head, &normed, &logits);
         Ok(())
     }
 }
@@ -1538,9 +1688,9 @@ impl CachedModel for TorchQwen3_6 {
 /// Where a cached forward reads and writes its K/V and GDN state.
 ///
 /// A host prefill keeps the `SequenceCache` in hand and addresses state with its
-/// slot number. A captured decode step instead carries device index tensors,
-/// because a graph bakes addresses and must never read a host slot (decision
-/// 51). Both arms drive the same `run_tower`.
+/// slot number. A batched decode step instead carries device `[rows]` index
+/// tensors, because a graph bakes addresses and must never read a host slot
+/// (decision 51). Both arms drive the same `run_tower`.
 enum CacheAccess<'a> {
     Host {
         cache: &'a SequenceCache,
@@ -1587,27 +1737,24 @@ impl TorchQwen3_6 {
             .map_err(|e| KvcacheError::MisalignedCache { why: e.to_string() })
     }
 
-    /// One captured decode step's forward: the token id, rope position, GDN
-    /// state slot, K/V store location and attention window all come off `bufs`,
-    /// and the logits go back to `bufs`. Nothing here touches a host value,
-    /// which is what lets the whole step be captured into a graph (decision 51).
+    /// One captured decode step's forward: each row's token id, rope position,
+    /// GDN state slot, K/V store location and attention window all come off
+    /// `bufs`, and the logits go back to `bufs`. Nothing here touches a host
+    /// value, which is what lets the whole step be captured into a graph
+    /// (decision 51).
     ///
-    /// The attention window is `bufs.kv_locs_row(0)`, the row's fixed-length
-    /// `[window]` pool locations. A captured step reads it in place, so it must
-    /// be staged (`DecodeBuffers::stage_window`) before every replay.
+    /// Every row of the captured batch is processed, so a replay at batch `n`
+    /// runs `n` independent one-token sequences in lockstep. The rows must be
+    /// staged before every replay: `DecodeBuffers::stage` (or `stage_padded`) for
+    /// the tokens and locations, `DecodeBuffers::stage_window` for each row's
+    /// fixed-length `[window]` pool locations.
     pub fn forward_decode_into(&self, bufs: &DecodeBuffers) -> Result<()> {
-        let ids = bufs.input_ids().narrow(0, 0, 1);
-        let pos = bufs.positions().narrow(0, 0, 1);
-        let out_locs = bufs.out_locs().narrow(0, 0, 1);
-        let slots = bufs.state_slots().narrow(0, 0, 1);
-        let kv_locs = bufs.kv_locs_row(0);
-        let logits = bufs.logits().select(0, 0);
         let access = CacheAccess::Device {
-            out_locs: &out_locs,
-            kv_locs: &kv_locs,
-            slots: &slots,
+            out_locs: bufs.out_locs(),
+            kv_locs: bufs.kv_locs(),
+            slots: bufs.state_slots(),
         };
-        self.run_tower(&ids, &pos, &access, &logits)
+        self.run_tower(bufs.input_ids(), bufs.positions(), &access, bufs.logits())
     }
 }
 

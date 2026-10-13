@@ -500,7 +500,7 @@ fn lm_head_logits_into_matches_the_host_pass() {
     let xt = up(&x, &[1, cols as i64]);
     let want = to_f32_vec(&f32_(&xt).matmul(&f32_(&head.w).transpose(0, 1)));
 
-    let out = Tensor::zeros([rows as i64], (Kind::Float, dev().to_tch()));
+    let out = Tensor::zeros([1, rows as i64], (Kind::Float, dev().to_tch()));
     lm_head_logits_into(&head, &xt, &out);
     close(&to_f32_vec(&out), &want, 1e-4, "lm_head_logits_into");
 }
@@ -523,7 +523,7 @@ fn lm_head_logits_into_applies_the_row_scale() {
         .map(|(a, b)| a * b)
         .collect();
 
-    let out = Tensor::zeros([rows as i64], (Kind::Float, dev().to_tch()));
+    let out = Tensor::zeros([1, rows as i64], (Kind::Float, dev().to_tch()));
     lm_head_logits_into(&head, &xt, &out);
     close(&to_f32_vec(&out), &want, 1e-4, "lm_head_logits_into scale");
 }
@@ -968,6 +968,121 @@ fn a_carried_gdn_state_matches_the_stateless_recurrence_over_the_concatenation()
     let mut got = to_f32_vec(&first);
     got.extend(to_f32_vec(&second));
     close(&got, &want, 1e-4, "cached gdn_recurrence");
+}
+
+#[test]
+fn a_batched_conv_step_matches_each_single_row_step() {
+    // `n` independent one-step convs in one depthwise op must equal `n` calls
+    // of the host conv, or a batched decode would drift from a single row.
+    let (n, c, k) = (3, 6, 4);
+    let width = k as i64 - 1;
+    let xt = up(&data(n * c, 71), &[n as i64, c as i64]);
+    let wt = up(&data(c * k, 72), &[c as i64, 1, k as i64]);
+    let state = up(
+        &data(n * c * width as usize, 73),
+        &[n as i64, c as i64, width],
+    );
+    let (out, new_state) = conv1d_silu_step_batch(&xt, &wt, c as i64, k as i64, &state);
+    for row in 0..n as i64 {
+        let (want, want_state) = conv1d_silu_cached(
+            &xt.narrow(0, row, 1),
+            &wt,
+            c as i64,
+            k as i64,
+            &state.select(0, row),
+        );
+        close(
+            &to_f32_vec(&out.select(0, row)),
+            &to_f32_vec(&want),
+            1e-6,
+            "batched conv out",
+        );
+        close(
+            &to_f32_vec(&new_state.select(0, row)),
+            &to_f32_vec(&want_state),
+            1e-6,
+            "batched conv state",
+        );
+    }
+}
+
+#[test]
+fn a_batched_recurrence_step_matches_each_single_row_step() {
+    let (n, hv, dk, dv) = (3, 2, 4, 4);
+    let qt = up(&data(n * hv * dk, 74), &[n as i64, hv as i64, dk as i64]);
+    let kt = up(&data(n * hv * dk, 75), &[n as i64, hv as i64, dk as i64]);
+    let vt = up(&data(n * hv * dv, 76), &[n as i64, hv as i64, dv as i64]);
+    let gt = up(
+        &data(n * hv, 77).iter().map(|x| x.abs()).collect::<Vec<_>>(),
+        &[n as i64, hv as i64],
+    );
+    let bt = up(
+        &data(n * hv, 78).iter().map(|x| x.abs()).collect::<Vec<_>>(),
+        &[n as i64, hv as i64],
+    );
+    let state = up(
+        &data(n * hv * dk * dv, 79),
+        &[n as i64, hv as i64, dk as i64, dv as i64],
+    );
+    let (out, new_state) = gdn_recurrence_step_batch(&qt, &kt, &vt, &gt, &bt, dk as i64, &state);
+    for row in 0..n as i64 {
+        let (want, want_state) = gdn_recurrence_cached(
+            &qt.narrow(0, row, 1),
+            &kt.narrow(0, row, 1),
+            &vt.narrow(0, row, 1),
+            &gt.narrow(0, row, 1),
+            &bt.narrow(0, row, 1),
+            hv as i64,
+            dk as i64,
+            dv as i64,
+            &state.select(0, row),
+        );
+        close(
+            &to_f32_vec(&out.select(0, row)),
+            &to_f32_vec(&want.squeeze_dim(0)),
+            1e-5,
+            "batched recurrence out",
+        );
+        close(
+            &to_f32_vec(&new_state.select(0, row)),
+            &to_f32_vec(&want_state),
+            1e-5,
+            "batched recurrence state",
+        );
+    }
+}
+
+#[test]
+fn a_batched_attention_masks_each_row_by_its_own_position() {
+    let (n, qh, kvh, hd, window) = (3, 4, 2, 8, 5);
+    let positions = vec![2i64, 4, 0];
+    let qt = up(&data(n * qh * hd, 81), &[n as i64, qh as i64, hd as i64]);
+    let kt = up(
+        &data(n * window * kvh * hd, 82),
+        &[n as i64, window as i64, kvh as i64, hd as i64],
+    );
+    let vt = up(
+        &data(n * window * kvh * hd, 83),
+        &[n as i64, window as i64, kvh as i64, hd as i64],
+    );
+    let pt = Tensor::from_slice(&positions).to(dev().to_tch());
+    let got = to_f32_vec(&attention_cached_pos(&qt, &kt, &vt, &pt));
+    let qh_dim = qh * hd;
+    for row in 0..n {
+        // The host path with `q_offset = position` is the same mask: key <= pos.
+        let want = to_f32_vec(&attention_cached(
+            &qt.narrow(0, row as i64, 1),
+            &kt.select(0, row as i64),
+            &vt.select(0, row as i64),
+            positions[row] as usize,
+        ));
+        close(
+            &got[row * qh_dim..(row + 1) * qh_dim],
+            &want,
+            1e-5,
+            "batched attention row",
+        );
+    }
 }
 
 #[test]

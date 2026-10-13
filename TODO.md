@@ -1,6 +1,6 @@
 # FerrumTorrens -- FreeToken MVP port to Rust: TODO
 
-Status: M2 (API) current; M3 prerequisite 4 (device staging: lru_ensure + index_copy + pinned banks + wiring) complete, and decision 40's capture work advances: decision 49 gives the fixed-address `DecodeBuffers` batch-metadata staging, decision 50 settles the mempool -- torch's graph pool behind a tiny C++ bridge, with `tests/cuda_graph_torch_probe.rs` green on the device -- and the forward's output tail is now a device-logits step (`forward_cached_into`, no host round-trip). The decode step's inputs are now staged off the buffers (decision 54: `forward_decode_into`; only device tensors address the cache), attention gathers a fixed-length padded window (decision 55), and the gated `tests/device_decode_matches_refeed.rs` proves the device path equals the re-fed host forward at ~1e-6 on the real checkpoint. The MoE staging split is out of the captured path (decision 56: a resident E2M1 table and an on-device rope table remove the last host uploads), and the gated `tests/decode_graph_capture.rs` now captures one whole real decode step and replays it equal to the uncaptured twin. Remaining: per-batch-size executables `{1,2,4,max_running}` and their gate. Decision 36 is
+Status: M2 (API) current; M3 prerequisite 4 (device staging: lru_ensure + index_copy + pinned banks + wiring) complete, and decision 40's capture work advances: decision 49 gives the fixed-address `DecodeBuffers` batch-metadata staging, decision 50 settles the mempool -- torch's graph pool behind a tiny C++ bridge, with `tests/cuda_graph_torch_probe.rs` green on the device -- and the forward's output tail is now a device-logits step (`forward_cached_into`, no host round-trip). The decode step's inputs are now staged off the buffers (decision 54: `forward_decode_into`; only device tensors address the cache), attention gathers a fixed-length padded window (decision 55), and the gated `tests/device_decode_matches_refeed.rs` proves the device path equals the re-fed host forward at ~1e-6 on the real checkpoint. The MoE staging split is out of the captured path (decision 56: a resident E2M1 table and an on-device rope table remove the last host uploads), and the gated `tests/decode_graph_capture.rs` now captures one whole real decode step and replays it equal to the uncaptured twin. The device decode is now batch-generic (decision 58): `forward_decode_into` runs every row of `DecodeBuffers`, and the gated `a_batched_decode_step_matches_n_single_row_steps` pins a batch-3 step to three single-row steps on the real checkpoint. Remaining: per-batch-size executables `{1,2,4,max_running}` and their gate. Decision 36 is
 done end to end: the serving path is Python-free. The sm_120 cubins are
 committed under `kernel/` with an ABI manifest, `infrastructure/kernel_abi.rs`
 packs the launch arguments and checks them against the committed PTX,
@@ -560,7 +560,11 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
       vector, now device-resident (decision 56), and `tests/decode_graph_capture.rs`
       (`a_captured_decode_step_replays_equal_to_an_uncaptured_step`) records one
       whole decode step at a fixed context, instantiates it and replays it equal
-      to the uncaptured twin 2026-10-13. Item 3 is the remaining step.
+      to the uncaptured twin 2026-10-13. The forward is also batch-generic now
+      (decision 58): `forward_decode_into` runs every row, and
+      `tests/device_decode_matches_refeed.rs::a_batched_decode_step_matches_n_single_row_steps`
+      pins a batch-3 device step to three single-row steps (real checkpoint). Item
+      3 is the remaining step: the executables themselves.
   3. **Per-batch-size executables** for `{1,2,4, max_running}` with dummy-req
      padding to the captured size; the mempool is decided (decision 50: the
      torch graph pool, one per captured batch size), so this lands the shared
@@ -1916,6 +1920,36 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
       (`staged_moe_step_does_not_fault`) runs a device-staged MoE step over the
       real checkpoint, finite with no fault; the rebuilt `kernel/lru_ensure.cubin`
       and `kernel-selftest --interp` are green.
+
+58. **A decode step is batch-generic: one batched device path, pinned to the
+    single-row path by a gate** (2026-10-13)
+    - **What changed.** `TorchQwen3_6::forward_decode_into` now runs every row of
+      `DecodeBuffers` (`bufs.max_bs()`), not just row 0. The `CacheAccess::Device`
+      arms of `full_attention_cached` / `gdn_cached` read batched pool and state
+      accessors; the host prefill arms are untouched. `run_tower` branches only in
+      the tail (prefill normalizes the last token, decode normalizes all rows) and
+      `lm_head_logits_into` takes `x [rows, hidden]` writing `out [rows, vocab]`.
+    - **Why.** A captured grid pins the batch shape, so one executable per batch
+      size `{1,2,4,max}` means the forward itself must be batch-N before any
+      capture (P1 item 3). The batched device path is the prerequisite for the
+      per-size executables and their Gate (P1 item 4).
+    - **Batched peers, not a rewrite.** The validated single-row host helpers stay
+      (`conv1d_silu_cached`, `gdn_recurrence_cached`, `gdn_core`, `attention_cached`
+      and its callers), and additive batched peers are used by the device arms:
+      `conv1d_silu_step_batch` (one grouped depthwise conv, `groups = n*channels`),
+      `gdn_recurrence_step_batch`, `gdn_core_batch`, and a batch-generic
+      `attention_cached_pos` whose mask is `[t, 1, 1, window]` (four dims, so it
+      broadcasts over the query heads of each row's single query). Batched state
+      access is `LinearStateSlabs::{conv,recurrent}_state_rows` and
+      `MhaPool::gather_rows`, all device `[rows]` indexed.
+    - **Coverage.** CPU units assert batch-N equals N single-row applications:
+      `a_batched_conv_step_matches_each_single_row_step`,
+      `a_batched_recurrence_step_matches_each_single_row_step`,
+      `a_batched_attention_masks_each_row_by_its_own_position`, and
+      `a_batched_gather_reads_each_rows_window_in_order`. The gated
+      `tests/device_decode_matches_refeed.rs::a_batched_decode_step_matches_n_single_row_steps`
+      pins a batch-3 device step to three single-row steps on the real checkpoint
+      (argmax equal, `max|dlogit|/scale ~7e-7`, 2026-10-13).
 
 ### Config defaults for the RTX 5060 / 8 GB target
 
