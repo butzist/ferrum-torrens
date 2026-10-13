@@ -33,6 +33,7 @@ use ferrum_torrens::infrastructure::cuda_driver::{CAPTURE_MODE_GLOBAL, Driver};
 use ferrum_torrens::infrastructure::cuda_graph::{self, GraphPool};
 use ferrum_torrens::infrastructure::cuda_moe::CudaMoE;
 use ferrum_torrens::infrastructure::decode_buffers::{DecodeBuffers, DecodeRow};
+use ferrum_torrens::infrastructure::decode_graph::DecodeGraph;
 use ferrum_torrens::infrastructure::ftw::{FtwIndex, MmapFtwReader};
 use ferrum_torrens::infrastructure::kvcache_dev::{DeviceCache, KvDType};
 use ferrum_torrens::infrastructure::torch::{Device, auto_device, to_f32_vec};
@@ -56,7 +57,7 @@ struct Built {
 
 /// Build the tower with the engine's device-staged MoE port, on the side stream
 /// the capture records. Mirrors `registry::moe_port`.
-fn build() -> Built {
+fn build(num_pages: usize, num_slots: usize) -> Built {
     let device = auto_device();
     assert!(
         matches!(device, Device::Cuda(_)),
@@ -112,11 +113,10 @@ fn build() -> Built {
         CACHE_SLOTS,
     ));
 
-    let num_pages = PROMPT.len() + DECODE_STEPS + 16;
     let cache = Arc::new(DeviceCache::new(
         &params,
         num_pages,
-        4,
+        num_slots,
         KvDType::F32,
         device,
     ));
@@ -185,7 +185,7 @@ fn logits(bufs: &DecodeBuffers) -> Vec<f32> {
 #[test]
 #[ignore = "needs a CUDA device and the FTW checkpoint"]
 fn a_captured_decode_step_replays_equal_to_an_uncaptured_step() {
-    let b = build();
+    let b = build(PROMPT.len() + DECODE_STEPS + 16, 4);
     let device = auto_device();
     // torch launches every recorded op on the very stream the capture uses.
     unsafe { cuda_graph::set_current_stream(b.stream, 0) };
@@ -269,5 +269,148 @@ fn a_captured_decode_step_replays_equal_to_an_uncaptured_step() {
 
     unsafe { b.lib.graph_exec_destroy(exec) }.expect("drop the instance");
     drop(pool);
+    unsafe { b.lib.destroy_stream(b.stream) }.expect("destroy stream");
+}
+
+/// The per-live-row prompt length and the batch sizes the batch gate captures.
+const ROW_PROMPT: usize = 3;
+const BATCHES: [usize; 3] = [1, 2, 4];
+
+/// Prefill one live row's prompt through the host path, returning the logits it
+/// predicts for the next position.
+fn prefill_prompt(b: &Built, c: &mut SequenceCache, p: &[u32]) -> Vec<f32> {
+    b.cache.reserve(c, p.len()).unwrap();
+    b.model.forward_cached(&input_at(p, 0), c).unwrap()
+}
+
+/// Reserve each session's decode page and stage its row and fixed-length window
+/// into `bufs`. Returns the tokens it staged.
+fn stage_batch(
+    cache: &Arc<DeviceCache>,
+    sessions: &mut [SequenceCache],
+    tokens: &[u32],
+    bufs: &DecodeBuffers,
+) {
+    let mut rows = Vec::with_capacity(sessions.len());
+    for (i, c) in sessions.iter_mut().enumerate() {
+        cache.reserve(c, 1).unwrap();
+        rows.push(DecodeRow {
+            input_id: tokens[i],
+            position: (c.cached() - 1) as u32,
+            state_slot: c.state_slot(),
+            out_loc: c.tail(1)[0],
+        });
+    }
+    bufs.stage(&rows).unwrap();
+    for (i, c) in sessions.iter().enumerate() {
+        bufs.stage_window(i, c.filled()).unwrap();
+    }
+}
+
+/// Prefill `prompts` into fresh sessions, returning them and the token each
+/// predicts next.
+fn prefill_set(b: &Built, prompts: &[Vec<u32>]) -> (Vec<SequenceCache>, Vec<u32>) {
+    let mut sessions = Vec::with_capacity(prompts.len());
+    let mut tokens = Vec::with_capacity(prompts.len());
+    for p in prompts {
+        let mut c = b.cache.begin();
+        let last = prefill_prompt(b, &mut c, p);
+        tokens.push(argmax(&last) as u32);
+        sessions.push(c);
+    }
+    (sessions, tokens)
+}
+
+/// A captured batch step replays equal to the uncaptured one at every batch
+/// size `{1, 2, 4}` (TODO.md P1 item 4). Each size captures its own executable,
+/// re-prefills the same requests, re-stages the same rows into the graph's
+/// buffers and replays; the logits must match the uncaptured twin row by row.
+#[test]
+#[ignore = "needs a CUDA device and the FTW checkpoint"]
+fn a_captured_batch_decode_step_replays_equal_to_an_uncaptured_step() {
+    const L: usize = 3;
+    let max_bs = *BATCHES.iter().max().unwrap();
+    let b = build(2 * max_bs * (L + 1) + 32, 2 * max_bs + 2);
+    let device = auto_device();
+    unsafe { cuda_graph::set_current_stream(b.stream, 0) };
+    let window = ROW_PROMPT + 1;
+
+    for &bs in &BATCHES {
+        // Distinct in-vocab prompts per row, so a mixed-up row is visible.
+        let prompts: Vec<Vec<u32>> = (0..bs)
+            .map(|i| {
+                (0..ROW_PROMPT)
+                    .map(|j| PROMPT[(i + j) % PROMPT.len()])
+                    .collect()
+            })
+            .collect();
+
+        // Reference: one uncaptured batched step from the prefilled state.
+        let refbuf = DecodeBuffers::new(bs, b.vocab, window, device);
+        let (mut set_a, tokens) = prefill_set(&b, &prompts);
+        stage_batch(&b.cache, &mut set_a, &tokens, &refbuf);
+        b.model.forward_decode_into(&refbuf).unwrap();
+        let want: Vec<Vec<f32>> = (0..bs)
+            .map(|i| to_f32_vec(&refbuf.logits().select(0, i as i64)))
+            .collect();
+        for c in &mut set_a {
+            b.cache.end(c);
+        }
+
+        // Capture: prefill the same requests, stage the same rows, warm the
+        // kernels and record one step into a graph of this batch size.
+        let capbuf = DecodeBuffers::new(bs, b.vocab, window, device);
+        let (mut set_b, _) = prefill_set(&b, &prompts);
+        stage_batch(&b.cache, &mut set_b, &tokens, &capbuf);
+        let graph = unsafe {
+            DecodeGraph::capture(b.lib.clone(), b.stream, capbuf, |bufs| {
+                b.model.forward_decode_into(bufs)
+            })
+        }
+        .expect("capture the decode step");
+        for c in &mut set_b {
+            b.cache.end(c);
+        }
+
+        // Replay: the recurrent state is not idempotent, so re-prefill the same
+        // requests, re-stage the same rows into the graph's own buffers, and
+        // launch. The graph reads the new values at its baked addresses.
+        let (mut set_c, _) = prefill_set(&b, &prompts);
+        stage_batch(&b.cache, &mut set_c, &tokens, graph.buffers());
+        unsafe { graph.replay() }.expect("replay the graph");
+        unsafe { b.lib.synchronize(b.stream) }.unwrap();
+        let got: Vec<Vec<f32>> = (0..bs)
+            .map(|i| to_f32_vec(&graph.buffers().logits().select(0, i as i64)))
+            .collect();
+        for c in &mut set_c {
+            b.cache.end(c);
+        }
+
+        for i in 0..bs {
+            assert_eq!(
+                argmax(&got[i]),
+                argmax(&want[i]),
+                "batch {bs} row {i} replayed a different token"
+            );
+            let scale = want[i].iter().fold(0.0f32, |acc, v| acc.max(v.abs()));
+            let diff = got[i]
+                .iter()
+                .zip(&want[i])
+                .map(|(a, c)| (a - c).abs())
+                .fold(0.0f32, f32::max)
+                / scale;
+            assert!(
+                diff < 1e-3,
+                "batch {bs} row {i} drifted from the uncaptured step by {diff:.3e} of scale"
+            );
+            eprintln!(
+                "batch {bs} row {i}: argmax {} ok, max|dlogit|/scale = {diff:.3e}",
+                argmax(&got[i])
+            );
+        }
+        println!("PASS: batch {bs} captured step replays equal to the uncaptured twin");
+        drop(graph);
+    }
+
     unsafe { b.lib.destroy_stream(b.stream) }.expect("destroy stream");
 }

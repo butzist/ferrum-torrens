@@ -531,9 +531,10 @@ runtime is never blocked by GPU work. A client hang-up aborts the run.
 
 ### 3.9 CUDA-graph decode capture `[partial]`
 
-The goal is one captured executable per decode batch size, over the whole
-forward, with the MoE launches inside it (decision 40). The addressing and
-fixed-window preconditions are now in place; the capture itself is next.
+One captured executable per decode batch size, over the whole forward, with the
+MoE launches inside it (decision 40). The capture, the per-size executables and
+their replay gate are in place; only the engine-owned allocation of the buffers
+and graphs remains.
 
 ```mermaid
 flowchart TB
@@ -544,16 +545,16 @@ flowchart TB
     DB["decode_buffers\nfixed-address batch metadata +\nfixed-length KV window"]
     B4["device-logits tail\nforward_cached_into writes the\nlm_head pass into a device buffer"]
     B5["device-addressed step\nforward_decode_into reads\nids/positions/slots off buffer\n(gated device == re-fed forward)"]
+    N1["MoE staging split\nresident E2M1 + on-device rope\n(no host upload in the step)"]
+    N2["decode_graph\nDecodeGraph capture/replay with a\nprivate pool + DecodeGraphSet\nper-size plan and dummy padding"]
   end
   subgraph Next["[TODO]"]
-    N1["MoE staging split\nhost work out of the captured\nrouted path"]
-    N2["warmup + capture one real\ndecode step on the side stream"]
-    N3["per-batch-size executables\n{1,2,4,max_running} + replay gate"]
+    N3["engine owns the buffers and\ngraphs; max_running joins the set"]
   end
-  Done --> N1 --> N2 --> N3
+  Done --> N3
 ```
 
-**Dynamic -- capture and replay (target shape).**
+**Dynamic -- capture and replay (as built, one `DecodeGraph` per size).**
 
 ```mermaid
 sequenceDiagram
@@ -596,9 +597,14 @@ round-trip, and `forward_decode_into` addresses the same forward entirely from a
 device-staged MoE port (`routed_via_port` -> `grouped_moe_staged`) reads its
 activations, router ids and route weights off device buffers, keeps its `E2M1`
 decode table resident, and builds the rope table on the device, so no step
-uploads a host tensor. `tests/decode_graph_capture.rs` captures one whole real
-decode step and replays it equal to the uncaptured twin; the per-batch-size
-executables are the next piece.
+uploads a host tensor. `infrastructure/decode_graph.rs` then captures one
+`DecodeGraph` per batch size -- each with its own private torch graph pool and
+its fixed-address `DecodeBuffers` -- and a `DecodeGraphSet` picks the smallest
+captured size that fits a step and pads the tail with dummy rows (decision 59).
+`tests/decode_graph_capture.rs` captures one whole real decode step and replays
+it equal to the uncaptured twin, and its batch gate replays `{1,2,4}` equal to
+the uncaptured twin; the engine owning the buffers and graphs (and `max_running`
+joining the captured set) is the next piece.
 
 ---
 
@@ -606,10 +612,10 @@ executables are the next piece.
 
 | Library / tool | Kind | Used by | Purpose |
 |---|---|---|---|
-| `libtorch` (via `tch`) | runtime, `cuda` feature | `infrastructure/torch.rs`, `models/qwen3_6/forward_torch.rs`, `infrastructure/kvcache_dev.rs`, `infrastructure/cuda_moe.rs` | All dense compute (GEMMs, norms, rope, attention, GDN), device tensors, the KV/state slabs, and the MoE slot banks |
+| `libtorch` (via `tch`) | runtime, `cuda` feature | `infrastructure/torch.rs`, `models/qwen3_6/forward_torch.rs`, `infrastructure/kvcache_dev.rs`, `infrastructure/cuda_moe.rs`, `infrastructure/decode_graph.rs` | All dense compute (GEMMs, norms, rope, attention, GDN), device tensors, the KV/state slabs, and the MoE slot banks |
 | CUDA driver API (`libcuda.so.1`) | runtime, hand-rolled FFI | `infrastructure/cuda_driver.rs` | Load and launch the committed cubins, allocate device + page-locked memory, capture and replay CUDA graphs |
 | Triton (cubins) | build-time authoring; committed artifacts at runtime | `python/ferrum_kernel/*`, `kernel/*.cubin` | The one hand-written NVFP4 grouped-MoE GEMV plus the silu/sum-reduce and the two offload staging kernels. Authored and AOT-compiled in Python; launched by `cuda_driver` with no interpreter at runtime |
-| `c10_cuda` (torch C++) | runtime, via `build.rs` shim | `shim/c10_graph_shim.cpp`, `infrastructure/cuda_graph.rs` | The torch current-stream set and the graph memory pool that `tch` does not expose; needed for CUDA-graph capture of torch ops |
+| `c10_cuda` (torch C++) | runtime, via `build.rs` shim | `shim/c10_graph_shim.cpp`, `infrastructure/cuda_graph.rs`, `infrastructure/decode_graph.rs` | The torch current-stream set and the graph memory pool that `tch` does not expose; needed for CUDA-graph capture of torch ops |
 | `axum` + `tokio` | runtime | `infrastructure/http.rs`, `main.rs` | HTTP server, SSE streaming, and the async runtime that offloads forwards to blocking threads |
 | `tokenizers` + `minijinja` | runtime | `infrastructure/tokenizers_hf.rs` | HF byte-level BPE tokenizer and the checkpoint's chat template (Python string methods rewritten to filters) |
 | `memmap2` | runtime | `infrastructure/ftw.rs` | mmap the FTW shards for zero-copy weight access |

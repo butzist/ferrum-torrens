@@ -1,6 +1,6 @@
 # FerrumTorrens -- FreeToken MVP port to Rust: TODO
 
-Status: M2 (API) current; M3 prerequisite 4 (device staging: lru_ensure + index_copy + pinned banks + wiring) complete, and decision 40's capture work advances: decision 49 gives the fixed-address `DecodeBuffers` batch-metadata staging, decision 50 settles the mempool -- torch's graph pool behind a tiny C++ bridge, with `tests/cuda_graph_torch_probe.rs` green on the device -- and the forward's output tail is now a device-logits step (`forward_cached_into`, no host round-trip). The decode step's inputs are now staged off the buffers (decision 54: `forward_decode_into`; only device tensors address the cache), attention gathers a fixed-length padded window (decision 55), and the gated `tests/device_decode_matches_refeed.rs` proves the device path equals the re-fed host forward at ~1e-6 on the real checkpoint. The MoE staging split is out of the captured path (decision 56: a resident E2M1 table and an on-device rope table remove the last host uploads), and the gated `tests/decode_graph_capture.rs` now captures one whole real decode step and replays it equal to the uncaptured twin. The device decode is now batch-generic (decision 58): `forward_decode_into` runs every row of `DecodeBuffers`, and the gated `a_batched_decode_step_matches_n_single_row_steps` pins a batch-3 step to three single-row steps on the real checkpoint. Remaining: per-batch-size executables `{1,2,4,max_running}` and their gate. Decision 36 is
+Status: M2 (API) current; M3 prerequisite 4 (device staging: lru_ensure + index_copy + pinned banks + wiring) complete, and decision 40's capture work advances: decision 49 gives the fixed-address `DecodeBuffers` batch-metadata staging, decision 50 settles the mempool -- torch's graph pool behind a tiny C++ bridge, with `tests/cuda_graph_torch_probe.rs` green on the device -- and the forward's output tail is now a device-logits step (`forward_cached_into`, no host round-trip). The decode step's inputs are now staged off the buffers (decision 54: `forward_decode_into`; only device tensors address the cache), attention gathers a fixed-length padded window (decision 55), and the gated `tests/device_decode_matches_refeed.rs` proves the device path equals the re-fed host forward at ~1e-6 on the real checkpoint. The MoE staging split is out of the captured path (decision 56: a resident E2M1 table and an on-device rope table remove the last host uploads), and the gated `tests/decode_graph_capture.rs` now captures one whole real decode step and replays it equal to the uncaptured twin. The device decode is now batch-generic (decision 58): `forward_decode_into` runs every row of `DecodeBuffers`, and the gated `a_batched_decode_step_matches_n_single_row_steps` pins a batch-3 step to three single-row steps on the real checkpoint. The per-batch-size executables are landed (decision 59): `infrastructure/decode_graph.rs` captures one `DecodeGraph` (its own private pool and fixed-address buffers) per size and a `DecodeGraphSet` picks the smallest captured size that fits and pads with dummy rows, and the gated `tests/decode_graph_capture.rs::a_captured_batch_decode_step_replays_equal_to_an_uncaptured_step` replays batch `{1,2,4}` equal to the uncaptured twin on the real checkpoint. Remaining in P1: the engine-owned allocation of the buffers and graphs (the "pinned batch-metadata staging" line) and `max_running` in the captured set. Decision 36 is
 done end to end: the serving path is Python-free. The sm_120 cubins are
 committed under `kernel/` with an ABI manifest, `infrastructure/kernel_abi.rs`
 packs the launch arguments and checks them against the committed PTX,
@@ -520,7 +520,7 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
   (and different from step 1). Green 2026-10-06 alongside the scalar-oracle,
   cubin-smoke and tower gates. A `StagedGroup` must outlive every graph
   captured over it, and the batch shape is pinned with it.
-- [ ] P1 CUDA-graph capture for decode batch sizes `{1,2,4, max_running}` (shared
+- [x] P1 CUDA-graph capture for decode batch sizes `{1,2,4, max_running}` (shared
   mempool, dummy-req padding, logits `[bs, vocab]` inside graph) over the driver
   FFI (decision 39: not "via tch" -- `tch` 0.22 has no capture API), plus the
   no-inference-during-capture warmup pattern (mirror `engine/graph.py`).
@@ -569,6 +569,12 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
      padding to the captured size; the mempool is decided (decision 50: the
      torch graph pool, one per captured batch size), so this lands the shared
      address space and records what a per-size pool shares in section 7.
+     **Done, decision 59.** `infrastructure/decode_graph.rs` owns a
+     `DecodeGraph` per captured size -- one private `GraphPool` and one
+     `DecodeBuffers` each, per decision 50 -- and a `DecodeGraphSet` that picks
+     the smallest captured size that fits and pads the tail with dummy rows. The
+     sizes captured and gated so far are `{1,2,4}`; `max_running` joins the set
+     when the engine owns the buffers (the pinned-staging line below).
   4. **Gate**: a `--ignored` test beside `tests/cuda_graph_moe_smoke.rs` that
      replays the captured decode step against the uncaptured twin on the real
      checkpoint for each batch size (argmax equal, logits within the 2e-6 of
@@ -576,7 +582,10 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
      oracle-match and the engine gates green -- and run the five
      `engine_real_generate` tests **serially**: five model loads in parallel
      OOMed the 8 GiB device (observed 2026-10-06; the same tests pass one at
-     a time).
+     a time). **Done, decision 59**:
+     `tests/decode_graph_capture.rs::a_captured_batch_decode_step_replays_equal_to_an_uncaptured_step`
+     captures and replays `{1,2,4}` against the uncaptured twin on the real
+     checkpoint (argmax equal, `max|dlogit|/scale = 0` at every size).
   Contracts from slice 1 that do not change: a `StagedGroup` outlives every
   graph captured over it, `stage_into` is the only writer between replays, a
   captured grid pins the batch shape (different shape = error containing
@@ -1950,6 +1959,45 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
       `tests/device_decode_matches_refeed.rs::a_batched_decode_step_matches_n_single_row_steps`
       pins a batch-3 device step to three single-row steps on the real checkpoint
       (argmax equal, `max|dlogit|/scale ~7e-7`, 2026-10-13).
+
+59. **The decode graph is one executable per batch size, each with its own pool**
+    (2026-10-13) -- decision 40's P1 items 3 and 4.
+    - **What changed.** `infrastructure/decode_graph.rs` owns the captured set.
+      `DecodeGraph::capture` allocates that size's `DecodeBuffers`, warms the
+      step, synchronizes, opens a private `GraphPool`, records one
+      `forward_decode_into`, instantiates and drops the source graph; it holds
+      the pool and buffers for the life of the executable (a replay reads their
+      baked addresses) and destroys the instance before the pool closes.
+      `DecodeGraphSet` keys the executables by batch size, `plan(n)` returns the
+      smallest captured size `>= n`, and `stage_and_launch(rows, windows)` stages
+      the live rows, pads the tail with its configured dummy `DecodeRow`, and
+      launches. The real capture/launch live behind `DecodeExec`; the unit tests
+      stand in a fake so the selection and padding are exercised with no device.
+    - **Why one pool per size.** Decision 50 fixes the torch graph pool as the
+      only pool a torch-op capture can allocate out of, and the probe
+      (`cuda_graph_torch_probe.rs`) and the whole-step capture both open a pool
+      across exactly one capture. Sharing one pool across sizes would keep it
+      open for the engine's whole life and route every unrelated allocation into
+      it, so each `DecodeGraph` opens its own across its own capture. The buffers
+      are likewise per size, because the forward runs every row and a captured
+      grid pins the shape.
+    - **Dummy-req padding.** `DecodeGraphSet` carries the padding row and stages
+      it into the tail; the padded rows run the whole forward, so their K/V and
+      GDN writes are real side effects -- the caller must pass a row that names a
+      reserved state slot and a reserved pool location. The CPU unit tests pin
+      the selection (`plan`) and that a 1-row step on a batch-4 graph stages the
+      live row then dummy rows, with the dummy windows cleared.
+    - **Coverage.** Four CPU units in `decode_graph.rs` (selection, padding,
+      over-size and window-count refusals). The gated
+      `tests/decode_graph_capture.rs::a_captured_batch_decode_step_replays_equal_to_an_uncaptured_step`
+      captures `{1,2,4}` over the device-staged MoE port on the real checkpoint,
+      re-prefills the same requests, replays each graph and matches the
+      uncaptured twin row by row (argmax equal, `max|dlogit|/scale = 0`,
+      2026-10-13). `BATCHES` is `{1,2,4}` because `max_running` joins the set only
+      when the engine owns the buffers (decision 40's P1 pinned-staging line).
+    - **Still open.** The engine still allocates neither the buffers nor the
+      graphs; the pinned batch-metadata staging P1 line covers that wiring, and
+      `max_running` is captured with it.
 
 ### Config defaults for the RTX 5060 / 8 GB target
 

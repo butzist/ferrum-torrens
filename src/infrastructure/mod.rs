@@ -10,6 +10,8 @@ pub mod cuda_graph;
 pub mod cuda_moe;
 #[cfg(feature = "cuda")]
 pub mod decode_buffers;
+#[cfg(feature = "cuda")]
+pub mod decode_graph;
 pub mod ftw;
 pub mod http;
 pub mod kernel_abi;
