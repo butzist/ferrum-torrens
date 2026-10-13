@@ -510,10 +510,8 @@ impl CudaMoE {
             num_cached: st.plan_cap as u32,
             id_base: (layer * st.experts) as u32,
         };
-        let mut params = lru_ensure_args(&self.staging_abi, &args)
-            .map_err(bad_abi)?
-            .kernel_params()
-            .map_err(bad_abi)?;
+        let pack = lru_ensure_args(&self.staging_abi, &args).map_err(bad_abi)?;
+        let mut params = pack.kernel_params().map_err(bad_abi)?;
         // SAFETY: every pointer in `args` is a live libtorch allocation in the
         // context made current at construction, `params` was built from this
         // kernel's manifest entry, and `stream` is this adapter's stream.
@@ -542,10 +540,8 @@ impl CudaMoE {
             src_idx: ptr(&st.misses),
             num: ptr(&st.num),
         };
-        let mut params = index_copy_args(&self.staging_abi, &args)
-            .map_err(bad_abi)?
-            .kernel_params()
-            .map_err(bad_abi)?;
+        let pack = index_copy_args(&self.staging_abi, &args).map_err(bad_abi)?;
+        let mut params = pack.kernel_params().map_err(bad_abi)?;
         // SAFETY: as `ensure_experts`: every pointer is a live allocation and
         // `params` matches this kernel's manifest entry.
         unsafe { self.staging.launch(copy, &mut params, self.stream) }.map_err(driver)

@@ -27,11 +27,11 @@
 $L__func_begin0:
 
 // %bb.0:
-	.loc	1 134 25                        // offload.py:134:25
+	.loc	1 143 25                        // offload.py:143:25
 	mov.u32 	%r1, %ctaid.x;
-	.loc	1 136 14                        // offload.py:136:14
+	.loc	1 145 14                        // offload.py:145:14
 	setp.gt.u32 	%p1, %r1, 5;
-	.loc	1 136 7                         // offload.py:136:7
+	.loc	1 145 7                         // offload.py:145:7
 	@%p1 bra 	$L__BB0_195;
 // %bb.1:
 	.loc	1 0 7                           // offload.py:0:7
@@ -41,42 +41,42 @@ $L__func_begin0:
 	ld.param.b64 	%rd83, [_index_copy_multi_kernel_param_2];
 	ld.param.b64 	%rd82, [_index_copy_multi_kernel_param_1];
 	ld.param.b64 	%rd81, [_index_copy_multi_kernel_param_0];
-	.loc	1 135 26                        // offload.py:135:26
+	.loc	1 144 26                        // offload.py:144:26
 	mov.u32 	%r2, %ctaid.y;
-	.loc	1 137 36                        // offload.py:137:36
+	.loc	1 146 36                        // offload.py:146:36
 	mul.wide.u32 	%rd93, %r1, 8;
 	add.s64 	%rd86, %rd83, %rd93;
-	.loc	1 137 23                        // offload.py:137:23
+	.loc	1 146 23                        // offload.py:146:23
 	// begin inline asm
 	mov.u64 %rd1, 0x0;
 	ld.global.b64 { %rd1 }, [ %rd86 + 0 ];
 	// end inline asm
-	.loc	1 138 20                        // offload.py:138:20
+	.loc	1 147 20                        // offload.py:147:20
 	// begin inline asm
 	mov.u64 %rd87, 0x0;
 	ld.global.b64 { %rd87 }, [ %rd88 + 0 ];
 	// end inline asm
-	.loc	1 139 20                        // offload.py:139:20
+	.loc	1 148 20                        // offload.py:148:20
 	mul.lo.s64 	%rd2, %rd87, %rd1;
-	.loc	1 140 38                        // offload.py:140:38
+	.loc	1 149 38                        // offload.py:149:38
 	add.s64 	%rd90, %rd81, %rd93;
-	.loc	1 140 27                        // offload.py:140:27
+	.loc	1 149 27                        // offload.py:149:27
 	// begin inline asm
 	mov.u64 %rd89, 0x0;
 	ld.global.b64 { %rd89 }, [ %rd90 + 0 ];
 	// end inline asm
-	.loc	1 141 38                        // offload.py:141:38
+	.loc	1 150 38                        // offload.py:150:38
 	add.s64 	%rd92, %rd82, %rd93;
-	.loc	1 141 27                        // offload.py:141:27
+	.loc	1 150 27                        // offload.py:150:27
 	// begin inline asm
 	mov.u64 %rd91, 0x0;
 	ld.global.b64 { %rd91 }, [ %rd92 + 0 ];
 	// end inline asm
-	.loc	1 148 66                        // offload.py:148:66
+	.loc	1 157 66                        // offload.py:157:66
 	mov.u32 	%r3, %tid.x;
 	and.b32 	%r4, %r3, 127;
 	shl.b32 	%r5, %r2, 13;
-	.loc	1 147 29                        // offload.py:147:29
+	.loc	1 156 29                        // offload.py:156:29
 	or.b32 	%r6, %r3, %r5;
 	cvt.u64.u32 	%rd3, %r6;
 	or.b32 	%r7, %r5, %r4;
@@ -84,10 +84,10 @@ $L__func_begin0:
 	mov.b64 	%rd912, 0;
 	bra.uni 	$L__BB0_2;
 $L__BB0_193:                            //   in Loop: Header=BB0_2 Depth=1
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	div.s64 	%rd976, %rd80, %rd1;
 $L__BB0_194:                            //   in Loop: Header=BB0_2 Depth=1
-	.loc	1 149 20                        // offload.py:149:20
+	.loc	1 158 20                        // offload.py:158:20
 	setp.gt.s64 	%p122, %rd2, %rd64;
 	setp.gt.s64 	%p121, %rd2, %rd65;
 	setp.gt.s64 	%p120, %rd2, %rd66;
@@ -152,7 +152,7 @@ $L__BB0_194:                            //   in Loop: Header=BB0_2 Depth=1
 	setp.gt.s64 	%p61, %rd2, %rd6;
 	setp.gt.s64 	%p60, %rd2, %rd5;
 	setp.gt.s64 	%p59, %rd2, %rd72;
-	.loc	1 151 25                        // offload.py:151:25
+	.loc	1 160 25                        // offload.py:160:25
 	mul.lo.s64 	%rd464, %rd913, %rd1;
 	sub.s64 	%rd465, %rd72, %rd464;
 	mul.lo.s64 	%rd466, %rd914, %rd1;
@@ -281,7 +281,7 @@ $L__BB0_194:                            //   in Loop: Header=BB0_2 Depth=1
 	sub.s64 	%rd589, %rd59, %rd588;
 	mul.lo.s64 	%rd590, %rd976, %rd1;
 	sub.s64 	%rd591, %rd80, %rd590;
-	.loc	1 152 34                        // offload.py:152:34
+	.loc	1 161 34                        // offload.py:161:34
 	shl.b64 	%rd592, %rd913, 2;
 	add.s64 	%rd208, %rd84, %rd592;
 	shl.b64 	%rd593, %rd914, 2;
@@ -410,7 +410,7 @@ $L__BB0_194:                            //   in Loop: Header=BB0_2 Depth=1
 	add.s64 	%rd270, %rd84, %rd654;
 	shl.b64 	%rd655, %rd976, 2;
 	add.s64 	%rd271, %rd84, %rd655;
-	.loc	1 152 24                        // offload.py:152:24
+	.loc	1 161 24                        // offload.py:161:24
 	// begin inline asm
 	mov.u32 %r217, 0xffffffffffffffff;
 	@%p59 ld.global.b32 { %r217 }, [ %rd208 + 0 ];
@@ -667,7 +667,7 @@ $L__BB0_194:                            //   in Loop: Header=BB0_2 Depth=1
 	mov.u32 %r280, 0xffffffffffffffff;
 	@%p122 ld.global.b32 { %r280 }, [ %rd271 + 0 ];
 	// end inline asm
-	.loc	1 152 60                        // offload.py:152:60
+	.loc	1 161 60                        // offload.py:161:60
 	cvt.s64.s32 	%rd656, %r217;
 	cvt.s64.s32 	%rd657, %r218;
 	cvt.s64.s32 	%rd658, %r219;
@@ -732,7 +732,7 @@ $L__BB0_194:                            //   in Loop: Header=BB0_2 Depth=1
 	cvt.s64.s32 	%rd717, %r278;
 	cvt.s64.s32 	%rd718, %r279;
 	cvt.s64.s32 	%rd719, %r280;
-	.loc	1 153 40                        // offload.py:153:40
+	.loc	1 162 40                        // offload.py:162:40
 	add.s64 	%rd272, %rd85, %rd592;
 	add.s64 	%rd273, %rd85, %rd593;
 	add.s64 	%rd274, %rd85, %rd594;
@@ -797,7 +797,7 @@ $L__BB0_194:                            //   in Loop: Header=BB0_2 Depth=1
 	add.s64 	%rd333, %rd85, %rd653;
 	add.s64 	%rd334, %rd85, %rd654;
 	add.s64 	%rd335, %rd85, %rd655;
-	.loc	1 153 30                        // offload.py:153:30
+	.loc	1 162 30                        // offload.py:162:30
 	// begin inline asm
 	mov.u32 %r281, 0xffffffffffffffff;
 	@%p59 ld.global.b32 { %r281 }, [ %rd272 + 0 ];
@@ -1054,7 +1054,7 @@ $L__BB0_194:                            //   in Loop: Header=BB0_2 Depth=1
 	mov.u32 %r344, 0xffffffffffffffff;
 	@%p122 ld.global.b32 { %r344 }, [ %rd335 + 0 ];
 	// end inline asm
-	.loc	1 153 66                        // offload.py:153:66
+	.loc	1 162 66                        // offload.py:162:66
 	cvt.s64.s32 	%rd720, %r281;
 	cvt.s64.s32 	%rd721, %r282;
 	cvt.s64.s32 	%rd722, %r283;
@@ -1119,7 +1119,7 @@ $L__BB0_194:                            //   in Loop: Header=BB0_2 Depth=1
 	cvt.s64.s32 	%rd781, %r342;
 	cvt.s64.s32 	%rd782, %r343;
 	cvt.s64.s32 	%rd783, %r344;
-	.loc	1 154 0                         // offload.py:154
+	.loc	1 163 0                         // offload.py:163
 	mad.lo.s64 	%rd784, %rd1, %rd720, %rd91;
 	add.s64 	%rd336, %rd784, %rd465;
 	mad.lo.s64 	%rd785, %rd1, %rd721, %rd91;
@@ -1248,7 +1248,7 @@ $L__BB0_194:                            //   in Loop: Header=BB0_2 Depth=1
 	add.s64 	%rd398, %rd846, %rd589;
 	mad.lo.s64 	%rd847, %rd1, %rd783, %rd91;
 	add.s64 	%rd399, %rd847, %rd591;
-	.loc	1 154 24                        // offload.py:154:24
+	.loc	1 163 24                        // offload.py:163:24
 	// begin inline asm
 	mov.u16 %rs1, 0x0;
 	@%p59 ld.global.b8 { %rs1 }, [ %rd336 + 0 ];
@@ -1505,7 +1505,7 @@ $L__BB0_194:                            //   in Loop: Header=BB0_2 Depth=1
 	mov.u16 %rs64, 0x0;
 	@%p122 ld.global.b8 { %rs64 }, [ %rd399 + 0 ];
 	// end inline asm
-	.loc	1 155 0                         // offload.py:155
+	.loc	1 164 0                         // offload.py:164
 	mad.lo.s64 	%rd848, %rd1, %rd656, %rd89;
 	add.s64 	%rd400, %rd848, %rd465;
 	mad.lo.s64 	%rd849, %rd1, %rd657, %rd89;
@@ -1634,7 +1634,7 @@ $L__BB0_194:                            //   in Loop: Header=BB0_2 Depth=1
 	add.s64 	%rd462, %rd910, %rd589;
 	mad.lo.s64 	%rd911, %rd1, %rd719, %rd89;
 	add.s64 	%rd463, %rd911, %rd591;
-	.loc	1 155 51                        // offload.py:155:51
+	.loc	1 164 51                        // offload.py:164:51
 	// begin inline asm
 	@%p59 st.global.b8 [ %rd400 + 0 ], { %rs1 };
 	// end inline asm
@@ -1827,16 +1827,16 @@ $L__BB0_194:                            //   in Loop: Header=BB0_2 Depth=1
 	// begin inline asm
 	@%p122 st.global.b8 [ %rd463 + 0 ], { %rs64 };
 	// end inline asm
-	.loc	1 147 29                        // offload.py:147:29
+	.loc	1 156 29                        // offload.py:156:29
 	add.s64 	%rd912, %rd912, 1048576;
 	setp.ne.b64 	%p123, %rd912, 134217728;
 	@%p123 bra 	$L__BB0_2;
 	bra.uni 	$L__BB0_195;
 $L__BB0_2:                              // =>This Inner Loop Header: Depth=1
-	.loc	1 148 53                        // offload.py:148:53
+	.loc	1 157 53                        // offload.py:157:53
 	add.s64 	%rd72, %rd4, %rd912;
 	add.s64 	%rd5, %rd72, 128;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	or.b64 	%rd95, %rd72, %rd1;
 	and.b64 	%rd96, %rd95, -4294967296;
 	setp.ne.b64 	%p2, %rd96, 0;
@@ -1853,7 +1853,7 @@ $L__BB0_3:                              //   in Loop: Header=BB0_2 Depth=1
 $L__BB0_5:                              //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 0                           // offload.py:0
 	add.s64 	%rd6, %rd72, 256;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	or.b64 	%rd97, %rd5, %rd1;
 	and.b64 	%rd98, %rd97, -4294967296;
 	setp.ne.b64 	%p3, %rd98, 0;
@@ -1870,7 +1870,7 @@ $L__BB0_6:                              //   in Loop: Header=BB0_2 Depth=1
 $L__BB0_8:                              //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 0                           // offload.py:0
 	add.s64 	%rd7, %rd72, 384;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	or.b64 	%rd99, %rd6, %rd1;
 	and.b64 	%rd100, %rd99, -4294967296;
 	setp.ne.b64 	%p4, %rd100, 0;
@@ -1887,7 +1887,7 @@ $L__BB0_9:                              //   in Loop: Header=BB0_2 Depth=1
 $L__BB0_11:                             //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 0                           // offload.py:0
 	add.s64 	%rd8, %rd72, 512;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	or.b64 	%rd101, %rd7, %rd1;
 	and.b64 	%rd102, %rd101, -4294967296;
 	setp.ne.b64 	%p5, %rd102, 0;
@@ -1904,7 +1904,7 @@ $L__BB0_12:                             //   in Loop: Header=BB0_2 Depth=1
 $L__BB0_14:                             //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 0                           // offload.py:0
 	add.s64 	%rd9, %rd72, 640;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	or.b64 	%rd103, %rd8, %rd1;
 	and.b64 	%rd104, %rd103, -4294967296;
 	setp.ne.b64 	%p6, %rd104, 0;
@@ -1921,7 +1921,7 @@ $L__BB0_15:                             //   in Loop: Header=BB0_2 Depth=1
 $L__BB0_17:                             //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 0                           // offload.py:0
 	add.s64 	%rd10, %rd72, 768;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	or.b64 	%rd105, %rd9, %rd1;
 	and.b64 	%rd106, %rd105, -4294967296;
 	setp.ne.b64 	%p7, %rd106, 0;
@@ -1939,7 +1939,7 @@ $L__BB0_20:                             //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 23                          // offload.py:0:23
 	add.s64 	%rd94, %rd3, %rd912;
 	cvt.u32.u64 	%r8, %rd94;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	or.b64 	%rd107, %rd10, %rd1;
 	and.b64 	%rd108, %rd107, -4294967296;
 	setp.ne.b64 	%p8, %rd108, 0;
@@ -1959,7 +1959,7 @@ $L__BB0_23:                             //   in Loop: Header=BB0_2 Depth=1
 	or.b32 	%r10, %r8, 1920;
 	mov.b64 	%rd63, {%r10, %r9};
 	add.s64 	%rd11, %rd72, 1024;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	mov.b64 	{_, %r38}, %rd63;
 	cvt.u64.u32 	%rd73, %r38;
 	and.b64 	%rd109, %rd1, -4294967296;
@@ -1977,7 +1977,7 @@ $L__BB0_24:                             //   in Loop: Header=BB0_2 Depth=1
 $L__BB0_26:                             //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 0                           // offload.py:0
 	add.s64 	%rd12, %rd72, 1152;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	or.b64 	%rd110, %rd11, %rd1;
 	and.b64 	%rd111, %rd110, -4294967296;
 	setp.ne.b64 	%p10, %rd111, 0;
@@ -1994,7 +1994,7 @@ $L__BB0_27:                             //   in Loop: Header=BB0_2 Depth=1
 $L__BB0_29:                             //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 0                           // offload.py:0
 	add.s64 	%rd13, %rd72, 1280;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	or.b64 	%rd112, %rd12, %rd1;
 	and.b64 	%rd113, %rd112, -4294967296;
 	setp.ne.b64 	%p11, %rd113, 0;
@@ -2011,7 +2011,7 @@ $L__BB0_30:                             //   in Loop: Header=BB0_2 Depth=1
 $L__BB0_32:                             //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 0                           // offload.py:0
 	add.s64 	%rd14, %rd72, 1408;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	or.b64 	%rd114, %rd13, %rd1;
 	and.b64 	%rd115, %rd114, -4294967296;
 	setp.ne.b64 	%p12, %rd115, 0;
@@ -2028,7 +2028,7 @@ $L__BB0_33:                             //   in Loop: Header=BB0_2 Depth=1
 $L__BB0_35:                             //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 0                           // offload.py:0
 	add.s64 	%rd15, %rd72, 1536;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	or.b64 	%rd116, %rd14, %rd1;
 	and.b64 	%rd117, %rd116, -4294967296;
 	setp.ne.b64 	%p13, %rd117, 0;
@@ -2045,7 +2045,7 @@ $L__BB0_36:                             //   in Loop: Header=BB0_2 Depth=1
 $L__BB0_38:                             //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 0                           // offload.py:0
 	add.s64 	%rd16, %rd72, 1664;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	or.b64 	%rd118, %rd15, %rd1;
 	and.b64 	%rd119, %rd118, -4294967296;
 	setp.ne.b64 	%p14, %rd119, 0;
@@ -2062,7 +2062,7 @@ $L__BB0_39:                             //   in Loop: Header=BB0_2 Depth=1
 $L__BB0_41:                             //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 0                           // offload.py:0
 	add.s64 	%rd17, %rd72, 1792;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	or.b64 	%rd120, %rd16, %rd1;
 	and.b64 	%rd121, %rd120, -4294967296;
 	setp.ne.b64 	%p15, %rd121, 0;
@@ -2093,7 +2093,7 @@ $L__BB0_45:                             //   in Loop: Header=BB0_2 Depth=1
 $L__BB0_47:                             //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 0                           // offload.py:0
 	add.s64 	%rd18, %rd72, 2048;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	mov.b64 	{%r63, _}, %rd63;
 	cvt.u64.u32 	%rd74, %r63;
 	@%p9 bra 	$L__BB0_49;
@@ -2109,7 +2109,7 @@ $L__BB0_48:                             //   in Loop: Header=BB0_2 Depth=1
 $L__BB0_50:                             //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 0                           // offload.py:0
 	add.s64 	%rd19, %rd72, 2176;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	or.b64 	%rd124, %rd18, %rd1;
 	and.b64 	%rd125, %rd124, -4294967296;
 	setp.ne.b64 	%p17, %rd125, 0;
@@ -2126,7 +2126,7 @@ $L__BB0_51:                             //   in Loop: Header=BB0_2 Depth=1
 $L__BB0_53:                             //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 0                           // offload.py:0
 	add.s64 	%rd20, %rd72, 2304;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	or.b64 	%rd126, %rd19, %rd1;
 	and.b64 	%rd127, %rd126, -4294967296;
 	setp.ne.b64 	%p18, %rd127, 0;
@@ -2143,7 +2143,7 @@ $L__BB0_54:                             //   in Loop: Header=BB0_2 Depth=1
 $L__BB0_56:                             //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 0                           // offload.py:0
 	add.s64 	%rd21, %rd72, 2432;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	or.b64 	%rd128, %rd20, %rd1;
 	and.b64 	%rd129, %rd128, -4294967296;
 	setp.ne.b64 	%p19, %rd129, 0;
@@ -2160,7 +2160,7 @@ $L__BB0_57:                             //   in Loop: Header=BB0_2 Depth=1
 $L__BB0_59:                             //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 0                           // offload.py:0
 	add.s64 	%rd22, %rd72, 2560;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	or.b64 	%rd130, %rd21, %rd1;
 	and.b64 	%rd131, %rd130, -4294967296;
 	setp.ne.b64 	%p20, %rd131, 0;
@@ -2177,7 +2177,7 @@ $L__BB0_60:                             //   in Loop: Header=BB0_2 Depth=1
 $L__BB0_62:                             //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 0                           // offload.py:0
 	add.s64 	%rd23, %rd72, 2688;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	or.b64 	%rd132, %rd22, %rd1;
 	and.b64 	%rd133, %rd132, -4294967296;
 	setp.ne.b64 	%p21, %rd133, 0;
@@ -2194,7 +2194,7 @@ $L__BB0_63:                             //   in Loop: Header=BB0_2 Depth=1
 $L__BB0_65:                             //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 0                           // offload.py:0
 	add.s64 	%rd24, %rd72, 2816;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	or.b64 	%rd134, %rd23, %rd1;
 	and.b64 	%rd135, %rd134, -4294967296;
 	setp.ne.b64 	%p22, %rd135, 0;
@@ -2228,7 +2228,7 @@ $L__BB0_71:                             //   in Loop: Header=BB0_2 Depth=1
 	or.b32 	%r12, %r8, 3968;
 	mov.b64 	%rd62, {%r12, %r11};
 	add.s64 	%rd25, %rd72, 3072;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	mov.b64 	{_, %r88}, %rd62;
 	cvt.u64.u32 	%rd75, %r88;
 	@%p9 bra 	$L__BB0_73;
@@ -2244,7 +2244,7 @@ $L__BB0_72:                             //   in Loop: Header=BB0_2 Depth=1
 $L__BB0_74:                             //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 0                           // offload.py:0
 	add.s64 	%rd26, %rd72, 3200;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	or.b64 	%rd138, %rd25, %rd1;
 	and.b64 	%rd139, %rd138, -4294967296;
 	setp.ne.b64 	%p24, %rd139, 0;
@@ -2261,7 +2261,7 @@ $L__BB0_75:                             //   in Loop: Header=BB0_2 Depth=1
 $L__BB0_77:                             //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 0                           // offload.py:0
 	add.s64 	%rd27, %rd72, 3328;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	or.b64 	%rd140, %rd26, %rd1;
 	and.b64 	%rd141, %rd140, -4294967296;
 	setp.ne.b64 	%p25, %rd141, 0;
@@ -2278,7 +2278,7 @@ $L__BB0_78:                             //   in Loop: Header=BB0_2 Depth=1
 $L__BB0_80:                             //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 0                           // offload.py:0
 	add.s64 	%rd28, %rd72, 3456;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	or.b64 	%rd142, %rd27, %rd1;
 	and.b64 	%rd143, %rd142, -4294967296;
 	setp.ne.b64 	%p26, %rd143, 0;
@@ -2295,7 +2295,7 @@ $L__BB0_81:                             //   in Loop: Header=BB0_2 Depth=1
 $L__BB0_83:                             //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 0                           // offload.py:0
 	add.s64 	%rd29, %rd72, 3584;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	or.b64 	%rd144, %rd28, %rd1;
 	and.b64 	%rd145, %rd144, -4294967296;
 	setp.ne.b64 	%p27, %rd145, 0;
@@ -2312,7 +2312,7 @@ $L__BB0_84:                             //   in Loop: Header=BB0_2 Depth=1
 $L__BB0_86:                             //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 0                           // offload.py:0
 	add.s64 	%rd30, %rd72, 3712;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	or.b64 	%rd146, %rd29, %rd1;
 	and.b64 	%rd147, %rd146, -4294967296;
 	setp.ne.b64 	%p28, %rd147, 0;
@@ -2329,7 +2329,7 @@ $L__BB0_87:                             //   in Loop: Header=BB0_2 Depth=1
 $L__BB0_89:                             //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 0                           // offload.py:0
 	add.s64 	%rd31, %rd72, 3840;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	or.b64 	%rd148, %rd30, %rd1;
 	and.b64 	%rd149, %rd148, -4294967296;
 	setp.ne.b64 	%p29, %rd149, 0;
@@ -2360,7 +2360,7 @@ $L__BB0_93:                             //   in Loop: Header=BB0_2 Depth=1
 $L__BB0_95:                             //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 0                           // offload.py:0
 	add.s64 	%rd32, %rd72, 4096;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	mov.b64 	{%r113, _}, %rd62;
 	cvt.u64.u32 	%rd76, %r113;
 	@%p9 bra 	$L__BB0_97;
@@ -2376,7 +2376,7 @@ $L__BB0_96:                             //   in Loop: Header=BB0_2 Depth=1
 $L__BB0_98:                             //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 0                           // offload.py:0
 	add.s64 	%rd33, %rd72, 4224;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	or.b64 	%rd152, %rd32, %rd1;
 	and.b64 	%rd153, %rd152, -4294967296;
 	setp.ne.b64 	%p31, %rd153, 0;
@@ -2393,7 +2393,7 @@ $L__BB0_99:                             //   in Loop: Header=BB0_2 Depth=1
 $L__BB0_101:                            //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 0                           // offload.py:0
 	add.s64 	%rd34, %rd72, 4352;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	or.b64 	%rd154, %rd33, %rd1;
 	and.b64 	%rd155, %rd154, -4294967296;
 	setp.ne.b64 	%p32, %rd155, 0;
@@ -2410,7 +2410,7 @@ $L__BB0_102:                            //   in Loop: Header=BB0_2 Depth=1
 $L__BB0_104:                            //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 0                           // offload.py:0
 	add.s64 	%rd35, %rd72, 4480;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	or.b64 	%rd156, %rd34, %rd1;
 	and.b64 	%rd157, %rd156, -4294967296;
 	setp.ne.b64 	%p33, %rd157, 0;
@@ -2427,7 +2427,7 @@ $L__BB0_105:                            //   in Loop: Header=BB0_2 Depth=1
 $L__BB0_107:                            //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 0                           // offload.py:0
 	add.s64 	%rd36, %rd72, 4608;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	or.b64 	%rd158, %rd35, %rd1;
 	and.b64 	%rd159, %rd158, -4294967296;
 	setp.ne.b64 	%p34, %rd159, 0;
@@ -2444,7 +2444,7 @@ $L__BB0_108:                            //   in Loop: Header=BB0_2 Depth=1
 $L__BB0_110:                            //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 0                           // offload.py:0
 	add.s64 	%rd37, %rd72, 4736;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	or.b64 	%rd160, %rd36, %rd1;
 	and.b64 	%rd161, %rd160, -4294967296;
 	setp.ne.b64 	%p35, %rd161, 0;
@@ -2461,7 +2461,7 @@ $L__BB0_111:                            //   in Loop: Header=BB0_2 Depth=1
 $L__BB0_113:                            //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 0                           // offload.py:0
 	add.s64 	%rd38, %rd72, 4864;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	or.b64 	%rd162, %rd37, %rd1;
 	and.b64 	%rd163, %rd162, -4294967296;
 	setp.ne.b64 	%p36, %rd163, 0;
@@ -2495,7 +2495,7 @@ $L__BB0_119:                            //   in Loop: Header=BB0_2 Depth=1
 	or.b32 	%r14, %r8, 6016;
 	mov.b64 	%rd61, {%r14, %r13};
 	add.s64 	%rd39, %rd72, 5120;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	mov.b64 	{_, %r138}, %rd61;
 	cvt.u64.u32 	%rd77, %r138;
 	@%p9 bra 	$L__BB0_121;
@@ -2511,7 +2511,7 @@ $L__BB0_120:                            //   in Loop: Header=BB0_2 Depth=1
 $L__BB0_122:                            //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 0                           // offload.py:0
 	add.s64 	%rd40, %rd72, 5248;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	or.b64 	%rd166, %rd39, %rd1;
 	and.b64 	%rd167, %rd166, -4294967296;
 	setp.ne.b64 	%p38, %rd167, 0;
@@ -2528,7 +2528,7 @@ $L__BB0_123:                            //   in Loop: Header=BB0_2 Depth=1
 $L__BB0_125:                            //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 0                           // offload.py:0
 	add.s64 	%rd41, %rd72, 5376;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	or.b64 	%rd168, %rd40, %rd1;
 	and.b64 	%rd169, %rd168, -4294967296;
 	setp.ne.b64 	%p39, %rd169, 0;
@@ -2545,7 +2545,7 @@ $L__BB0_126:                            //   in Loop: Header=BB0_2 Depth=1
 $L__BB0_128:                            //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 0                           // offload.py:0
 	add.s64 	%rd42, %rd72, 5504;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	or.b64 	%rd170, %rd41, %rd1;
 	and.b64 	%rd171, %rd170, -4294967296;
 	setp.ne.b64 	%p40, %rd171, 0;
@@ -2562,7 +2562,7 @@ $L__BB0_129:                            //   in Loop: Header=BB0_2 Depth=1
 $L__BB0_131:                            //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 0                           // offload.py:0
 	add.s64 	%rd43, %rd72, 5632;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	or.b64 	%rd172, %rd42, %rd1;
 	and.b64 	%rd173, %rd172, -4294967296;
 	setp.ne.b64 	%p41, %rd173, 0;
@@ -2579,7 +2579,7 @@ $L__BB0_132:                            //   in Loop: Header=BB0_2 Depth=1
 $L__BB0_134:                            //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 0                           // offload.py:0
 	add.s64 	%rd44, %rd72, 5760;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	or.b64 	%rd174, %rd43, %rd1;
 	and.b64 	%rd175, %rd174, -4294967296;
 	setp.ne.b64 	%p42, %rd175, 0;
@@ -2596,7 +2596,7 @@ $L__BB0_135:                            //   in Loop: Header=BB0_2 Depth=1
 $L__BB0_137:                            //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 0                           // offload.py:0
 	add.s64 	%rd45, %rd72, 5888;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	or.b64 	%rd176, %rd44, %rd1;
 	and.b64 	%rd177, %rd176, -4294967296;
 	setp.ne.b64 	%p43, %rd177, 0;
@@ -2627,7 +2627,7 @@ $L__BB0_141:                            //   in Loop: Header=BB0_2 Depth=1
 $L__BB0_143:                            //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 0                           // offload.py:0
 	add.s64 	%rd46, %rd72, 6144;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	mov.b64 	{%r163, _}, %rd61;
 	cvt.u64.u32 	%rd78, %r163;
 	@%p9 bra 	$L__BB0_145;
@@ -2643,7 +2643,7 @@ $L__BB0_144:                            //   in Loop: Header=BB0_2 Depth=1
 $L__BB0_146:                            //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 0                           // offload.py:0
 	add.s64 	%rd47, %rd72, 6272;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	or.b64 	%rd180, %rd46, %rd1;
 	and.b64 	%rd181, %rd180, -4294967296;
 	setp.ne.b64 	%p45, %rd181, 0;
@@ -2660,7 +2660,7 @@ $L__BB0_147:                            //   in Loop: Header=BB0_2 Depth=1
 $L__BB0_149:                            //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 0                           // offload.py:0
 	add.s64 	%rd48, %rd72, 6400;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	or.b64 	%rd182, %rd47, %rd1;
 	and.b64 	%rd183, %rd182, -4294967296;
 	setp.ne.b64 	%p46, %rd183, 0;
@@ -2677,7 +2677,7 @@ $L__BB0_150:                            //   in Loop: Header=BB0_2 Depth=1
 $L__BB0_152:                            //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 0                           // offload.py:0
 	add.s64 	%rd49, %rd72, 6528;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	or.b64 	%rd184, %rd48, %rd1;
 	and.b64 	%rd185, %rd184, -4294967296;
 	setp.ne.b64 	%p47, %rd185, 0;
@@ -2694,7 +2694,7 @@ $L__BB0_153:                            //   in Loop: Header=BB0_2 Depth=1
 $L__BB0_155:                            //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 0                           // offload.py:0
 	add.s64 	%rd50, %rd72, 6656;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	or.b64 	%rd186, %rd49, %rd1;
 	and.b64 	%rd187, %rd186, -4294967296;
 	setp.ne.b64 	%p48, %rd187, 0;
@@ -2711,7 +2711,7 @@ $L__BB0_156:                            //   in Loop: Header=BB0_2 Depth=1
 $L__BB0_158:                            //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 0                           // offload.py:0
 	add.s64 	%rd51, %rd72, 6784;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	or.b64 	%rd188, %rd50, %rd1;
 	and.b64 	%rd189, %rd188, -4294967296;
 	setp.ne.b64 	%p49, %rd189, 0;
@@ -2728,7 +2728,7 @@ $L__BB0_159:                            //   in Loop: Header=BB0_2 Depth=1
 $L__BB0_161:                            //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 0                           // offload.py:0
 	add.s64 	%rd52, %rd72, 6912;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	or.b64 	%rd190, %rd51, %rd1;
 	and.b64 	%rd191, %rd190, -4294967296;
 	setp.ne.b64 	%p50, %rd191, 0;
@@ -2762,7 +2762,7 @@ $L__BB0_167:                            //   in Loop: Header=BB0_2 Depth=1
 	or.b32 	%r16, %r8, 8064;
 	mov.b64 	%rd60, {%r16, %r15};
 	add.s64 	%rd53, %rd72, 7168;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	mov.b64 	{_, %r188}, %rd60;
 	cvt.u64.u32 	%rd79, %r188;
 	@%p9 bra 	$L__BB0_169;
@@ -2778,7 +2778,7 @@ $L__BB0_168:                            //   in Loop: Header=BB0_2 Depth=1
 $L__BB0_170:                            //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 0                           // offload.py:0
 	add.s64 	%rd54, %rd72, 7296;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	or.b64 	%rd194, %rd53, %rd1;
 	and.b64 	%rd195, %rd194, -4294967296;
 	setp.ne.b64 	%p52, %rd195, 0;
@@ -2795,7 +2795,7 @@ $L__BB0_171:                            //   in Loop: Header=BB0_2 Depth=1
 $L__BB0_173:                            //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 0                           // offload.py:0
 	add.s64 	%rd55, %rd72, 7424;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	or.b64 	%rd196, %rd54, %rd1;
 	and.b64 	%rd197, %rd196, -4294967296;
 	setp.ne.b64 	%p53, %rd197, 0;
@@ -2812,7 +2812,7 @@ $L__BB0_174:                            //   in Loop: Header=BB0_2 Depth=1
 $L__BB0_176:                            //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 0                           // offload.py:0
 	add.s64 	%rd56, %rd72, 7552;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	or.b64 	%rd198, %rd55, %rd1;
 	and.b64 	%rd199, %rd198, -4294967296;
 	setp.ne.b64 	%p54, %rd199, 0;
@@ -2829,7 +2829,7 @@ $L__BB0_177:                            //   in Loop: Header=BB0_2 Depth=1
 $L__BB0_179:                            //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 0                           // offload.py:0
 	add.s64 	%rd57, %rd72, 7680;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	or.b64 	%rd200, %rd56, %rd1;
 	and.b64 	%rd201, %rd200, -4294967296;
 	setp.ne.b64 	%p55, %rd201, 0;
@@ -2846,7 +2846,7 @@ $L__BB0_180:                            //   in Loop: Header=BB0_2 Depth=1
 $L__BB0_182:                            //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 0                           // offload.py:0
 	add.s64 	%rd58, %rd72, 7808;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	or.b64 	%rd202, %rd57, %rd1;
 	and.b64 	%rd203, %rd202, -4294967296;
 	setp.ne.b64 	%p56, %rd203, 0;
@@ -2863,7 +2863,7 @@ $L__BB0_183:                            //   in Loop: Header=BB0_2 Depth=1
 $L__BB0_185:                            //   in Loop: Header=BB0_2 Depth=1
 	.loc	1 0 0                           // offload.py:0
 	add.s64 	%rd59, %rd72, 7936;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	or.b64 	%rd204, %rd58, %rd1;
 	and.b64 	%rd205, %rd204, -4294967296;
 	setp.ne.b64 	%p57, %rd205, 0;
@@ -2901,7 +2901,7 @@ $L__BB0_191:                            //   in Loop: Header=BB0_2 Depth=1
 	cvt.u64.u32 	%rd66, %r14;
 	cvt.u64.u32 	%rd65, %r15;
 	cvt.u64.u32 	%rd64, %r16;
-	.loc	1 150 23                        // offload.py:150:23
+	.loc	1 159 23                        // offload.py:159:23
 	mov.b64 	{%r213, _}, %rd60;
 	cvt.u64.u32 	%rd80, %r213;
 	@%p9 bra 	$L__BB0_193;
@@ -2912,7 +2912,7 @@ $L__BB0_191:                            //   in Loop: Header=BB0_2 Depth=1
 	cvt.u64.u32 	%rd976, %r216;
 	bra.uni 	$L__BB0_194;
 $L__BB0_195:                            // %.loopexit
-	.loc	1 136 4                         // offload.py:136:4
+	.loc	1 145 4                         // offload.py:145:4
 	ret;
 $L__tmp0:
 $L__func_end0:

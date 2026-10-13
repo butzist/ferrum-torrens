@@ -29,11 +29,16 @@ import torch
 import triton
 import triton.language as tl
 
-# Sentinel usage for the pack of the victim key. It must satisfy
-# `(USAGE_MAX << SLOT_BITS) < 2**63` or the shifted key wraps negative and a
-# step-touched slot sorts as if it were the coldest. Usage counts layer-steps,
-# so 2**55 is unreachable in any run.
+# Sentinel usage for lanes the mask drops. It is only the `other` of the masked
+# usage load and is overwritten for every non-evictable lane, so its magnitude
+# does not enter the packed key. Usage counts layer-steps, so 2**55 is
+# unreachable in any run.
 USAGE_MAX = (1 << 55) - 1
+
+# The non-evictable victim key. It is assigned after the shift, never packed
+# through it: `USAGE_MAX << SLOT_BITS` overflows int64 to a negative key, which
+# would make a free or step-touched slot sort as if it were the coldest.
+KEY_MAX = tl.constexpr(0x7FFFFFFFFFFFFFFF)
 
 # Copy geometry. `GROUPS` programs per bank, each copying `BLOCK_BYTES` at a
 # time; `STEPS` is derived at launch from the largest bank and the plan cap.
@@ -90,12 +95,16 @@ def _ensure_experts_kernel(
     c = tl.arange(0, BLOCK_C)
     cm = c < num_cached
     u = tl.load(usage_ptr + c, mask=cm, other=USAGE_MAX)
-    # Free slots stay selectable (usage 0); only the slots touched this step are
-    # pushed past every real key, mirroring `ExpertCache`'s step bump.
-    u = tl.where((u == step) | (~cm), USAGE_MAX, u)
     # Pack (usage, slot) into one sortable int64: ascending sort is exactly the
     # sequence of `pick_victim` argmins, because the packed keys are distinct.
-    cand = tl.sort((u << SLOT_BITS) | c)
+    # Free slots and slots bumped by this step's hit store are not evictable and
+    # take `KEY_MAX`, so they sort past every real key.
+    key = tl.where(
+        cm & (u != step),
+        (u.to(tl.int64) << SLOT_BITS) | c.to(tl.int64),
+        KEY_MAX,
+    )
+    cand = tl.sort(key)
 
     j = tl.arange(0, BLOCK_C)
     jm = j < num_missing
