@@ -250,6 +250,22 @@
             alias kernel-compile-check="''${pythonEnv}/bin/python3 -m ferrum_kernel.compile_check"
             # Rebuild kernel/*.cubin and kernel/*.ptx from the Triton sources.
             alias kernel-aot="''${pythonEnv}/bin/python3 -m ferrum_kernel.aot"
+            # A gated run maps the 20 GiB FTW shard and holds the 4.5 GiB tower
+            # resident; a live FreeToken engine keeps ~22 GiB of weights of its
+            # own, which is enough together to invite the OOM killer. Warn, do
+            # not fail. `ft-daemon` runs the serve as a child that outlives it
+            # (KillMode=process), so also look for a bare `ft serve`.
+            if command -v systemctl >/dev/null 2>&1; then
+              for unit in ft-daemon freetoken; do
+                if systemctl --user is-active --quiet "$unit" 2>/dev/null; then
+                  echo "warning: $unit.service is running; it or its 'ft serve' child holds FreeToken's ~22 GiB resident." >&2
+                  echo "         stop it (systemctl --user stop $unit) before a gated run." >&2
+                fi
+              done
+            fi
+            if command -v pgrep >/dev/null 2>&1 && pgrep -f 'ft serve' >/dev/null 2>&1; then
+              echo "warning: an 'ft serve' process holds FreeToken's ~22 GiB resident; stop it before a gated run." >&2
+            fi
           '';
         };
       };
