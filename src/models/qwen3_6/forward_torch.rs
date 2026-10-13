@@ -415,13 +415,14 @@ fn partial_rope(
         x3.narrow(2, rotary_dim, head_dim - rotary_dim),
     );
 
-    // inv_freq[i] = base^(-2i/rotary_dim), angles [t, half]
-    let inv: Vec<f64> = (0..half)
-        .map(|i| (base as f64).powf(-2.0 * i as f64 / rotary_dim as f64))
-        .collect();
-    let inv_t = Tensor::from_slice(&inv)
-        .reshape([1, half])
-        .to_device(x.device());
+    // inv_freq[i] = base^(-2i/rotary_dim) = exp(-2i/rotary_dim * ln base),
+    // built on the device: a decode step replays this in a capture, and a
+    // pageable host-to-device copy is illegal while a stream is capturing.
+    let inv_t = Tensor::arange(half as f64, (Kind::Double, x.device()))
+        .g_mul_scalar(-2.0 * (base as f64).ln() / rotary_dim as f64)
+        .exp()
+        .reshape([1, half]);
+
     let ang_t = positions
         .reshape([t, 1])
         .to_kind(Kind::Double)

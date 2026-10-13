@@ -581,14 +581,17 @@ sequenceDiagram
 Contracts already fixed: capture runs only on a flags-0 side stream (never the
 legacy stream); a `StagedGroup` and the pinned banks must outlive every graph
 captured over them; a captured grid pins the batch shape; `stage_into` is the
-only writer between replays. The forward's tail is already capture-shaped:
-`TorchQwen3_6::forward_cached_into` writes the `lm_head` block pass straight
-into a caller-owned device logits buffer with no host round-trip, and
-`forward_decode_into` addresses the same forward entirely from a `DecodeBuffers`
-row (ids, positions, state slots, fixed KV window), so the step reads no host
-memory. What still runs host code inside a would-be capture is the MoE staging
-split (`routed_via_port` / `routed_inline` build a plan before the launch), which
-is the next piece.
+only writer between replays. The whole step is now capture-shaped. The forward's
+tail is device-local: `TorchQwen3_6::forward_cached_into` writes the `lm_head`
+block pass straight into a caller-owned device logits buffer with no host
+round-trip, and `forward_decode_into` addresses the same forward entirely from a
+`DecodeBuffers` row (ids, positions, state slots, fixed KV window). The
+device-staged MoE port (`routed_via_port` -> `grouped_moe_staged`) reads its
+activations, router ids and route weights off device buffers, keeps its `E2M1`
+decode table resident, and builds the rope table on the device, so no step
+uploads a host tensor. `tests/decode_graph_capture.rs` captures one whole real
+decode step and replays it equal to the uncaptured twin; the per-batch-size
+executables are the next piece.
 
 ---
 

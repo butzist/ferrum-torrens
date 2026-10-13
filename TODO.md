@@ -1,6 +1,6 @@
 # FerrumTorrens -- FreeToken MVP port to Rust: TODO
 
-Status: M2 (API) current; M3 prerequisite 4 (device staging: lru_ensure + index_copy + pinned banks + wiring) complete, and decision 40's capture work advances: decision 49 gives the fixed-address `DecodeBuffers` batch-metadata staging, decision 50 settles the mempool -- torch's graph pool behind a tiny C++ bridge, with `tests/cuda_graph_torch_probe.rs` green on the device -- and the forward's output tail is now a device-logits step (`forward_cached_into`, no host round-trip). The decode step's inputs are now staged off the buffers (decision 54: `forward_decode_into`; only device tensors address the cache), attention gathers a fixed-length padded window (decision 55), and the gated `tests/device_decode_matches_refeed.rs` proves the device path equals the re-fed host forward at ~1e-6 on the real checkpoint. Remaining: pull the MoE staging split out of the captured path, then capture one real decode step. Decision 36 is
+Status: M2 (API) current; M3 prerequisite 4 (device staging: lru_ensure + index_copy + pinned banks + wiring) complete, and decision 40's capture work advances: decision 49 gives the fixed-address `DecodeBuffers` batch-metadata staging, decision 50 settles the mempool -- torch's graph pool behind a tiny C++ bridge, with `tests/cuda_graph_torch_probe.rs` green on the device -- and the forward's output tail is now a device-logits step (`forward_cached_into`, no host round-trip). The decode step's inputs are now staged off the buffers (decision 54: `forward_decode_into`; only device tensors address the cache), attention gathers a fixed-length padded window (decision 55), and the gated `tests/device_decode_matches_refeed.rs` proves the device path equals the re-fed host forward at ~1e-6 on the real checkpoint. The MoE staging split is out of the captured path (decision 56: a resident E2M1 table and an on-device rope table remove the last host uploads), and the gated `tests/decode_graph_capture.rs` now captures one whole real decode step and replays it equal to the uncaptured twin. Remaining: per-batch-size executables `{1,2,4,max_running}` and their gate. Decision 36 is
 done end to end: the serving path is Python-free. The sm_120 cubins are
 committed under `kernel/` with an ABI manifest, `infrastructure/kernel_abi.rs`
 packs the launch arguments and checks them against the committed PTX,
@@ -555,9 +555,12 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
      (decision 54) and the attention gather is a fixed-length padded window
      (decision 55), with the gated `tests/device_decode_matches_refeed.rs`
      proving the device path equals the re-fed host forward on the real
-     checkpoint. Still to do: pull the MoE staging split out of the captured
-     path, then the bounded proof captures one real decode step at a small fixed
-     context.
+      checkpoint. The MoE staging split is out of the captured path: the last
+      host uploads were the E2M1 decode table and the rope inverse-frequency
+      vector, now device-resident (decision 56), and `tests/decode_graph_capture.rs`
+      (`a_captured_decode_step_replays_equal_to_an_uncaptured_step`) records one
+      whole decode step at a fixed context, instantiates it and replays it equal
+      to the uncaptured twin 2026-10-13. Item 3 is the remaining step.
   3. **Per-batch-size executables** for `{1,2,4, max_running}` with dummy-req
      padding to the captured size; the mempool is decided (decision 50: the
      torch graph pool, one per captured batch size), so this lands the shared
@@ -1868,6 +1871,51 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
       max|dlogit|/scale ~1e-6 (well under the 1e-3 gate). 323 lib tests green.
     - **Still open.** The window is a dense per-request gather, not yet paged or
       flashinfer-backed; that swap is its own M3 item.
+
+56. **The captured decode step uploads no host tensors** (2026-10-13)
+    - **What changed.** Two pageable host-to-device copies on the replay path
+      became device work, so a captured step records only kernels and device
+      copies. (i) `CudaMoE` builds the `E2M1` decode table once in
+      `new_with_stream` and holds it as a resident device tensor; `stage` and
+      `group_with_slots` bind it by `Tensor::shallow_clone` instead of
+      `f32_tensor(&E2M1, ..)`, which uploaded it every step. (ii) `partial_rope`
+      builds its inverse-frequency vector on the device
+      (`arange` + `g_mul_scalar(-2 ln base / rotary_dim)` + `exp`) instead of
+      `from_slice(&inv).to_device(..)`.
+    - **Why.** A `cudaMemcpyAsync` from pageable host memory returns
+      `cudaErrorStreamCaptureUnsupported` while a stream is capturing, so
+      `begin_capture` faulted at the next `.to(device)` on the replay path
+      (`grouped_moe_staged` -> `group_with_slots`, and
+      `full_attention_cached` -> `partial_rope`). Decision 40 needs the whole
+      forward, MoE staging included, to be one capturable executable.
+    - **Coverage.** `tests/decode_graph_capture.rs`
+      (`a_captured_decode_step_replays_equal_to_an_uncaptured_step`) records and
+      instantiates a whole decode step over the device-staged MoE port and
+      replays it equal to the uncaptured reference on the real checkpoint; the
+      rope unit tests (`partial_rope_matches_the_reference`,
+      `partial_rope_with_no_rotary_dim_is_the_identity`) stay green.
+    - **Still open.** Per-batch-size executables `{1,2,4,max_running}` and the
+      per-size replay gate (P1 items 3 and 4).
+
+57. **The LRU victim key packs in int64, and `copy_missing` binds its arg pack
+    before launch** (2026-10-13)
+    - **What changed.** `_ensure_experts_kernel` computes its sortable victim key
+      as `key = where(evictable, (usage.to(int64) << SLOT_BITS) | slot, KEY_MAX)`
+      and sorts that; `KEY_MAX` is a `tl.constexpr(0x7FFFFFFFFFFFFFFF)` sentinel
+      for lanes that must not be evicted (free slots and slots this step's store
+      just touched). A module-level `int` is not accepted by Triton's AOT
+      codegen, so the sentinel has to be a `tl.constexpr`. `CudaMoE::copy_missing`
+      now binds its `index_copy_args(..)` pack to a local before taking
+      `kernel_params()`, matching `ensure_experts`.
+    - **Why.** The old `(u << SLOT_BITS) | c` used `USAGE_MAX << SLOT_BITS`
+      (= 2**64 in int64) as its sentinel, which wrapped negative, so a free or
+      just-touched slot sorted as the coldest and could be picked as the victim
+      -- the `staged_moe_repro` fault. `copy_missing` had taken `kernel_params()`
+      off a temporary `ArgPack`, a dangling read into the launch.
+    - **Coverage.** `tests/staged_moe_repro.rs`
+      (`staged_moe_step_does_not_fault`) runs a device-staged MoE step over the
+      real checkpoint, finite with no fault; the rebuilt `kernel/lru_ensure.cubin`
+      and `kernel-selftest --interp` are green.
 
 ### Config defaults for the RTX 5060 / 8 GB target
 

@@ -130,6 +130,10 @@ pub struct CudaMoE {
     shapes: ExpertShapes,
     slots: usize,
     device: Device,
+    /// The E2M1 decode table the GEMV reads. Resident and never moved, so a
+    /// captured graph bakes one stable address instead of uploading it per
+    /// step (decision 40 prerequisite 4).
+    lut: Tensor,
     /// libtorch's default stream, whose handle is 0 (the legacy stream). Torch's
     /// own copies and our launches are therefore ordered by CUDA rather than by
     /// an explicit sync. It is a field because CUDA-graph capture will need a
@@ -245,6 +249,7 @@ impl CudaMoE {
         let lib = Arc::new(lib);
         let kernels = CudaKernels::load(Arc::clone(&lib), abi.clone()).map_err(driver)?;
         let staging = StagingKernels::load(lib, staging_abi.clone()).map_err(driver)?;
+        let lut = f32_tensor(&E2M1, &[E2M1.len() as i64], device);
         Ok(Self {
             kernels,
             abi,
@@ -254,6 +259,7 @@ impl CudaMoE {
             shapes,
             slots,
             device,
+            lut,
             stream,
             gate_up: None,
             down: None,
@@ -628,7 +634,7 @@ impl CudaMoE {
             slot_t: Tensor::from_slice(&route_slot).to(dev.to_tch()),
             token_t: Tensor::from_slice(&route_token).to(dev.to_tch()),
             weight_t: f32_tensor(&req.weights[..routes], &[routes as i64], dev),
-            lut: f32_tensor(&E2M1, &[E2M1.len() as i64], dev),
+            lut: self.lut.shallow_clone(),
             ic1: Tensor::empty([routes as i64, (2 * inter) as i64], bf16),
             ic2: Tensor::empty([routes as i64, inter as i64], bf16),
             ic3: Tensor::empty([routes as i64, hidden as i64], bf16),
@@ -683,7 +689,7 @@ impl CudaMoE {
             slot_t,
             token_t,
             weight_t: Tensor::zeros([routes as i64], (tch::Kind::Float, dev.to_tch())),
-            lut: f32_tensor(&E2M1, &[E2M1.len() as i64], dev),
+            lut: self.lut.shallow_clone(),
             ic1: Tensor::empty([routes as i64, (2 * inter) as i64], bf16),
             ic2: Tensor::empty([routes as i64, inter as i64], bf16),
             ic3: Tensor::empty([routes as i64, hidden as i64], bf16),
