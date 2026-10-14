@@ -1073,7 +1073,30 @@ impl TorchQwen3_6 {
     }
 
     /// Logits for the last token of one contiguous sequence.
+    /// Point torch at the stream this model's own launches land on. A captured
+    /// build puts the attention launcher and the MoE offload on a side stream so
+    /// a decode step can be recorded; every torch op of the forward must follow
+    /// them or the two would race. On the default build the stream is 0 and this
+    /// leaves torch where it was.
+    fn bind_stream(&self) {
+        let Some(attention) = &self.attention else {
+            return;
+        };
+        let stream = attention.stream();
+        if stream.is_null() {
+            return;
+        }
+        if let Device::Cuda(ordinal) = self.device {
+            // SAFETY: the launcher was built on the primary context of this
+            // ordinal, and `stream` is live for the model's life.
+            unsafe {
+                crate::infrastructure::cuda_graph::set_current_stream(stream, ordinal);
+            }
+        }
+    }
+
     fn run_sequence(&self, ids: &[u32], positions: &[u32]) -> Result<Vec<f32>> {
+        self.bind_stream();
         let p = &self.params;
         let t = ids.len();
         let mut x = self.embed.gather(ids);
@@ -1617,6 +1640,7 @@ impl TorchQwen3_6 {
         access: &CacheAccess<'_>,
         out: &Tensor,
     ) -> Result<()> {
+        self.bind_stream();
         let p = &self.params;
         let t = ids.size()[0];
         let slab = self.cache.as_ref().expect("no kv cache attached");

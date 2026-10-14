@@ -2,6 +2,7 @@
 // `Model` implementation. There is no arch label in the FTW index meta, so the
 // FTW dir's copied config.json is the dispatch key (TODO.md section 3).
 
+use crate::domain::decode::CapturedDecode;
 use crate::domain::kvcache::CachedModel;
 use crate::domain::model::Model;
 use crate::domain::weights::WeightsReader;
@@ -21,6 +22,13 @@ pub enum RegistryError {
     Unsupported(String),
     #[error("model construction failed: {0}")]
     Build(String),
+}
+
+/// A model plus the capture service the composition root built over its own KV
+/// cache, when `model.cuda_graph` asked for one. The engine holds both.
+pub struct BuiltModel {
+    pub model: Box<dyn CachedModel>,
+    pub captured: Option<Arc<dyn CapturedDecode>>,
 }
 
 /// The arch label from `config.json` `architectures[0]`, used to dispatch.
@@ -52,7 +60,7 @@ pub fn build(
     reader: Arc<dyn WeightsReader>,
     device: Device,
     config: &crate::config::Config,
-) -> Result<Box<dyn CachedModel>, RegistryError> {
+) -> Result<BuiltModel, RegistryError> {
     match arch_of(config_json)? {
         "Qwen3_5MoeForConditionalGeneration" | "Qwen3_5MoeForCausalLM" => {
             let tc = config_json
@@ -65,24 +73,172 @@ pub fn build(
                 // scalar path's pre-loaded dense store.
                 let params = crate::models::qwen3_6::config::parse_text_config(tc)
                     .map_err(|e| RegistryError::Build(e.to_string()))?;
-                let moe = moe_port(config, &params, index.clone(), reader.clone(), device)?;
-                let attention = attention_port(&params, device)?;
-                let cache = Arc::new(kv_cache(config, &params, device));
-                Ok(Box::new(
-                    crate::models::qwen3_6::forward_torch::TorchQwen3_6::load(
-                        params, device, index, reader, moe, attention, cache,
-                    )
-                    .map_err(|e| RegistryError::Build(e.to_string()))?,
-                ))
+                // Capture needs the device-staged MoE path (the inline path reads
+                // the router's ids back to the host, which a graph cannot record),
+                // so it only turns on with the kernel and a CUDA device.
+                let capture = config.model.cuda_graph
+                    && config.kernel.triton
+                    && matches!(device, Device::Cuda(_));
+                let (lib, stream) = side_stream(capture, device)?;
+                let moe = moe_port(
+                    config,
+                    &params,
+                    index.clone(),
+                    reader.clone(),
+                    device,
+                    stream,
+                )?;
+                let attention = attention_port(&params, device, stream)?;
+                let cache = Arc::new(kv_cache(config, &params, device, capture));
+                let model = crate::models::qwen3_6::forward_torch::TorchQwen3_6::load(
+                    params,
+                    device,
+                    index,
+                    reader,
+                    moe,
+                    attention,
+                    cache.clone(),
+                )
+                .map_err(|e| RegistryError::Build(e.to_string()))?;
+                let captured = match lib {
+                    Some(lib) => Some(capture_decode(config, &model, cache, lib, stream, device)?),
+                    None => None,
+                };
+                Ok(BuiltModel {
+                    model: Box::new(model),
+                    captured,
+                })
             }
             #[cfg(not(feature = "cuda"))]
-            Ok(Box::new(
-                Qwen3_6::from_text_config(tc, index, reader)
-                    .map_err(|e| RegistryError::Build(e.to_string()))?,
-            ))
+            Ok(BuiltModel {
+                model: Box::new(
+                    Qwen3_6::from_text_config(tc, index, reader)
+                        .map_err(|e| RegistryError::Build(e.to_string()))?,
+                ),
+                captured: None,
+            })
         }
         other => Err(RegistryError::Unsupported(other.to_string())),
     }
+}
+
+/// The process-wide driver and the non-legacy side stream a capture records on,
+/// or `(None, null)` when capture is off. Creating the stream attaches the
+/// primary context of `device`, which the MoE adapter then reuses.
+#[cfg(feature = "cuda")]
+fn capture_driver(
+    device: Device,
+) -> Result<
+    (
+        Arc<crate::infrastructure::cuda_driver::Driver>,
+        crate::infrastructure::cuda_driver::CUstream,
+    ),
+    RegistryError,
+> {
+    use crate::infrastructure::cuda_driver::Driver;
+    let Device::Cuda(ordinal) = device else {
+        return Err(RegistryError::Build(
+            "a decode capture needs a CUDA device".to_string(),
+        ));
+    };
+    let build_err = |e: String| RegistryError::Build(e);
+    let lib = Arc::new(Driver::open().map_err(|e| build_err(e.to_string()))?);
+    lib.init().map_err(|e| build_err(e.to_string()))?;
+    lib.attach_primary_context(ordinal as i32)
+        .map_err(|e| build_err(e.to_string()))?;
+    let stream = unsafe { lib.create_stream() }.map_err(|e| build_err(e.to_string()))?;
+    Ok((lib, stream))
+}
+
+/// The side stream a capture records on, or `(None, null)` when capture is off.
+#[cfg(feature = "cuda")]
+fn side_stream(
+    capture: bool,
+    device: Device,
+) -> Result<
+    (
+        Option<Arc<crate::infrastructure::cuda_driver::Driver>>,
+        crate::infrastructure::cuda_driver::CUstream,
+    ),
+    RegistryError,
+> {
+    if capture {
+        let (lib, stream) = capture_driver(device)?;
+        Ok((Some(lib), stream))
+    } else {
+        Ok((None, std::ptr::null_mut()))
+    }
+}
+
+/// Record one decode graph per batch size and wrap them in the engine's service.
+/// The padding row claims a reserved state slot and pool location, and the
+/// reservation itself is moved into the service so nothing else can take them.
+#[cfg(feature = "cuda")]
+fn capture_decode(
+    config: &crate::config::Config,
+    model: &crate::models::qwen3_6::forward_torch::TorchQwen3_6,
+    cache: Arc<crate::infrastructure::kvcache_dev::DeviceCache>,
+    lib: Arc<crate::infrastructure::cuda_driver::Driver>,
+    stream: crate::infrastructure::cuda_driver::CUstream,
+    device: Device,
+) -> Result<Arc<dyn CapturedDecode>, RegistryError> {
+    use crate::domain::decode::DecodeRow;
+    use crate::domain::kvcache::KvCache;
+    use crate::infrastructure::decode_buffers::DecodeBuffers;
+    use crate::infrastructure::decode_graph::EngineDecodeGraphs;
+
+    let build_err = |e: String| RegistryError::Build(e);
+    let Device::Cuda(ordinal) = device else {
+        return Err(build_err("a decode capture needs a CUDA device".into()));
+    };
+    // The capture records every torch op on the side stream.
+    unsafe { crate::infrastructure::cuda_graph::set_current_stream(stream, ordinal) };
+
+    let mut padding_cache = cache.begin();
+    cache
+        .reserve(&mut padding_cache, 1)
+        .map_err(|e| build_err(e.to_string()))?;
+    let padding = DecodeRow {
+        input_id: 0,
+        position: 0,
+        state_slot: padding_cache.state_slot(),
+        out_loc: padding_cache.tail(1)[0],
+    };
+
+    let sizes = graph_batch_sizes(config.model.max_running_requests);
+    let graphs = unsafe {
+        // SAFETY: `stream` is the non-legacy side stream just created on the
+        // device's primary context, and the step is the strictly device-only
+        // decode forward (no host copy, no allocation outside the pool, no sync).
+        EngineDecodeGraphs::capture(
+            lib,
+            stream,
+            device,
+            model.params().vocab_size,
+            config.model.max_seq_len,
+            &sizes,
+            padding,
+            padding_cache,
+            |bufs: &DecodeBuffers| model.forward_decode_into(bufs).map_err(|e| e.to_string()),
+        )
+    }
+    .map_err(|e| RegistryError::Build(e.to_string()))?;
+    Ok(Arc::new(graphs))
+}
+
+/// The batch sizes to capture: `1`, `2`, `4` and `max_running`, deduplicated and
+/// capped at `max_running`. A step of `n` rows replays on the smallest captured
+/// size at or above `n`.
+#[cfg(feature = "cuda")]
+fn graph_batch_sizes(max_running: usize) -> Vec<usize> {
+    let mut sizes = vec![1usize];
+    for s in [2usize, 4, max_running] {
+        if (1..=max_running).contains(&s) && !sizes.contains(&s) {
+            sizes.push(s);
+        }
+    }
+    sizes.sort_unstable();
+    sizes
 }
 
 /// The device KV cache the engine hands page tables out from: `[kv]` sizes it,
@@ -96,15 +252,13 @@ fn kv_cache(
     config: &crate::config::Config,
     params: &ModelParams,
     device: Device,
+    reserve_padding: bool,
 ) -> crate::infrastructure::kvcache_dev::DeviceCache {
     use crate::infrastructure::kvcache_dev::{DeviceCache, KvDType};
-    DeviceCache::new(
-        params,
-        config.kv_tokens(),
-        config.model.max_running_requests,
-        KvDType::F32,
-        device,
-    )
+    // The captured service reserves one state slot for its dummy padding row, so
+    // the pool is one wider than the scheduler's cap.
+    let slots = config.model.max_running_requests + usize::from(reserve_padding);
+    DeviceCache::new(params, config.kv_tokens(), slots, KvDType::F32, device)
 }
 
 /// The engine's MoE port for `kernel.triton = true`: the driver-API adapter over
@@ -122,6 +276,7 @@ fn moe_port(
     index: Arc<FtwIndex>,
     reader: Arc<dyn WeightsReader>,
     device: Device,
+    stream: crate::infrastructure::cuda_driver::CUstream,
 ) -> Result<Option<Arc<dyn MoEExecutor>>, RegistryError> {
     use crate::application::run_experts::CachedExperts;
     use crate::domain::expert_kernel::ExpertShapes;
@@ -136,11 +291,12 @@ fn moe_port(
         .map_err(|e| build_err(e.to_string()))?;
     // One `Mutex<CudaMoE>` is both ports: the store stages into it and the gemm
     // reads the same device banks.
-    let mut adapter = CudaMoE::new(
+    let mut adapter = CudaMoE::new_with_stream(
         device,
         Arc::new(FtwBanks::new(reader.clone(), index.clone())),
         shapes,
         config.moe.cache_size_slots,
+        stream,
     )
     .map_err(|e| build_err(e.to_string()))?;
     // Decision 40 prerequisite 4: a page-locked copy of every expert bank that
@@ -174,17 +330,18 @@ fn moe_port(
 /// device decode path reads each row's KV window straight out of the pool
 /// through it; a CPU device gets `None` and keeps the dense gather, which is
 /// what keeps `cargo test --features cuda` meaningful without a device
-/// (decision 21). Stream 0 (the legacy default stream) because the engine does
-/// not capture yet; a capture rebuilds this on its own side stream.
+/// (decision 21). `stream` is the capture side stream when the engine captures,
+/// otherwise stream 0 (the legacy default stream).
 #[cfg(feature = "cuda")]
 fn attention_port(
     params: &ModelParams,
     device: Device,
+    stream: crate::infrastructure::cuda_driver::CUstream,
 ) -> Result<Option<Arc<crate::infrastructure::cuda_attention::PagedAttention>>, RegistryError> {
     use crate::infrastructure::cuda_attention::PagedAttention;
     match device {
         Device::Cuda(_) => Ok(Some(Arc::new(
-            PagedAttention::new(device, params, std::ptr::null_mut())
+            PagedAttention::new(device, params, stream)
                 .map_err(|e| RegistryError::Build(e.to_string()))?,
         ))),
         _ => Ok(None),
@@ -323,6 +480,7 @@ mod tests {
             Arc::new(empty_index()),
             Arc::new(MockReader),
             Device::Cpu,
+            std::ptr::null_mut(),
         )
         .unwrap();
         assert!(port.is_none());
@@ -332,6 +490,19 @@ mod tests {
     fn missing_arch_errors() {
         let v: Value = serde_json::from_str(r#"{"model_type": "qwen3_5_moe"}"#).unwrap();
         assert!(matches!(arch_of(&v), Err(RegistryError::NoArch)));
+    }
+
+    /// The captured set is `1`, `2`, `4` and `max_running`, deduplicated and
+    /// capped so a small `max_running` does not capture a size the scheduler can
+    /// never run.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn graph_batch_sizes_cover_one_two_four_and_max() {
+        assert_eq!(graph_batch_sizes(1), vec![1]);
+        assert_eq!(graph_batch_sizes(2), vec![1, 2]);
+        assert_eq!(graph_batch_sizes(3), vec![1, 2, 3]);
+        assert_eq!(graph_batch_sizes(4), vec![1, 2, 4]);
+        assert_eq!(graph_batch_sizes(8), vec![1, 2, 4, 8]);
     }
 
     /// Reader that only exists to satisfy `build`; no weights are read there.

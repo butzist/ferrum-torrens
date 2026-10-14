@@ -58,7 +58,7 @@ flowchart TB
     end
 
     subgraph Core["domain/ -- pure core (traits + data, no IO)"]
-      Ports["Model / CachedModel\nWeightsReader / Tokenizer\nKvCache / ExpertCache\nMoEExecutor / ExpertGemm\nscheduler / sampling"]
+      Ports["Model / CachedModel\nWeightsReader / Tokenizer\nKvCache / ExpertCache\nMoEExecutor / ExpertGemm\nCapturedDecode\nscheduler / sampling"]
     end
 
     subgraph Models["models/qwen3_6/ -- arch-specific"]
@@ -77,6 +77,7 @@ flowchart TB
       Graph["cuda_graph\ntorch stream + graph pool bridge"]
       KvcDev["kvcache_dev\nMHA pool + GDN state slabs"]
       DecBuf["decode_buffers\nfixed-address decode staging"]
+      DecGraph["decode_graph\nper-size graphs + engine service"]
       Http["http\naxum routes + SSE"]
       Toker["tokenizers_hf\nHF tokenizer + chat template"]
     end
@@ -96,6 +97,7 @@ flowchart TB
   Gen --> Ports
   Registry --> Models
   Registry --> CudaMoe
+  Registry --> DecGraph
   Scalar -.-> Ports
   Torch -.-> Ports
   Models --> TorchRt
@@ -109,6 +111,8 @@ flowchart TB
   CudaAttn --> Abi
   CudaAttn --> CudaDrv
   Graph --> CudaDrv
+  DecGraph --> Graph
+  DecBuf --> TorchRt
   Torch --> KvcDev
   Torch --> CudaAttn
   Torch --> TorchRt --> LibTorch
@@ -234,6 +238,7 @@ classDiagram
   class Tokenizer { <<trait>> +encode() +decode() +render_chat() }
   class KvCache { <<trait>> +begin() +reserve() +end() +available() }
   class MoEExecutor { <<trait>> +execute_device(req, out) +steps() }
+  class CapturedDecode { <<trait>> +max_batch() +window() +step(rows, windows) }
   class ExpertGemm { <<trait>> +grouped_moe() +grouped_moe_dev() +grouped_moe_staged() }
   class ExpertSlotStore { <<trait>> +load(layer, expert, slot) +slots() }
   class ExpertSlabSource { <<trait>> +slab(layer, expert, part) }
@@ -250,6 +255,7 @@ classDiagram
   class CudaMoE
   class CachedExperts
   class DevTensor
+  class EngineDecodeGraphs
 
   Qwen3_6 ..|> CachedModel
   TorchQwen3_6 ..|> CachedModel
@@ -262,6 +268,7 @@ classDiagram
   CudaMoE ..|> ExpertSlotStore
   CachedExperts ..|> MoEExecutor
   DevTensor ..|> MoETensor
+  EngineDecodeGraphs ..|> CapturedDecode
 ```
 
 Note the two deliberate non-obvious shapes:
@@ -521,7 +528,7 @@ sequenceDiagram
   H->>T: encode prompt (or render chat template then encode)
   H->>G: spawn_blocking(run_batch)
   loop until stop
-    G->>E: run_forward_cached (or run_forward without cache)
+    G->>E: prefill: run_forward_cached / decode: replay captured graphs (or run_forward_cached)
     E-->>G: sampled token
     G->>T: decode token
     G->>Sink: token(piece) -> SSE frame
@@ -533,12 +540,13 @@ sequenceDiagram
 The whole forward runs inside `tokio::task::spawn_blocking`, so the async
 runtime is never blocked by GPU work. A client hang-up aborts the run.
 
-### 3.9 CUDA-graph decode capture `[partial]`
+### 3.9 CUDA-graph decode capture `[core]`
 
 One captured executable per decode batch size, over the whole forward, with the
-MoE launches inside it (decision 40). The capture, the per-size executables and
-their replay gate are in place; only the engine-owned allocation of the buffers
-and graphs remains.
+MoE launches inside it (decision 40). The composition root builds the side
+stream, the buffers and the graphs at load and hands the engine the
+`CapturedDecode` service; the generation loop replays the smallest captured size
+that fits a decode step (decision 61).
 
 ```mermaid
 flowchart TB
@@ -551,33 +559,33 @@ flowchart TB
     B5["device-addressed step\nforward_decode_into reads\nids/positions/slots off buffer\n(gated device == re-fed forward)"]
     N1["MoE staging split\nresident E2M1 + on-device rope\n(no host upload in the step)"]
     N2["decode_graph\nDecodeGraph capture/replay with a\nprivate pool + DecodeGraphSet\nper-size plan and dummy padding"]
+    N3["engine-owned capture\nregistry builds the side stream + graphs,\nEngine::with_captured owns the service"]
   end
-  subgraph Next["[TODO]"]
-    N3["engine owns the buffers and\ngraphs; max_running joins the set"]
-  end
-  Done --> N3
 ```
 
-**Dynamic -- capture and replay (as built, one `DecodeGraph` per size).**
+**Dynamic -- capture at load (composition root) and replay (engine).**
 
 ```mermaid
 sequenceDiagram
+  participant Root as registry (composition root)
   participant Eng as engine
   participant DB as DecodeBuffers
   participant GP as GraphPool (shim)
   participant DR as cuda_driver
   participant MoE as cuda_moe launch
   participant Torch as torch ops
-  Eng->>DB: stage(input_ids, positions, state_slots, out_locs)
-  Eng->>MoE: warmup uncaptured step
-  Eng->>DR: create side stream, flush both streams
-  Eng->>GP: set current stream + begin pool
-  Eng->>DR: begin_capture(side stream)
-  Eng->>Torch: forward ops (recorded)
-  Eng->>MoE: launch (recorded)
-  Eng->>DR: end_capture -> graph_instantiate
+  Note over Root: at load, decision 61
+  Root->>DR: create side stream, set current stream
+  Root->>DB: reserve padding row (slot + page)
+  Root->>DB: warmup uncaptured step
+  Root->>GP: begin pool
+  Root->>DR: begin_capture(side stream)
+  Root->>Torch: forward ops (recorded)
+  Root->>MoE: launch (recorded)
+  Root->>DR: end_capture -> graph_instantiate
+  Root->>Eng: Engine::with_captured(service)
   loop each decode step
-    Eng->>DB: overwrite staging in place
+    Eng->>DB: overwrite staging in place (pad with the dummy row)
     Eng->>DR: graph_launch(exec, side stream)
     Eng->>DB: read logits rows
   end
@@ -613,8 +621,17 @@ its fixed-address `DecodeBuffers` -- and a `DecodeGraphSet` picks the smallest
 captured size that fits a step and pads the tail with dummy rows (decision 59).
 `tests/decode_graph_capture.rs` captures one whole real decode step and replays
 it equal to the uncaptured twin, and its batch gate replays `{1,2,4}` equal to
-the uncaptured twin; the engine owning the buffers and graphs (and `max_running`
-joining the captured set) is the next piece.
+the uncaptured twin. The composition root (`application/registry.rs`) now owns
+the allocation: with `model.cuda_graph` on, it creates the side stream, builds
+the MoE and attention ports on it, reserves the dummy padding row (which needs
+one extra state slot, hence a `max_running_requests + 1` pool), records the
+graphs for `graph_batch_sizes(max_running)` and returns them in
+`BuiltModel::captured`, which `load_engine` passes to `Engine::with_captured`
+(decision 61). A captured build keeps torch on the side stream: `run_step` binds
+it before staging and `TorchQwen3_6::bind_stream` binds it for every forward, so
+prefill's torch ops do not race the driver-API MoE and attention launches. The
+gated `tests/engine_real_generate.rs::a_captured_engine_decodes_on_its_graphs`
+reaches the oracle token through the captured graph.
 
 ---
 
@@ -644,6 +661,11 @@ Boundary note: `tch`/`Tensor` and the CUDA driver handles live entirely in
 - **Stable addresses for capture.** Dense weights, MoE banks and pinned host
   banks are allocated once and never move; that is a precondition for a captured
   graph to bake their pointers.
+- **A captured build follows one stream.** When the composition root captures, the
+  driver-API MoE and attention launches and every torch op of a forward run on the
+  capture's flags-0 side stream: `EngineDecodeGraphs::run_step` binds it before
+  staging and `TorchQwen3_6::bind_stream` binds it for each forward, so the
+  staged H2D copies, the recorded ops and the replay are ordered on one stream.
 - **Least-lock, `&self` ports.** The device slot cache is process-wide, so the
   store/gemm ports take `&self` and `Mutex<CudaMoE>` is passed as both.
 - **The scalar forward is an oracle.** It stays behind the same `Model` trait,

@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use crate::domain::decode::{CapturedDecode, DecodeError, DecodeRow};
 use crate::domain::kvcache::{CachedModel, KvCache, SequenceCache};
 use crate::domain::model::{ForwardInput, LayerProbe, Model, ModelParams};
 use crate::domain::sampling::{Rng, SamplingParams, sample};
@@ -47,6 +48,16 @@ pub enum EngineError {
     BadLogits { got: usize, want: usize },
     #[error("no sampling parameters for uid {0}")]
     NoParams(u64),
+    #[error("this engine has no captured decode service")]
+    NoCapturedDecode,
+    #[error("captured decode for uid {uid} needs exactly one new token, got {tokens} at {start}")]
+    DecodeStepNotOne {
+        uid: u64,
+        start: usize,
+        tokens: usize,
+    },
+    #[error("captured decode failed: {0}")]
+    Captured(String),
 }
 
 /// One row of a forward batch: a request's full id sequence plus the sampling
@@ -71,6 +82,10 @@ pub struct CachedStep<'a> {
 pub struct Engine {
     model: Arc<dyn CachedModel>,
     cache: Option<Arc<dyn KvCache>>,
+    /// The captured decode graphs the engine owns, when the composition root
+    /// built them. `None` on a CPU build or any device without capture, and then
+    /// decode stays the per-request cached forward.
+    captured: Option<Arc<dyn CapturedDecode>>,
     tokenizer: Arc<dyn Tokenizer>,
     eos_ids: Vec<u32>,
     limits: EngineLimits,
@@ -233,13 +248,14 @@ pub fn load_engine(config: &crate::config::Config) -> Result<Engine, LoadError> 
     let config_json: serde_json::Value = serde_json::from_str(&config_json_text)
         .map_err(|e| LoadError::Io(format!("{}/config.json: {e}", dir.display())))?;
     let device = resolve_compute_device(config)?;
-    let model = crate::application::registry::build(
+    let built = crate::application::registry::build(
         &config_json,
         std::sync::Arc::new(index),
         reader,
         device,
         config,
     )?;
+    let model = built.model;
     let params = model.params().clone();
 
     if config.model.max_seq_len > params.max_position_embeddings {
@@ -261,12 +277,13 @@ pub fn load_engine(config: &crate::config::Config) -> Result<Engine, LoadError> 
     )?;
     let eos_ids = eos_ids_from_ftw_dir(dir)?;
 
-    Ok(Engine::new(
+    Ok(Engine::with_captured(
         std::sync::Arc::from(model),
         std::sync::Arc::new(tokenizer),
         eos_ids,
         limits,
         device,
+        built.captured,
     ))
 }
 
@@ -282,6 +299,20 @@ impl Engine {
         limits: EngineLimits,
         device: Device,
     ) -> Self {
+        Self::with_captured(model, tokenizer, eos_ids, limits, device, None)
+    }
+
+    /// `Engine::new` plus the captured decode service the composition root built
+    /// over the model's own KV cache. Kept separate so a CPU build and every unit
+    /// test keep the capture-free constructor.
+    pub fn with_captured(
+        model: Arc<dyn CachedModel>,
+        tokenizer: Arc<dyn Tokenizer>,
+        eos_ids: Vec<u32>,
+        limits: EngineLimits,
+        device: Device,
+        captured: Option<Arc<dyn CapturedDecode>>,
+    ) -> Self {
         assert!(limits.max_seq_len > 0);
         assert!(limits.max_output_tokens > 0);
         assert!(limits.max_running_requests > 0);
@@ -290,11 +321,34 @@ impl Engine {
         Self {
             model,
             cache,
+            captured,
             tokenizer,
             eos_ids,
             limits,
             device,
         }
+    }
+
+    /// The engine's captured decode service, when it has one. The generation
+    /// loop takes the batched captured path for a decode step whenever this is
+    /// `Some`.
+    pub fn captured(&self) -> Option<&Arc<dyn CapturedDecode>> {
+        self.captured.as_ref()
+    }
+
+    /// One captured decode step over `rows`, each with its own KV window. The
+    /// engine owns the graphs; the caller stages the rows and samples the
+    /// returned per-row logits.
+    pub fn run_captured(
+        &self,
+        rows: &[DecodeRow],
+        windows: &[&[u32]],
+    ) -> Result<Vec<Vec<f32>>, EngineError> {
+        let captured = self
+            .captured
+            .as_ref()
+            .ok_or(EngineError::NoCapturedDecode)?;
+        captured.step(rows, windows).map_err(engine_decode_error)
     }
 
     /// The KV cache, `None` for a forward that has none (the scalar reference,
@@ -455,6 +509,12 @@ impl Engine {
             })
             .collect())
     }
+}
+
+/// The captured port's error, stringified for the engine's own error type: the
+/// infeasible-batch and window cases carry the same counts in their message.
+fn engine_decode_error(e: DecodeError) -> EngineError {
+    EngineError::Captured(e.to_string())
 }
 
 #[cfg(test)]
@@ -736,6 +796,82 @@ pub(crate) mod fake {
         )
     }
 
+    /// A captured decode service with no device behind it: it answers the same
+    /// way the cached forward does (`argmax = last_id + 1`) and records the rows
+    /// of every step, so a test can see that decode took the batched path.
+    pub struct FakeCaptured {
+        calls: Arc<Mutex<Vec<Vec<DecodeRow>>>>,
+        max_batch: usize,
+        window: usize,
+    }
+
+    impl CapturedDecode for FakeCaptured {
+        fn max_batch(&self) -> usize {
+            self.max_batch
+        }
+
+        fn window(&self) -> usize {
+            self.window
+        }
+
+        fn step(
+            &self,
+            rows: &[DecodeRow],
+            windows: &[&[u32]],
+        ) -> Result<Vec<Vec<f32>>, DecodeError> {
+            if rows.len() != windows.len() {
+                return Err(DecodeError::RowWindowMismatch {
+                    rows: rows.len(),
+                    windows: windows.len(),
+                });
+            }
+            if rows.len() > self.max_batch {
+                return Err(DecodeError::NoBatchFits { rows: rows.len() });
+            }
+            self.calls.lock().unwrap().push(rows.to_vec());
+            Ok(rows
+                .iter()
+                .map(|r| {
+                    let mut logits = vec![-1.0f32; FAKE_VOCAB];
+                    logits[(r.input_id as usize + 1) % FAKE_VOCAB] = 10.0;
+                    logits
+                })
+                .collect())
+        }
+    }
+
+    /// `test_cached_engine` plus a captured decode service, and the record of the
+    /// rows every captured step carried.
+    pub type CapturedFixture = (
+        Engine,
+        Recorder,
+        Arc<FakeCache>,
+        Arc<Mutex<Vec<Vec<DecodeRow>>>>,
+    );
+
+    pub fn test_captured_engine(limits: EngineLimits) -> CapturedFixture {
+        let (model, rec, cache) = FakeCachedModel::new();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::new(FakeCaptured {
+            calls: calls.clone(),
+            max_batch: limits.max_running_requests,
+            window: limits.max_seq_len,
+        });
+        (
+            Engine::with_captured(
+                Arc::new(model),
+                Arc::new(FakeTokenizer),
+                vec![FAKE_EOS],
+                limits,
+                Device::Cpu,
+                Some(captured),
+            ),
+            rec,
+            cache,
+            calls,
+        )
+    }
+
     pub fn limits() -> EngineLimits {
         EngineLimits {
             max_seq_len: 64,
@@ -808,6 +944,22 @@ mod tests {
         let (e, _) = test_engine(limits());
         let mut rng = Rng::new(1);
         assert!(e.run_forward(&[], &mut rng).unwrap().is_empty());
+    }
+
+    #[test]
+    fn run_captured_without_a_service_is_an_error() {
+        let (e, _) = test_engine(limits());
+        assert!(e.captured().is_none());
+        let row = DecodeRow {
+            input_id: 1,
+            position: 0,
+            state_slot: 0,
+            out_loc: 0,
+        };
+        assert!(matches!(
+            e.run_captured(&[row], &[&[]]),
+            Err(EngineError::NoCapturedDecode)
+        ));
     }
 
     #[test]

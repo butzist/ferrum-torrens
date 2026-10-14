@@ -369,9 +369,13 @@ impl From<EngineError> for ApiError {
             NoParams(uid) => ApiError::unprocessable(format!("no sampling parameters for {uid}")),
             // Engine-side faults, not anything the caller can fix: the cache is
             // a server resource and its bookkeeping failing is a server bug.
-            e @ (NoKvCache | EmptyStep { .. } | CacheOutOfStep { .. } | KvCache(_)) => {
-                ApiError::unprocessable(format!("engine kv cache: {e}"))
-            }
+            e @ (NoKvCache
+            | EmptyStep { .. }
+            | CacheOutOfStep { .. }
+            | KvCache(_)
+            | NoCapturedDecode
+            | DecodeStepNotOne { .. }
+            | Captured(_)) => ApiError::unprocessable(format!("engine kv cache: {e}")),
         }
     }
 }

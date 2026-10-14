@@ -1,5 +1,6 @@
 // Pure domain core: data types and ports. No CUDA, no IO, no adapter imports.
 
+pub mod decode;
 pub mod dequant;
 pub mod expert_cache;
 pub mod expert_kernel;
@@ -11,6 +12,7 @@ pub mod scheduler;
 pub mod tokenizer;
 pub mod weights;
 
+pub use decode::{CapturedDecode, DecodeError, DecodeRow};
 pub use expert_cache::{ExpertCache, ExpertPlan};
 pub use expert_kernel::{
     ExpertGemm, ExpertSlabSource, ExpertSlotStore, MoEDeviceGroup, MoEDeviceRequest, MoEError,

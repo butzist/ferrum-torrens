@@ -171,6 +171,44 @@ fn one_token_through_the_kernel_matches_the_oracle() {
     );
 }
 
+#[test]
+#[ignore = "requires the converted checkpoint and a cuda device"]
+fn a_captured_engine_decodes_on_its_graphs() {
+    if !cfg!(feature = "cuda") {
+        panic!("this gate needs --features cuda; without it there is no capture");
+    }
+    let mut cfg = config(1);
+    cfg.kernel.triton = true;
+    cfg.model.device = ferrum_torrens::config::ComputeDevice::Cuda;
+    cfg.model.cuda_graph = true;
+    let engine = load_engine(&cfg).unwrap();
+    assert!(
+        engine.captured().is_some(),
+        "the composition root must build the captured decode service"
+    );
+    eprintln!(
+        "captured decode: max_batch {}, window {}",
+        engine.captured().unwrap().max_batch(),
+        engine.captured().unwrap().window()
+    );
+
+    let ids = engine.encode(PROMPT).unwrap();
+    let request = make_request(&engine, 1, ids, greedy(1)).unwrap();
+    let start = Instant::now();
+    let g = generation::generate(&engine, request, 0).unwrap();
+    eprintln!("1 token in {:.1}s", start.elapsed().as_secs_f64());
+    assert_eq!(g.tokens.len(), 1);
+    assert_eq!(
+        g.tokens[0], ORACLE_FIRST_TOKEN,
+        "the captured path must reach the same oracle token, got {:?} ({:?})",
+        g.tokens[0], g.text
+    );
+    assert!(
+        engine.expert_steps() > 0,
+        "the offload ran through the kernel"
+    );
+}
+
 /// Bisect the forward with a logit lens: print what the final norm + lm_head
 /// make of the residual stream after every `EVERY`-th layer. A healthy model
 /// sharpens into sensible tokens with depth; the first layer where the reading

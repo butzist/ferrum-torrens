@@ -56,6 +56,7 @@ fn model() -> Box<dyn CachedModel> {
         &config,
     )
     .unwrap()
+    .model
 }
 
 fn input(ids: &[u32], start: usize) -> ForwardInput {

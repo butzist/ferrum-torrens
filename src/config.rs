@@ -111,6 +111,8 @@ pub struct Model {
     pub cache_type: CacheType,
     #[serde(default)]
     pub attention_backend: AttentionBackend,
+    #[serde(default)]
+    pub cuda_graph: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]

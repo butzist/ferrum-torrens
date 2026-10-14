@@ -83,7 +83,9 @@ fn scalar_and_libtorch_paths_agree_on_the_oracle_prompt() {
     let scalar = build_scalar(&cfg, ix.clone(), rd.clone()).unwrap();
     eprintln!("--- scalar ---");
     let a = scalar.forward(&inp);
-    let torch = build(&cfg, ix, rd, Device::Cpu, &server_config()).unwrap();
+    let torch = build(&cfg, ix, rd, Device::Cpu, &server_config())
+        .unwrap()
+        .model;
     eprintln!("--- libtorch ---");
     let b = torch.forward(&inp);
 

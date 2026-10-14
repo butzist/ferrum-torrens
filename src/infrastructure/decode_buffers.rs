@@ -18,36 +18,13 @@ use tch::{Kind, Tensor};
 
 use crate::infrastructure::torch::Device;
 
+/// Re-export the row type so callers that stage buffers get it from one place.
+pub use crate::domain::decode::DecodeRow;
+
 /// The out-of-range pool location a padded (dummy) request carries. Real
 /// locations are never negative, so the sentinel can never alias one; every
 /// location that reads back as this was padding rather than a live request.
 pub const SENTINEL_LOC: i32 = -1;
-
-/// One request's row in a decode step: the token it is advancing, where in the
-/// sequence it sits, the GDN state slot it owns, and the KV pool location it
-/// writes this step's K/V at.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DecodeRow {
-    pub input_id: u32,
-    pub position: u32,
-    pub state_slot: u32,
-    pub out_loc: u32,
-}
-
-impl DecodeRow {
-    /// The row a padded request carries: no real token, no real position, and
-    /// sentinel locations that read as padding. Padding to the captured batch
-    /// size must leave the graph reading well-defined buffers, so a dummy row is
-    /// a real row with a marker value rather than an unwritten one.
-    pub const fn sentinel() -> Self {
-        Self {
-            input_id: 0,
-            position: 0,
-            state_slot: 0,
-            out_loc: u32::MAX,
-        }
-    }
-}
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum DecodeBufferError {

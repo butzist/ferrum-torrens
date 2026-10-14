@@ -15,10 +15,12 @@
 // re-fed one on the real checkpoint (`tests/kvcache_incremental_decode.rs`).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::application::engine::{BatchRow, CachedStep, Engine, EngineError};
-use crate::domain::kvcache::SequenceCache;
-use crate::domain::sampling::{Rng, SamplingParams};
+use crate::domain::decode::DecodeRow;
+use crate::domain::kvcache::{KvCache, SequenceCache};
+use crate::domain::sampling::{Rng, SamplingParams, sample};
 use crate::domain::scheduler::{
     Budget, FinishReason, Phase, Req, check_stop, match_stop_str, schedule_next_batch,
 };
@@ -181,32 +183,39 @@ fn run_batch(
             // One page table per request, and every step advances it by the
             // tokens it has not seen: the prompt first, then one token each.
             let kv = engine.cache().expect("checked above").clone();
-            let mut out = Vec::with_capacity(batch.reqs.len());
-            for req in &batch.reqs {
-                let s = sessions
-                    .get_mut(&req.uid)
-                    .expect("scheduled row has a session");
-                let Session {
-                    ids,
-                    generated: _,
-                    cache: slot,
-                    req,
-                } = s;
-                let cache = slot.get_or_insert_with(|| kv.begin());
-                let start = cache.cached();
-                let step = engine.run_forward_cached(
-                    CachedStep {
-                        uid: req.uid,
-                        ids: &ids[start..],
-                        start,
-                        cache,
-                        params: &req.sampling,
-                    },
-                    &mut rng,
-                )?;
-                out.push(step);
+            if phase == Phase::Decode && engine.captured().is_some() {
+                // The engine owns a captured decode service, so a whole decode
+                // step replays on one graph instead of one cached forward per
+                // request. Prefill stays on the per-request path (see below).
+                captured_decode_step(engine, &kv, &mut sessions, &batch.reqs, &mut rng)?
+            } else {
+                let mut out = Vec::with_capacity(batch.reqs.len());
+                for req in &batch.reqs {
+                    let s = sessions
+                        .get_mut(&req.uid)
+                        .expect("scheduled row has a session");
+                    let Session {
+                        ids,
+                        generated: _,
+                        cache: slot,
+                        req,
+                    } = s;
+                    let cache = slot.get_or_insert_with(|| kv.begin());
+                    let start = cache.cached();
+                    let step = engine.run_forward_cached(
+                        CachedStep {
+                            uid: req.uid,
+                            ids: &ids[start..],
+                            start,
+                            cache,
+                            params: &req.sampling,
+                        },
+                        &mut rng,
+                    )?;
+                    out.push(step);
+                }
+                out
             }
-            out
         } else {
             let rows: Vec<BatchRow<'_>> = batch
                 .reqs
@@ -272,6 +281,62 @@ fn run_batch(
         });
     }
     Ok(out)
+}
+
+/// One batched decode step over the engine's captured graphs: reserve one token
+/// per live request, build its `DecodeRow` and KV window, replay the captured
+/// step, and sample each row. This is the captured twin of the per-request
+/// `run_forward_cached` loop; the tokens match because the captured step runs
+/// the same forward over the same staged metadata.
+fn captured_decode_step(
+    engine: &Engine,
+    kv: &Arc<dyn KvCache>,
+    sessions: &mut HashMap<u64, Session>,
+    reqs: &[Req],
+    rng: &mut Rng,
+) -> Result<Vec<(u64, u32)>, EngineError> {
+    let mut rows = Vec::with_capacity(reqs.len());
+    let mut windows: Vec<Vec<u32>> = Vec::with_capacity(reqs.len());
+    for req in reqs {
+        let s = sessions
+            .get_mut(&req.uid)
+            .expect("scheduled row has a session");
+        let Session {
+            ids, cache: slot, ..
+        } = s;
+        let cache = slot.get_or_insert_with(|| kv.begin());
+        let start = cache.cached();
+        if ids.len() != start + 1 {
+            return Err(EngineError::DecodeStepNotOne {
+                uid: req.uid,
+                start,
+                tokens: ids.len().saturating_sub(start),
+            });
+        }
+        let input_id = ids[start];
+        kv.reserve(cache, 1)
+            .map_err(|e| EngineError::KvCache(e.to_string()))?;
+        rows.push(DecodeRow {
+            input_id,
+            position: start as u32,
+            state_slot: cache.state_slot(),
+            out_loc: cache.tail(1)[0],
+        });
+        windows.push(cache.filled().to_vec());
+    }
+    let refs: Vec<&[u32]> = windows.iter().map(Vec::as_slice).collect();
+    let logits = engine.run_captured(&rows, &refs)?;
+    if logits.len() != reqs.len() {
+        return Err(EngineError::BadLogits {
+            got: logits.len(),
+            want: reqs.len(),
+        });
+    }
+    Ok(reqs
+        .iter()
+        .enumerate()
+        .map(|(i, req)| (req.uid, sample(&logits[i], &req.sampling, rng)))
+        .collect())
 }
 
 fn stop_string_hit(engine: &Engine, s: &Session) -> Result<Option<FinishReason>, EngineError> {
@@ -374,6 +439,62 @@ mod tests {
             rec.calls().is_empty(),
             "the cached path never re-feeds a prefix"
         );
+    }
+
+    /// With a captured decode service the decode phase replays the graphs, one
+    /// batched step for the whole scheduler batch, while prefill stays on the
+    /// per-request cached forward.
+    #[test]
+    fn a_captured_engine_decodes_batched_on_the_graphs() {
+        let (e, rec, _cache, captured) = test_captured_engine(limits());
+        let batch = vec![req(&e, 1, "ab", params(2)), req(&e, 2, "xyz", params(2))];
+        let out = generate_batch(&e, batch, 0).unwrap();
+        assert_eq!(out[0].tokens, vec![99, 100], "uid 1 walks the counter");
+        assert_eq!(out[1].tokens, vec![123, 124], "uid 2 walks its own");
+
+        let cached = rec.cached_calls();
+        assert_eq!(cached.len(), 2, "one prefill per request, no cached decode");
+        assert_eq!(captured.lock().unwrap().len(), 1, "one batched decode step");
+        let rows = &captured.lock().unwrap()[0];
+        assert_eq!(rows.len(), 2, "both live requests ride one captured step");
+        assert_eq!(rows[0].input_id, 99, "the token prefill sampled");
+        assert_eq!(rows[1].input_id, 123);
+    }
+
+    /// The captured decode path and the per-request cached path produce the same
+    /// tokens and finish reasons, which is what the gated checkpoint test checks
+    /// on real hardware.
+    #[test]
+    fn the_captured_path_matches_the_per_request_path() {
+        let (captured, _rec, _cache, _calls) = test_captured_engine(limits());
+        let (plain, _rec2, _cache2) = test_cached_engine(limits());
+        let a = generate_batch(
+            &captured,
+            vec![
+                req(&captured, 1, "ab", params(3)),
+                req(&captured, 2, "xyz", params(3)),
+            ],
+            0,
+        )
+        .unwrap();
+        let b = generate_batch(
+            &plain,
+            vec![
+                req(&plain, 1, "ab", params(3)),
+                req(&plain, 2, "xyz", params(3)),
+            ],
+            0,
+        )
+        .unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn a_captured_engine_without_a_service_still_uses_the_cached_path() {
+        let (e, rec, _cache) = test_cached_engine(limits());
+        let g = generate(&e, req(&e, 1, "ab", params(2)), 0).unwrap();
+        assert_eq!(g.tokens, vec![99, 100]);
+        assert_eq!(rec.cached_calls().len(), 2, "prefill plus one decode");
     }
 
     /// The engine can say how many routed-expert steps went through the kernel

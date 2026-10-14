@@ -1,6 +1,6 @@
 # FerrumTorrens -- FreeToken MVP port to Rust: TODO
 
-Status: M2 (API) current; M3 prerequisite 4 (device staging: lru_ensure + index_copy + pinned banks + wiring) complete, and decision 40's capture work advances: decision 49 gives the fixed-address `DecodeBuffers` batch-metadata staging, decision 50 settles the mempool -- torch's graph pool behind a tiny C++ bridge, with `tests/cuda_graph_torch_probe.rs` green on the device -- and the forward's output tail is now a device-logits step (`forward_cached_into`, no host round-trip). The decode step's inputs are now staged off the buffers (decision 54: `forward_decode_into`; only device tensors address the cache), attention gathers a fixed-length padded window (decision 55), and the gated `tests/device_decode_matches_refeed.rs` proves the device path equals the re-fed host forward at ~1e-6 on the real checkpoint. The MoE staging split is out of the captured path (decision 56: a resident E2M1 table and an on-device rope table remove the last host uploads), and the gated `tests/decode_graph_capture.rs` now captures one whole real decode step and replays it equal to the uncaptured twin. The device decode is now batch-generic (decision 58): `forward_decode_into` runs every row of `DecodeBuffers`, and the gated `a_batched_decode_step_matches_n_single_row_steps` pins a batch-3 step to three single-row steps on the real checkpoint. The per-batch-size executables are landed (decision 59): `infrastructure/decode_graph.rs` captures one `DecodeGraph` (its own private pool and fixed-address buffers) per size and a `DecodeGraphSet` picks the smallest captured size that fits and pads with dummy rows, and the gated `tests/decode_graph_capture.rs::a_captured_batch_decode_step_replays_equal_to_an_uncaptured_step` replays batch `{1,2,4}` equal to the uncaptured twin on the real checkpoint. Remaining in P1: the engine-owned allocation of the buffers and graphs (the "pinned batch-metadata staging" line) and `max_running` in the captured set. The paged GQA decode attention kernel is now authored and AOT-registered (decision 60): `python/ferrum_kernel/attention.py`, a new `attention` manifest section and `AttentionAbi`, the interpreter selftest against the torch oracle at ~1e-7 and the ABI units green; the driver-API launcher (`infrastructure/cuda_attention.rs`), the `MhaPool` paged gather and the forward wiring are landed too, and the gated `tests/device_decode_matches_refeed.rs` and `tests/decode_graph_capture.rs` prove the paged device step equals the re-fed forward and replays from a captured graph at batch `{1,2,4}` on the real checkpoint. Decision 36 is
+Status: M2 (API) current; M3 prerequisite 4 (device staging: lru_ensure + index_copy + pinned banks + wiring) complete, and decision 40's capture work advances: decision 49 gives the fixed-address `DecodeBuffers` batch-metadata staging, decision 50 settles the mempool -- torch's graph pool behind a tiny C++ bridge, with `tests/cuda_graph_torch_probe.rs` green on the device -- and the forward's output tail is now a device-logits step (`forward_cached_into`, no host round-trip). The decode step's inputs are now staged off the buffers (decision 54: `forward_decode_into`; only device tensors address the cache), attention gathers a fixed-length padded window (decision 55), and the gated `tests/device_decode_matches_refeed.rs` proves the device path equals the re-fed host forward at ~1e-6 on the real checkpoint. The MoE staging split is out of the captured path (decision 56: a resident E2M1 table and an on-device rope table remove the last host uploads), and the gated `tests/decode_graph_capture.rs` now captures one whole real decode step and replays it equal to the uncaptured twin. The device decode is now batch-generic (decision 58): `forward_decode_into` runs every row of `DecodeBuffers`, and the gated `a_batched_decode_step_matches_n_single_row_steps` pins a batch-3 step to three single-row steps on the real checkpoint. The per-batch-size executables are landed (decision 59): `infrastructure/decode_graph.rs` captures one `DecodeGraph` (its own private pool and fixed-address buffers) per size and a `DecodeGraphSet` picks the smallest captured size that fits and pads with dummy rows, and the gated `tests/decode_graph_capture.rs::a_captured_batch_decode_step_replays_equal_to_an_uncaptured_step` replays batch `{1,2,4}` equal to the uncaptured twin on the real checkpoint. Remaining in P1: the engine-owned allocation of the buffers and graphs (the "pinned batch-metadata staging" line) and `max_running` in the captured set -- both now landed (decision 61): the composition root (`application/registry.rs`) creates the non-legacy side stream, builds the MoE and attention ports on it, sizes the pool `max_running_requests + 1` for the reserved dummy padding row, captures `{1,2,4,max_running}` and hands `Engine::with_captured` the service; `model.cuda_graph` turns it on, and the generation loop replays the smallest graph that fits. The gated `tests/engine_real_generate.rs::a_captured_engine_decodes_on_its_graphs` reaches the oracle token through the captured batch-1 graph, which closes P1. The paged GQA decode attention kernel is now authored and AOT-registered (decision 60): `python/ferrum_kernel/attention.py`, a new `attention` manifest section and `AttentionAbi`, the interpreter selftest against the torch oracle at ~1e-7 and the ABI units green; the driver-API launcher (`infrastructure/cuda_attention.rs`), the `MhaPool` paged gather and the forward wiring are landed too, and the gated `tests/device_decode_matches_refeed.rs` and `tests/decode_graph_capture.rs` prove the paged device step equals the re-fed forward and replays from a captured graph at batch `{1,2,4}` on the real checkpoint. Decision 36 is
 done end to end: the serving path is Python-free. The sm_120 cubins are
 committed under `kernel/` with an ABI manifest, `infrastructure/kernel_abi.rs`
 packs the launch arguments and checks them against the committed PTX,
@@ -524,7 +524,6 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
   mempool, dummy-req padding, logits `[bs, vocab]` inside graph) over the driver
   FFI (decision 39: not "via tch" -- `tch` 0.22 has no capture API), plus the
   no-inference-during-capture warmup pattern (mirror `engine/graph.py`).
-  Slice 1 landed (see the `[x]` above); take the rest in this order:
   1. **Decide the MoE-in-graph shape first -- it is blocking.** Done, decision
      40: one executable per batch size covering the whole forward, MoE launches
      inside it (candidate (b)); (a) is rejected because its torch segments carry
@@ -591,13 +590,14 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
   captured grid pins the batch shape (different shape = error containing
   "captured"), and capture runs on a flags-0 side stream only -- the legacy
   stream cannot be captured.
-- [ ] P1 pinned staging buffers for batch metadata (positions / input_mapping /
+- [x] P1 pinned staging buffers for batch metadata (positions / input_mapping /
   out_loc / token_pool / page_table sentinel dummy row). The fixed-address
   `DecodeBuffers` (input_ids/positions/state_slots/out_locs + `[max_bs, vocab]`
   logits, with sentinel padding, and a fixed-length KV window, decision 55) are in
   place (decision 49), and the forward now reads them (`forward_decode_into`,
-  decision 54); allocation from the engine (not just the test) is the remaining
-  wiring.
+  decision 54); allocation from the engine (not just the test) is done (decision
+  61: the composition root builds the buffers via `EngineDecodeGraphs::capture`
+  and hands the service to `Engine::with_captured`).
 
 ### Superseded by libtorch (decision 2) -- do not implement
 - [ ] ~~fused add+rmsnorm~~ (libtorch: `add` + `rms_norm`).
@@ -690,6 +690,9 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
   prefix reuse). Note the kernel work pulls the device slot cache
   (M4's `copy_missing`) forward: the adapter cannot run without somewhere to
   stage an expert, so `copy_missing` lands with the adapter, not after it.
+  CUDA-graph decode is done (decision 61): the composition root builds the
+  per-batch-size decode graphs over a side stream and the engine replays them
+  in the decode phase, gated by `a_captured_engine_decodes_on_its_graphs`.
 - **M4 offload**: LRU slot cache + fused copy + prefill double buffer; radix
   prefix cache wired to the running server; batch concurrency.
 - **M5**: optional `/v1/responses`, hybrid_radix GDN reuse, startup
@@ -2057,6 +2060,52 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
     - **Still open.** A bf16 pool variant of the kernel (the committed cubin is
       f32-only), and the engine-owned allocation of the buffers and graphs.
 
+61. **Engine-owned decode capture** -- the composition root builds the buffers and
+    graphs once and the engine owns the service, so a decode step replays a
+    captured graph instead of re-running the eager forward. This closes the P1
+    "pinned batch-metadata staging" line and decision 40's capture plan.
+    - **Config.** A new `model.cuda_graph` boolean (default `false`) opts in. It
+      takes effect only with `kernel.triton = true` on a CUDA device: the
+      device-staged MoE path is the only capturable one (the inline host path
+      reads the router's ids back to the host, which a capture cannot record). Off
+      by default keeps a CPU build, a kernel-less CUDA build, and every existing
+      gated engine test on the eager path.
+    - **Return shape.** `registry::build` returns `BuiltModel { model, captured }`
+      instead of `Box<dyn CachedModel>`; `load_engine` hands `captured` to the new
+      `Engine::with_captured`. The domain port is `CapturedDecode` (`domain/decode`)
+      and the infra adapter is `EngineDecodeGraphs<DecodeGraph>` (`infrastructure/
+      decode_graph`); the engine never names a graph type.
+    - **Composition root.** `build` creates a flags-0 side stream on the device's
+      primary context (`Driver::create_stream`), builds `CudaMoE`
+      (`new_with_stream`) and `PagedAttention` on that stream, and sizes the
+      `DeviceCache` state-slot pool to `max_running_requests + 1`. It reserves one
+      dummy `SequenceCache` (one slot plus one page) whose `DecodeRow` pads every
+      captured batch -- the engine path cannot use `DecodeRow::sentinel()`, whose
+      out-of-range location would index page -1 in `store_at`; the reservation
+      lives in the service for its whole life. `EngineDecodeGraphs::capture` then
+      records one graph per size in `graph_batch_sizes(max_running)` =
+      `dedup(1, 2, 4, max_running)` capped at `max_running`, window `max_seq_len`,
+      vocab `params.vocab_size`, over the strictly device-only
+      `forward_decode_into`.
+    - **Stream discipline.** A captured build launches the driver-API MoE and
+      paged attention on the side stream, so every torch op of a forward must land
+      there too or the two would race. `EngineDecodeGraphs::run_step` sets torch's
+      current stream to the capture stream before staging (via `ReplaySync::Driver`
+      -> `cuda_graph::set_current_stream`), and `TorchQwen3_6::run_tower`/
+      `run_sequence` call `bind_stream` first so prefill's torch ops follow the
+      attention launcher's stream. On the default stream-0 build `bind_stream` is
+      a no-op.
+    - **Gates.** The gated `tests/engine_real_generate.rs::a_captured_engine_decodes_
+      on_its_graphs` loads a captured engine and reaches the FreeToken oracle token
+      through the captured batch-1 graph; the kernel gate
+      (`one_token_through_the_kernel_matches_the_oracle`) and both
+      `tests/decode_graph_capture.rs` gates stay green. Unit tests cover the
+      layout (`graph_batch_sizes`) and the adapter (`EngineDecodeGraphs`).
+    - **Still open.** The side stream is not explicitly destroyed while the graphs
+      live (process-lifetime; the pool and instances are dropped on the adapter's
+      drop), and the captured set is captured eagerly at load rather than lazily
+      on first use.
+
 ### Config defaults for the RTX 5060 / 8 GB target
 
 ```
@@ -2067,4 +2116,5 @@ moe_cache_size_slots = 256     # 256 (0.43 GB) or 512 (0.87 GB); floor = 256
 max_running_requests = 4
 max_prefill_length = 8192
 prefill_overlap = true         # takes effect only when cache_size_slots >= 512
+cuda_graph = false             # opt in; needs kernel.triton + a CUDA device
 ```
