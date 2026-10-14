@@ -155,6 +155,44 @@
             "TRITON_PTXAS_BLACKWELL_PATH"
           ];
         };
+
+        # Google Antigravity CLI (`agy`), jailed like opencode. Its permission
+        # prompts are skipped by force-injecting `--dangerously-skip-permissions`
+        # on every launch: safe here precisely because the jail, not the CLI, is
+        # the isolation boundary. That flag also gives up agy's inner sandbox
+        # (it auto-approves sandbox bypass), which is the point.
+        jailedAntigravity = jlib.makeJailedAgent {
+          name = "agy";
+          pkg = pkgs.antigravity-cli;
+          # `~/.gemini` holds settings.json, conversations and the CLI's
+          # self-updated binaries; `~/.cache/antigravity` holds its embedded rg.
+          configPaths = [
+            "~/.gemini"
+            "~/.cache/antigravity"
+          ];
+          extraPkgs = basePackages;
+          baseJailOptions = jailOptions;
+          # Forge the flag in front of whatever argv the caller passes (before
+          # any subcommand or positional prompt), so every run auto-approves.
+          extraJailOptions = [
+            (combinators.set-argv [
+              "--dangerously-skip-permissions"
+              (combinators.noescape "\"$@\"")
+            ])
+          ];
+          fwdEnv = [
+            "LIBTORCH"
+            "LIBTORCH_INCLUDE"
+            "LIBTORCH_LIB"
+            "CUDA_HOME"
+            "CXX"
+            "LD_LIBRARY_PATH"
+            "PYTHONPATH"
+            "TRITON_LIBCUDA_PATH"
+            "TRITON_PTXAS_PATH"
+            "TRITON_PTXAS_BLACKWELL_PATH"
+          ];
+        };
       in {
         devShells.default = pkgs.mkShell {
           name = "ferrum-torrens";
@@ -162,6 +200,7 @@
             basePackages
             ++ [
               jailedOpencode
+              jailedAntigravity
             ];
 
           inputsFrom = [config.flake-root.devShell];

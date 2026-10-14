@@ -2106,6 +2106,25 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
       drop), and the captured set is captured eagerly at load rather than lazily
       on first use.
 
+62. **Google Antigravity CLI is a second jailed agent, and the jail is the only
+    approval gate** (2026-10-14) -- the devshell grows `jailed-agy` alongside
+    `jailedOpencode`.
+    - **What changed.** A new `llm-agents` flake input supplies
+      `packages.${system}.antigravity-cli` (the `agy` binary); jailed-agents'
+      generic `makeJailedAgent` builds the jail, reusing `jailOptions` and
+      `basePackages`. Read-write config paths are `~/.gemini` (settings,
+      conversations, the CLI's self-updated binaries) and `~/.cache/antigravity`
+      (its embedded `rg`).
+    - **Approval flag.** The jail force-injects `--dangerously-skip-permissions`
+      with jail.nix's `set-argv` combinator, ahead of the caller's argv (before
+      any subcommand or positional prompt), so `agy` never stops for a prompt.
+      This is deliberate: the jail, not the CLI's permission engine, is the
+      isolation boundary, and the flag also disables `agy`'s own sandbox (it
+      auto-approves sandbox bypass).
+    - **Why a new input.** jailed-agents does not re-export its transitive
+      `llm-agents` packages, so the flake names the source directly. This whole
+      change is one commit, revertible on its own.
+
 ### Config defaults for the RTX 5060 / 8 GB target
 
 ```
