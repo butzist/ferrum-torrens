@@ -15,6 +15,15 @@ from __future__ import annotations
 from .nvfp4_moe import DECODE_BLOCK_KB, DECODE_BLOCK_N
 from .offload import COPY_BLOCK_BYTES, COPY_GROUPS, USAGE_MAX, copy_steps
 
+# The serving attention geometry (Qwen3.6-35B-A3B): 16 query heads over 2 KV
+# heads at head_dim 256. All four are constexpr, so the committed cubin is
+# specialized to this checkpoint (TODO.md decision 36).
+SERVING_Q_HEADS = 16
+SERVING_KV_HEADS = 2
+SERVING_HEAD_DIM = 256
+# The paged decode tile over a row's keys.
+SERVING_ATTN_BLOCK_N = 64
+
 # One hidden size and one intermediate size in a serving checkpoint; both are
 # constexpr trip counts, so the committed cubins are shape-specialized and the
 # manifest records the shapes (TODO.md decision 36).
@@ -192,4 +201,34 @@ def index_copy_constexprs(
         "GROUPS": COPY_GROUPS,
         "STEPS": steps,
         "BLOCK_BYTES": COPY_BLOCK_BYTES,
+    }
+
+
+def paged_attention() -> dict:
+    """Paged GQA decode attention (TODO.md M3 paged attention)."""
+    return {
+        "q_ptr": "*fp32",
+        "k_ptr": "*fp32",
+        "v_ptr": "*fp32",
+        "indices_ptr": "*i32",
+        "indptr_ptr": "*i32",
+        "out_ptr": "*fp32",
+        "NUM_Q_HEADS": "constexpr",
+        "NUM_KV_HEADS": "constexpr",
+        "HEAD_DIM": "constexpr",
+        "BLOCK_N": "constexpr",
+    }
+
+
+def paged_attention_constexprs(
+    q_heads: int = SERVING_Q_HEADS,
+    kv_heads: int = SERVING_KV_HEADS,
+    head_dim: int = SERVING_HEAD_DIM,
+    block_n: int = SERVING_ATTN_BLOCK_N,
+) -> dict:
+    return {
+        "NUM_Q_HEADS": q_heads,
+        "NUM_KV_HEADS": kv_heads,
+        "HEAD_DIM": head_dim,
+        "BLOCK_N": block_n,
     }

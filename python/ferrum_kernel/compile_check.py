@@ -33,10 +33,13 @@ from .nvfp4_moe import (
     _sum_reduce_kernel,
 )
 from .offload import _ensure_experts_kernel, _index_copy_multi_kernel
+from .attention import _paged_attention_decode_kernel
 from .signatures import gemv as _gemv_sig
 from .signatures import index_copy as _index_copy_sig
 from .signatures import index_copy_constexprs, lru_constexprs
 from .signatures import lru_ensure as _lru_sig
+from .signatures import paged_attention as _paged_attention_sig
+from .signatures import paged_attention_constexprs
 from .signatures import reduce as _reduce_sig
 from .signatures import silu as _silu_sig
 
@@ -103,6 +106,16 @@ def main() -> int:
     except Exception as e:  # noqa: BLE001
         failures += 1
         print(f"index_copy FAILED: {type(e).__name__}: {str(e)[:200]}")
+    try:
+        check(
+            "paged_attention",
+            _paged_attention_decode_kernel,
+            _paged_attention_sig(),
+            paged_attention_constexprs(),
+        )
+    except Exception as e:  # noqa: BLE001
+        failures += 1
+        print(f"paged_attention FAILED: {type(e).__name__}: {str(e)[:200]}")
     print("FAIL" if failures else "PASS")
     return 1 if failures else 0
 

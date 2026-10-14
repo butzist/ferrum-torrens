@@ -41,6 +41,7 @@ from .nvfp4_moe import (
     _sum_reduce_kernel,
 )
 from .offload import COPY_GROUPS, _ensure_experts_kernel, _index_copy_multi_kernel
+from .attention import _paged_attention_decode_kernel
 
 # The silu kernel's tile is derived from the intermediate size at launch
 # (`min(next_power_of_2(inter), 256)`), so the AOT build pins the serving value.
@@ -58,6 +59,8 @@ from .signatures import (
     index_copy_constexprs,
     lru_constexprs,
     lru_ensure,
+    paged_attention,
+    paged_attention_constexprs,
     reduce,
     reduce_constexprs,
     silu,
@@ -118,6 +121,20 @@ STAGING_KERNELS: dict[str, dict] = {
         "signature": index_copy(),
         "constexprs": index_copy_constexprs(),
         "grid": [SERVING_NUM_BANKS, COPY_GROUPS, 1],
+    },
+}
+
+# The paged GQA decode attention (TODO.md M3 paged attention). Its grid is
+# `(rows, NUM_Q_HEADS, 1)`, runtime in x (the batch size) and a constexpr in y,
+# so it is neither the grouped `n`/`block` tile nor a fixed staging `grid`: the
+# launcher reads `NUM_Q_HEADS` from the constexprs and takes the rows from the
+# step. It lives in its own manifest section so a grouped or staging change
+# cannot alter an attention launch.
+ATTENTION_KERNELS: dict[str, dict] = {
+    "paged_attention": {
+        "fn": _paged_attention_decode_kernel,
+        "signature": paged_attention(),
+        "constexprs": paged_attention_constexprs(),
     },
 }
 
@@ -224,7 +241,11 @@ def emit() -> Artifacts:
     }
     cubins: dict[str, bytes] = {}
     ptxs: dict[str, str] = {}
-    for section, specs in (("kernels", KERNELS), ("staging", STAGING_KERNELS)):
+    for section, specs in (
+        ("kernels", KERNELS),
+        ("staging", STAGING_KERNELS),
+        ("attention", ATTENTION_KERNELS),
+    ):
         manifest[section] = {}
         for name, spec in specs.items():
             print(f"compiling {name} ...", flush=True)

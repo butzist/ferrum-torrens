@@ -19,6 +19,7 @@ import sys
 
 import torch
 
+from . import attention as attn
 from . import offload as off
 from .nvfp4_moe import _check_constexprs, grouped_moe, require_native_e4m3
 
@@ -189,6 +190,64 @@ def check_offload(device: torch.device) -> int:
     return failures
 
 
+def random_attention_case(
+    device: str,
+    rows: int = 3,
+    q_heads: int = 4,
+    kv_heads: int = 2,
+    head_dim: int = 64,
+    lens: list[int] | None = None,
+    pool: int | None = None,
+    seed: int = 0,
+):
+    """A paged decode case: `rows` queries, each against its own pool locations.
+
+    Distinct locations per row plus a few unused pool slots, so an off-by-one in
+    the indptr walk or the location gather shows up as a wrong score rather than
+    a coincidentally correct one.
+    """
+    if lens is None:
+        lens = [1 + (i * 7) % 11 for i in range(rows)]
+    total = sum(lens)
+    if pool is None:
+        pool = total + 5
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    dev = torch.device(device)
+    q = torch.randn((rows, q_heads, head_dim), generator=g, dtype=torch.float32, device=dev)
+    k = torch.randn((pool, kv_heads, head_dim), generator=g, dtype=torch.float32, device=dev)
+    v = torch.randn((pool, kv_heads, head_dim), generator=g, dtype=torch.float32, device=dev)
+    locs = torch.randperm(pool, generator=g)[:total].to(torch.int32)
+    indptr = torch.zeros(rows + 1, dtype=torch.int32)
+    for r, ln in enumerate(lens):
+        indptr[r + 1] = indptr[r] + ln
+    return q, k, v, locs.to(dev), indptr.to(dev)
+
+
+def check_paged_attention(device: torch.device, tol: float) -> int:
+    """Paged GQA decode: the kernel against the plain-torch oracle."""
+    cases = [
+        ("small", {"rows": 3, "q_heads": 4, "kv_heads": 2, "head_dim": 64}, 16),
+        ("single", {"rows": 1, "q_heads": 4, "kv_heads": 2, "head_dim": 64}, 32),
+        # A row longer than BLOCK_N, so the online-softmax loop runs twice.
+        ("multiblock", {"rows": 2, "q_heads": 4, "kv_heads": 2, "head_dim": 64, "lens": [40, 3]}, 16),
+        # The serving GQA ratio and head width.
+        ("qwen-shape", {"rows": 2, "q_heads": 16, "kv_heads": 2, "head_dim": 256}, 64),
+    ]
+    failures = 0
+    for label, shape, block_n in cases:
+        for seed in range(2):
+            q, k, v, indices, indptr = random_attention_case(str(device), seed=seed, **shape)
+            want = attn.paged_attention_reference(q, k, v, indices, indptr)
+            got = torch.empty_like(q)
+            attn.paged_attention_decode(q, k, v, indices, indptr, got, block_n=block_n)
+            rel = (got - want).abs().max().item() / want.abs().max().clamp(min=1e-6).item()
+            print(f"attention {label} seed {seed}: rel {rel:.3e}")
+            if rel > tol:
+                failures += 1
+                print(f"attention {label} seed {seed}: FAIL", file=sys.stderr)
+    return failures
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--device", default="cpu")
@@ -250,6 +309,10 @@ def main(argv: list[str] | None = None) -> int:
 
     offload_failures = check_offload(torch.device(args.device))
     if offload_failures:
+        print("FAIL", file=sys.stderr)
+        return 1
+    attention_failures = check_paged_attention(torch.device(args.device), args.tol)
+    if offload_failures or attention_failures:
         print("FAIL", file=sys.stderr)
         return 1
     print("PASS")

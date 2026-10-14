@@ -1,6 +1,6 @@
 # FerrumTorrens -- FreeToken MVP port to Rust: TODO
 
-Status: M2 (API) current; M3 prerequisite 4 (device staging: lru_ensure + index_copy + pinned banks + wiring) complete, and decision 40's capture work advances: decision 49 gives the fixed-address `DecodeBuffers` batch-metadata staging, decision 50 settles the mempool -- torch's graph pool behind a tiny C++ bridge, with `tests/cuda_graph_torch_probe.rs` green on the device -- and the forward's output tail is now a device-logits step (`forward_cached_into`, no host round-trip). The decode step's inputs are now staged off the buffers (decision 54: `forward_decode_into`; only device tensors address the cache), attention gathers a fixed-length padded window (decision 55), and the gated `tests/device_decode_matches_refeed.rs` proves the device path equals the re-fed host forward at ~1e-6 on the real checkpoint. The MoE staging split is out of the captured path (decision 56: a resident E2M1 table and an on-device rope table remove the last host uploads), and the gated `tests/decode_graph_capture.rs` now captures one whole real decode step and replays it equal to the uncaptured twin. The device decode is now batch-generic (decision 58): `forward_decode_into` runs every row of `DecodeBuffers`, and the gated `a_batched_decode_step_matches_n_single_row_steps` pins a batch-3 step to three single-row steps on the real checkpoint. The per-batch-size executables are landed (decision 59): `infrastructure/decode_graph.rs` captures one `DecodeGraph` (its own private pool and fixed-address buffers) per size and a `DecodeGraphSet` picks the smallest captured size that fits and pads with dummy rows, and the gated `tests/decode_graph_capture.rs::a_captured_batch_decode_step_replays_equal_to_an_uncaptured_step` replays batch `{1,2,4}` equal to the uncaptured twin on the real checkpoint. Remaining in P1: the engine-owned allocation of the buffers and graphs (the "pinned batch-metadata staging" line) and `max_running` in the captured set. Decision 36 is
+Status: M2 (API) current; M3 prerequisite 4 (device staging: lru_ensure + index_copy + pinned banks + wiring) complete, and decision 40's capture work advances: decision 49 gives the fixed-address `DecodeBuffers` batch-metadata staging, decision 50 settles the mempool -- torch's graph pool behind a tiny C++ bridge, with `tests/cuda_graph_torch_probe.rs` green on the device -- and the forward's output tail is now a device-logits step (`forward_cached_into`, no host round-trip). The decode step's inputs are now staged off the buffers (decision 54: `forward_decode_into`; only device tensors address the cache), attention gathers a fixed-length padded window (decision 55), and the gated `tests/device_decode_matches_refeed.rs` proves the device path equals the re-fed host forward at ~1e-6 on the real checkpoint. The MoE staging split is out of the captured path (decision 56: a resident E2M1 table and an on-device rope table remove the last host uploads), and the gated `tests/decode_graph_capture.rs` now captures one whole real decode step and replays it equal to the uncaptured twin. The device decode is now batch-generic (decision 58): `forward_decode_into` runs every row of `DecodeBuffers`, and the gated `a_batched_decode_step_matches_n_single_row_steps` pins a batch-3 step to three single-row steps on the real checkpoint. The per-batch-size executables are landed (decision 59): `infrastructure/decode_graph.rs` captures one `DecodeGraph` (its own private pool and fixed-address buffers) per size and a `DecodeGraphSet` picks the smallest captured size that fits and pads with dummy rows, and the gated `tests/decode_graph_capture.rs::a_captured_batch_decode_step_replays_equal_to_an_uncaptured_step` replays batch `{1,2,4}` equal to the uncaptured twin on the real checkpoint. Remaining in P1: the engine-owned allocation of the buffers and graphs (the "pinned batch-metadata staging" line) and `max_running` in the captured set. The paged GQA decode attention kernel is now authored and AOT-registered (decision 60): `python/ferrum_kernel/attention.py`, a new `attention` manifest section and `AttentionAbi`, the interpreter selftest against the torch oracle at ~1e-7 and the ABI units green, with the driver launcher, the `MhaPool` paged gather and the forward wiring still open. Decision 36 is
 done end to end: the serving path is Python-free. The sm_120 cubins are
 committed under `kernel/` with an ABI manifest, `infrastructure/kernel_abi.rs`
 packs the launch arguments and checks them against the committed PTX,
@@ -602,8 +602,9 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 ### Superseded by libtorch (decision 2) -- do not implement
 - [ ] ~~fused add+rmsnorm~~ (libtorch: `add` + `rms_norm`).
 - [ ] ~~sigmoid / silu-and-mul / topk-softmax router kernel~~ (libtorch ops).
-- [ ] ~~paged GQA attention prefill+decode kernel~~ (FlashInfer via libtorch, so
-  the "[opt] reuse the FlashInfer C API" idea is simply what we do).
+- [ ] ~~paged GQA attention prefill+decode kernel~~ (prefill stays libtorch; the
+  decode kernel is hand-written in Triton instead of FlashInfer, which has no C
+  ABI reachable from `tch` -- decision 60).
 - [ ] ~~partial-rope kernel~~ (`Tensor` slicing + `cos`/`sin`).
 - [ ] ~~GDN conv1d / delta-rule / GatedRMSNorm kernels~~ (torch ops; the fast
   chunked form is ALGORITHM.md 2.3.1).
@@ -1882,8 +1883,8 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
       `tests/device_decode_matches_refeed.rs` runs three device decode steps
       against the re-fed host forward on the real checkpoint and reports
       max|dlogit|/scale ~1e-6 (well under the 1e-3 gate). 323 lib tests green.
-    - **Still open.** The window is a dense per-request gather, not yet paged or
-      flashinfer-backed; that swap is its own M3 item.
+    - **Still open.** The window is a dense per-request gather, not yet paged;
+      the hand-written paged GQA decode kernel supersedes it (decision 60).
 
 56. **The captured decode step uploads no host tensors** (2026-10-13)
     - **What changed.** Two pageable host-to-device copies on the replay path
@@ -1998,6 +1999,43 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
     - **Still open.** The engine still allocates neither the buffers nor the
       graphs; the pinned batch-metadata staging P1 line covers that wiring, and
       `max_running` is captured with it.
+
+60. **The paged GQA decode attention is a hand-written Triton kernel** (2026-10-14)
+    -- the M3 attention swap decision 55 left open.
+    - **What changed.** `python/ferrum_kernel/attention.py` authors
+      `_paged_attention_decode_kernel`, AOT-compiled to
+      `kernel/paged_attention.cubin` / `.ptx` and registered in a new `attention`
+      manifest section. One program per `(row, q_head)`: each row walks its own
+      KV through a per-row location list (`indices` / `indptr`, the FlashInfer
+      paging view of ALGORITHM.md 3.1), an online-softmax loop over
+      `BLOCK_N`-key tiles, all f32, with `scale = head_dim ** -0.5` baked in and
+      GQA read as `kv_head = q_head * kv_heads / q_heads`. The externally visible
+      shapes are fixed (`q` / `out` `[rows, q_heads, head_dim]`, `k` / `v` the
+      pool viewed `[num_tokens, kv_heads, head_dim]`, `indices` / `indptr` i32),
+      so the work scales with each row's real length instead of a
+      max-context window.
+    - **Why hand-written.** FlashInfer is a separate Python package (FreeToken's
+      `fi` extra) with no C ABI reachable from `tch` and absent from the flake,
+      so the plan's "libtorch supplies FlashInfer" cannot mean calling it. This
+      supersedes the "paged GQA attention kernel" line under the
+      superseded-by-libtorch list (decision 2); the prefill kernel stays out of
+      scope (the chunked prefill path already exists).
+    - **ABI.** `kernel_abi.rs` gains an `AttentionAbi` / `AttentionKernel` parsed
+      from the `attention` section, `paged_attention_args`, and
+      `attention_grid(rows, kernel) = (rows, NUM_Q_HEADS, 1)` -- runtime rows in
+      x, the baked head count in y, so this is neither the grouped `n`/`block`
+      tile nor the staging pair's fixed grid. The constexprs baked in are
+      `NUM_Q_HEADS=16`, `NUM_KV_HEADS=2`, `HEAD_DIM=256`, `BLOCK_N=64`. The Rust
+      ABI test re-derives the param list from the committed PTX.
+    - **Coverage.** `selftest.py --interp` compares the interpreter run against
+      the plain-torch oracle (small, single, a row longer than `BLOCK_N`, and the
+      serving qwen head ratio) at ~1e-7; `compile_check.py` still compiles it for
+      sm_120; five ABI units validate the manifest, the PTX agreement, the
+      argument builder, the grid and the section's own error paths.
+    - **Still open.** The driver-API launcher and the `MhaPool` paged gather, the
+      wiring of the device decode forward onto it, and the gated gate against the
+      dense/refeed reference on the real checkpoint. The dense padded-window path
+      (decision 55) stays until that gate is green.
 
 ### Config defaults for the RTX 5060 / 8 GB target
 

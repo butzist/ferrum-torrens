@@ -403,6 +403,147 @@ fn staging_ptx(name: &str) -> &'static str {
     }
 }
 
+/// The paged GQA decode attention kernel `MhaPool` launches.
+pub const PAGED_ATTENTION: &str = "paged_attention";
+
+const ATTENTION_NAMES: [&str; 1] = [PAGED_ATTENTION];
+
+#[derive(Debug, Deserialize)]
+struct AttentionEntry {
+    entry: String,
+    params: Vec<Param>,
+    declared_args: Vec<String>,
+    scratch_params: usize,
+    num_warps: u32,
+    shared: u32,
+    global_scratch_size: u32,
+    profile_scratch_size: u32,
+    /// The constexprs baked into the cubin, by name: the head geometry and the
+    /// key tile. All are non-negative counts, so `u64` is the natural type.
+    constexprs: BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AttentionManifest {
+    attention: BTreeMap<String, AttentionEntry>,
+}
+
+/// One attention kernel as its launcher sees it.
+#[derive(Debug, Clone)]
+pub struct AttentionKernel {
+    pub name: &'static str,
+    pub entry: String,
+    pub args: Vec<ArgKind>,
+    pub scratch_params: usize,
+    pub num_warps: u32,
+    pub shared: u32,
+    constexprs: BTreeMap<String, u64>,
+}
+
+impl AttentionKernel {
+    /// Threads per block: one warp per `num_warps`, NVIDIA warp size 32.
+    pub fn block_threads(&self) -> u32 {
+        self.num_warps * 32
+    }
+
+    /// A constexpr baked into the cubin, by name. The launcher reads the head
+    /// geometry from here so it cannot drift from the build.
+    pub fn constexpr(&self, name: &str) -> Result<u64, MoEError> {
+        self.constexprs
+            .get(name)
+            .copied()
+            .ok_or_else(|| MoEError::Bad(format!("kernel {}: no constexpr {name}", self.name)))
+    }
+}
+
+/// The committed attention kernels, parsed from the manifest's `attention`
+/// section.
+///
+/// Separate from `Abi` and `StagingAbi`: the attention launch grid is
+/// `(rows, num_q_heads, 1)` -- runtime in x, a baked constexpr in y -- which is
+/// neither the grouped `n`/`block` tile nor the staging pair's fixed grid, and
+/// keeping the contracts apart means a change to one cannot alter another.
+#[derive(Debug, Clone)]
+pub struct AttentionAbi {
+    kernels: BTreeMap<&'static str, AttentionKernel>,
+}
+
+impl AttentionAbi {
+    pub fn parse(json: &str) -> Result<Self, MoEError> {
+        let m: AttentionManifest = serde_json::from_str(json)
+            .map_err(|e| MoEError::Bad(format!("kernel manifest: {e}")))?;
+        let mut kernels = BTreeMap::new();
+        for (name, entry) in m.attention {
+            let args = parse_args(
+                &name,
+                &entry.params,
+                entry.scratch_params,
+                entry.declared_args.len(),
+                entry.global_scratch_size,
+                entry.profile_scratch_size,
+            )?;
+            let name: &'static str = ATTENTION_NAMES
+                .iter()
+                .copied()
+                .find(|n| *n == name)
+                .ok_or_else(|| MoEError::Bad(format!("unknown attention kernel {name}")))?;
+            kernels.insert(
+                name,
+                AttentionKernel {
+                    name,
+                    entry: entry.entry,
+                    args,
+                    scratch_params: entry.scratch_params,
+                    num_warps: entry.num_warps,
+                    shared: entry.shared,
+                    constexprs: entry.constexprs,
+                },
+            );
+        }
+        for name in ATTENTION_NAMES {
+            if !kernels.contains_key(name) {
+                return Err(MoEError::Bad(format!(
+                    "manifest is missing attention kernel {name}"
+                )));
+            }
+        }
+        Ok(Self { kernels })
+    }
+
+    /// The manifest as committed.
+    pub fn committed() -> Result<Self, MoEError> {
+        Self::parse(MANIFEST_JSON)
+    }
+
+    /// The attention kernel names, in launch order.
+    pub fn kernel_names() -> &'static [&'static str] {
+        &ATTENTION_NAMES
+    }
+
+    pub fn kernel(&self, name: &str) -> Result<&AttentionKernel, MoEError> {
+        self.kernels
+            .get(name)
+            .ok_or_else(|| MoEError::Bad(format!("no committed attention kernel {name}")))
+    }
+}
+
+/// The attention cubin bytes, by name.
+pub fn attention_cubin(name: &str) -> Result<&'static [u8], MoEError> {
+    Ok(match name {
+        PAGED_ATTENTION => include_bytes!("../../kernel/paged_attention.cubin"),
+        other => return Err(MoEError::Bad(format!("no committed cubin for {other}"))),
+    })
+}
+
+/// The committed attention PTX, by name. Only the ABI tests read this.
+#[cfg(test)]
+fn attention_ptx(name: &str) -> &'static str {
+    match name {
+        PAGED_ATTENTION => include_str!("../../kernel/paged_attention.ptx"),
+        other => panic!("no committed ptx for {other}"),
+    }
+}
+
 /// The committed PTX, by name. Only the ABI tests read this.
 #[cfg(test)]
 fn ptx(name: &str) -> &'static str {
@@ -503,6 +644,11 @@ impl ArgPack {
 
     /// Sized for a staging `kernel`, scratch pointers already zeroed.
     pub fn for_staging(kernel: &StagingKernel) -> Self {
+        Self::with_args(&kernel.args, kernel.scratch_params)
+    }
+
+    /// Sized for an attention `kernel`, scratch pointers already zeroed.
+    pub fn for_attention(kernel: &AttentionKernel) -> Self {
         Self::with_args(&kernel.args, kernel.scratch_params)
     }
 
@@ -762,6 +908,40 @@ pub fn index_copy_args(abi: &StagingAbi, a: &CopyArgs) -> Result<ArgPack, MoEErr
     Ok(p)
 }
 
+/// Device addresses for one paged GQA decode launch. Every buffer is a raw
+/// address the caller owns: `q`/`out` are `[rows, q_heads, head_dim]`, `k`/`v`
+/// the layer's KV pool viewed as `[num_tokens, kv_heads, head_dim]`, and
+/// `indices`/`indptr` the per-row pool locations and their offsets (`i32`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AttentionArgs {
+    pub q: u64,
+    pub k: u64,
+    pub v: u64,
+    pub indices: u64,
+    pub indptr: u64,
+    pub out: u64,
+}
+
+/// The paged attention launch argument pack, in the cubin's declared order.
+pub fn paged_attention_args(abi: &AttentionAbi, a: &AttentionArgs) -> Result<ArgPack, MoEError> {
+    let kernel = abi.kernel(PAGED_ATTENTION)?;
+    let mut p = ArgPack::for_attention(kernel);
+    p.ptr(a.q)?;
+    p.ptr(a.k)?;
+    p.ptr(a.v)?;
+    p.ptr(a.indices)?;
+    p.ptr(a.indptr)?;
+    p.ptr(a.out)?;
+    Ok(p)
+}
+
+/// The attention launch grid: one program per (row, q_head). The y extent is the
+/// baked `NUM_Q_HEADS`; the x extent is the step's row count, which is why this
+/// cannot come from the cubin alone.
+pub fn attention_grid(rows: usize, kernel: &AttentionKernel) -> Result<(u32, u32, u32), MoEError> {
+    Ok((rows as u32, kernel.constexpr("NUM_Q_HEADS")? as u32, 1))
+}
+
 /// The launch grid for a kernel: one program per row (a route, or a token for
 /// the reduce) and one per `block`-column tile.
 ///
@@ -943,13 +1123,10 @@ mod tests {
     }
 
     #[test]
-    fn a_manifest_with_scratch_to_allocate_is_rejected() {
-        let json = MANIFEST_JSON.replacen(
-            "\"global_scratch_size\": 0",
-            "\"global_scratch_size\": 64",
-            1,
-        );
-        let err = Abi::parse(&json).unwrap_err().to_string();
+    fn a_manifest_with_attention_scratch_to_allocate_is_rejected() {
+        let mut v: serde_json::Value = serde_json::from_str(MANIFEST_JSON).unwrap();
+        v["attention"][PAGED_ATTENTION]["global_scratch_size"] = serde_json::json!(64);
+        let err = AttentionAbi::parse(&v.to_string()).unwrap_err().to_string();
         assert!(err.contains("need a real allocation"), "{err}");
     }
 
@@ -1052,17 +1229,17 @@ mod tests {
     }
 
     #[test]
-    fn a_manifest_with_an_unknown_staging_kernel_is_rejected() {
+    fn a_manifest_with_an_unknown_attention_kernel_is_rejected() {
         let mut v: serde_json::Value = serde_json::from_str(MANIFEST_JSON).unwrap();
-        let copy = v["staging"]
+        let entry = v["attention"]
             .as_object_mut()
             .unwrap()
-            .remove(INDEX_COPY)
+            .remove(PAGED_ATTENTION)
             .unwrap();
-        v["staging"]["copy_sideways"] = copy;
-        let err = StagingAbi::parse(&v.to_string()).unwrap_err().to_string();
+        v["attention"]["paged_sideways"] = entry;
+        let err = AttentionAbi::parse(&v.to_string()).unwrap_err().to_string();
         assert!(
-            err.contains("unknown staging kernel copy_sideways"),
+            err.contains("unknown attention kernel paged_sideways"),
             "{err}"
         );
     }
@@ -1083,5 +1260,85 @@ mod tests {
         assert!(abi.kernel(LRU_ENSURE).is_err());
         let staging = StagingAbi::committed().unwrap();
         assert!(staging.kernel(GEMV_GATE_UP).is_err());
+    }
+
+    #[test]
+    fn the_attention_manifest_lists_the_paged_kernel() {
+        let abi = AttentionAbi::committed().expect("the committed manifest must parse");
+        let kernel = abi.kernel(PAGED_ATTENTION).unwrap();
+        assert_eq!(kernel.block_threads(), 128);
+        assert_eq!(kernel.args.len(), 6);
+        assert_eq!(kernel.constexpr("NUM_Q_HEADS").unwrap(), 16);
+        assert_eq!(kernel.constexpr("NUM_KV_HEADS").unwrap(), 2);
+        assert_eq!(kernel.constexpr("HEAD_DIM").unwrap(), 256);
+        assert_eq!(kernel.constexpr("BLOCK_N").unwrap(), 64);
+    }
+
+    #[test]
+    fn the_attention_manifest_agrees_with_the_committed_ptx() {
+        let abi = AttentionAbi::committed().unwrap();
+        for name in ATTENTION_NAMES {
+            let kernel = abi.kernel(name).unwrap();
+            let from_ptx = ptx_entry_args(attention_ptx(name));
+            let mut want = kernel.args.clone();
+            want.extend(std::iter::repeat_n(ArgKind::Ptr, kernel.scratch_params));
+            assert_eq!(
+                from_ptx, want,
+                "{name}: manifest does not match the PTX entry"
+            );
+            assert!(!from_ptx.is_empty());
+        }
+    }
+
+    #[test]
+    fn the_attention_argument_builder_matches_its_kernel_signature() {
+        let abi = AttentionAbi::committed().unwrap();
+        let args = AttentionArgs {
+            q: 0x1000,
+            k: 0x2000,
+            v: 0x3000,
+            indices: 0x4000,
+            indptr: 0x5000,
+            out: 0x6000,
+        };
+        let pack = paged_attention_args(&abi, &args).unwrap();
+        let kernel = abi.kernel(PAGED_ATTENTION).unwrap();
+        let params = pack.kernel_params().unwrap();
+        assert_eq!(params.len(), kernel.args.len() + kernel.scratch_params);
+        for slot in &pack.slots()[kernel.args.len()..] {
+            assert_eq!(*slot, 0, "scratch slot is not null");
+        }
+    }
+
+    #[test]
+    fn the_attention_grid_uses_the_baked_head_count() {
+        let abi = AttentionAbi::committed().unwrap();
+        let kernel = abi.kernel(PAGED_ATTENTION).unwrap();
+        assert_eq!(attention_grid(3, kernel).unwrap(), (3, 16, 1));
+    }
+
+    #[test]
+    fn a_manifest_missing_the_paged_attention_kernel_is_rejected() {
+        let mut v: serde_json::Value = serde_json::from_str(MANIFEST_JSON).unwrap();
+        v["attention"]
+            .as_object_mut()
+            .unwrap()
+            .remove(PAGED_ATTENTION);
+        let err = AttentionAbi::parse(&v.to_string()).unwrap_err().to_string();
+        assert!(
+            err.contains("missing attention kernel paged_attention"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_three_sections_are_disjoint() {
+        let abi = abi();
+        assert!(abi.kernel(PAGED_ATTENTION).is_err());
+        let staging = StagingAbi::committed().unwrap();
+        assert!(staging.kernel(PAGED_ATTENTION).is_err());
+        let attention = AttentionAbi::committed().unwrap();
+        assert!(attention.kernel(GEMV_GATE_UP).is_err());
+        assert!(attention.kernel(LRU_ENSURE).is_err());
     }
 }
