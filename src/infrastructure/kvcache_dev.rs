@@ -104,6 +104,25 @@ impl MhaPool {
         self.kv.size()[2] as usize
     }
 
+    /// What the pool stores a token in. The paged attention kernel is compiled
+    /// for one pointer element type, so the forward picks the paged path only
+    /// when this matches what the cubin was built for.
+    pub fn dtype(&self) -> KvDType {
+        self.dtype
+    }
+
+    /// Device addresses of this layer's K and V slabs, each viewed as
+    /// `[num_pages * PAGE_SIZE, kv_heads, head_dim]`; PAGE_SIZE is 1, so a
+    /// token's byte stride is `kv_heads * head_dim * elt`. The driver-API
+    /// attention launcher takes raw addresses, and this accessor is the one
+    /// place that knows the pool's physical layout.
+    pub fn kv_slab_ptrs(&self, layer: usize) -> (u64, u64) {
+        let slab = self.slab(layer);
+        let k = self.kv.select(0, 0).select(0, slab);
+        let v = self.kv.select(0, 1).select(0, slab);
+        (k.data_ptr() as u64, v.data_ptr() as u64)
+    }
+
     /// Bytes the pool holds, for the config's memory arithmetic.
     pub fn bytes(&self) -> usize {
         self.kv.numel() * self.dtype.kind().elt_size_in_bytes()
@@ -569,6 +588,19 @@ mod tests {
             "a lossy pool must round, not truncate"
         );
         assert_ne!(to_f32_vec(&gk), want);
+    }
+
+    #[test]
+    fn the_kv_slab_pointers_step_by_one_layer_of_tokens() {
+        let p = params();
+        let pool = MhaPool::new(&p, 7, KvDType::F32, auto_device());
+        let (k0, v0) = pool.kv_slab_ptrs(0);
+        let (k1, _) = pool.kv_slab_ptrs(3);
+        // Two dense slabs in the tower, K then V, so V starts two layers in.
+        let per = 7 * PAGE_SIZE * p.num_kv_heads as i64 * p.head_dim as i64 * 4;
+        assert_eq!(v0 - k0, 2 * per as u64, "V follows both K slabs");
+        assert_eq!(k1 - k0, per as u64, "slab 1 is one layer after slab 0");
+        assert_eq!(pool.dtype(), KvDType::F32);
     }
 
     #[test]

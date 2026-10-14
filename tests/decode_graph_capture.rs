@@ -29,6 +29,7 @@ use ferrum_torrens::domain::kvcache::{CachedModel, KvCache, SequenceCache};
 use ferrum_torrens::domain::model::ForwardInput;
 use ferrum_torrens::domain::weights::WeightsReader;
 use ferrum_torrens::infrastructure::banks::{FtwBanks, FtwPinnedBanks};
+use ferrum_torrens::infrastructure::cuda_attention::PagedAttention;
 use ferrum_torrens::infrastructure::cuda_driver::{CAPTURE_MODE_GLOBAL, Driver};
 use ferrum_torrens::infrastructure::cuda_graph::{self, GraphPool};
 use ferrum_torrens::infrastructure::cuda_moe::CudaMoE;
@@ -120,8 +121,19 @@ fn build(num_pages: usize, num_slots: usize) -> Built {
         KvDType::F32,
         device,
     ));
-    let model =
-        TorchQwen3_6::load(params, device, index, reader, Some(port), cache.clone()).unwrap();
+    let attention = Arc::new(
+        PagedAttention::new(device, &params, stream).expect("the paged attention launcher"),
+    );
+    let model = TorchQwen3_6::load(
+        params,
+        device,
+        index,
+        reader,
+        Some(port),
+        Some(attention),
+        cache.clone(),
+    )
+    .unwrap();
     Built {
         model,
         cache,

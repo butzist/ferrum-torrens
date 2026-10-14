@@ -72,6 +72,7 @@ flowchart TB
       TorchRt["torch\ndevice + tensor helpers"]
       CudaDrv["cuda_driver\nlibcuda FFI, cubin launch, pinned mem"]
       CudaMoe["cuda_moe\nNVFP4 slot cache + grouped GEMM"]
+      CudaAttn["cuda_attention\npaged GQA decode launcher"]
       Abi["kernel_abi\ncubin manifest + arg packing"]
       Graph["cuda_graph\ntorch stream + graph pool bridge"]
       KvcDev["kvcache_dev\nMHA pool + GDN state slabs"]
@@ -105,8 +106,11 @@ flowchart TB
   CudaMoe --> Abi --> Cubins
   CudaMoe --> CudaDrv --> LibCuda
   CudaMoe --> TorchRt
+  CudaAttn --> Abi
+  CudaAttn --> CudaDrv
   Graph --> CudaDrv
   Torch --> KvcDev
+  Torch --> CudaAttn
   Torch --> TorchRt --> LibTorch
   Http --> Toker
 ```
@@ -589,7 +593,13 @@ batched pool and state accessors (`MhaPool::gather_rows`,
 `LinearStateSlabs::{conv,recurrent}_state_rows`) and additive batched peers
 (`conv1d_silu_step_batch`, `gdn_recurrence_step_batch`, `gdn_core_batch`) beside
 the untouched single-row host helpers; only the tower tail branches (prefill
-normalizes the last token, decode normalizes all rows). The forward's tail is
+normalizes the last token, decode normalizes all rows). The device attention arm
+runs the paged GQA kernel through `infrastructure/cuda_attention.rs`
+(`PagedAttention`): it loads the `attention` manifest section and launches the
+committed cubin on the capture's stream, reading the row's KV straight out of the
+`MhaPool` slabs (`kv_slab_ptrs`) through the staged `DecodeBuffers` location
+window; when the launcher is absent or the pool is not f32 the arm falls back to
+the dense padded-window gather (decision 55). The forward's tail is
 device-local: `TorchQwen3_6::forward_cached_into` writes the `lm_head` block pass
 straight into a caller-owned `[rows, vocab]` device logits buffer with no host
 round-trip, and `forward_decode_into` addresses the same forward entirely from a
@@ -614,7 +624,7 @@ joining the captured set) is the next piece.
 |---|---|---|---|
 | `libtorch` (via `tch`) | runtime, `cuda` feature | `infrastructure/torch.rs`, `models/qwen3_6/forward_torch.rs`, `infrastructure/kvcache_dev.rs`, `infrastructure/cuda_moe.rs`, `infrastructure/decode_graph.rs` | All dense compute (GEMMs, norms, rope, attention, GDN), device tensors, the KV/state slabs, and the MoE slot banks |
 | CUDA driver API (`libcuda.so.1`) | runtime, hand-rolled FFI | `infrastructure/cuda_driver.rs` | Load and launch the committed cubins, allocate device + page-locked memory, capture and replay CUDA graphs |
-| Triton (cubins) | build-time authoring; committed artifacts at runtime | `python/ferrum_kernel/*`, `kernel/*.cubin` | The one hand-written NVFP4 grouped-MoE GEMV plus the silu/sum-reduce and the two offload staging kernels. Authored and AOT-compiled in Python; launched by `cuda_driver` with no interpreter at runtime |
+| Triton (cubins) | build-time authoring; committed artifacts at runtime | `python/ferrum_kernel/*`, `kernel/*.cubin` | The hand-written NVFP4 grouped-MoE GEMV, the silu/sum-reduce, the two offload staging kernels, and the paged GQA decode attention kernel. Authored and AOT-compiled in Python; launched by `cuda_driver` with no interpreter at runtime |
 | `c10_cuda` (torch C++) | runtime, via `build.rs` shim | `shim/c10_graph_shim.cpp`, `infrastructure/cuda_graph.rs`, `infrastructure/decode_graph.rs` | The torch current-stream set and the graph memory pool that `tch` does not expose; needed for CUDA-graph capture of torch ops |
 | `axum` + `tokio` | runtime | `infrastructure/http.rs`, `main.rs` | HTTP server, SSE streaming, and the async runtime that offloads forwards to blocking threads |
 | `tokenizers` + `minijinja` | runtime | `infrastructure/tokenizers_hf.rs` | HF byte-level BPE tokenizer and the checkpoint's chat template (Python string methods rewritten to filters) |

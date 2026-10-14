@@ -200,15 +200,17 @@ def random_attention_case(
     pool: int | None = None,
     seed: int = 0,
 ):
-    """A paged decode case: `rows` queries, each against its own pool locations.
+    """A paged decode case: `rows` queries, each against its own pool window.
 
-    Distinct locations per row plus a few unused pool slots, so an off-by-one in
-    the indptr walk or the location gather shows up as a wrong score rather than
-    a coincidentally correct one.
+    The window is padded to the longest row, distinct locations per row, and a
+    few unused pool slots, so an off-by-one in the position bound or the
+    location gather shows up as a wrong score rather than a coincidentally
+    correct one.
     """
     if lens is None:
         lens = [1 + (i * 7) % 11 for i in range(rows)]
     total = sum(lens)
+    window = max(lens)
     if pool is None:
         pool = total + 5
     g = torch.Generator(device="cpu").manual_seed(seed)
@@ -216,11 +218,15 @@ def random_attention_case(
     q = torch.randn((rows, q_heads, head_dim), generator=g, dtype=torch.float32, device=dev)
     k = torch.randn((pool, kv_heads, head_dim), generator=g, dtype=torch.float32, device=dev)
     v = torch.randn((pool, kv_heads, head_dim), generator=g, dtype=torch.float32, device=dev)
-    locs = torch.randperm(pool, generator=g)[:total].to(torch.int32)
-    indptr = torch.zeros(rows + 1, dtype=torch.int32)
+    flat = torch.randperm(pool, generator=g)[:total].to(torch.int32)
+    locs = torch.zeros((rows, window), dtype=torch.int32)
+    positions = torch.zeros(rows, dtype=torch.int32)
+    at = 0
     for r, ln in enumerate(lens):
-        indptr[r + 1] = indptr[r] + ln
-    return q, k, v, locs.to(dev), indptr.to(dev)
+        locs[r, :ln] = flat[at : at + ln]
+        positions[r] = ln - 1
+        at += ln
+    return q, k, v, locs.to(dev), positions.to(dev)
 
 
 def check_paged_attention(device: torch.device, tol: float) -> int:
@@ -236,10 +242,10 @@ def check_paged_attention(device: torch.device, tol: float) -> int:
     failures = 0
     for label, shape, block_n in cases:
         for seed in range(2):
-            q, k, v, indices, indptr = random_attention_case(str(device), seed=seed, **shape)
-            want = attn.paged_attention_reference(q, k, v, indices, indptr)
+            q, k, v, locs, positions = random_attention_case(str(device), seed=seed, **shape)
+            want = attn.paged_attention_reference(q, k, v, locs, positions)
             got = torch.empty_like(q)
-            attn.paged_attention_decode(q, k, v, indices, indptr, got, block_n=block_n)
+            attn.paged_attention_decode(q, k, v, locs, positions, got, block_n=block_n)
             rel = (got - want).abs().max().item() / want.abs().max().clamp(min=1e-6).item()
             print(f"attention {label} seed {seed}: rel {rel:.3e}")
             if rel > tol:

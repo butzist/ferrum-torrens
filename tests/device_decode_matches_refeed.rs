@@ -18,10 +18,11 @@ use std::sync::Arc;
 
 use ferrum_torrens::domain::kvcache::{CachedModel, KvCache, SequenceCache};
 use ferrum_torrens::domain::model::{ForwardInput, Model};
+use ferrum_torrens::infrastructure::cuda_attention::PagedAttention;
 use ferrum_torrens::infrastructure::decode_buffers::{DecodeBuffers, DecodeRow};
 use ferrum_torrens::infrastructure::ftw::{FtwIndex, MmapFtwReader};
 use ferrum_torrens::infrastructure::kvcache_dev::{DeviceCache, KvDType};
-use ferrum_torrens::infrastructure::torch::{auto_device, to_f32_vec};
+use ferrum_torrens::infrastructure::torch::{Device, auto_device, to_f32_vec};
 use ferrum_torrens::models::qwen3_6::config::parse_text_config;
 use ferrum_torrens::models::qwen3_6::forward_torch::TorchQwen3_6;
 
@@ -52,7 +53,16 @@ fn model(num_pages: usize, num_slots: usize) -> (TorchQwen3_6, Arc<DeviceCache>,
         .unwrap(),
     );
     let reader = Arc::new(MmapFtwReader::open(std::path::Path::new(FTW_DIR)).unwrap());
-    let m = TorchQwen3_6::load(params, device, ix, reader, None, cache.clone()).unwrap();
+    // On a CUDA device the device step runs the paged kernel, so this becomes the
+    // paged-vs-re-fed numeric gate; on the CPU backend it falls back to the dense
+    // gather, exactly as `registry` chooses.
+    let attention = match device {
+        Device::Cuda(_) => Some(Arc::new(
+            PagedAttention::new(device, &params, std::ptr::null_mut()).unwrap(),
+        )),
+        _ => None,
+    };
+    let m = TorchQwen3_6::load(params, device, ix, reader, None, attention, cache.clone()).unwrap();
     (m, cache, vocab)
 }
 

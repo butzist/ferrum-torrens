@@ -66,10 +66,11 @@ pub fn build(
                 let params = crate::models::qwen3_6::config::parse_text_config(tc)
                     .map_err(|e| RegistryError::Build(e.to_string()))?;
                 let moe = moe_port(config, &params, index.clone(), reader.clone(), device)?;
+                let attention = attention_port(&params, device)?;
                 let cache = Arc::new(kv_cache(config, &params, device));
                 Ok(Box::new(
                     crate::models::qwen3_6::forward_torch::TorchQwen3_6::load(
-                        params, device, index, reader, moe, cache,
+                        params, device, index, reader, moe, attention, cache,
                     )
                     .map_err(|e| RegistryError::Build(e.to_string()))?,
                 ))
@@ -167,6 +168,27 @@ fn moe_port(
         params.num_experts,
         config.moe.cache_size_slots,
     ))))
+}
+
+/// The paged attention launcher, when the engine runs on a CUDA device. The
+/// device decode path reads each row's KV window straight out of the pool
+/// through it; a CPU device gets `None` and keeps the dense gather, which is
+/// what keeps `cargo test --features cuda` meaningful without a device
+/// (decision 21). Stream 0 (the legacy default stream) because the engine does
+/// not capture yet; a capture rebuilds this on its own side stream.
+#[cfg(feature = "cuda")]
+fn attention_port(
+    params: &ModelParams,
+    device: Device,
+) -> Result<Option<Arc<crate::infrastructure::cuda_attention::PagedAttention>>, RegistryError> {
+    use crate::infrastructure::cuda_attention::PagedAttention;
+    match device {
+        Device::Cuda(_) => Ok(Some(Arc::new(
+            PagedAttention::new(device, params, std::ptr::null_mut())
+                .map_err(|e| RegistryError::Build(e.to_string()))?,
+        ))),
+        _ => Ok(None),
+    }
 }
 
 /// Always the scalar reference forward, whatever the `cuda` feature says.

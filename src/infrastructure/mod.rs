@@ -3,6 +3,8 @@
 
 pub mod banks;
 #[cfg(feature = "cuda")]
+pub mod cuda_attention;
+#[cfg(feature = "cuda")]
 pub mod cuda_driver;
 #[cfg(feature = "cuda")]
 pub mod cuda_graph;

@@ -11,9 +11,10 @@
         "q_ptr",
         "k_ptr",
         "v_ptr",
-        "indices_ptr",
-        "indptr_ptr",
-        "out_ptr"
+        "locs_ptr",
+        "positions_ptr",
+        "out_ptr",
+        "window"
       ],
       "entry": "_paged_attention_decode_kernel",
       "global_scratch_size": 0,
@@ -45,10 +46,14 @@
         },
         {
           "index": 6,
-          "kind": "ptr"
+          "kind": "u32"
         },
         {
           "index": 7,
+          "kind": "ptr"
+        },
+        {
+          "index": 8,
           "kind": "ptr"
         }
       ],

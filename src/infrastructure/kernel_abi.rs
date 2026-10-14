@@ -910,16 +910,20 @@ pub fn index_copy_args(abi: &StagingAbi, a: &CopyArgs) -> Result<ArgPack, MoEErr
 
 /// Device addresses for one paged GQA decode launch. Every buffer is a raw
 /// address the caller owns: `q`/`out` are `[rows, q_heads, head_dim]`, `k`/`v`
-/// the layer's KV pool viewed as `[num_tokens, kv_heads, head_dim]`, and
-/// `indices`/`indptr` the per-row pool locations and their offsets (`i32`).
+/// the layer's KV pool viewed as `[num_tokens, kv_heads, head_dim]`, `locs` the
+/// `[rows, window]` pool locations the engine staged (head-aligned, padded) and
+/// `positions` the rows' newest absolute positions. `window` is the location
+/// buffer's row stride, a runtime value because the engine's window is not baked
+/// into the cubin.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AttentionArgs {
     pub q: u64,
     pub k: u64,
     pub v: u64,
-    pub indices: u64,
-    pub indptr: u64,
+    pub locs: u64,
+    pub positions: u64,
     pub out: u64,
+    pub window: u32,
 }
 
 /// The paged attention launch argument pack, in the cubin's declared order.
@@ -929,9 +933,10 @@ pub fn paged_attention_args(abi: &AttentionAbi, a: &AttentionArgs) -> Result<Arg
     p.ptr(a.q)?;
     p.ptr(a.k)?;
     p.ptr(a.v)?;
-    p.ptr(a.indices)?;
-    p.ptr(a.indptr)?;
+    p.ptr(a.locs)?;
+    p.ptr(a.positions)?;
     p.ptr(a.out)?;
+    p.u32(a.window)?;
     Ok(p)
 }
 
@@ -1267,7 +1272,9 @@ mod tests {
         let abi = AttentionAbi::committed().expect("the committed manifest must parse");
         let kernel = abi.kernel(PAGED_ATTENTION).unwrap();
         assert_eq!(kernel.block_threads(), 128);
-        assert_eq!(kernel.args.len(), 6);
+        assert_eq!(kernel.args.len(), 7);
+        assert_eq!(kernel.args[..6], [ArgKind::Ptr; 6]);
+        assert_eq!(kernel.args[6], ArgKind::U32);
         assert_eq!(kernel.constexpr("NUM_Q_HEADS").unwrap(), 16);
         assert_eq!(kernel.constexpr("NUM_KV_HEADS").unwrap(), 2);
         assert_eq!(kernel.constexpr("HEAD_DIM").unwrap(), 256);
@@ -1297,9 +1304,10 @@ mod tests {
             q: 0x1000,
             k: 0x2000,
             v: 0x3000,
-            indices: 0x4000,
-            indptr: 0x5000,
+            locs: 0x4000,
+            positions: 0x5000,
             out: 0x6000,
+            window: 7,
         };
         let pack = paged_attention_args(&abi, &args).unwrap();
         let kernel = abi.kernel(PAGED_ATTENTION).unwrap();

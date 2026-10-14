@@ -26,9 +26,10 @@ use crate::domain::expert_kernel::{MoEDeviceRequest, MoEError, MoEExecutor};
 use crate::domain::kvcache::{CachedModel, KvCache, KvcacheError, SequenceCache};
 use crate::domain::model::{ForwardInput, LayerType, Model, ModelParams};
 use crate::domain::weights::{DType, TensorDesc, TensorKind, WeightsReader};
+use crate::infrastructure::cuda_attention::PagedAttention;
 use crate::infrastructure::decode_buffers::DecodeBuffers;
 use crate::infrastructure::ftw::FtwIndex;
-use crate::infrastructure::kvcache_dev::{DeviceCache, LinearStateSlabs, MhaPool};
+use crate::infrastructure::kvcache_dev::{DeviceCache, KvDType, LinearStateSlabs, MhaPool};
 use crate::infrastructure::torch::{DevTensor, Device, bf16_tensor, f32_tensor, to_f32_vec};
 
 #[derive(Debug, thiserror::Error)]
@@ -907,6 +908,11 @@ pub struct TorchQwen3_6 {
     /// widens a routed expert slab itself. `None` keeps the inline host path,
     /// which is what `kernel.triton = false` still runs.
     moe: Option<std::sync::Arc<dyn MoEExecutor>>,
+    /// The paged attention launcher, when this device can run it. The device
+    /// decode path reads each row's KV window straight out of the pool through
+    /// this instead of materializing it; `None` keeps the dense gather, which is
+    /// what a CPU device (decision 21) and a bf16 pool use.
+    attention: Option<std::sync::Arc<PagedAttention>>,
     /// The KV cache this forward reads and writes, when the engine gave it one.
     /// The engine keeps a clone of the same allocation to hand out page tables.
     cache: Option<std::sync::Arc<DeviceCache>>,
@@ -935,6 +941,7 @@ impl TorchQwen3_6 {
         index: std::sync::Arc<FtwIndex>,
         reader: std::sync::Arc<dyn WeightsReader>,
         moe: Option<std::sync::Arc<dyn MoEExecutor>>,
+        attention: Option<std::sync::Arc<PagedAttention>>,
         cache: std::sync::Arc<DeviceCache>,
     ) -> Result<Self> {
         let ld = Loader {
@@ -1060,6 +1067,7 @@ impl TorchQwen3_6 {
             index,
             reader,
             moe,
+            attention,
             cache: Some(cache),
         })
     }
@@ -1182,7 +1190,7 @@ impl TorchQwen3_6 {
         positions: &Tensor,
         access: &CacheAccess<'_>,
         pool: &MhaPool,
-    ) -> Tensor {
+    ) -> Result<Tensor> {
         let (q, k, v, gate) = self.project_attention(fa, x, positions);
         let t = k.size()[0];
         let attn = match access {
@@ -1195,12 +1203,29 @@ impl TorchQwen3_6 {
                 out_locs, kv_locs, ..
             } => {
                 pool.store_at(layer, out_locs, &k, &v);
-                let (k_all, v_all) = pool.gather_rows(layer, kv_locs);
-                attention_cached_pos(&q, &k_all, &v_all, positions)
+                // The paged kernel reads each row's window straight out of the
+                // pool; the dense gather is the fallback for a CPU device or a
+                // pool dtype the cubin was not built for.
+                match (&self.attention, pool.dtype()) {
+                    (Some(attn), KvDType::F32) => {
+                        let (qh, hd) = (q.size()[1], q.size()[2]);
+                        let out = Tensor::zeros([t, qh, hd], (Kind::Float, q.device()));
+                        let (k_ptr, v_ptr) = pool.kv_slab_ptrs(layer);
+                        // SAFETY: every address is a live device allocation in
+                        // the launcher's context (the pool and the step's own
+                        // buffers), and `locs` names the tokens the pool holds.
+                        unsafe { attn.decode(&q, &out, k_ptr, v_ptr, kv_locs, positions) }?;
+                        out.reshape([t, qh * hd])
+                    }
+                    _ => {
+                        let (k_all, v_all) = pool.gather_rows(layer, kv_locs);
+                        attention_cached_pos(&q, &k_all, &v_all, positions)
+                    }
+                }
             }
         };
         let gated = attn * sigmoid(&gate);
-        fa.o.apply(&gated)
+        Ok(fa.o.apply(&gated))
     }
 
     fn gdn(&self, gdn: &GatedDeltaNet, x: &Tensor) -> Tensor {
@@ -1607,7 +1632,7 @@ impl TorchQwen3_6 {
             let h1 = rms_norm(&xsum, &layer.input_norm, p.rms_norm_eps);
             let mixer_out = match &layer.mixer {
                 Mixer::Full(fa) => {
-                    self.full_attention_cached(li, fa, &h1, positions, access, slab.mha())
+                    self.full_attention_cached(li, fa, &h1, positions, access, slab.mha())?
                 }
                 Mixer::Linear(gdn) => self.gdn_cached(li, gdn, &h1, access, slab.state()),
             };

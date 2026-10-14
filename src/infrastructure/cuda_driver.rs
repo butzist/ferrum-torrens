@@ -17,7 +17,9 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
-use crate::infrastructure::kernel_abi::{Abi, Kernel, StagingAbi, StagingKernel};
+use crate::infrastructure::kernel_abi::{
+    Abi, AttentionAbi, AttentionKernel, Kernel, StagingAbi, StagingKernel,
+};
 
 #[derive(Debug, Error)]
 pub enum CudaError {
@@ -750,8 +752,93 @@ impl CudaKernels {
     }
 }
 
+/// The committed paged attention cubin, loaded and ready to launch. Separate
+/// from `CudaKernels` and `StagingKernels` because it is a third contract
+/// (decision 60): one program per (row, q_head) with the head count baked in,
+/// so its launch grid is computed per call rather than fixed in the manifest.
+pub struct AttentionKernels {
+    driver: Arc<Driver>,
+    abi: AttentionAbi,
+    loaded: Vec<(CUmodule, FunctionTable)>,
+}
+
+// SAFETY: as `CudaKernels`: the handles are immutable once `load` returns and
+// the driver behind them is thread-safe.
+unsafe impl Send for AttentionKernels {}
+unsafe impl Sync for AttentionKernels {}
+
+impl AttentionKernels {
+    /// Load every attention kernel in `abi` from the committed cubins.
+    pub fn load(driver: Arc<Driver>, abi: AttentionAbi) -> Result<Self, CudaError> {
+        let mut loaded = Vec::new();
+        for name in AttentionAbi::kernel_names() {
+            let image = crate::infrastructure::kernel_abi::attention_cubin(name)
+                .map_err(|e| CudaError::Driver(format!("cubin: {e}")))?;
+            let module = driver.load_module(image)?;
+            let kernel = abi
+                .kernel(name)
+                .map_err(|e| CudaError::Driver(format!("attention abi: {e}")))?;
+            // SAFETY: `module` was just loaded by `driver`, whose context is
+            // current on this thread.
+            let f = unsafe { driver.function(module, &kernel.entry)? };
+            let mut table = FunctionTable::default();
+            table.push(kernel.name, f);
+            loaded.push((module, table));
+        }
+        Ok(Self {
+            driver,
+            abi,
+            loaded,
+        })
+    }
+
+    pub fn abi(&self) -> &AttentionAbi {
+        &self.abi
+    }
+
+    fn function(&self, kernel: &AttentionKernel) -> Result<CUfunction, CudaError> {
+        for (_, table) in &self.loaded {
+            if let Some(f) = table.get(kernel.name) {
+                return Ok(f);
+            }
+        }
+        Err(CudaError::Driver(format!(
+            "no loaded function for {}",
+            kernel.name
+        )))
+    }
+
+    /// Launch an attention kernel on `grid` with the block its manifest entry
+    /// recorded.
+    ///
+    /// # Safety
+    /// `stream` must belong to the context that is current on this thread, and
+    /// `params` must be the `kernel_abi` pack for this same kernel.
+    pub unsafe fn launch(
+        &self,
+        kernel: &AttentionKernel,
+        grid: (u32, u32, u32),
+        params: &mut [*mut c_void],
+        stream: CUstream,
+    ) -> Result<(), CudaError> {
+        let f = self.function(kernel)?;
+        // SAFETY: `f` came from this type's own `load`, so it is live in the
+        // driver's current context, and the grid comes from `kernel_abi`.
+        unsafe {
+            self.driver.launch(
+                f,
+                grid,
+                (kernel.block_threads(), 1, 1),
+                kernel.shared,
+                stream,
+                params,
+            )
+        }
+    }
+}
+
 /// The committed staging cubins (`lru_ensure`, `index_copy`), loaded and ready
-/// to launch. Separate from `CudaKernels` because they are a separate ABI
+/// to launch. Separate from `CudaKernels` because it is a separate ABI
 /// (decision 46): fixed grids, their own constexprs, no `n`/`block` tile.
 pub struct StagingKernels {
     driver: Arc<Driver>,
