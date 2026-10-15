@@ -242,11 +242,11 @@ fn graph_batch_sizes(max_running: usize) -> Vec<usize> {
 }
 
 /// The device KV cache the engine hands page tables out from: `[kv]` sizes it,
-/// one state slot per request the scheduler may run at once.
-///
-/// f32 KV, because the cached forward's contract is to reproduce a re-fed
-/// forward, and this is the lossless option. TODO.md decision 33 keeps the
-/// narrower serving dtypes for when VRAM is the binding constraint.
+/// one state slot per request the scheduler may run at once, and `[kv] dtype`
+/// picks the element type. The default `bf16` is half of f32, which is what lets
+/// the 4.51 GiB resident tower and the pool coexist on the 8 GB device; `f32`
+/// stays available because the cached forward's contract is to reproduce a
+/// re-fed forward and that is the lossless option (TODO.md decision 33).
 #[cfg(feature = "cuda")]
 fn kv_cache(
     config: &crate::config::Config,
@@ -254,11 +254,18 @@ fn kv_cache(
     device: Device,
     reserve_padding: bool,
 ) -> crate::infrastructure::kvcache_dev::DeviceCache {
+    use crate::config::KvDtype;
     use crate::infrastructure::kvcache_dev::{DeviceCache, KvDType};
+    let dtype = match config.kv.dtype {
+        KvDtype::F32 => KvDType::F32,
+        KvDtype::Bf16 => KvDType::BFloat16,
+        // Refused at config validation; a real dtype never reaches here.
+        KvDtype::Fp8 => unreachable!("kv.dtype = fp8 is rejected at config validation"),
+    };
     // The captured service reserves one state slot for its dummy padding row, so
     // the pool is one wider than the scheduler's cap.
     let slots = config.model.max_running_requests + usize::from(reserve_padding);
-    DeviceCache::new(params, config.kv_tokens(), slots, KvDType::F32, device)
+    DeviceCache::new(params, config.kv_tokens(), slots, dtype, device)
 }
 
 /// The engine's MoE port for `kernel.triton = true`: the driver-API adapter over

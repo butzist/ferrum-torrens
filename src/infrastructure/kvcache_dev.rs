@@ -178,12 +178,16 @@ impl MhaPool {
 
     fn gather_indexed(&self, layer: usize, idx: &Tensor) -> (Tensor, Tensor) {
         let slab = self.slab(layer);
+        // Gathers are always f32: the attention math and the paged-kernel
+        // fallback read f32, and a narrower pool stores bf16 only to save bytes.
+        // Upcasting bf16 -> f32 is exact.
         let half = |h: i64| -> Tensor {
             self.kv
                 .select(0, h)
                 .select(0, slab)
                 .index_select(0, idx)
                 .squeeze_dim(1)
+                .to_kind(Kind::Float)
         };
         (half(0), half(1))
     }
@@ -582,6 +586,11 @@ mod tests {
         let k = f32_tensor(&want, &[2, 2, 4], auto_device());
         pool.store(0, &[4, 6], &k, &k);
         let (gk, _) = pool.gather(0, &[4, 6]);
+        assert_eq!(
+            gk.kind(),
+            Kind::Float,
+            "a bf16 pool must gather back as f32 for the attention math"
+        );
         assert_eq!(
             to_f32_vec(&gk),
             to_f32_vec(&k.to_kind(Kind::BFloat16)),

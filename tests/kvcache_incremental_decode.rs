@@ -34,7 +34,7 @@ const DECODE_STEPS: usize = 4;
 
 fn model() -> Box<dyn CachedModel> {
     let config = ferrum_torrens::config::Config::from_str(&format!(
-        "[model]\npath = \".model-cache\"\n[kv]\nnum_tokens = {}\n",
+        "[model]\npath = \".model-cache\"\n[kv]\nnum_tokens = {}\ndtype = \"f32\"\n",
         PROMPT.len() + DECODE_STEPS + 8
     ))
     .unwrap();

@@ -489,8 +489,11 @@ sequenceDiagram
 domain, and the engine decodes off per-request page tables, but the server does
 not yet commit finished prefixes into the radix tree for cross-request reuse;
 `hybrid_radix` GDN-state donation is `[TODO]` (MVP keeps cold per-request GDN
-states). f32 KV is the correctness dtype; fp8/bf16 `kv_cache_dtype` is `[TODO]`
-and is the lever when VRAM binds.
+states). KV is f32 or bf16: `[kv] dtype` picks it and the default is bf16 (half
+the bytes; the lever when VRAM binds), while `fp8` -- the checkpoint's declared
+`kv_cache_quant_algo` -- is still `[TODO]`. Gathers always return f32, so the
+attention math is dtype-agnostic and the f32-only paged decode kernel is skipped
+for a bf16 pool.
 
 ### 3.7 Scheduler and sampling `[core]`
 

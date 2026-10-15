@@ -158,11 +158,26 @@ pub struct Kernel {
     pub triton: bool,
 }
 
+/// `[kv] dtype`. `fp8` is the checkpoint's declared `kv_cache_quant_algo`, but no
+/// fp8 KV path exists yet, so it is refused rather than silently downgraded; the
+/// serving default is `bf16` (half the bytes of f32, which is what lets the
+/// resident tower and the pool fit the 8 GB device together).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum KvDtype {
+    F32,
+    #[default]
+    Bf16,
+    Fp8,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Kv {
     pub num_pages: Option<usize>,
     pub num_tokens: Option<usize>,
+    #[serde(default)]
+    pub dtype: KvDtype,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -286,6 +301,11 @@ impl Config {
             }
         } else {
             kv.num_pages = Some(DEFAULT_NUM_TOKENS);
+        }
+        if kv.dtype == KvDtype::Fp8 {
+            return Err(err(
+                "kv.dtype = \"fp8\" is not implemented yet; use \"bf16\" or \"f32\"",
+            ));
         }
 
         let s = &self.sampling;
@@ -495,6 +515,46 @@ num_tokens = 4096
         assert_eq!(c.kv.num_tokens, Some(4096));
         assert_eq!(c.kv.num_pages, None);
         assert_eq!(c.kv_tokens(), 4096);
+    }
+
+    #[test]
+    fn kv_dtype_defaults_to_bf16_for_serving() {
+        let c = Config::from_str("[model]\npath = \"/tmp/Qwen.ftw\"").unwrap();
+        assert_eq!(c.kv.dtype, KvDtype::Bf16);
+    }
+
+    #[test]
+    fn kv_dtype_reads_explicit_f32_and_bf16() {
+        let c = Config::from_str(
+            r#"[model]
+path = "/tmp/Qwen.ftw"
+[kv]
+dtype = "f32"
+"#,
+        )
+        .unwrap();
+        assert_eq!(c.kv.dtype, KvDtype::F32);
+        let c = Config::from_str(
+            r#"[model]
+path = "/tmp/Qwen.ftw"
+[kv]
+dtype = "bf16"
+"#,
+        )
+        .unwrap();
+        assert_eq!(c.kv.dtype, KvDtype::Bf16);
+    }
+
+    #[test]
+    fn kv_dtype_fp8_is_rejected_until_implemented() {
+        let r = Config::from_str(
+            r#"[model]
+path = "/tmp/Qwen.ftw"
+[kv]
+dtype = "fp8"
+"#,
+        );
+        assert!(r.is_err(), "fp8 KV has no implementation yet");
     }
 
     #[test]

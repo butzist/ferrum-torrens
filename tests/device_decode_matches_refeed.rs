@@ -34,6 +34,17 @@ const PROMPT: [u32; 7] = [248044, 19593, 48128, 16, 2177, 42, 42];
 const DECODE_STEPS: usize = 3;
 
 fn model(num_pages: usize, num_slots: usize) -> (TorchQwen3_6, Arc<DeviceCache>, usize) {
+    model_with_dtype(num_pages, num_slots, KvDType::F32)
+}
+
+/// The serving pool is `bf16` by default (`config::KvDtype`); this lets the
+/// device-path gate run on either dtype. A bf16 pool falls back from the f32-only
+/// paged kernel to the dense padded-window gather (decision 60).
+fn model_with_dtype(
+    num_pages: usize,
+    num_slots: usize,
+    dtype: KvDType,
+) -> (TorchQwen3_6, Arc<DeviceCache>, usize) {
     let device = auto_device();
     let cfg: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(format!("{FTW_DIR}/config.json")).unwrap())
@@ -41,11 +52,7 @@ fn model(num_pages: usize, num_slots: usize) -> (TorchQwen3_6, Arc<DeviceCache>,
     let params = parse_text_config(cfg.get("text_config").unwrap()).unwrap();
     let vocab = params.vocab_size;
     let cache = Arc::new(DeviceCache::new(
-        &params,
-        num_pages,
-        num_slots,
-        KvDType::F32,
-        device,
+        &params, num_pages, num_slots, dtype, device,
     ));
     let ix = Arc::new(
         FtwIndex::parse(
@@ -174,6 +181,72 @@ fn a_device_decode_step_matches_refeeding_the_whole_prefix() {
 
     cache.end(&mut cached);
     assert_eq!(cached.cached(), 0, "ending a request gives its pages back");
+    assert_eq!(cache.available(), cache.num_pages());
+}
+
+/// The serving KV dtype is bf16. The cached decode must still land on the same
+/// token as a re-fed f32 forward: bf16 only rounds K/V on store, and the f32
+/// attention math reads them back upcast (a bf16 pool falls back from the
+/// f32-only paged kernel to the dense window gather).
+///
+/// The *logits* are not expected to match the f32 re-fed forward: storing K/V as
+/// bf16 is a deliberate precision loss (the checkpoint itself serves fp8 KV),
+/// and over this prompt it moves the worst logit by ~13% of scale while the
+/// argmax, which is what greedy serving reads, stays fixed at every step. The
+/// loose bound is a safety net against an addressing regression, which would
+/// blow past it, not a parity claim.
+#[test]
+#[ignore = "requires converted checkpoint in .model-cache"]
+#[serial]
+fn a_bf16_pool_device_decode_matches_refeeding_the_whole_prefix() {
+    let (m, cache, vocab) = model_with_dtype(PROMPT.len() + DECODE_STEPS + 8, 4, KvDType::BFloat16);
+    assert_eq!(cache.mha().dtype(), KvDType::BFloat16);
+    let window = PROMPT.len() + DECODE_STEPS;
+    let bufs = DecodeBuffers::new(1, vocab, window, auto_device());
+    let mut cached = cache.begin();
+
+    let mut last = Vec::new();
+    for chunk in [3usize, 4] {
+        let start = cached.cached();
+        cache.reserve(&mut cached, chunk).unwrap();
+        last = m
+            .forward_cached(&input_at(&PROMPT[start..start + chunk], start), &mut cached)
+            .unwrap();
+    }
+
+    let mut tokens: Vec<u32> = PROMPT.to_vec();
+    for _ in 0..DECODE_STEPS {
+        let next = argmax(&last) as u32;
+        tokens.push(next);
+        let dev = decode_step(&m, &cache, &mut cached, &bufs, next);
+        let whole = m.forward(&input(&tokens));
+        assert_eq!(
+            argmax(&dev),
+            argmax(&whole),
+            "bf16 pool argued with the re-fed forward at {}",
+            tokens.len() - 1
+        );
+        let scale = whole.iter().fold(0.0f32, |acc, v| acc.max(v.abs()));
+        let diff = dev
+            .iter()
+            .zip(&whole)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max)
+            / scale;
+        assert!(
+            diff < 2.5e-1,
+            "bf16 pool drifted from the re-fed forward at {}: {diff:.3e} of scale",
+            tokens.len() - 1
+        );
+        eprintln!(
+            "bf16 device decode at {}: argmax {} ok, max|dlogit|/scale = {diff:.3e}",
+            tokens.len() - 1,
+            argmax(&dev)
+        );
+        last = dev;
+    }
+
+    cache.end(&mut cached);
     assert_eq!(cache.available(), cache.num_pages());
 }
 
