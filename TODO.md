@@ -773,7 +773,12 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
     is validated against (ALGORITHM.md 2.3.1 is the other oracle), and as the
     implementation used when the `cuda` feature is off. It is *not* the path we
     ship and never will be (decision 14). `tests/ftw_real_forward.rs` (gated)
-    keeps it honest: finite, deterministic, plausible argmax.
+    keeps it honest: finite, deterministic, plausible argmax. Status (decision
+    13): the scalar reference is a *consistency check*, not an absolute ground
+    truth -- it was wrong against FreeToken before the libtorch port (id 33974 vs
+    11751), so the `ftw_cross_check` agreement proves the libtorch path computes
+    the same thing as the scalar path, not FreeToken parity beyond the one pinned
+    token. Keep that distinction when reading the cross-check.
 13. **RESOLVED-BY-ABANDONMENT: the scalar forward does not match FreeToken
     (2026-09-30)** -- a live FreeToken 0.1.3 GPU server on `127.0.0.1:1919` is the
     oracle. For `"The capital of France is"` greedy it returns `" Paris, a"`
@@ -2130,6 +2135,25 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
     - **Why a new input.** jailed-agents does not re-export its transitive
       `llm-agents` packages, so the flake names the source directly. This whole
       change is one commit, revertible on its own.
+
+63. **The committed-cubin check is a script, and it caught a debug-only drift**
+    (2026-10-15) -- section 8 item 4.
+    - **What.** `scripts/check-kernels.sh` runs `kernel-compile-check` plus
+      `aot.py --check` in the devShell (no GPU). It strips the C++ libtorch from
+      `LD_LIBRARY_PATH` for the check, because a `--features cuda` devShell puts
+      it there and the toolchain's python torch then loads the wrong
+      `libtorch_python.so` (`undefined symbol: _PyThreadState_UncheckedGet`).
+      `AGENTS.md` points at the script for any `python/ferrum_kernel/` or
+      `kernel/` change until real CI lands.
+    - **The finding.** Running it reported `kernel/index_copy.cubin` STALE while
+      `index_copy.ptx` was byte-for-byte identical. The fresh build was
+      deterministic (two `emit()` runs equal) and only 6 bytes differed from the
+      committed cubin, in two copies of the same 5-byte value inside the DWARF
+      line table. So the code was identical and only debug metadata drifted
+      (neither the store path -- there are none in this PTX -- nor the source
+      mtime, which `os.utime` proved is not embedded). `kernel-aot` rewrote just
+      that one file and the check is green: 7 cubins up to date. The GPU-qualified
+      PTX is untouched, so no gated gate needs a rerun.
 
 ### Config defaults for the RTX 5060 / 8 GB target
 

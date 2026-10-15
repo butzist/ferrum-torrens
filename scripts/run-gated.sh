@@ -9,11 +9,12 @@
 #
 # The cap has to clear address space, not resident bytes: RLIMIT_AS counts the
 # 20.3 GiB shard mapping, the CUDA device VA, libtorch's own mappings and the
-# 4.51 GiB of resident tower weights (decision 40). Measured VmPeak on
-# `one_token_prediction_matches_the_oracle` with `--features cuda` is 42 GiB
-# while VmRSS is 5.8 GiB, so the cap is 48 GiB: it still catches an accidental
-# whole-bank widening (16.9 GiB of anonymous growth) without mistaking mapped
-# file and device memory for a leak. Override with FT_MEM_CAP_GIB.
+# 4.51 GiB of resident tower weights (decision 40). The cap is 64 GiB: it still
+# catches an accidental whole-bank widening (16.9 GiB of anonymous growth)
+# without mistaking mapped file and device memory for a leak. It was lowered from
+# a measured 42 GiB VmPeak (VmRSS 5.8 GiB) to 48 GiB in decision 41, then raised
+# to 64 when the captured decode graphs and the paged-attention launcher (decision
+# 61) added device VA. Override with FT_MEM_CAP_GIB.
 #
 # Usage: scripts/run-gated.sh [--release] [--features <list>] <test-name> [-- args]
 #   scripts/run-gated.sh --release one_token_prediction_matches_the_oracle

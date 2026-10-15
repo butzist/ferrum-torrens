@@ -6,6 +6,12 @@
 // implementations print the same per-layer l2/amax lines, so a divergence can
 // be pinned to the first layer and stage that disagrees. Both must land on the
 // oracle token 11751 with logits within 5% of each other.
+//
+// Caveat (decision 13): the scalar reference is a consistency check, not an
+// absolute ground truth. It was wrong against FreeToken before the libtorch port
+// (id 33974 vs 11751) and is kept only as an independent implementation to
+// cross-check the libtorch path. Agreement here proves the two paths compute the
+// same thing, not parity with FreeToken beyond the single pinned token.
 
 use ferrum_torrens::application::registry::{build, build_scalar};
 use ferrum_torrens::domain::model::ForwardInput;
