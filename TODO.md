@@ -1,6 +1,6 @@
 # FerrumTorrens -- FreeToken MVP port to Rust: TODO
 
-Status (2026-10-15): M2 (API) current, late M3 in practice. This pass closed the Tier-1 hardening (scalar-oracle note, one-stream debug_assert, `serial_test`, `scripts/check-kernels.sh`, OpenAI compat fields) and the serving-memory blocker (KV now defaults to bf16, decision 64), so a default config fits the 8 GiB device. Section 8's item 7 (radix wiring) is **blocked**: for a 30-GDN/10-attention tower, prefix reuse is zero without GDN snapshot donation (decision 65), so the only actionable remaining item is 8 (prefill MoE device-staged path + overlap), which is large. Earlier: M2 (API) current; M3 prerequisite 4 (device staging: lru_ensure + index_copy + pinned banks + wiring) complete, and decision 40's capture work advances: decision 49 gives the fixed-address `DecodeBuffers` batch-metadata staging, decision 50 settles the mempool -- torch's graph pool behind a tiny C++ bridge, with `tests/cuda_graph_torch_probe.rs` green on the device -- and the forward's output tail is now a device-logits step (`forward_cached_into`, no host round-trip). The decode step's inputs are now staged off the buffers (decision 54: `forward_decode_into`; only device tensors address the cache), attention gathers a fixed-length padded window (decision 55), and the gated `tests/device_decode_matches_refeed.rs` proves the device path equals the re-fed host forward at ~1e-6 on the real checkpoint. The MoE staging split is out of the captured path (decision 56: a resident E2M1 table and an on-device rope table remove the last host uploads), and the gated `tests/decode_graph_capture.rs` now captures one whole real decode step and replays it equal to the uncaptured twin. The device decode is now batch-generic (decision 58): `forward_decode_into` runs every row of `DecodeBuffers`, and the gated `a_batched_decode_step_matches_n_single_row_steps` pins a batch-3 step to three single-row steps on the real checkpoint. The per-batch-size executables are landed (decision 59): `infrastructure/decode_graph.rs` captures one `DecodeGraph` (its own private pool and fixed-address buffers) per size and a `DecodeGraphSet` picks the smallest captured size that fits and pads with dummy rows, and the gated `tests/decode_graph_capture.rs::a_captured_batch_decode_step_replays_equal_to_an_uncaptured_step` replays batch `{1,2,4}` equal to the uncaptured twin on the real checkpoint. Remaining in P1: the engine-owned allocation of the buffers and graphs (the "pinned batch-metadata staging" line) and `max_running` in the captured set -- both now landed (decision 61): the composition root (`application/registry.rs`) creates the non-legacy side stream, builds the MoE and attention ports on it, sizes the pool `max_running_requests + 1` for the reserved dummy padding row, captures `{1,2,4,max_running}` and hands `Engine::with_captured` the service; `model.cuda_graph` turns it on, and the generation loop replays the smallest graph that fits. The gated `tests/engine_real_generate.rs::a_captured_engine_decodes_on_its_graphs` reaches the oracle token through the captured batch-1 graph, which closes P1. The paged GQA decode attention kernel is now authored and AOT-registered (decision 60): `python/ferrum_kernel/attention.py`, a new `attention` manifest section and `AttentionAbi`, the interpreter selftest against the torch oracle at ~1e-7 and the ABI units green; the driver-API launcher (`infrastructure/cuda_attention.rs`), the `MhaPool` paged gather and the forward wiring are landed too, and the gated `tests/device_decode_matches_refeed.rs` and `tests/decode_graph_capture.rs` prove the paged device step equals the re-fed forward and replays from a captured graph at batch `{1,2,4}` on the real checkpoint. Decision 36 is
+Status (2026-10-15): M2 (API) current, late M3 in practice. This pass closed the Tier-1 hardening (scalar-oracle note, one-stream debug_assert, `serial_test`, `scripts/check-kernels.sh`, OpenAI compat fields) and the serving-memory blocker (KV now defaults to bf16, decision 64), so a default config fits the 8 GiB device. Section 8's item 7 (radix wiring) is **blocked**: for a 30-GDN/10-attention tower, prefix reuse is zero without GDN snapshot donation (decision 65). Item 8's **slice 1 landed** (decision 66): prefill now runs the device-staged MoE path (chunked over the `BLOCK_K` route cap) and no longer falls back to the host plan; slice 2 (copy/compute overlap) is budget-blocked on the 8 GiB target. Earlier: M2 (API) current; M3 prerequisite 4 (device staging: lru_ensure + index_copy + pinned banks + wiring) complete, and decision 40's capture work advances: decision 49 gives the fixed-address `DecodeBuffers` batch-metadata staging, decision 50 settles the mempool -- torch's graph pool behind a tiny C++ bridge, with `tests/cuda_graph_torch_probe.rs` green on the device -- and the forward's output tail is now a device-logits step (`forward_cached_into`, no host round-trip). The decode step's inputs are now staged off the buffers (decision 54: `forward_decode_into`; only device tensors address the cache), attention gathers a fixed-length padded window (decision 55), and the gated `tests/device_decode_matches_refeed.rs` proves the device path equals the re-fed host forward at ~1e-6 on the real checkpoint. The MoE staging split is out of the captured path (decision 56: a resident E2M1 table and an on-device rope table remove the last host uploads), and the gated `tests/decode_graph_capture.rs` now captures one whole real decode step and replays it equal to the uncaptured twin. The device decode is now batch-generic (decision 58): `forward_decode_into` runs every row of `DecodeBuffers`, and the gated `a_batched_decode_step_matches_n_single_row_steps` pins a batch-3 step to three single-row steps on the real checkpoint. The per-batch-size executables are landed (decision 59): `infrastructure/decode_graph.rs` captures one `DecodeGraph` (its own private pool and fixed-address buffers) per size and a `DecodeGraphSet` picks the smallest captured size that fits and pads with dummy rows, and the gated `tests/decode_graph_capture.rs::a_captured_batch_decode_step_replays_equal_to_an_uncaptured_step` replays batch `{1,2,4}` equal to the uncaptured twin on the real checkpoint. Remaining in P1: the engine-owned allocation of the buffers and graphs (the "pinned batch-metadata staging" line) and `max_running` in the captured set -- both now landed (decision 61): the composition root (`application/registry.rs`) creates the non-legacy side stream, builds the MoE and attention ports on it, sizes the pool `max_running_requests + 1` for the reserved dummy padding row, captures `{1,2,4,max_running}` and hands `Engine::with_captured` the service; `model.cuda_graph` turns it on, and the generation loop replays the smallest graph that fits. The gated `tests/engine_real_generate.rs::a_captured_engine_decodes_on_its_graphs` reaches the oracle token through the captured batch-1 graph, which closes P1. The paged GQA decode attention kernel is now authored and AOT-registered (decision 60): `python/ferrum_kernel/attention.py`, a new `attention` manifest section and `AttentionAbi`, the interpreter selftest against the torch oracle at ~1e-7 and the ABI units green; the driver-API launcher (`infrastructure/cuda_attention.rs`), the `MhaPool` paged gather and the forward wiring are landed too, and the gated `tests/device_decode_matches_refeed.rs` and `tests/decode_graph_capture.rs` prove the paged device step equals the re-fed forward and replays from a captured graph at batch `{1,2,4}` on the real checkpoint. Decision 36 is
 done end to end: the serving path is Python-free. The sm_120 cubins are
 committed under `kernel/` with an ABI manifest, `infrastructure/kernel_abi.rs`
 packs the launch arguments and checks them against the committed PTX,
@@ -618,9 +618,9 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 - [x] P0 `ensure_experts` (LRU): rewrite routed ids -> slot ids in place; emit miss list; LRU victim = argmin(usage) with same-step owner protection (an expert used earlier in this step may not be evicted).
 - [x] P0 device-side staging kernels ported to `python/ferrum_kernel/offload.py` (`ensure_experts` LRU + `index_copy_multi` fused multi-bank copy, fixed-shape, decision 44); Python oracle compared in `selftest.py --interp`, sm_120 compile check green. AOT registration is done (decision 46), the pinned host banks are done (decision 47), and the device slot-table mirror plus `CudaMoE` wiring are done (decision 48).
 - [x] P0 `copy_missing`: fused copy of all banks' missed rows on the compute stream (serial per step). `CudaMoE::grouped_moe_staged` drives `lru_ensure` then `index_copy` over the pinned banks, and `CachedExperts` prefers it for any step that fits the cubin's route cap (decision 48).
-- [ ] P0 **prefill MoE device-staged path (LARGEST REMAINING PERF GAP).** Decode already runs `grouped_moe_staged` (`lru_ensure` + `index_copy` over the pinned banks), but prefill routes through `run_experts` + `ExpertCache` + `FtwBanks`, which reads all 16.93 GiB of expert banks serially on the host; `CachedExperts::with_device_staging` only prefers the staged path while `tokens * top_k <= staged_route_cap()` (the committed `lru_ensure` bakes `BLOCK_K = 128`, decision 48). Land `materialize_layer` / a prefill-capable staged kernel (`prefill_overlap` two-buffer, copy stream + ready/release events, layer+1 prefetch) guarded by `cache_size >= 2*E`, so time-to-first-token stops being host-plan-bound. Large; depends on decisions 44/46/48 (staging infra, already landed).
+- [x] P0 **prefill MoE device-staged path, slice 1: chunked staged prefill (2026-10-15).** The committed `lru_ensure` dedups first-occurrences in one CTA, so `BLOCK_K = 128` is a route cap (decision 44/48). `CudaMoE::grouped_moe_staged` now chunks the route list by tokens (`staged_chunk_tokens`), runs `lru_ensure` + `index_copy` + the four kernels per chunk with the device LRU and pinned banks carried across, and `CachedExperts` with device staging uses it for every step (prefill included) instead of falling back to the host plan. So the router's ids and the misses never leave the device for prefill. Gate: `tests/cuda_moe_matches_reference.rs::a_chunked_prefill_step_matches_the_host_plan` runs 512 routes (4x the cap) and matches the host plan byte for byte on the real checkpoint. Remaining below: the copy/compute **overlap** half.
 - [x] P0 `cache_size_slots` explicit from config; floor `>= num_experts`. (floor enforced in `application::engine::load_engine`)
-- [ ] P0 prefill double-buffer and decode path must not clobber each other (begin_prefill fence). Lands with the prefill staged path above.
+- [ ] P0 **prefill overlap (slice 2).** Two full-layer buffers + a copy stream and ready/release events so layer `l+1`'s whole-layer expert stream overlaps layer `l`'s compute (FreeToken's `materialize_layer` + `prefill_overlap`), guarded by `cache_size_slots >= 2*num_experts`. Budget note: two 256-expert buffers are ~0.85 GiB, which does not fit the 8 GiB target beside the resident tower and the bf16 KV default, so this needs either a smaller KV pool or a shared-buffer design; decide before building. Also the `begin_prefill` fence so a prefill buffer swap and the decode path cannot clobber each other. Large; depends on decisions 44/46/48 and slice 1 above.
 
 ### KV cache + radix
 - [x] P0 MHA paged pool `[2, num_full_layers, num_pages, page_size, kv_heads, head_dim]` with global-layer->dense-index remap (only 10 full layers get slabs). (`infrastructure/kvcache_dev.rs`, decision 33)
@@ -693,15 +693,15 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
   prefix. Done: the engine decodes off the KV page table, the paged GQA decode
   kernel is live (decision 60), and CUDA-graph decode is owned by the engine
   (decision 61: per-batch-size graphs over a side stream, gated by
-  `a_captured_engine_decodes_on_its_graphs`). Remaining M3: the prefill MoE
-  device-staged path, which is the largest perf gap (section 8 item 8). The
-  former **serving blocker** (memory: an f32 KV default did not fit the device)
-  is closed: KV now defaults to bf16 (decision 64), so a default config fits.
-  The radix prefix cache moved to M5: it is meaningless without GDN snapshot
-  donation (decision 65).
-- **M4 offload**: LRU slot cache + fused copy (DONE, decisions 42-48) + prefill
-  double buffer (the prefill device-staged path, section 8 item 8); batch
-  concurrency.
+  `a_captured_engine_decodes_on_its_graphs`). The prefill MoE now runs the
+  device-staged path (slice 1, decision 66); its copy/compute overlap (slice 2)
+  is budget-blocked. The former **serving blocker** (memory: an f32 KV default
+  did not fit the device) is closed: KV now defaults to bf16 (decision 64), so a
+  default config fits. The radix prefix cache moved to M5: it is meaningless
+  without GDN snapshot donation (decision 65).
+- **M4 offload**: LRU slot cache + fused copy + chunked staged prefill (DONE,
+  decisions 42-48, 66) + prefill copy/compute overlap (slice 2, budget-blocked);
+  batch concurrency.
 - **M5**: optional `/v1/responses`, hybrid_radix GDN snapshot donation (which is
   what makes the radix prefix cache real, decision 65), startup load tuning.
 
@@ -2203,6 +2203,38 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
       feature" and "the feature is meaningless without its second currency", and
       it re-ranks item 7 out of the actionable backlog.
 
+66. **Prefill chunks the staged route list instead of falling back to the host**
+    (2026-10-15) -- section 8 item 8, slice 1.
+    - **Why the host fallback existed.** `lru_ensure` computes first-occurrences
+      with an `O(BLOCK_K^2)` pairwise compare inside one CTA (decision 44), so it
+      bakes `BLOCK_K = 128` as a hard route cap. A prefill routes up to
+      `max_prefill_length * top_k` (thousands), which does not fit, so
+      `CachedExperts` fell back to `run_experts` + `ExpertCache` + `FtwBanks` --
+      the host plan, which reads the router's ids back and pages the mmap.
+    - **What changed.** `CudaMoE::grouped_moe_staged` chunks the route list by
+      tokens (one chunk = `BLOCK_K / top_k` tokens) and runs
+      `lru_ensure` -> `index_copy` -> the four kernels per chunk. The device LRU,
+      the slot banks and the pinned banks carry across chunks, so an expert an
+      earlier chunk made resident is a hit in a later one; each chunk's reduce
+      lands in its own output rows. `CachedExperts` with device staging now
+      always uses this path, prefill included. `staged_chunk_tokens` is the pure,
+      CPU-tested planner.
+    - **Why chunking is correct, not just convenient.** The slot floor is
+      `cache_size_slots >= num_experts`, so one layer's experts all fit and no
+      chunk can evict an expert another chunk of the same layer still needs; the
+      cross-layer LRU is unchanged from decode. Outputs are per-row, so a chunked
+      reduce is the same arithmetic as one launch (the GEMV grid already scales
+      with routes).
+    - **Cost, honest.** This removes the host crossing, not the PCIe volume: a
+      cold prefill still streams the experts it needs from the pinned banks. The
+      overlap that hides that copy behind compute is slice 2, and it is budget-
+      blocked on the 8 GiB target (two full-layer buffers are ~0.85 GiB).
+    - **Gate.** `tests/cuda_moe_matches_reference.rs::a_chunked_prefill_step_matches_the_host_plan`
+      runs 512 routes (4x `BLOCK_K`) over 256 experts through the full adapter
+      with device staging on the real checkpoint and asserts the output is byte
+      for byte the host plan's. `cargo test` 264, `--features cuda` 355 + the
+      real-checkpoint CPU test, `fmt`/`clippy` clean.
+
 ### Config defaults for the RTX 5060 / 8 GB target
 
 ```
@@ -2243,14 +2275,12 @@ performance work.
    tombstones), which is large/P2; `match_req`/`cache_req` wiring rides with it.
 
 **Tier 3 -- large performance (the only actionable remaining tier):**
-8. Prefill MoE device-staged path + `prefill_overlap` (MoE offload cache) --
-   largest remaining gap. The committed `lru_ensure` is a decode-shaped kernel:
-   `BLOCK_K = 128` because it dedups first-occurrences with an `O(BLOCK_K^2)`
-   pairwise compare in one CTA, so a prefill's thousands of routes fall back to
-   the host plan (`run_experts` + `FtwBanks`). Needs a route-parallel kernel for
-   large K (or a route-chunked staged path, which needs a `MoETensor` sub-slice
-   the port does not have yet) plus the two-buffer copy/compute overlap. Large;
-   depends on the landed staging infra (decisions 44/46/48).
+8. Prefill MoE path (MoE offload cache) -- **slice 1 DONE (2026-10-15)**, the
+   chunked staged prefill (decision 66). Prefill no longer falls back to the host
+   plan. **Slice 2 remaining:** the copy/compute `prefill_overlap` (two full-layer
+   buffers + a copy stream + events), which needs a VRAM decision first (two
+   ~0.43 GiB buffers do not fit the 8 GiB target beside the tower and bf16 KV).
+   Large; depends on the landed staging infra (decisions 44/46/48).
 
 ### State of play
 

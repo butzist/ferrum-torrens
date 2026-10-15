@@ -422,7 +422,7 @@ sequenceDiagram
   participant CP as index_copy (device)
   participant GEMM as grouped GEMM (device)
   M->>CE: execute_device(layer, x, expert ids, weights, out)
-  CE->>CM: grouped_moe_staged (if tokens*top_k <= staged_route_cap)
+  CE->>CM: grouped_moe_staged (every step when staging is on)
   CM->>LRU: rewrite dense ids -> slot ids, emit miss/victim plan
   CM->>CP: copy missed expert rows from pinned host banks
   CM->>GEMM: gate_up GEMV -> silu_mul -> down GEMV -> sum_reduce
@@ -430,13 +430,18 @@ sequenceDiagram
   CE-->>M: routed sum
 ```
 
-If a step is past the cubin's baked route cap (large prefill), `CachedExperts`
-falls back to the host plan (`run_experts` + `ExpertCache` + `FtwBanks`), and the
-two residency states are reset on every path transition.
+`lru_ensure` dedups first-occurrences in one CTA, so its committed `BLOCK_K = 128`
+is a route cap. `CudaMoE::grouped_moe_staged` chunks a larger list by tokens
+(`staged_chunk_tokens`) and repeats the sequence per chunk, the device LRU and
+the pinned banks carrying across, so prefill uses the same device path as decode
+(decision 66). `CachedExperts` without device staging still takes the host plan
+(`run_experts` + `ExpertCache` + `FtwBanks`).
 
 `[TODO]` Prefill double-buffered whole-layer streaming and the
 `prefill_overlap` two-buffer path (`cache_size_slots >= 2*num_experts`) are not
-implemented; prefill currently takes the host plan.
+implemented; the copy half of the prefill step is not yet overlapped with
+compute, and the two whole-layer buffers do not fit the 8 GB target beside the
+tower and the default bf16 KV pool.
 
 ### 3.6 KV cache, radix, and GDN state `[core]` (radix wired into serving `[partial]`)
 
@@ -487,9 +492,12 @@ sequenceDiagram
 
 `[TODO]`/`[partial]`: the radix tree is implemented and unit-tested in the
 domain, and the engine decodes off per-request page tables, but the server does
-not yet commit finished prefixes into the radix tree for cross-request reuse;
-`hybrid_radix` GDN-state donation is `[TODO]` (MVP keeps cold per-request GDN
-states). KV is f32 or bf16: `[kv] dtype` picks it and the default is bf16 (half
+not commit prefixes into it. That is deliberate, not just unfinished: for this
+30-GDN/10-attention tower a match is only reusable up to the deepest node with a
+live GDN state snapshot, so KV-only reuse is zero value (decision 65). The
+`[TODO]` that makes radix real is `hybrid_radix` GDN-state donation
+(donate-not-copy, dual refcounts, restore on match); the MVP keeps cold
+per-request GDN states. KV is f32 or bf16: `[kv] dtype` picks it and the default is bf16 (half
 the bytes; the lever when VRAM binds), while `fp8` -- the checkpoint's declared
 `kv_cache_quant_algo` -- is still `[TODO]`. Gathers always return f32, so the
 attention math is dtype-agnostic and the f32-only paged decode kernel is skipped
