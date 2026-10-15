@@ -253,7 +253,7 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 
 ## 7. Decisions
 
-The full log of confirmed decisions (numbers 1..66, stable -- code, tests and
+The full log of confirmed decisions (numbers 1..67, stable -- code, tests and
 `ARCHITECTURE.md` reference them by number) lives in `DONE.md`. This section
 lists only the decisions that still bind open work; everything else there is
 history.
