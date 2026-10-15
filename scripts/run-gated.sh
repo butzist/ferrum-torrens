@@ -67,7 +67,7 @@ if [[ -z "$target" ]]; then
   exit 2
 fi
 
-cap_gib="${FT_MEM_CAP_GIB:-48}"
+cap_gib="${FT_MEM_CAP_GIB:-64}"
 cap_kb=$((cap_gib * 1024 * 1024))
 
 cargo_args=("--profile=$profile" --test "$target" --no-run --message-format=json)
