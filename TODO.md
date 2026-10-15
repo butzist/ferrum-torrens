@@ -1,6 +1,6 @@
 # FerrumTorrens -- FreeToken MVP port to Rust: TODO
 
-Status (2026-10-15): M2 (API) current, late M3 in practice. This pass closed the Tier-1 hardening (scalar-oracle note, one-stream debug_assert, `serial_test`, `scripts/check-kernels.sh`, OpenAI compat fields) and the serving-memory blocker (KV now defaults to bf16, decision 64), so a default config fits the 8 GiB device. Next in section 8: wiring the radix prefix cache into the generation loop (item 7), then the prefill MoE device-staged path (item 8). Earlier: M2 (API) current; M3 prerequisite 4 (device staging: lru_ensure + index_copy + pinned banks + wiring) complete, and decision 40's capture work advances: decision 49 gives the fixed-address `DecodeBuffers` batch-metadata staging, decision 50 settles the mempool -- torch's graph pool behind a tiny C++ bridge, with `tests/cuda_graph_torch_probe.rs` green on the device -- and the forward's output tail is now a device-logits step (`forward_cached_into`, no host round-trip). The decode step's inputs are now staged off the buffers (decision 54: `forward_decode_into`; only device tensors address the cache), attention gathers a fixed-length padded window (decision 55), and the gated `tests/device_decode_matches_refeed.rs` proves the device path equals the re-fed host forward at ~1e-6 on the real checkpoint. The MoE staging split is out of the captured path (decision 56: a resident E2M1 table and an on-device rope table remove the last host uploads), and the gated `tests/decode_graph_capture.rs` now captures one whole real decode step and replays it equal to the uncaptured twin. The device decode is now batch-generic (decision 58): `forward_decode_into` runs every row of `DecodeBuffers`, and the gated `a_batched_decode_step_matches_n_single_row_steps` pins a batch-3 step to three single-row steps on the real checkpoint. The per-batch-size executables are landed (decision 59): `infrastructure/decode_graph.rs` captures one `DecodeGraph` (its own private pool and fixed-address buffers) per size and a `DecodeGraphSet` picks the smallest captured size that fits and pads with dummy rows, and the gated `tests/decode_graph_capture.rs::a_captured_batch_decode_step_replays_equal_to_an_uncaptured_step` replays batch `{1,2,4}` equal to the uncaptured twin on the real checkpoint. Remaining in P1: the engine-owned allocation of the buffers and graphs (the "pinned batch-metadata staging" line) and `max_running` in the captured set -- both now landed (decision 61): the composition root (`application/registry.rs`) creates the non-legacy side stream, builds the MoE and attention ports on it, sizes the pool `max_running_requests + 1` for the reserved dummy padding row, captures `{1,2,4,max_running}` and hands `Engine::with_captured` the service; `model.cuda_graph` turns it on, and the generation loop replays the smallest graph that fits. The gated `tests/engine_real_generate.rs::a_captured_engine_decodes_on_its_graphs` reaches the oracle token through the captured batch-1 graph, which closes P1. The paged GQA decode attention kernel is now authored and AOT-registered (decision 60): `python/ferrum_kernel/attention.py`, a new `attention` manifest section and `AttentionAbi`, the interpreter selftest against the torch oracle at ~1e-7 and the ABI units green; the driver-API launcher (`infrastructure/cuda_attention.rs`), the `MhaPool` paged gather and the forward wiring are landed too, and the gated `tests/device_decode_matches_refeed.rs` and `tests/decode_graph_capture.rs` prove the paged device step equals the re-fed forward and replays from a captured graph at batch `{1,2,4}` on the real checkpoint. Decision 36 is
+Status (2026-10-15): M2 (API) current, late M3 in practice. This pass closed the Tier-1 hardening (scalar-oracle note, one-stream debug_assert, `serial_test`, `scripts/check-kernels.sh`, OpenAI compat fields) and the serving-memory blocker (KV now defaults to bf16, decision 64), so a default config fits the 8 GiB device. Section 8's item 7 (radix wiring) is **blocked**: for a 30-GDN/10-attention tower, prefix reuse is zero without GDN snapshot donation (decision 65), so the only actionable remaining item is 8 (prefill MoE device-staged path + overlap), which is large. Earlier: M2 (API) current; M3 prerequisite 4 (device staging: lru_ensure + index_copy + pinned banks + wiring) complete, and decision 40's capture work advances: decision 49 gives the fixed-address `DecodeBuffers` batch-metadata staging, decision 50 settles the mempool -- torch's graph pool behind a tiny C++ bridge, with `tests/cuda_graph_torch_probe.rs` green on the device -- and the forward's output tail is now a device-logits step (`forward_cached_into`, no host round-trip). The decode step's inputs are now staged off the buffers (decision 54: `forward_decode_into`; only device tensors address the cache), attention gathers a fixed-length padded window (decision 55), and the gated `tests/device_decode_matches_refeed.rs` proves the device path equals the re-fed host forward at ~1e-6 on the real checkpoint. The MoE staging split is out of the captured path (decision 56: a resident E2M1 table and an on-device rope table remove the last host uploads), and the gated `tests/decode_graph_capture.rs` now captures one whole real decode step and replays it equal to the uncaptured twin. The device decode is now batch-generic (decision 58): `forward_decode_into` runs every row of `DecodeBuffers`, and the gated `a_batched_decode_step_matches_n_single_row_steps` pins a batch-3 step to three single-row steps on the real checkpoint. The per-batch-size executables are landed (decision 59): `infrastructure/decode_graph.rs` captures one `DecodeGraph` (its own private pool and fixed-address buffers) per size and a `DecodeGraphSet` picks the smallest captured size that fits and pads with dummy rows, and the gated `tests/decode_graph_capture.rs::a_captured_batch_decode_step_replays_equal_to_an_uncaptured_step` replays batch `{1,2,4}` equal to the uncaptured twin on the real checkpoint. Remaining in P1: the engine-owned allocation of the buffers and graphs (the "pinned batch-metadata staging" line) and `max_running` in the captured set -- both now landed (decision 61): the composition root (`application/registry.rs`) creates the non-legacy side stream, builds the MoE and attention ports on it, sizes the pool `max_running_requests + 1` for the reserved dummy padding row, captures `{1,2,4,max_running}` and hands `Engine::with_captured` the service; `model.cuda_graph` turns it on, and the generation loop replays the smallest graph that fits. The gated `tests/engine_real_generate.rs::a_captured_engine_decodes_on_its_graphs` reaches the oracle token through the captured batch-1 graph, which closes P1. The paged GQA decode attention kernel is now authored and AOT-registered (decision 60): `python/ferrum_kernel/attention.py`, a new `attention` manifest section and `AttentionAbi`, the interpreter selftest against the torch oracle at ~1e-7 and the ABI units green; the driver-API launcher (`infrastructure/cuda_attention.rs`), the `MhaPool` paged gather and the forward wiring are landed too, and the gated `tests/device_decode_matches_refeed.rs` and `tests/decode_graph_capture.rs` prove the paged device step equals the re-fed forward and replays from a captured graph at batch `{1,2,4}` on the real checkpoint. Decision 36 is
 done end to end: the serving path is Python-free. The sm_120 cubins are
 committed under `kernel/` with an ABI manifest, `infrastructure/kernel_abi.rs`
 packs the launch arguments and checks them against the committed PTX,
@@ -630,9 +630,9 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 - [x] P0 page free-list (`free_slots` holds page bases) + per-req page table holding **token locations** + dummy row pointing at a sentinel page. (`domain/kvcache.rs`)
 - [x] P0 radix prefix tree: walk by first-page-key, `std::mismatch`-comparison align-down to page, node split, insert, LRU evict (unlocked leaf only), ref-counted handles. (`domain/kvcache.rs`, page_size=1)
 - [x] P0 **KV dtype serving-safe (SERVING BLOCKER).** Done 2026-10-15. `[kv] dtype = "f32" | "bf16"` (`fp8` refused at validation until a path exists) now picks the pool element type in `registry::kv_cache`; the default is `bf16`, which halves the pool, so the 4.51 GiB resident tower and the default `num_tokens = 131072` pool (2.5 GiB) fit the 7.53 GiB device. `MhaPool::gather*` now always returns f32 (upcasting bf16 on read), which is what lets the f32 attention math and the dense padded-window fallback consume a bf16 pool; the f32-only paged kernel still serves f32 pools. Measured on the device: `a_bf16_pool_device_decode_matches_refeeding_the_whole_prefix` keeps the greedy token equal to the f32 re-fed forward at every step with a worst logit shift of ~13% of scale (bf16 K/V rounding; the checkpoint itself serves fp8 KV). Gated f32 gates are pinned `dtype = "f32"` where they assert exact numerics (decision 64).
-- [ ] P0 prefill flow: `match_req` -> lock -> allocate_paged -> compute/store kv -> `cache_req` commit (unfinished rows re-point at canonical tree pages). The radix `RadixIndex` is implemented and unit-tested in `domain/kvcache.rs` but the generation loop does not call `match_req`/`cache_req`, so completed prefixes are never committed and no cross-request hit happens (`ARCHITECTURE.md ss3.6` `[partial]`). Wiring this is the main long-context KV leverage point. Depends on the KV dtype item above (a real pool budget) and touches `application/generation.rs`. Medium-large.
+- [ ] **BLOCKED on the GDN snapshot donation below.** prefill flow: `match_req` -> lock -> allocate_paged -> compute/store kv -> `cache_req` commit. Audited 2026-10-15: for this 30-GDN/10-attention tower, KV-only reuse is **zero value** and must not be wired alone. FreeToken's `HybridRadixCache.match_prefix` walks to the deepest node that owns a **live GDN state snapshot** and truncates `cached_len` to it; with no snapshot anywhere it returns `cached_len = 0, mamba_value = None` (cold), i.e. no reuse. A request cannot resume attention K/V without the matching GDN recurrence, so committing KV pages alone would either reuse nothing or (if forced) compute the GDN state from zero and produce wrong output. Wiring `match_req`/`cache_req` is therefore part of the hybrid feature, not a standalone item.
 - [x] P0 GDN linear-state pool: free-slot bookkeeping (conv-state + recurrent fp32 rows are infra tensors); ping-pong live slots and restore land with the hybrid path.
-- [ ] [opt] hybrid_radix full feature: donate GDN snapshot at chunk boundary (x64 alignment), dual (full+mamba) refcounts, dual eviction (tombstones). Without it, fall back to radix-KV-only + always-cold GDN state.
+- [ ] [opt] hybrid_radix full feature (the real radix enabler): donate the GDN state slot at a page/chunk-aligned boundary node, dual (full+mamba) ref-counts and dual eviction (tombstones), then wire `match_req`/`cache_req` and the snapshot restore into the generation loop. FreeToken mirrors `MambaRadixCache` (donate-not-copy, `full_ref >= mamba_ref`, deepest-live-snapshot truncation). P2/large; without it the MVP correctly does no cross-request reuse.
 
 ### Scheduler
 - [x] P0 in-process tokenize/detokenize.
@@ -693,16 +693,17 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
   prefix. Done: the engine decodes off the KV page table, the paged GQA decode
   kernel is live (decision 60), and CUDA-graph decode is owned by the engine
   (decision 61: per-batch-size graphs over a side stream, gated by
-  `a_captured_engine_decodes_on_its_graphs`). Remaining M3: the radix prefix
-  cache wired into the generation loop (section 8 item 7), and the prefill MoE
-  device-staged path, which is the largest perf gap (item 8). The former
-  **serving blocker** (memory: an f32 KV default did not fit the device) is
-  closed: KV now defaults to bf16 (decision 64), so a default config fits.
+  `a_captured_engine_decodes_on_its_graphs`). Remaining M3: the prefill MoE
+  device-staged path, which is the largest perf gap (section 8 item 8). The
+  former **serving blocker** (memory: an f32 KV default did not fit the device)
+  is closed: KV now defaults to bf16 (decision 64), so a default config fits.
+  The radix prefix cache moved to M5: it is meaningless without GDN snapshot
+  donation (decision 65).
 - **M4 offload**: LRU slot cache + fused copy (DONE, decisions 42-48) + prefill
-  double buffer (the prefill device-staged path, section 8 item 8); radix
-  prefix cache wired to the running server (item 7); batch concurrency.
-- **M5**: optional `/v1/responses`, hybrid_radix GDN reuse, startup
-  load tuning.
+  double buffer (the prefill device-staged path, section 8 item 8); batch
+  concurrency.
+- **M5**: optional `/v1/responses`, hybrid_radix GDN snapshot donation (which is
+  what makes the radix prefix cache real, decision 65), startup load tuning.
 
 ## 7. Decisions (confirmed)
 
@@ -2179,6 +2180,29 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
       runs the bf16 default at load. The decode-graph gates build their own
       `DeviceCache` and stay f32.
 
+65. **The radix prefix cache cannot be wired without GDN snapshot donation**
+    (2026-10-15) -- a correction to section 8's "radix not wired" gap.
+    - **The claim that did not survive the reference.** The section 8 item said
+      wiring `match_req`/`cache_req` is the main long-context leverage point. For
+      Qwen3.6 it is not: `HybridRadixCache.match_prefix`
+      (`FreeToken/.../kvcache/hybrid_radix_cache.py`) walks to the deepest node
+      that owns a **live GDN state snapshot** (`node.mamba_value`) and truncates
+      `cached_len` to that boundary; with no snapshot anywhere it returns
+      `cached_len = 0, mamba_value = None`. So an ordinary finished request that
+      donated only KV pages yields **no reuse**: the next request still prefills
+      from zero. Attention K/V alone cannot resume the GDN recurrence, and a cold
+      GDN start would produce wrong logits, so wiring the tree KV-only is either
+      inert or incorrect.
+    - **Consequence for the plan.** The P0 "prefill flow" item is folded into the
+      `[opt] hybrid_radix` feature (donate a GDN state slot at a page/chunk
+      boundary node, dual refcounts and tombstones, restore on match), which is
+      P2/large. The MVP correctly does no cross-request reuse until then. The
+      current behaviours that stay: the per-request `SequenceCache` reuse across
+      decode steps, and re-feeding when a forward has no cache.
+    - **Why record it.** It is the difference between "we forgot to wire a
+      feature" and "the feature is meaningless without its second currency", and
+      it re-ranks item 7 out of the actionable backlog.
+
 ### Config defaults for the RTX 5060 / 8 GB target
 
 ```
@@ -2211,12 +2235,22 @@ performance work.
 6. KV dtype serving-safe (KV cache + radix) -- **DONE (2026-10-15)**. `[kv] dtype`
    with a bf16 default; measured ~13% logit shift at stable greedy argmax
    (decision 64).
-7. Radix prefix cache wired into the generation loop (KV cache + radix) --
-   medium-large, depends on 6 (now landed) for a real pool budget.
+7. Radix prefix cache in the generation loop -- **BLOCKED, re-ranked (2026-10-15)**.
+   KV-only reuse is zero value for a 30-GDN/10-attention tower: FreeToken's
+   `HybridRadixCache` truncates a match to the deepest node with a **live GDN
+   state snapshot**, so without snapshot donation `cached_len = 0`. The real item
+   is the `[opt] hybrid_radix` GDN donation (donate-not-copy, dual refcounts,
+   tombstones), which is large/P2; `match_req`/`cache_req` wiring rides with it.
 
-**Tier 3 -- large performance:**
+**Tier 3 -- large performance (the only actionable remaining tier):**
 8. Prefill MoE device-staged path + `prefill_overlap` (MoE offload cache) --
-   largest remaining gap, depends on the landed staging infra (decisions 44/46/48).
+   largest remaining gap. The committed `lru_ensure` is a decode-shaped kernel:
+   `BLOCK_K = 128` because it dedups first-occurrences with an `O(BLOCK_K^2)`
+   pairwise compare in one CTA, so a prefill's thousands of routes fall back to
+   the host plan (`run_experts` + `FtwBanks`). Needs a route-parallel kernel for
+   large K (or a route-chunked staged path, which needs a `MoETensor` sub-slice
+   the port does not have yet) plus the two-buffer copy/compute overlap. Large;
+   depends on the landed staging infra (decisions 44/46/48).
 
 ### State of play
 
