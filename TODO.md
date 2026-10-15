@@ -1,6 +1,6 @@
 # FerrumTorrens -- FreeToken MVP port to Rust: TODO
 
-Status: M2 (API) current; M3 prerequisite 4 (device staging: lru_ensure + index_copy + pinned banks + wiring) complete, and decision 40's capture work advances: decision 49 gives the fixed-address `DecodeBuffers` batch-metadata staging, decision 50 settles the mempool -- torch's graph pool behind a tiny C++ bridge, with `tests/cuda_graph_torch_probe.rs` green on the device -- and the forward's output tail is now a device-logits step (`forward_cached_into`, no host round-trip). The decode step's inputs are now staged off the buffers (decision 54: `forward_decode_into`; only device tensors address the cache), attention gathers a fixed-length padded window (decision 55), and the gated `tests/device_decode_matches_refeed.rs` proves the device path equals the re-fed host forward at ~1e-6 on the real checkpoint. The MoE staging split is out of the captured path (decision 56: a resident E2M1 table and an on-device rope table remove the last host uploads), and the gated `tests/decode_graph_capture.rs` now captures one whole real decode step and replays it equal to the uncaptured twin. The device decode is now batch-generic (decision 58): `forward_decode_into` runs every row of `DecodeBuffers`, and the gated `a_batched_decode_step_matches_n_single_row_steps` pins a batch-3 step to three single-row steps on the real checkpoint. The per-batch-size executables are landed (decision 59): `infrastructure/decode_graph.rs` captures one `DecodeGraph` (its own private pool and fixed-address buffers) per size and a `DecodeGraphSet` picks the smallest captured size that fits and pads with dummy rows, and the gated `tests/decode_graph_capture.rs::a_captured_batch_decode_step_replays_equal_to_an_uncaptured_step` replays batch `{1,2,4}` equal to the uncaptured twin on the real checkpoint. Remaining in P1: the engine-owned allocation of the buffers and graphs (the "pinned batch-metadata staging" line) and `max_running` in the captured set -- both now landed (decision 61): the composition root (`application/registry.rs`) creates the non-legacy side stream, builds the MoE and attention ports on it, sizes the pool `max_running_requests + 1` for the reserved dummy padding row, captures `{1,2,4,max_running}` and hands `Engine::with_captured` the service; `model.cuda_graph` turns it on, and the generation loop replays the smallest graph that fits. The gated `tests/engine_real_generate.rs::a_captured_engine_decodes_on_its_graphs` reaches the oracle token through the captured batch-1 graph, which closes P1. The paged GQA decode attention kernel is now authored and AOT-registered (decision 60): `python/ferrum_kernel/attention.py`, a new `attention` manifest section and `AttentionAbi`, the interpreter selftest against the torch oracle at ~1e-7 and the ABI units green; the driver-API launcher (`infrastructure/cuda_attention.rs`), the `MhaPool` paged gather and the forward wiring are landed too, and the gated `tests/device_decode_matches_refeed.rs` and `tests/decode_graph_capture.rs` prove the paged device step equals the re-fed forward and replays from a captured graph at batch `{1,2,4}` on the real checkpoint. Decision 36 is
+Status (2026-10-15): M2 (API) current, late M3 in practice. The serving blocker is memory, not speed: the 4.51 GiB resident tower plus an f32 KV default do not fit the 8 GiB device (section 8 item 6). This pass closed the precomputed-rope, HF->FTW conversion and abort items, and folded the progress review's gaps into the milestone checkboxes; section 8 records the work order. Next status was: M2 (API) current; M3 prerequisite 4 (device staging: lru_ensure + index_copy + pinned banks + wiring) complete, and decision 40's capture work advances: decision 49 gives the fixed-address `DecodeBuffers` batch-metadata staging, decision 50 settles the mempool -- torch's graph pool behind a tiny C++ bridge, with `tests/cuda_graph_torch_probe.rs` green on the device -- and the forward's output tail is now a device-logits step (`forward_cached_into`, no host round-trip). The decode step's inputs are now staged off the buffers (decision 54: `forward_decode_into`; only device tensors address the cache), attention gathers a fixed-length padded window (decision 55), and the gated `tests/device_decode_matches_refeed.rs` proves the device path equals the re-fed host forward at ~1e-6 on the real checkpoint. The MoE staging split is out of the captured path (decision 56: a resident E2M1 table and an on-device rope table remove the last host uploads), and the gated `tests/decode_graph_capture.rs` now captures one whole real decode step and replays it equal to the uncaptured twin. The device decode is now batch-generic (decision 58): `forward_decode_into` runs every row of `DecodeBuffers`, and the gated `a_batched_decode_step_matches_n_single_row_steps` pins a batch-3 step to three single-row steps on the real checkpoint. The per-batch-size executables are landed (decision 59): `infrastructure/decode_graph.rs` captures one `DecodeGraph` (its own private pool and fixed-address buffers) per size and a `DecodeGraphSet` picks the smallest captured size that fits and pads with dummy rows, and the gated `tests/decode_graph_capture.rs::a_captured_batch_decode_step_replays_equal_to_an_uncaptured_step` replays batch `{1,2,4}` equal to the uncaptured twin on the real checkpoint. Remaining in P1: the engine-owned allocation of the buffers and graphs (the "pinned batch-metadata staging" line) and `max_running` in the captured set -- both now landed (decision 61): the composition root (`application/registry.rs`) creates the non-legacy side stream, builds the MoE and attention ports on it, sizes the pool `max_running_requests + 1` for the reserved dummy padding row, captures `{1,2,4,max_running}` and hands `Engine::with_captured` the service; `model.cuda_graph` turns it on, and the generation loop replays the smallest graph that fits. The gated `tests/engine_real_generate.rs::a_captured_engine_decodes_on_its_graphs` reaches the oracle token through the captured batch-1 graph, which closes P1. The paged GQA decode attention kernel is now authored and AOT-registered (decision 60): `python/ferrum_kernel/attention.py`, a new `attention` manifest section and `AttentionAbi`, the interpreter selftest against the torch oracle at ~1e-7 and the ABI units green; the driver-API launcher (`infrastructure/cuda_attention.rs`), the `MhaPool` paged gather and the forward wiring are landed too, and the gated `tests/device_decode_matches_refeed.rs` and `tests/decode_graph_capture.rs` prove the paged device step equals the re-fed forward and replays from a captured graph at batch `{1,2,4}` on the real checkpoint. Decision 36 is
 done end to end: the serving path is Python-free. The sm_120 cubins are
 committed under `kernel/` with an ABI manifest, `infrastructure/kernel_abi.rs`
 packs the launch arguments and checks them against the committed PTX,
@@ -330,16 +330,16 @@ prefill double-buffer path active.
 Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]** intended but undecided / optional.
 
 ### Conversion (one-time, python)
-- [ ] P0 `scripts/convert_hf_to_ftw.py`: runs `ft checkpoint --model <hf_dir> --out <ftw> --moe-backend offload` inside a python/uv env; asserts `quant_format == "nvfp4"` and arch `Qwen3_5MoeForCausalLM` in the FTW index before returning.
+- [x] P0 `scripts/convert_hf_to_ftw.py`: runs `ft checkpoint --model <hf_dir> --out <ftw> --moe-backend offload` inside a python/uv env; asserts `quant_format == "nvfp4"` and arch `Qwen3_5MoeForCausalLM` in the FTW index before returning. It locates `ft` (FreeToken venv, then `PATH`, then `--ft-bin`), builds the loader env, runs the conversion and validates `format`/`quant_format`/`config.json` arch; `--check-only` validates an existing FTW dir (verified against `.model-cache`).
 - [ ] P0 note: running the converter requires building FreeToken once (torch + flashinfer + nvcc deps, see `FreeToken/README.md`). If that is undesirable on the target machine, a standalone converter (safetensors -> FTW) is a P2 fallback; it does not change the Rust side because FTW is the input format either way.
 
 ### Weights / model load
 - [x] P0 `ftw.rs`: parse `freetoken_weight.json` (schema: `format="freetoken_weight"`, `version=1`, `align=4096`, `shards[]` with `file/global_off/nbytes`, `tensors[]` with `name/kind/dtype/shape/global_off/nbytes`).
 - [x] P0 mmap all `freetoken-NNNNN.ftw` shards; resolve per-tensor `global_off -> (shard, offset)` (`MmapFtwReader`: memmap2, `WeightsReader` port, `pieces()` split).
 - [x] P0 load & cast dense weights to GPU: embeddings, all tensor projections + norms + router (bf16), lm_head. Gemma norms: bake `w+1.0` at load. (Done, decision 41: one widen at load into 4.51 GiB resident bf16, block-windowed so the host holds one 4096-row window; `lm_head` narrows the resident tensor per `LM_HEAD_BLOCK`, the embedding gathers off it, and neither path reads the checkpoint again -- `a_dense_projection_is_widened_at_load_and_apply_never_reads_again` counts the reads.)
-- [ ] P0 GDN fp32 params (`A_log`, `dt_bias`) kept fp32; biased/linear projections per checkpoint quant.
-- [ ] P0 expert host banks from per-layer FTW entries (`gate_up_packed#L`, `gate_up_scale#L`, `gate_up_global#L`, `down_*#L`) read serially into pinned host buffers; keep a GPU-resident `[L*E]` set for the fp16 global alphas. The pinned host side is done (decision 47): `FtwPinnedBanks` allocates one device-mapped page-locked region per bank and fills every layer via `read_bank_layer`; the GPU-resident `[L*E]` alpha set is still open.
-- [ ] P0 precompute partial-Neox rope cos/sin cache on device up to `max_seq_len`.
+- [x] P0 GDN fp32 params (`A_log`, `dt_bias`) kept fp32; biased/linear projections per checkpoint quant. Audited 2026-10-15: the FTW stores both as `bfloat16` (checked in `freetoken_weight.json`), so `forward_torch` loads them with `bf16_vec` and upcasts to f32 for `exp`/`softplus` (`gdn_cached`); the fp32 state dtype is `mamba_ssm_dtype` (decision 33), independent of the param dtype. No fp32 params to preserve.
+- [x] P0 expert host banks from per-layer FTW entries (`gate_up_packed#L`, `gate_up_scale#L`, `gate_up_global#L`, `down_*#L`) read serially into pinned host buffers; keep a GPU-resident `[L*E]` set for the fp16 global alphas. The pinned host side is done (decision 47): `FtwPinnedBanks` allocates one device-mapped page-locked region per bank and fills every layer via `read_bank_layer`. Audited 2026-10-15: the globals are one of the six `BANKS` and are staged into the per-slot device banks by `index_copy` (same path as packed/scale), so `grouped_moe_staged` reads a real global per resident expert; the separate `[L*E]` resident table is not needed and is dropped from the design.
+- [x] P0 precompute partial-Neox rope cos/sin cache on device up to `max_seq_len`. `precompute_rope_cache` builds `[max_len, 1, half]` cos/sin tables once at load into `TorchQwen3_6::{rope_cos,rope_sin}`; `full_attention_cached` `index_select`s them by the device position tensor and `apply_rope_cos_sin` applies the rotation. GDN layers carry no positional embedding, so only the 10 full-attention layers rope; the cached table is the only rope path. `precomputed_rope_matches_dynamic_partial_rope` pins it to the old dynamic form.
 - [ ] P1 load dense weights via the 4096-aligned O_DIRECT-friendly path (preadv) to cut startup, or rely on mmap page-in; decide.
 
 ### GPU runtime
@@ -618,9 +618,9 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 - [x] P0 `ensure_experts` (LRU): rewrite routed ids -> slot ids in place; emit miss list; LRU victim = argmin(usage) with same-step owner protection (an expert used earlier in this step may not be evicted).
 - [x] P0 device-side staging kernels ported to `python/ferrum_kernel/offload.py` (`ensure_experts` LRU + `index_copy_multi` fused multi-bank copy, fixed-shape, decision 44); Python oracle compared in `selftest.py --interp`, sm_120 compile check green. AOT registration is done (decision 46), the pinned host banks are done (decision 47), and the device slot-table mirror plus `CudaMoE` wiring are done (decision 48).
 - [x] P0 `copy_missing`: fused copy of all banks' missed rows on the compute stream (serial per step). `CudaMoE::grouped_moe_staged` drives `lru_ensure` then `index_copy` over the pinned banks, and `CachedExperts` prefers it for any step that fits the cubin's route cap (decision 48).
-- [ ] P0 prefill: `materialize_layer` per-layer full stream; `prefill_overlap` two-buffer (copy stream + ready/release events, layer+1 prefetch) guarded by `cache_size >= 2*E`.
+- [ ] P0 **prefill MoE device-staged path (LARGEST REMAINING PERF GAP).** Decode already runs `grouped_moe_staged` (`lru_ensure` + `index_copy` over the pinned banks), but prefill routes through `run_experts` + `ExpertCache` + `FtwBanks`, which reads all 16.93 GiB of expert banks serially on the host; `CachedExperts::with_device_staging` only prefers the staged path while `tokens * top_k <= staged_route_cap()` (the committed `lru_ensure` bakes `BLOCK_K = 128`, decision 48). Land `materialize_layer` / a prefill-capable staged kernel (`prefill_overlap` two-buffer, copy stream + ready/release events, layer+1 prefetch) guarded by `cache_size >= 2*E`, so time-to-first-token stops being host-plan-bound. Large; depends on decisions 44/46/48 (staging infra, already landed).
 - [x] P0 `cache_size_slots` explicit from config; floor `>= num_experts`. (floor enforced in `application::engine::load_engine`)
-- [ ] P0 prefill double-buffer and decode path must not clobber each other (begin_prefill fence).
+- [ ] P0 prefill double-buffer and decode path must not clobber each other (begin_prefill fence). Lands with the prefill staged path above.
 
 ### KV cache + radix
 - [x] P0 MHA paged pool `[2, num_full_layers, num_pages, page_size, kv_heads, head_dim]` with global-layer->dense-index remap (only 10 full layers get slabs). (`infrastructure/kvcache_dev.rs`, decision 33)
@@ -629,7 +629,8 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 - [x] P0 the engine decodes off the page table: one `SequenceCache` per request, opened on its first step and released when it finishes; a forward without a cache keeps re-feeding and must produce the same tokens (`application/generation.rs`).
 - [x] P0 page free-list (`free_slots` holds page bases) + per-req page table holding **token locations** + dummy row pointing at a sentinel page. (`domain/kvcache.rs`)
 - [x] P0 radix prefix tree: walk by first-page-key, `std::mismatch`-comparison align-down to page, node split, insert, LRU evict (unlocked leaf only), ref-counted handles. (`domain/kvcache.rs`, page_size=1)
-- [ ] P0 prefill flow: `match_req` -> lock -> allocate_paged -> compute/store kv -> `cache_req` commit (unfinished rows re-point at canonical tree pages).
+- [ ] P0 **KV dtype serving-safe (SERVING BLOCKER).** `MhaPool` is built `KvDType::F32` unconditionally (`registry::kv_cache`), so the config default `num_pages = 131072` alone is 5.0 GiB and, with the 4.51 GiB resident tower, does not fit the 7.53 GiB device; only the gated tests (which size their own `kv.num_tokens`) can run. `KvDType::BFloat16` already exists and `MhaPool` stores/gathers in it (unit-tested), and the device decode arm already falls back to the dense padded-window gather when the pool is not f32 (decision 60: the paged cubin is f32-only). Do: add a `[kv] dtype = "f32" | "bf16"` field (default `bf16` for serving; `fp8` refused until a kernel exists), thread it into `registry::kv_cache`, and re-green the two gated decode gates on a bf16 pool. Medium, no cross-milestone dependency; unblocks running the engine outside a harness.
+- [ ] P0 prefill flow: `match_req` -> lock -> allocate_paged -> compute/store kv -> `cache_req` commit (unfinished rows re-point at canonical tree pages). The radix `RadixIndex` is implemented and unit-tested in `domain/kvcache.rs` but the generation loop does not call `match_req`/`cache_req`, so completed prefixes are never committed and no cross-request hit happens (`ARCHITECTURE.md ss3.6` `[partial]`). Wiring this is the main long-context KV leverage point. Depends on the KV dtype item above (a real pool budget) and touches `application/generation.rs`. Medium-large.
 - [x] P0 GDN linear-state pool: free-slot bookkeeping (conv-state + recurrent fp32 rows are infra tensors); ping-pong live slots and restore land with the hybrid path.
 - [ ] [opt] hybrid_radix full feature: donate GDN snapshot at chunk boundary (x64 alignment), dual (full+mamba) refcounts, dual eviction (tombstones). Without it, fall back to radix-KV-only + always-cold GDN state.
 
@@ -638,12 +639,12 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 - [x] P0 `POST /v1/completions` (non-stream, n=1, `cmpl-{uid}` ids, usage block, `spawn_blocking` for the forward), `GET /v1/models`, `GET /health`. (`infrastructure/http.rs`, `main.rs`)
 - [x] P0 SSE framing `data: {json}\n\n` + `data: [DONE]`; usage block. (both `/v1/completions` and `/v1/chat/completions`)
 - [x] P0 streaming (`stream: true`): one frame per sampled token as it is produced (`generation::TokenSink`), a frame with the finish reason and the usage, then `[DONE]`; a bad prompt is still a JSON error with its status, a client that hangs up aborts the run, a slow one holds it back. (`infrastructure/http.rs`)
-- [ ] P0 `presence_penalty`/`frequency_penalty`/`best_of`/`user` still 400 (`deny_unknown_fields`).
+- [ ] P1 accept `presence_penalty`/`frequency_penalty`/`best_of`/`user` instead of 400. `deny_unknown_fields` rejects them today, so a drop-in OpenAI client that sends even the defaults fails; `unsupported_openai_fields_return_400_via_deny_unknown_fields` pins the current behavior. Accept `presence_penalty`/`frequency_penalty` and apply them to the logits row before sampling (needs the request's generated history threaded into `SamplingParams`/`sample`), accept-and-ignore `best_of` (n=1) and `user` (logging only). Small, no cross-milestone dependency.
 - [x] P0 strict prefill-priority `schedule_next_batch()`; chunked prefill budget `max_prefill_length`; no decode starvation guard in v0 (mirror FreeToken, note as known issue). (simple M1 form in `domain/scheduler.rs`)
 - [x] P0 decode batch sorted by uid (deterministic).
 - [x] P0 per-step `run_forward`: build positions/answers -> model forward -> sample -> `complete_one()` advancement -> next-token for stop/detokenize. (M1 reference form in `application/engine.rs` + `application/generation.rs`; `token_pool` scatter and `out_loc` land with the paged KV pool)
 - [x] P0 stop handling: max_tokens, eos (`248044`), stop-strings (decode last N tokens); EOS/stop wins over length.
-- [ ] P0 abort: mark aborted; free resources only after in-flight forward drained (idempotent via table_idx==-1).
+- [x] P0 abort: mark aborted; free resources only after in-flight forward drained (idempotent via table_idx==-1). A sink that stops a run marks `FinishReason::Abort`, the current batch's forward completes, and the session's `SequenceCache` is released only when the request leaves the loop (`kv.end(&mut cache)`); `an_aborted_streaming_request_drains_its_in_flight_forward_and_frees_cache_pages` pins that all pages are returned after the drain.
 
 ### Sampling
 - [x] P0 greedy fast-path (argmax shortcut, lowest-id tie-break; mixed-batch mask
@@ -669,6 +670,10 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
   right. Also pinned: `tests/ftw_real_forward.rs` (finite, deterministic,
   plausible argmax) for the scalar oracle.
 - [ ] P1 smoke: llama.cpp-style single-request throughput; token/s vs paper (77-83 tok/s on RTX 5090) as a target, not a benchmark suite.
+- [ ] P1 **committed cubins have no CI enforcement.** `aot.py --check` reproduces the committed `kernel/*.cubin`/`.ptx` (decision 45 normalizes store paths) but nothing runs it automatically, so a `python/ferrum_kernel/` edit without `kernel-aot` leaves stale cubins that only a real-GPU run would catch. Add `scripts/check-kernels.sh` running `kernel-compile-check` + `aot.py --check`, call it from the devShell/`AGENTS.md` verify line, and gate on `python/ferrum_kernel/**`. Small; devShell-only.
+- [ ] P1 **gated-test serialization is shell-enforced only.** Five model loads in parallel OOM the 8 GiB device; `scripts/run-gated.sh` (`ft-gate`) serializes them but a plain `cargo test -- --ignored` bypasses it. Add `serial_test` as a dev-dependency and mark the model-loading `--ignored` tests in `tests/engine_real_generate.rs` (and the other real-checkpoint gates) `#[serial]` so libtest threads cannot run them together. Small, test-only.
+- [ ] P1 **one-stream invariant not runtime-asserted.** A captured build requires every torch op and driver launch of a forward to run on the capture's flags-0 side stream (`TorchQwen3_6::bind_stream` sets it); nothing fails loudly if a refactor drops `bind_stream` or launches on stream 0. Add a `debug_assert` (device builds) that the torch current stream equals the attention launcher's stream inside `forward_decode_into`, via a `ft_get_current_stream` shim accessor. Small; touches the C++ shim.
+- [ ] P2 **make the scalar oracle's status explicit.** Decision 13 records that the scalar forward is wrong against FreeToken (id 33974 vs 11751); the 1.7e-6 scalar-vs-libtorch agreement is a consistency check, not a FreeToken parity proof beyond the one pinned token. Add a comment near decision 12 and in `tests/engine_real_generate.rs` saying so, so the cross-check is not mistaken for parity. Trivial.
 
 ## 6. Milestones
 
@@ -682,19 +687,20 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
   FreeToken GPU oracle plus the two-implementation cross-check, not against our
   own CPU path alone.
 - **M2 API (CURRENT)**: sampling params, chat template + `/v1/chat/completions`, SSE.
-- **M3 performance**: the NVFP4 expert Triton kernel (kernels + port DONE, the
-  `triton.rs` adapter and the GPU gate pending -- decisions 24-26), paged KV +
-  radix, fast chunked GDN, CUDA-graph decode, prefill/decode split so decode
-  stops re-feeding the prefix (the decode side of this is done: the engine takes
-  its steps off the KV page table, M3 keeps the batching and the radix
-  prefix reuse). Note the kernel work pulls the device slot cache
-  (M4's `copy_missing`) forward: the adapter cannot run without somewhere to
-  stage an expert, so `copy_missing` lands with the adapter, not after it.
-  CUDA-graph decode is done (decision 61): the composition root builds the
-  per-batch-size decode graphs over a side stream and the engine replays them
-  in the decode phase, gated by `a_captured_engine_decodes_on_its_graphs`.
-- **M4 offload**: LRU slot cache + fused copy + prefill double buffer; radix
-  prefix cache wired to the running server; batch concurrency.
+- **M3 performance**: the NVFP4 expert Triton kernel (kernels + port + driver
+  adapter + GPU gate DONE; decisions 24-26, 36), paged KV + radix, fast chunked
+  GDN, CUDA-graph decode, prefill/decode split so decode stops re-feeding the
+  prefix. Done: the engine decodes off the KV page table, the paged GQA decode
+  kernel is live (decision 60), and CUDA-graph decode is owned by the engine
+  (decision 61: per-batch-size graphs over a side stream, gated by
+  `a_captured_engine_decodes_on_its_graphs`). Remaining M3: the radix prefix
+  cache wired into the generation loop (section 8 item 7), and the prefill MoE
+  device-staged path, which is the largest perf gap (item 8). The **serving
+  blocker** is memory, not speed: an f32 KV default does not fit the device
+  (item 6 / the KV-cache section).
+- **M4 offload**: LRU slot cache + fused copy (DONE, decisions 42-48) + prefill
+  double buffer (the prefill device-staged path, section 8 item 8); radix
+  prefix cache wired to the running server (item 7); batch concurrency.
 - **M5**: optional `/v1/responses`, hybrid_radix GDN reuse, startup
   load tuning.
 
@@ -2137,3 +2143,52 @@ max_prefill_length = 8192
 prefill_overlap = true         # takes effect only when cache_size_slots >= 512
 cuda_graph = false             # opt in; needs kernel.triton + a CUDA device
 ```
+
+## 8. Ordered backlog (2026-10-15)
+
+The 2026-10-15 progress review's open gaps are now items in section 5, each under
+its milestone. This section only records the recommended **order** (by increment,
+estimate and dependency). Tier 1 is small, self-contained and testable without the
+full checkpoint; Tier 2 is medium and unblocks serving; Tier 3 is the large
+performance work.
+
+**Tier 1 -- small, no cross-milestone dependency (do first):**
+1. Scalar-oracle status comment (Hygiene) -- trivial.
+2. One-stream invariant `debug_assert` (Hygiene) -- small, touches the C++ shim.
+3. Gated-test serialization via `serial_test` (Hygiene) -- small, test-only.
+4. Committed-cubin check script (Hygiene) -- small, devShell-only.
+5. `presence_penalty`/`frequency_penalty`/`best_of`/`user` acceptance (Scheduler)
+   -- small-medium, needs the request history in the sampler.
+
+**Tier 2 -- medium, unblocks serving:**
+6. KV dtype serving-safe (KV cache + radix) -- **SERVING BLOCKER**, medium,
+   independent. `bf16` pool + config field; re-green the gated decode gates.
+7. Radix prefix cache wired into the generation loop (KV cache + radix) --
+   medium-large, depends on 6 for a real pool budget.
+
+**Tier 3 -- large performance:**
+8. Prefill MoE device-staged path + `prefill_overlap` (MoE offload cache) --
+   largest remaining gap, depends on the landed staging infra (decisions 44/46/48).
+
+### State of play
+
+The hardest infrastructure -- GPU-graph capture over the full MoE forward,
+driver-API kernel launching (MoE GEMM + paged GQA attention), device-staged
+offload, per-batch-size executables -- is done and gated on the real checkpoint.
+The milestone label says M2 but the reality is late M3: most M3 performance work
+landed before the API cleanup, so the milestone accounting is a little lagged.
+The serving blocker is now memory, not speed: the resident tower plus an f32 KV
+default do not fit the 8 GiB device (item 6).
+
+### Closed by the 2026-10-15 pass (kept so they are not re-opened)
+
+- **GPU-resident fp16 global alpha table (`[L*E]`)**: not needed. The globals are
+  one of the six `BANKS`, staged into the per-slot device banks by `index_copy`
+  alongside packed/scale, so `grouped_moe_staged` reads a real global per
+  resident expert.
+- **GDN fp32 params (`A_log`, `dt_bias`)**: the FTW stores both as `bfloat16`;
+  `forward_torch` loads them with `bf16_vec` and upcasts to f32 in the GDN math.
+  There are no fp32 params to preserve; the f32 dtype belongs to the state
+  (`mamba_ssm_dtype`), not the params.
+- **Abort handling**: the drain semantics are implemented and now pinned by
+  `an_aborted_streaming_request_drains_its_in_flight_forward_and_frees_cache_pages`.
