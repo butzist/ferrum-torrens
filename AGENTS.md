@@ -159,6 +159,12 @@ Instructions for AI coding agents working in this repository.
   cannot run them; hand them to a devshell run. Run a gated test with
   `... -- --ignored --nocapture 2>&1 | tee log`: cargo captures a failing test's
   panic text on stderr, so a plain `| tee` log reads as an empty failure.
+- Any change under `python/ferrum_kernel/` or `kernel/` must pass
+  `scripts/check-kernels.sh` (equivalent to `kernel-compile-check` +
+  `aot.py --check`) before committing: it lowers every kernel for sm_120 and
+  recompiles each committed `kernel/*.cubin`/`.ptx` in memory, so a kernel edit
+  without a matching `kernel-aot` fails instead of shipping stale artifacts.
+  Run it in the devShell; it needs no GPU.
 - Kernel work has a CPU inner loop, no GPU needed (TODO.md decision 31), and it
   is **hermetic in the devShell**. The flake's `pythonEnv` is torch + triton +
   numpy, and its `shellHook` wires triton to the cudatoolkit's `ptxas`
