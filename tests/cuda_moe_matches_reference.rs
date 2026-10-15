@@ -510,6 +510,163 @@ fn a_chunked_prefill_step_matches_the_host_plan() {
     );
 }
 
+/// Item 8 slice 2 (decision 67): the whole-layer prefill double buffer. Two
+/// prefill-sized layers stream through the two halves of a 512-slot cache while
+/// the next layer's copy rides the non-blocking copy stream, and each layer's
+/// output must still be byte for byte the host plan's. Before the overlap, only
+/// a single layer was ever streamed; this exercises the prefetch of layer 1
+/// during layer 0, the ready/release event ordering, and the second half.
+#[test]
+#[ignore = "needs a CUDA device and the converted checkpoint in .model-cache"]
+#[serial]
+fn a_whole_layer_prefill_overlap_matches_the_host_plan() {
+    use ferrum_torrens::infrastructure::banks::FtwPinnedBanks;
+
+    const LAYERS: usize = 2;
+    const EXPERTS: usize = 256;
+    const SLOTS: usize = 512;
+    // 64 x top_k 8 = 512 routes, four times the committed `BLOCK_K` (128), so
+    // every layer takes the whole-layer path.
+    const TOKENS: usize = 64;
+
+    let Some((index, reader)) = open_checkpoint() else {
+        panic!("gate needs the checkpoint in {FTW_DIR}");
+    };
+    let shapes = shapes(&index);
+    let (hidden, inter) = (shapes.hidden, shapes.inter);
+    let source: Arc<dyn ExpertSlabSource> = Arc::new(FtwBanks::new(reader.clone(), index.clone()));
+
+    let x: Vec<f32> = (0..TOKENS * hidden)
+        .map(|i| ((i * 2654435761usize % 1009) as f32 / 1009.0) - 0.5)
+        .collect();
+    let routed: Vec<u32> = (0..TOKENS * TOP_K)
+        .map(|i| ((i * 7 + 3) % EXPERTS) as u32)
+        .collect();
+    let weights: Vec<f32> = (0..TOKENS * TOP_K)
+        .map(|i| 1.0 / TOP_K as f32 + i as f32 * 1e-3)
+        .collect();
+
+    let mut adapter = gate(
+        "driver API + committed cubins",
+        CudaMoE::new_with_stream(Device::Cuda(0), source, shapes, SLOTS, std::ptr::null_mut()),
+    );
+    let driver = adapter.driver();
+    let pinned = gate(
+        "pinned expert banks",
+        FtwPinnedBanks::load(&driver, &reader, &index, shapes, LAYERS, EXPERTS),
+    );
+    gate(
+        "enable device staging",
+        adapter.enable_device_staging(Box::new(pinned), LAYERS, EXPERTS),
+    );
+    gate("enable prefill overlap", adapter.enable_prefill_overlap());
+    assert!(adapter.prefill_overlap(), "the harness must be present");
+    let moe = Arc::new(Mutex::new(adapter));
+
+    // The host plan over the same banks is the reference output, one layer at a
+    // time over a cache shared across layers.
+    let mut host_cache = ExpertCache::new(LAYERS, EXPERTS, SLOTS);
+    let mut host_out = vec![0.0f32; LAYERS * TOKENS * hidden];
+    for layer in 0..LAYERS {
+        let step = ExpertStep {
+            hidden,
+            inter,
+            top_k: TOP_K,
+            x: &x,
+            experts: &routed,
+            weights: &weights,
+        };
+        let out = &mut host_out[layer * TOKENS * hidden..(layer + 1) * TOKENS * hidden];
+        gate(
+            "run_experts (host plan)",
+            run_experts(&mut host_cache, &*moe, &*moe, layer, &step, out),
+        );
+    }
+
+    // The device whole-layer overlap: layer 0 prefetches layer 1 while it runs.
+    let exec = CachedExperts::with_device_staging(moe.clone(), moe.clone(), LAYERS, EXPERTS, SLOTS);
+    let dev = Device::Cuda(0);
+    let ids: Vec<f32> = routed.iter().map(|&e| e as f32).collect();
+    let xd = DevTensor::from_f32(&x, &[TOKENS as i64, hidden as i64], dev);
+    let ed = DevTensor::from_f32(&ids, &[TOKENS as i64, TOP_K as i64], dev);
+    let wd = DevTensor::from_f32(&weights, &[TOKENS as i64, TOP_K as i64], dev);
+    for layer in 0..LAYERS {
+        let mut out = DevTensor::zeros(&[TOKENS as i64, hidden as i64], dev);
+        gate(
+            "execute_device (whole-layer overlap)",
+            exec.execute_device(
+                &MoEDeviceRequest {
+                    layer,
+                    hidden,
+                    inter,
+                    top_k: TOP_K,
+                    x: &xd,
+                    experts: &ed,
+                    weights: &wd,
+                },
+                &mut out,
+            ),
+        );
+        let got = to_f32_vec(&out.0);
+        let want = &host_out[layer * TOKENS * hidden..(layer + 1) * TOKENS * hidden];
+        assert_eq!(
+            got, want,
+            "layer {layer}: the whole-layer overlap must equal the host plan"
+        );
+    }
+
+    // A decode-sized step after the prefill must drop back to the flat LRU (the
+    // `leave_prefill` reset) and still match the host plan.
+    let d_x: Vec<f32> = (0..hidden)
+        .map(|i| ((i * 40503usize % 101) as f32 / 101.0) - 0.5)
+        .collect();
+    let d_routed: Vec<u32> = (0..TOP_K)
+        .map(|i| ((i * 13 + 5) % EXPERTS) as u32)
+        .collect();
+    let d_weights: Vec<f32> = (0..TOP_K)
+        .map(|i| 1.0 / TOP_K as f32 + i as f32 * 1e-3)
+        .collect();
+    let d_step = ExpertStep {
+        hidden,
+        inter,
+        top_k: TOP_K,
+        x: &d_x,
+        experts: &d_routed,
+        weights: &d_weights,
+    };
+    let mut d_host = vec![0.0f32; hidden];
+    gate(
+        "run_experts (decode host plan)",
+        run_experts(&mut host_cache, &*moe, &*moe, 0, &d_step, &mut d_host),
+    );
+    let d_ids: Vec<f32> = d_routed.iter().map(|&e| e as f32).collect();
+    let dxd = DevTensor::from_f32(&d_x, &[1, hidden as i64], dev);
+    let ded = DevTensor::from_f32(&d_ids, &[1, TOP_K as i64], dev);
+    let dwd = DevTensor::from_f32(&d_weights, &[1, TOP_K as i64], dev);
+    let mut d_out = DevTensor::zeros(&[1, hidden as i64], dev);
+    gate(
+        "execute_device (decode after prefill)",
+        exec.execute_device(
+            &MoEDeviceRequest {
+                layer: 0,
+                hidden,
+                inter,
+                top_k: TOP_K,
+                x: &dxd,
+                experts: &ded,
+                weights: &dwd,
+            },
+            &mut d_out,
+        ),
+    );
+    assert_eq!(
+        to_f32_vec(&d_out.0),
+        d_host,
+        "a decode step after a prefill must match the host plan"
+    );
+    println!("PASS: {LAYERS} layers x {TOKENS} tokens through the double buffer, then decode");
+}
+
 /// Decision 40 prerequisite 2, the address half of it: a captured graph bakes
 /// the six bank pointers into its nodes, so staging another layer's expert must
 /// overwrite bytes at the same addresses instead of allocating new ones.

@@ -4,12 +4,13 @@ Status (2026-10-15): M2 (API) current, late M3 in practice. The heavy M3
 infrastructure is landed and gated on the real checkpoint: driver-API kernels
 (NVFP4 MoE + paged GQA decode), device-staged offload, engine-owned per-batch-size
 decode graphs, and bf16 KV by default so a default config fits the 8 GiB target.
-Prefill now runs the device-staged MoE path (chunked over the `BLOCK_K` route
-cap). Open work is the ordered backlog in section 8: the prefill copy/compute
-overlap (item 8 slice 2, budget-blocked) and, in M5, the `hybrid_radix` GDN
-snapshot donation that item 7 (radix wiring) is blocked on. Progress history and
-the full decision log (numbers 1..66) live in `DONE.md`; read that for the
-"why" behind any decision number referenced in code or tests.
+Prefill MoE now streams whole layers with the double-buffered copy/compute
+overlap (item 8 slice 2, decision 67); below `2*num_experts` slots it keeps the
+chunked LRU. Open work is the ordered backlog in section 8: the `hybrid_radix`
+GDN snapshot donation that item 7 (radix wiring) is blocked on, and the remaining
+M5 items. Progress history and the full decision log (numbers 1..67) live in
+`DONE.md`; read that for the "why" behind any decision number referenced in code
+or tests.
 
 Goal: a **minimal, fast, single-GPU** Rust serving engine for **one model** --
 `Qwen3.6-35B-A3B-NVFP4` (MoE + hybrid GatedDeltaNet/attention) -- using FreeToken's
@@ -205,7 +206,7 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 
 ### MoE offload cache
 
-- [ ] P0 **prefill overlap (item 8 slice 2), design decided: decision 67.** Whole-layer `materialize_layer` over the two halves of a `2*num_experts`-slot cache, with layer `l+1`'s copy on a copy stream overlapping layer `l`'s GEMV (`cache_size_slots >= 2*num_experts`; below that, keep slice 1's chunked LRU). Slices: (a) whole-layer materialize + deterministic route remap + prefill/decode residency reset, gated by host-plan parity; (b) the copy stream, ready/release events and per-layer prefetch, gated by equality with the un-overlapped materialize; then the `begin_prefill` fence and the no-overlap fallback. Large; depends on decisions 44/46/48/66.
+- [x] P0 **prefill whole-layer streaming + overlap (item 8 slice 2) -- DONE (2026-10-15), decision 67.** A prefill-shaped step with the overlap harness enabled and `cache_size_slots >= 2*num_experts` streams each layer whole into one of two half-cache buffers, with layer `l+1`'s copy on a non-blocking copy stream overlapping layer `l`'s GEMV; the `Residency` enum (`Decode`/`Prefill`) resets the borrowed-slot tables on the transition. Off (or below `2*num_experts`) keeps slice 1's chunked LRU. Gated by `a_whole_layer_prefill_overlap_matches_the_host_plan`.
 
 ### KV cache + radix
 
@@ -240,14 +241,14 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
   kernel is live (decision 60), and CUDA-graph decode is owned by the engine
   (decision 61: per-batch-size graphs over a side stream, gated by
   `a_captured_engine_decodes_on_its_graphs`). The prefill MoE now runs the
-  device-staged path (slice 1, decision 66); its copy/compute overlap (slice 2)
-  is budget-blocked. The former **serving blocker** (memory: an f32 KV default
+  device-staged path (slice 1, decision 66) and, with the cache at
+  `>= 2*num_experts` slots, streams whole layers with the copy/compute overlap
+  (slice 2, decision 67). The former **serving blocker** (memory: an f32 KV default
   did not fit the device) is closed: KV now defaults to bf16 (decision 64), so a
   default config fits. The radix prefix cache moved to M5: it is meaningless
   without GDN snapshot donation (decision 65).
-- **M4 offload**: LRU slot cache + fused copy + chunked staged prefill (DONE,
-  decisions 42-48, 66) + prefill copy/compute overlap (slice 2, budget-blocked);
-  batch concurrency.
+- **M4 offload**: LRU slot cache + fused copy + chunked staged prefill + whole
+  layer prefill overlap (DONE, decisions 42-48, 66, 67); batch concurrency.
 - **M5**: optional `/v1/responses`, hybrid_radix GDN snapshot donation (which is
   what makes the radix prefix cache real, decision 65), startup load tuning.
 
@@ -265,8 +266,10 @@ history.
   selects it; `fp8` is refused until a path exists.
 - **66** -- prefill chunks the staged route list instead of falling back to the
   host plan.
-- **67** -- the prefill copy/compute overlap is whole-layer `materialize_layer`
-  over two half-cache buffers, not in-layer chunk pipelining (item 8 slice 2).
+- **67** -- prefill streams whole layers, double-buffered over the cache's first
+  `2*num_experts` slots, with the next layer's copy on a non-blocking stream
+  overlapping the current layer's GEMV (item 8 slice 2). In-layer chunk
+  pipelining is rejected.
 - The capture/offload contracts (**40**-**61**) are DONE but still bind the
   decode path; see `DONE.md`.
 
@@ -297,14 +300,11 @@ performance work.
    tombstones), which is large/P2; `match_req`/`cache_req` wiring rides with it.
 
 **Tier 3 -- large performance (the only actionable remaining tier):**
-8. Prefill MoE path (MoE offload cache) -- **slice 1 DONE (2026-10-15)**, the
-   chunked staged prefill (decision 66). **Slice 2 decided (decision 67):**
-   whole-layer `materialize_layer` over the two halves of a `2*num_experts` slot
-   cache, with the next layer's copy on a copy stream overlapping the current
-   layer's GEMV. It fits the 8 GiB target at 512 slots with a bf16 pool of
-   `num_tokens = 65536`; no new VRAM (the halves are the existing slots).
-   Implement in two slices (materialize, then the overlap + events), each gated.
-   Large; depends on the landed staging infra (decisions 44/46/48).
+8. Prefill MoE path (MoE offload cache) -- **DONE (2026-10-15).** Slice 1
+   (decision 66) chunked the device-staged route list; slice 2 (decision 67) adds
+   whole-layer streaming with a double-buffered copy/compute overlap at
+   `cache_size_slots >= 2*num_experts`, gated by
+   `a_whole_layer_prefill_overlap_matches_the_host_plan`.
 
 ### State of play
 
@@ -334,8 +334,8 @@ default do not fit the 8 GiB device (item 6).
 ```
 max_seq_len = 65536            # floor; KV makes ~200k feasible if prompted
 kv_dtype = "bf16"              # [kv] dtype; half of f32, fits the 8 GB target
-moe_cache_size_slots = 256     # 256 (0.43 GB) or 512 (0.87 GB); floor = 256
-                               # 512 also re-enables prefill overlap (needs >= 2*E)
+moe_cache_size_slots = 512     # 256 (0.43 GB) or 512 (0.87 GB); floor = 256
+                               # 512 enables whole-layer prefill overlap (>= 2*E)
 max_running_requests = 4
 max_prefill_length = 8192
 prefill_overlap = true         # takes effect only when cache_size_slots >= 512

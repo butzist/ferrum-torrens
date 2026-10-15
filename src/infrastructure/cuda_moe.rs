@@ -26,7 +26,8 @@ use crate::domain::expert_kernel::{
     MoEDeviceRequest, MoEError, MoEGroup, MoETensor, Part, PinnedBankSource, Slab, route_lists,
 };
 use crate::infrastructure::cuda_driver::{
-    CUstream, CudaError, CudaKernels, Driver, StagingKernels,
+    CUstream, CudaError, CudaKernels, Driver, OwnedEvent, OwnedStream, STREAM_NON_BLOCKING,
+    StagingKernels,
 };
 use crate::infrastructure::kernel_abi::{
     Abi, CopyArgs, GEMV_DOWN, GEMV_GATE_UP, INDEX_COPY, LRU_ENSURE, LruArgs, MoEArgs, SILU_MUL,
@@ -148,6 +149,12 @@ pub struct CudaMoE {
     /// captured graph bakes their device aliases in and they must outlive every
     /// replay (decision 40 prerequisite 4).
     pinned: Option<Box<dyn PinnedBankSource>>,
+    /// The whole-layer prefill harness, present once `enable_prefill_overlap`
+    /// has run (item 8 slice 2). Retained across prefill/decode transitions, so
+    /// nothing is reallocated per prefill; `None` when overlap is off.
+    prefill: Option<PrefillHarness>,
+    /// The live residency policy over the shared slot banks.
+    residency: Residency,
 }
 
 // SAFETY: the fields are libtorch tensors, Arcs, plain data, and driver handles
@@ -204,6 +211,52 @@ struct DeviceStaging {
     dst_ptrs: Tensor,
     feat_bytes: Tensor,
     src_ptrs: Vec<Tensor>,
+}
+
+/// Which residency mapping over the shared slot banks is live. The banks are
+/// allocated once and never move (decision 40 prerequisite 2); this state only
+/// records *how* their slots are read, which is the whole difference between the
+/// decode LRU and the prefill double buffer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Residency {
+    /// Flat cross-layer LRU: the device tables are authoritative. Decode, and
+    /// any step too small to be worth a whole-layer stream.
+    Decode,
+    /// Whole-layer double buffer over slots `[0, 2*experts)`: a prefill sequence
+    /// is in flight, the harness is copying layers into the halves, and the LRU
+    /// tables are stale (reset on the way back to `Decode`).
+    Prefill,
+}
+
+/// The prefill's ordering machinery and static copy plan (item 8 slice 2). The
+/// two halves are the cache's own slots `[0, 2*experts)`, so this owns no expert
+/// memory -- only the non-blocking copy stream, five events and the row-index
+/// tensors, all retained across prefill/decode transitions.
+///
+/// A prefetch copies a whole layer from the pinned host banks into its half on
+/// the copy stream; the compute stream waits `ready[half]` before the GEMV reads
+/// that half and records `release[half]` when it is done, so the next reuse of
+/// the half waits the release. `begin` fences the copy stream behind everything
+/// already enqueued on the compute stream when a prefill starts.
+///
+/// The copy reuses the committed `index_copy` cubin, whose `STEPS` covers one
+/// `BLOCK_K`-row plan, so a whole layer is copied in `BLOCK_K`-row groups with
+/// precomputed row indices -- the prefetch does no per-layer host work.
+struct PrefillHarness {
+    copy_stream: OwnedStream,
+    begin: OwnedEvent,
+    ready: [OwnedEvent; 2],
+    release: [OwnedEvent; 2],
+    ready_armed: [bool; 2],
+    release_armed: [bool; 2],
+    /// Layer-local source rows per copy group, shared by both halves.
+    src_idx: Vec<Tensor>,
+    /// Slot rows per half and group (`half * experts + layer-local row`).
+    dst_idx: [Vec<Tensor>; 2],
+    /// Group size (rows), one int64 scalar each.
+    num: Vec<Tensor>,
+    /// The layer each half currently holds, `-1` when empty.
+    half_layer: [i64; 2],
 }
 
 impl CudaMoE {
@@ -265,6 +318,8 @@ impl CudaMoE {
             down: None,
             device_staging: None,
             pinned: None,
+            prefill: None,
+            residency: Residency::Decode,
         })
     }
 
@@ -440,6 +495,90 @@ impl CudaMoE {
         });
         self.pinned = Some(pinned);
         Ok(())
+    }
+
+    /// Build the whole-layer prefill harness (item 8 slice 2): a non-blocking
+    /// copy stream, its ordering events and the static row-index tensors. The
+    /// slot cache's first `2 * experts` slots become the two buffers, so this
+    /// allocates no expert memory and only changes how those slots are read.
+    ///
+    /// Refused unless the cache holds `2 * experts` slots, which is exactly the
+    /// condition the config gates `prefill_overlap` on.
+    pub fn enable_prefill_overlap(&mut self) -> Result<(), MoEError> {
+        let experts = self
+            .device_staging
+            .as_ref()
+            .ok_or_else(|| MoEError::Bad("enable_prefill_overlap before device staging".into()))?
+            .experts;
+        if self.slots < 2 * experts {
+            return Err(MoEError::Bad(format!(
+                "prefill overlap needs 2*{experts} slots, the cache holds {}",
+                self.slots
+            )));
+        }
+        if self.prefill.is_some() {
+            return Ok(());
+        }
+        // The committed copy cubin covers one `BLOCK_K`-row plan, so a whole
+        // layer is copied in that many groups; each group is a static index list.
+        let block_k = self.lru_block_k()?;
+        let groups = experts.div_ceil(block_k);
+        let lib = self.kernels.driver();
+        let copy_stream = lib.owned_stream(STREAM_NON_BLOCKING).map_err(driver)?;
+        let begin = lib.owned_event().map_err(driver)?;
+        let ready = [
+            lib.owned_event().map_err(driver)?,
+            lib.owned_event().map_err(driver)?,
+        ];
+        let release = [
+            lib.owned_event().map_err(driver)?,
+            lib.owned_event().map_err(driver)?,
+        ];
+        let dev = self.device.to_tch();
+        let mut src_idx = Vec::with_capacity(groups);
+        let mut dst_idx: [Vec<Tensor>; 2] =
+            [Vec::with_capacity(groups), Vec::with_capacity(groups)];
+        let mut num = Vec::with_capacity(groups);
+        for g in 0..groups {
+            let start = g * block_k;
+            let n = (experts - start).min(block_k);
+            // `from_slice` infers the kind: `i32` for the row indices, `i64` for
+            // the count the copy kernel reads.
+            let src: Vec<i32> = (start..start + n).map(|r| r as i32).collect();
+            src_idx.push(Tensor::from_slice(&src).to(dev));
+            num.push(Tensor::from_slice(&[n as i64]).to(dev));
+            for (half, dsts) in dst_idx.iter_mut().enumerate() {
+                let dst: Vec<i32> = (0..n)
+                    .map(|r| (half * experts + start + r) as i32)
+                    .collect();
+                dsts.push(Tensor::from_slice(&dst).to(dev));
+            }
+        }
+        self.prefill = Some(PrefillHarness {
+            copy_stream,
+            begin,
+            ready,
+            release,
+            ready_armed: [false; 2],
+            release_armed: [false; 2],
+            src_idx,
+            dst_idx,
+            num,
+            half_layer: [-1, -1],
+        });
+        Ok(())
+    }
+
+    /// Whether the whole-layer prefill harness is available.
+    pub fn prefill_overlap(&self) -> bool {
+        self.prefill.is_some()
+    }
+
+    /// Whether a step is prefill-shaped: more routes than one `lru_ensure`
+    /// launch handles. Below that it stays on the flat LRU, where a whole-layer
+    /// stream would over-copy for a token count that hides nothing.
+    fn is_prefill_step(&self, routes: usize) -> Result<bool, MoEError> {
+        Ok(self.prefill.is_some() && routes > self.lru_block_k()?)
     }
 
     /// The `lru_ensure` route cap, or zero when device staging is off. The
@@ -919,6 +1058,21 @@ impl CudaMoE {
             )));
         }
 
+        // A prefill-shaped step (`>` one `lru_ensure` launch of routes) with the
+        // overlap harness takes the whole-layer path: one streamed copy of the
+        // layer and one GEMV pass, no per-chunk `lru_ensure`. Anything smaller
+        // stays on the flat LRU, and a step that returns to decode clears the
+        // borrowed slots the prefill left behind.
+        if self.is_prefill_step(tokens * top_k)? {
+            if self.residency != Residency::Prefill {
+                self.enter_prefill()?;
+            }
+            return self.prefill_layer(req.layer, x, experts, weights, out_t, top_k);
+        }
+        if self.residency == Residency::Prefill {
+            self.leave_prefill()?;
+        }
+
         // `lru_ensure` dedups first occurrences inside one CTA, so its committed
         // `BLOCK_K` is a route cap (decisions 44/48). A prefill's route list is
         // far larger, so chunk it by tokens: each chunk fits the cap, the device
@@ -950,6 +1104,179 @@ impl CudaMoE {
             .constexpr("BLOCK_K")
             .map(|v| v as usize)
             .map_err(bad_abi)
+    }
+
+    /// Enter the whole-layer prefill: fence the copy stream behind the compute
+    /// stream (a preceding decode may still be reading the borrowed slots), clear
+    /// the now-stale LRU tables and reset the half bookkeeping.
+    fn enter_prefill(&mut self) -> Result<(), MoEError> {
+        self.reset_staging()?;
+        let copy_stream = {
+            let pf = self
+                .prefill
+                .as_mut()
+                .ok_or_else(|| MoEError::Bad("enter_prefill without a harness".into()))?;
+            pf.half_layer = [-1, -1];
+            pf.ready_armed = [false, false];
+            pf.release_armed = [false, false];
+            // SAFETY: `self.stream` is the adapter's live stream in the context
+            // made current at construction.
+            unsafe { pf.begin.record(self.stream) }.map_err(driver)?;
+            pf.copy_stream.raw()
+        };
+        let pf = self.prefill.as_ref().expect("harness");
+        // SAFETY: the copy stream is this harness's own live stream.
+        unsafe { pf.begin.wait_on(copy_stream) }.map_err(driver)?;
+        self.residency = Residency::Prefill;
+        Ok(())
+    }
+
+    /// Leave the whole-layer prefill: clear the borrowed-slot LRU state so the
+    /// next decode step starts cold rather than trusting a stale table.
+    fn leave_prefill(&mut self) -> Result<(), MoEError> {
+        self.reset_staging()?;
+        self.residency = Residency::Decode;
+        Ok(())
+    }
+
+    /// Copy a whole layer into one half of the double buffer on the copy stream,
+    /// waiting for that half's release event first, then record the ready event
+    /// the compute stream waits on. The caller owns the `half_layer` bookkeeping.
+    fn prefetch_half(&mut self, layer: usize, half: usize) -> Result<(), MoEError> {
+        let (src, dst_ptrs, feat_bytes) = {
+            let st = self
+                .device_staging
+                .as_ref()
+                .ok_or_else(|| MoEError::Bad("prefetch_half before device staging".into()))?;
+            let src = st
+                .src_ptrs
+                .get(layer)
+                .ok_or_else(|| MoEError::Bad(format!("layer {layer} past the pinned source plan")))?
+                .shallow_clone();
+            (
+                src,
+                st.dst_ptrs.shallow_clone(),
+                st.feat_bytes.shallow_clone(),
+            )
+        };
+        let copy = self.staging_abi.kernel(INDEX_COPY).map_err(bad_abi)?;
+        let ptr = |t: &Tensor| t.data_ptr() as u64;
+        let pf = self
+            .prefill
+            .as_mut()
+            .ok_or_else(|| MoEError::Bad("prefetch_half without a harness".into()))?;
+        let copy_stream = pf.copy_stream.raw();
+        if pf.release_armed[half] {
+            // SAFETY: the copy stream is this harness's own live stream.
+            unsafe { pf.release[half].wait_on(copy_stream) }.map_err(driver)?;
+        }
+        for g in 0..pf.num.len() {
+            let args = CopyArgs {
+                dst_ptrs: ptr(&dst_ptrs),
+                src_ptrs: ptr(&src),
+                feat_bytes: ptr(&feat_bytes),
+                dst_idx: ptr(&pf.dst_idx[half][g]),
+                src_idx: ptr(&pf.src_idx[g]),
+                num: ptr(&pf.num[g]),
+            };
+            let pack = index_copy_args(&self.staging_abi, &args).map_err(bad_abi)?;
+            let mut params = pack.kernel_params().map_err(bad_abi)?;
+            // SAFETY: as `copy_missing`: live allocations and params packed from
+            // this kernel's manifest entry, launched on the copy stream.
+            unsafe { self.staging.launch(copy, &mut params, copy_stream) }.map_err(driver)?;
+        }
+        // SAFETY: the copy stream is this harness's own live stream.
+        unsafe { pf.ready[half].record(copy_stream) }.map_err(driver)?;
+        pf.ready_armed[half] = true;
+        Ok(())
+    }
+
+    /// One layer of a whole-layer prefill: ensure the layer is in its half, kick
+    /// off the next layer's copy, wait for the half, run the GEMV per route chunk
+    /// over the materialized layer, then release the half. Position == expert id
+    /// (offset by the half), so no `lru_ensure` and no route rewrite happen.
+    fn prefill_layer(
+        &mut self,
+        layer: usize,
+        x: &Tensor,
+        experts: &Tensor,
+        weights: &Tensor,
+        out: &mut DevTensor,
+        top_k: usize,
+    ) -> Result<(), MoEError> {
+        let hidden = self.shapes.hidden;
+        let tokens = x.numel() / hidden;
+        let routes = tokens * top_k;
+        let (experts_per_layer, layers, block_k) = {
+            let st = self.device_staging.as_ref().expect("staging");
+            (st.experts, st.layers, self.lru_block_k()?)
+        };
+        let half = layer % 2;
+
+        // (1) This layer's half. Layer 0 has no lookahead, so it starts here; for
+        // every later layer the previous step already prefetched it.
+        if self.half_missing(half, layer) {
+            self.prefetch_half(layer, half)?;
+            self.prefill.as_mut().expect("harness").half_layer[half] = layer as i64;
+        }
+        // (2) Next layer's copy, which overlaps everything below.
+        if layer + 1 < layers {
+            let nh = (layer + 1) % 2;
+            if self.half_missing(nh, layer + 1) {
+                self.prefetch_half(layer + 1, nh)?;
+                self.prefill.as_mut().expect("harness").half_layer[nh] = (layer + 1) as i64;
+            }
+        }
+        // (3) Wait for this half (the copy stream's ready event), then run the
+        // GEMV over the materialized layer, chunked only to bound the scratch.
+        {
+            let pf = self.prefill.as_ref().expect("harness");
+            if pf.ready_armed[half] {
+                // SAFETY: `self.stream` is the adapter's live compute stream.
+                unsafe { pf.ready[half].wait_on(self.stream) }.map_err(driver)?;
+            }
+        }
+        let offset = (half * experts_per_layer) as i64;
+        let slots = experts
+            .reshape([routes as i64])
+            .to_kind(tch::Kind::Int)
+            .contiguous()
+            .g_add_scalar(offset);
+        let chunk = staged_chunk_tokens(block_k, top_k);
+        let dev = self.device.to_tch();
+        let mut start = 0usize;
+        while start < tokens {
+            let n = chunk.min(tokens - start);
+            let xc = x.narrow(0, start as i64, n as i64);
+            let wc = weights.narrow(0, start as i64, n as i64);
+            let sc = slots.narrow(0, (start * top_k) as i64, (n * top_k) as i64);
+            let token_t = Tensor::arange(n as i64, (tch::Kind::Int, dev))
+                .unsqueeze(1)
+                .expand([n as i64, top_k as i64], false)
+                .contiguous()
+                .reshape([(n * top_k) as i64]);
+            let mut oc = DevTensor(out.0.narrow(0, start as i64, n as i64));
+            let g = self.group_with_slots(&DevTensor(xc), &DevTensor(wc), sc, token_t, n, top_k)?;
+            self.launch(&g)?;
+            self.collect_dev(&g, &mut oc)?;
+            start += n;
+        }
+        // (4) Release the half so a future layer's prefetch may reuse it.
+        let pf = self.prefill.as_mut().expect("harness");
+        // SAFETY: `self.stream` is the adapter's live compute stream.
+        unsafe { pf.release[half].record(self.stream) }.map_err(driver)?;
+        pf.release_armed[half] = true;
+        Ok(())
+    }
+
+    /// Whether `half` does not already hold `layer`. A cheap read of the harness
+    /// bookkeeping, split out so the two call sites do not fight the borrow
+    /// checker over `self`.
+    fn half_missing(&self, half: usize, layer: usize) -> bool {
+        self.prefill
+            .as_ref()
+            .map(|p| p.half_layer[half] != layer as i64)
+            .unwrap_or(false)
     }
 
     /// One staged chunk: rewrite the chunk's layer-local ids into slots on the

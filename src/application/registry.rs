@@ -323,6 +323,15 @@ fn moe_port(
     adapter
         .enable_device_staging(Box::new(pinned), params.num_layers, params.num_experts)
         .map_err(|e| build_err(e.to_string()))?;
+    // Item 8 slice 2: the whole-layer prefill double buffer borrows the cache's
+    // first `2 * num_experts` slots, so it needs them to exist. With the config
+    // gate on, a cache at or above that size streams whole layers; below it the
+    // adapter keeps the chunked LRU (decision 67).
+    if config.moe.prefill_overlap && config.moe.cache_size_slots >= 2 * params.num_experts {
+        adapter
+            .enable_prefill_overlap()
+            .map_err(|e| build_err(e.to_string()))?;
+    }
     let moe = Arc::new(std::sync::Mutex::new(adapter));
     Ok(Some(Arc::new(CachedExperts::with_device_staging(
         moe.clone(),

@@ -126,8 +126,36 @@ the `engine`, which dispatches once through the `registry` to an arch `Model`.
 The model runs its forward via `torch` (serving) or the scalar oracle. The MoE
 block is not part of the model: the model hands its routing decision to the
 core `MoEExecutor` port, implemented by `run_experts::CachedExperts` over the
-`cuda_moe` adapter and the committed cubins. Everything the domain sees is a
-trait.
+  `cuda_moe` adapter and the committed cubins. Everything the domain sees is a
+  trait.
+
+### 1.1 Host/device split (one process, one GPU)
+
+The serving build (`cuda` feature, `model.device = "cuda"`) keeps the heavy,
+stateful work on the device and the control plane on the host. The domain core
+stays pure: `Tensor` and CUDA handles never cross it (section 4).
+
+| Block | Runs on | Where |
+|---|---|---|
+| HTTP + SSE, scheduling, stop rules, streaming | Host | `infrastructure/http.rs`, `domain/scheduler.rs`, `application/generation.rs` |
+| Tokenize / detokenize, chat template | Host | `infrastructure/tokenizers_hf.rs`, via `Engine::encode/decode` |
+| Sampling (temperature/top-k/top-p/penalties) | Host | `domain/sampling.rs`, over f32 logits copied D2H |
+| Generation loop + KV page-table bookkeeping (`SequenceCache`) | Host | `domain/kvcache.rs`, `application/engine.rs` |
+| FTW index parse + mmap of the checkpoint | Host | `infrastructure/ftw.rs` |
+| Pinned expert banks (17.3 GiB, page-locked, device-mapped) | Host memory | `infrastructure/banks.rs` (`FtwPinnedBanks`) |
+| Dense weights: embedding + all projections + `lm_head` (4.51 GiB bf16) | Device | `models/qwen3_6/forward_torch.rs` |
+| Embedding gather, RMSNorm, RoPE, attention (GQA), GDN recurrence, `lm_head` | Device | `models/qwen3_6/forward_torch.rs` (libtorch) |
+| Router: gate matmul + softmax + top-8 | Device | `forward_torch.rs::moe` (ids stay device) |
+| Routed experts: slot cache + grouped GEMV | Device | `infrastructure/cuda_moe.rs` (driver-API cubins) |
+| Slot residency plan (`lru_ensure` / whole-layer) | Device (host plan fallback) | `python/ferrum_kernel/offload.py`, `application/run_experts.rs` |
+| KV pool, GDN state slabs, paged GQA attention | Device | `infrastructure/kvcache_dev.rs`, `infrastructure/cuda_attention.rs` |
+| CUDA-graph capture/replay, torch graph pool | Device | `infrastructure/decode_graph.rs`, `infrastructure/cuda_graph.rs`, `infrastructure/cuda_driver.rs` |
+
+Crossings per step: token ids H2D, streamed expert rows H2D (misses only), logits
+D2H (for host sampling). The pinned expert banks and the dense weights are set up
+once at load. A build without the `cuda` feature, or with `model.device = "cpu"`,
+takes the scalar oracle instead and runs every stage on the host
+(`models/qwen3_6/forward.rs`, decision 12).
 
 ---
 
@@ -379,7 +407,7 @@ window`, staged per row by `stage_window`): the lagging slots are dropped by the
 step-position mask and carry only a valid pool index, so the gather keeps the
 same shape and addresses every step -- the precondition for a captured graph.
 
-### 3.5 MoE offload `[core]` (prefill overlap `[TODO]`)
+### 3.5 MoE offload `[core]` (whole-layer prefill overlap `[core]`)
 
 The heart of the port. The engine's MoE obligation is split: the model computes
 the router and top-k ids; `run_experts` owns
@@ -399,13 +427,15 @@ flowchart TB
   end
   subgraph Infra
     CM["CudaMoE\nslot cache in libtorch tensors\n+ driver-API launches"]
+    Res["Residency (state machine)\nDecode | Prefill\n+ PrefillHarness: copy stream,\n5 events, static row indices"]
     AB["kernel_abi\nmanifest + arg packs"]
-    DR["cuda_driver\nload cubin, launch, pinned mem"]
+    DR["cuda_driver\nload cubin, launch, pinned mem,\nowned stream/event"]
     PB["FtwPinnedBanks\n6 page-locked device-mapped regions"]
     FB["FtwBanks\nhost slab source"]
   end
   CE --> EC
   CE --> CM
+  CM --> Res
   CM --> AB --> DR
   CM --> PB
   FB --> PB
@@ -439,11 +469,21 @@ the pinned banks carrying across, so prefill uses the same device path as decode
 (decision 66). `CachedExperts` without device staging still takes the host plan
 (`run_experts` + `ExpertCache` + `FtwBanks`).
 
-`[TODO]` Prefill double-buffered whole-layer streaming and the
-`prefill_overlap` two-buffer path (`cache_size_slots >= 2*num_experts`) are not
-implemented; the copy half of the prefill step is not yet overlapped with
-compute, and the two whole-layer buffers do not fit the 8 GB target beside the
-tower and the default bf16 KV pool.
+**Whole-layer prefill overlap `[core]`** (decision 67). When the config enables
+it and the cache holds `2 * num_experts` slots (`enable_prefill_overlap`), a
+prefill-shaped step (routes > `BLOCK_K`) switches the `Residency` state machine
+to `Prefill`: the cache's first `2 * num_experts` slots become two full-layer
+buffers, the router's ids pass through as slot ids offset by the half, and there
+is one streamed copy of the layer plus one GEMV pass instead of a per-chunk
+`lru_ensure`. Layer `l+1` is copied into the other half on a non-blocking copy
+stream while layer `l` computes (`begin`/`ready`/`release` events order the two
+streams; the copy reuses `index_copy` in `BLOCK_K`-row groups with static index
+tensors). The GEMV still runs per route chunk only to bound the `[routes, ...]`
+scratch. A step that drops back below the cap returns to `Decode`, clearing the
+borrowed-slot tables. `PrefillHarness` (the copy stream, its events and the row
+indices) is retained across transitions; the driver exposes it through owned
+`OwnedStream`/`OwnedEvent` handles that destroy themselves on drop. The blocks
+are the cache's own slots, so this adds no expert VRAM.
 
 ### 3.6 KV cache, radix, and GDN state `[core]` (radix wired into serving `[partial]`)
 
@@ -681,6 +721,9 @@ Boundary note: `tch`/`Tensor` and the CUDA driver handles live entirely in
   staged H2D copies, the recorded ops and the replay are ordered on one stream.
 - **Least-lock, `&self` ports.** The device slot cache is process-wide, so the
   store/gemm ports take `&self` and `Mutex<CudaMoE>` is passed as both.
+- **Host/device boundary.** The serving forward is device-resident except
+  tokenization, scheduling and sampling, which run on the host; only token ids,
+  streamed expert rows (H2D) and logits (D2H) cross the boundary (section 1.1).
 - **The scalar forward is an oracle.** It stays behind the same `Model` trait,
   is what runs in the CPU build, and is what the libtorch path is checked
   against (plus the pinned FreeToken token oracle).

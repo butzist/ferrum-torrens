@@ -1541,39 +1541,43 @@ settled.
       for byte the host plan's. `cargo test` 264, `--features cuda` 355 + the
       real-checkpoint CPU test, `fmt`/`clippy` clean.
 
-67. **Prefill overlap is whole-layer materialize over two half-cache buffers, not
-    in-layer chunk pipelining** (2026-10-15) -- the design for item 8 slice 2.
-    - **The choice.** When `cache_size_slots >= 2*num_experts`, a prefill
-      materializes each layer's *whole* expert set (FreeToken's
-      `materialize_layer`) into one of two half-cache buffers (`num_experts`
-      slots each) and copies layer `l+1` into the other half on a copy stream
-      while layer `l`'s GEMV runs on the compute stream. The route mapping is
-      deterministic (`expert e -> half*num_experts + e`), so a whole-layer prefill
-      needs no `lru_ensure` and launches **one** GEMV per layer over all routes,
-      instead of slice 1's per-chunk launches. Below `2*num_experts` slots,
-      prefill keeps slice 1's chunked LRU path.
-    - **Why not in-layer chunk pipelining.** The GEMV reads the flat LRU slots;
-      overlapping chunk `k+1`'s `index_copy` with chunk `k`'s GEMV lets the LRU
-      evict a slot chunk `k` is still reading, so it needs per-chunk events and a
-      partition of the slot space to protect it -- more machinery for a copy that
-      is smaller (misses only) but still pays slice 1's per-chunk launch overhead.
-      The whole-layer copy is larger, but it is exactly the part that must be
-      hidden, and its static plan, fixed addresses and deterministic mapping keep
-      the residency simple. It also matches the reference.
-    - **Where the halves come from.** They are the existing `2*num_experts` slots,
-      not new VRAM, which is why the config already conditions `prefill_overlap`
-      on `cache_size_slots >= 512`. With the 4.51 GiB tower, `cache_size_slots =
-      512` (0.87 GiB) and a bf16 pool at `num_tokens = 65536` (1.25 GiB) the total
-      is ~6.6 GiB of the 7.53 GiB device, so the design fits.
-    - **Residency.** Materialize and the decode LRU are two mappings over the same
-      banks, so a prefill<->decode transition resets the entered path (the
-      decision-48 rule, moved back into the adapter now that prefill stays
-      staged). During one prefill the two halves are the whole residency.
-    - **Slicing.** (a) whole-layer materialize + the deterministic route remap +
-      the residency reset, gated by output parity with the host plan; (b) the copy
-      stream, ready/release events and the per-layer prefetch, gated by equality
-      with the un-overlapped materialize; then the `begin_prefill` fence and a
-      budget guard that falls back to slice 1 below `2*num_experts` slots.
+67. **Prefill streams whole layers, double-buffered over the cache's first
+    `2*num_experts` slots** (2026-10-15, implemented) -- item 8 slice 2.
+    - **The path.** With the harness enabled (`enable_prefill_overlap`, gated by
+      `moe.prefill_overlap && cache_size_slots >= 2*num_experts`) and a
+      prefill-shaped step (routes > the `lru_ensure` `BLOCK_K`), `grouped_moe_staged`
+      switches the `Residency` state machine to `Prefill`: the router's ids pass
+      through as slot ids offset by the half (`expert + half*num_experts`), so
+      there is no `lru_ensure`; each layer's whole expert set is copied into its
+      half and one GEMV pass runs. Layer `l+1` is prefetched into the other half on
+      a non-blocking copy stream while layer `l` computes. A step that drops below
+      the cap returns to `Decode`, clearing the borrowed-slot tables. Below
+      `2*num_experts` the adapter keeps slice 1's chunked LRU (decision 66).
+    - **Ordering.** A non-blocking copy stream plus five events: `begin` (fence the
+      copy stream behind the compute stream when a prefill starts), `ready[half]`
+      (the compute stream waits it before reading half `half`), and `release[half]`
+      (the copy into that half waits it first, so a half is not overwritten while
+      its GEMV still reads it). The stream and events are owned `OwnedStream` /
+      `OwnedEvent` handles in `cuda_driver.rs` that destroy themselves on drop; the
+      driver gained `cuEvent*` / `cuStreamWaitEvent` and a non-blocking stream.
+    - **Static copy plan.** The committed `index_copy` cubin's `STEPS` covers one
+      `BLOCK_K`-row plan, so a whole layer is copied in `BLOCK_K`-row groups with
+      precomputed row-index tensors -- the prefetch does no per-layer host work.
+      The GEMV still runs per route chunk only to bound the `[routes, ...]`
+      scratch: a single 8192-token pass would need ~0.5 GiB of `ic1`/`ic2`/`ic3`.
+    - **Budget.** The two buffers are the cache's own first `2*num_experts` slots
+      (no expert VRAM added), and they double as the decode LRU when the state
+      machine is back in `Decode`. At 512 slots (0.87 GiB) the 4.51 GiB tower plus
+      a bf16 pool at `num_tokens = 65536` (~1.3 GiB) is ~6.7 GiB of the 7.53 GiB
+      device.
+    - **Gate.** `tests/cuda_moe_matches_reference.rs::a_whole_layer_prefill_overlap_matches_the_host_plan`
+      streams two layers over the real checkpoint and asserts each layer's output,
+      plus a following decode step, is byte-for-byte the host plan's.
+    - **Rejected: in-layer chunk pipelining.** Overlapping chunk `k+1`'s
+      `index_copy` with chunk `k`'s GEMV lets the LRU evict a slot chunk `k` is
+      still reading; making it correct needs per-chunk slot protection and a
+      slot-space partition, and verifying it needs a race detector this repo has
+      no harness for.
 
 ---
 
