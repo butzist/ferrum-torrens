@@ -22,6 +22,7 @@ struct FtGraphPool {
 
 unsafe extern "C" {
     fn ft_set_current_stream(stream: CUstream, device: i32);
+    fn ft_get_current_stream(device: i32) -> CUstream;
     fn ft_pool_begin(stream: CUstream, device: i32) -> *mut FtGraphPool;
     fn ft_pool_end(pool: *mut FtGraphPool);
 }
@@ -33,6 +34,17 @@ unsafe extern "C" {
 /// the legacy default stream.
 pub unsafe fn set_current_stream(stream: CUstream, device: usize) {
     unsafe { ft_set_current_stream(stream, device as i32) }
+}
+
+/// The stream torch is currently launching its `device` ops on, as the raw
+/// `cudaStream_t`. Used by the one-stream invariant assert: during a captured
+/// forward every torch op must be on the side stream the driver launches on.
+///
+/// # Safety
+/// The caller must not race another thread that mutates the thread-local
+/// current stream for `device`.
+pub unsafe fn current_stream(device: usize) -> CUstream {
+    unsafe { ft_get_current_stream(device as i32) }
 }
 
 /// A private torch mempool that a capture's allocations route into, so the

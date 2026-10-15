@@ -26,6 +26,14 @@ void ft_set_current_stream(void* raw_stream, int device) {
     c10::cuda::setCurrentCUDAStream(stream);
 }
 
+// The torch current stream for `device`, as the raw `cudaStream_t` the driver
+// API uses. Used to assert that a captured forward is running on its side stream.
+void* ft_get_current_stream(int device) {
+    return c10::cuda::getCurrentCUDAStream(
+               static_cast<c10::DeviceIndex>(device))
+        .stream();
+}
+
 // The private mempool a capture allocates into. `begin` opens the pool and
 // starts routing this stream's allocations into it; the handle owns the pool id
 // and releasing it stops the routing and frees the pool.

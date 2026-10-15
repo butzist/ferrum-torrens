@@ -1148,6 +1148,19 @@ impl TorchQwen3_6 {
             unsafe {
                 crate::infrastructure::cuda_graph::set_current_stream(stream, ordinal);
             }
+            // The one-stream invariant: a captured build launches the MoE and
+            // attention kernels on this side stream, so every torch op of the
+            // forward must land on it too. Assert the bind actually took, so a
+            // refactor that drops `bind_stream` or points torch elsewhere fails
+            // loudly instead of racing the driver launches.
+            #[cfg(debug_assertions)]
+            {
+                let current = unsafe { crate::infrastructure::cuda_graph::current_stream(ordinal) };
+                debug_assert_eq!(
+                    current, stream,
+                    "torch current stream diverged from the capture side stream"
+                );
+            }
         }
     }
 
