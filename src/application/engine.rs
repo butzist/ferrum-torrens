@@ -1,5 +1,5 @@
 // Engine: owns the model + tokenizer handles and the engine-facing limits, and
-// runs batched forwards. M1 runs on the CPU reference path (TODO.md decision
+// runs batched forwards. M1 runs on the CPU reference path (DONE.md decision
 // 12): the model recomputes the whole sequence per step, so every row of a
 // batch is its request's full id sequence with positions 0..n and its answer row
 // at the end. KV reuse replaces the per-step refeed in M3 without changing this

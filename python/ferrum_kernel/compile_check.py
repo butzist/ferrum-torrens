@@ -43,7 +43,7 @@ from .signatures import paged_attention_constexprs
 from .signatures import reduce as _reduce_sig
 from .signatures import silu as _silu_sig
 
-# sm_120, the RTX 5060 Mobile this engine targets (TODO.md decision 1).
+# sm_120, the RTX 5060 Mobile this engine targets (DONE.md decision 1).
 TARGET = GPUTarget("cuda", 120, 32)
 
 
@@ -95,7 +95,7 @@ def main() -> int:
     except Exception as e:  # noqa: BLE001
         failures += 1
         print(f"sum_reduce FAILED: {type(e).__name__}: {str(e)[:200]}")
-    # The staging pair from TODO.md decision 40 prerequisite 4.
+    # The staging pair from DONE.md decision 40 prerequisite 4.
     try:
         check("lru_ensure", _ensure_experts_kernel, _lru_sig(), lru_constexprs())
     except Exception as e:  # noqa: BLE001

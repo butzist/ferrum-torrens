@@ -2,7 +2,7 @@
 
 Triton authors the kernel; this is where authoring stops. `triton.compile` with
 an explicit `GPUTarget` needs no device, and the nixpkgs ptxas turns the PTX into
-a real cubin, so the whole AOT step runs on a CPU-only box (TODO.md decision
+a real cubin, so the whole AOT step runs on a CPU-only box (DONE.md decision
 36). The engine then loads the cubin through the CUDA driver API and never
 imports Python again.
 
@@ -67,7 +67,7 @@ from .signatures import (
     silu_constexprs,
 )
 
-# sm_120, the RTX 5060 Mobile this engine targets (TODO.md decision 1).
+# sm_120, the RTX 5060 Mobile this engine targets (DONE.md decision 1).
 TARGET = GPUTarget("cuda", 120, 32)
 OUT_DIR = pathlib.Path("kernel")
 
@@ -104,7 +104,7 @@ KERNELS: dict[str, dict] = {
     },
 }
 
-# The staging pair (TODO.md decision 40 prerequisite 4). It is not part of
+# The staging pair (DONE.md decision 40 prerequisite 4). It is not part of
 # `grouped_moe`: it runs on its own streams around the grouped launches and has
 # its own launcher, so it lives in a separate manifest section (`staging`) with
 # a `grid` launch shape instead of the grouped `n`/`block` column tile. LRU is a
@@ -143,7 +143,7 @@ ATTENTION_KERNELS: dict[str, dict] = {
 # A rebuilt-but-identical closure gets a different store hash, so two builds of
 # the same kernel differ in those bytes even though the codegen is identical.
 # Normalize store paths away before comparing, or `--check` would call a healthy
-# set stale on any box whose toolchain closure was rebuilt (TODO.md decision 45).
+# set stale on any box whose toolchain closure was rebuilt (DONE.md decision 45).
 _STORE_PATH = re.compile(rb"/nix/store/[a-z0-9]{32}-[^/\x00]+")
 
 
@@ -266,7 +266,7 @@ def write(art: Artifacts) -> list[pathlib.Path]:
     A rebuild on a different toolchain closure differs only in the `/nix/store`
     paths triton bakes into the debug info. Leaving those artifacts as committed
     means registering a new kernel cannot churn the cubins the GPU gates were
-    qualified against (TODO.md decision 45); a real codegen change still writes.
+    qualified against (DONE.md decision 45); a real codegen change still writes.
     """
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     written = []

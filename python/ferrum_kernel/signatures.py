@@ -17,7 +17,7 @@ from .offload import COPY_BLOCK_BYTES, COPY_GROUPS, USAGE_MAX, copy_steps
 
 # The serving attention geometry (Qwen3.6-35B-A3B): 16 query heads over 2 KV
 # heads at head_dim 256. All four are constexpr, so the committed cubin is
-# specialized to this checkpoint (TODO.md decision 36).
+# specialized to this checkpoint (DONE.md decision 36).
 SERVING_Q_HEADS = 16
 SERVING_KV_HEADS = 2
 SERVING_HEAD_DIM = 256
@@ -26,7 +26,7 @@ SERVING_ATTN_BLOCK_N = 64
 
 # One hidden size and one intermediate size in a serving checkpoint; both are
 # constexpr trip counts, so the committed cubins are shape-specialized and the
-# manifest records the shapes (TODO.md decision 36).
+# manifest records the shapes (DONE.md decision 36).
 SERVING_HIDDEN = 2048
 SERVING_INTER = 512
 SERVING_TOP_K = 8
@@ -100,7 +100,7 @@ def reduce(dtype: str = SERVING_DTYPE) -> dict:
 
 
 def lru_ensure() -> dict:
-    """Device LRU admission (TODO.md decision 40 prerequisite 4)."""
+    """Device LRU admission (DONE.md decision 40 prerequisite 4)."""
     return {
         "experts_ptr": "*i32",
         "slot_for_id_ptr": "*i32",
@@ -121,7 +121,7 @@ def lru_ensure() -> dict:
 
 
 def index_copy() -> dict:
-    """Fused multi-bank host->slot copy (TODO.md decision 40 prerequisite 4)."""
+    """Fused multi-bank host->slot copy (DONE.md decision 40 prerequisite 4)."""
     return {
         "dst_ptrs": "*i64",
         "src_ptrs": "*i64",

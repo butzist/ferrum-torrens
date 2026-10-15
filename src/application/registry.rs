@@ -246,7 +246,7 @@ fn graph_batch_sizes(max_running: usize) -> Vec<usize> {
 /// picks the element type. The default `bf16` is half of f32, which is what lets
 /// the 4.51 GiB resident tower and the pool coexist on the 8 GB device; `f32`
 /// stays available because the cached forward's contract is to reproduce a
-/// re-fed forward and that is the lossless option (TODO.md decision 33).
+/// re-fed forward and that is the lossless option (DONE.md decision 33).
 #[cfg(feature = "cuda")]
 fn kv_cache(
     config: &crate::config::Config,

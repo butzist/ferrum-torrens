@@ -5,9 +5,11 @@ high-level building blocks, the build process, and a static plus a dynamic view
 of each subsystem. It exists so a reader can see the current shape of the code
 without reconstructing it from `TODO.md`.
 
-The three documents divide the work:
+The documents divide the work:
 
-- `TODO.md` -- the plan and the current status. **Plan of record.**
+- `README.md` -- the entry point: what the project is, the target, how to build.
+- `TODO.md` -- the open plan and the current status. **Plan of record.**
+- `DONE.md` -- history and the full decision log; look up `decision N` here.
 - `ALGORITHM.md` -- the exact math and caching algorithms (forward pass, MoE
   offload, KV/radix, GDN state). **Algorithm of record.**
 - `ARCHITECTURE.md` (this file) -- the code as built, and the boundaries between

@@ -4,10 +4,17 @@ Instructions for AI coding agents working in this repository.
 
 ## Read first, always
 
-- `TODO.md` is the single source of truth for the plan and the current status.
-  It contains the milestone list (M1..M5), the feature checklist, the config
-  schema and the confirmed decisions in section 7.
-- `ALGORITHM.md` is the design reference: exact forward-pass math, the MoE
+- `README.md` is the entry point: what the project is, the target model, how to
+  build/test, and the doc map.
+- `TODO.md` is the plan of record: the milestone list (M1..M5), the **open**
+  feature checklist, the config schema, the decisions that still bind open work
+  (section 7), and the ordered backlog. Completed checklist items, the full
+  confirmed-decision log (numbers 1..N, stable) and the progress narrative live
+  in `DONE.md`.
+- `DONE.md` is the history of record: the "why" behind any `decision N` a code
+  comment, test or `ARCHITECTURE.md` references, and how a completed piece was
+  built. Look a decision up here, not in `TODO.md`.
+- `ALGORITHM.md` is the algorithm of record: exact forward-pass math, the MoE
   offload cache, KV/radix and GDN state algorithms.
 - `ARCHITECTURE.md` is the description of record: the high-level building
   blocks, the build process, and a static plus dynamic view of each subsystem,
@@ -56,9 +63,10 @@ Instructions for AI coding agents working in this repository.
   the status legend at the top of `ARCHITECTURE.md` (`[core]` / `[partial]` /
   `[TODO]`), and describe only its boundary. Never draw a full design for a
   `[TODO]` piece.
-- When the two disagree, `TODO.md` is the plan of record, `ALGORITHM.md` the
-  algorithm of record, and `ARCHITECTURE.md` the description of record; fix the
-  description to match reality rather than reality to the description.
+- When they disagree, `TODO.md` is the plan of record, `DONE.md` the history of
+  record, `ALGORITHM.md` the algorithm of record, and `ARCHITECTURE.md` the
+  description of record; fix the description to match reality rather than reality
+  to the description.
 
 ## Testing (strict TDD)
 
@@ -82,10 +90,14 @@ Instructions for AI coding agents working in this repository.
 - After every task, update `TODO.md`:
   - tick the finished checkboxes,
   - move the now-complete milestone markers in section 6,
-  - refresh the one-line Status entry at the very top of `TODO.md` with the
+  - refresh the short Status entry at the very top of `TODO.md` with the
     in-progress milestone, what just completed, and any blocker.
+- Keep `TODO.md` about **open** work. When an item completes, move its detail (the
+  "how", the measurements, the history) to `DONE.md` and leave only a one-line
+  checked item or drop it entirely. `TODO.md` should stay a few hundred lines.
 - If you hit a blocker or make a decision not covered by section 7, add it to
-  `TODO.md` section 7 before stopping. Never silently change the plan.
+  `TODO.md` section 7 before stopping; a new decision gets the next number and
+  moves to `DONE.md`'s log once it is settled. Never silently change the plan.
 
 ## Conventions
 
@@ -102,7 +114,7 @@ Instructions for AI coding agents working in this repository.
   kernel in Triton), compiled ahead of time by `python/ferrum_kernel/aot.py`, and
   the resulting `kernel/*.cubin` are committed and launched by the driver-API
   adapter (`infrastructure/cuda_driver.rs`, `infrastructure/cuda_moe.rs`).
-  The pyo3 interpreter path is gone (`TODO.md` decision 30): there is no
+  The pyo3 interpreter path is gone (`DONE.md` decision 30): there is no
   `triton` cargo feature and `infrastructure/triton.rs` no longer exists.
   A hand-written cudarc version of the kernel is deferred, not ruled out. Keep
   Triton sources confined to `python/ferrum_kernel/`; the domain core stays pure
@@ -111,8 +123,9 @@ Instructions for AI coding agents working in this repository.
 ## Reference and tooling
 
 - `FreeToken/` is the reference implementation. It is READ-ONLY. Never edit it.
-- GPU runtime facts and target defaults live in `TODO.md` section 7
-  (RTX 5060 Mobile 8 GB VRAM, sm_120) and `ALGORITHM.md` section 0.
+- GPU runtime facts and target defaults live in `README.md` and the
+  "Config defaults" block at the end of `TODO.md` (RTX 5060 Mobile 8 GB VRAM,
+  sm_120) and in `ALGORITHM.md` section 0.
 - **The sandbox has a working CUDA device** (the driver is at
   `/run/opengl-driver/lib/libcuda.so.1` and `cuInit` succeeds), so the gated GPU
   tests run here. The agent jail inherits `LIBTORCH*`, `CUDA_HOME`, `CXX`
@@ -121,7 +134,7 @@ Instructions for AI coding agents working in this repository.
   a `nix develop` shell needs no manual export; from elsewhere, export them (see
   below). The compute runtime still auto-detects and falls back to CPU, which is
   what keeps `cargo test --features cuda` meaningful on a box with no device
-  (`TODO.md` decision 21). `model.device = "cuda"` forces the GPU. CUDA-graph
+  (`DONE.md` decision 21). `model.device = "cuda"` forces the GPU. CUDA-graph
   capture is still asked for explicitly rather than discovered by a red test.
 - The FTW checkpoint is served from the Nix store: add it with
   `nix store add-path <dir> --name qwen3.6-35b-a3b-nvfp4`. The jail binds only
@@ -154,7 +167,7 @@ Instructions for AI coding agents working in this repository.
   adapter is behind the non-default `cuda` feature, so additionally run
   `cargo clippy --all-targets --features cuda` inside the devshell (the flake
   exports `LIBTORCH`, `LIBTORCH_INCLUDE`, `LIBTORCH_LIB`, `CXX`; see
-  `TODO.md` decision 19 -- they must be libtorch **roots**). The gated
+  `DONE.md` decision 19 -- they must be libtorch **roots**). The gated
   oracle tests (`tests/engine_real_generate.rs`) need a GPU, so the agent sandbox
   cannot run them; hand them to a devshell run. Run a gated test with
   `... -- --ignored --nocapture 2>&1 | tee log`: cargo captures a failing test's
@@ -165,7 +178,7 @@ Instructions for AI coding agents working in this repository.
   recompiles each committed `kernel/*.cubin`/`.ptx` in memory, so a kernel edit
   without a matching `kernel-aot` fails instead of shipping stale artifacts.
   Run it in the devShell; it needs no GPU.
-- Kernel work has a CPU inner loop, no GPU needed (TODO.md decision 31), and it
+- Kernel work has a CPU inner loop, no GPU needed (DONE.md decision 31), and it
   is **hermetic in the devShell**. The flake's `pythonEnv` is torch + triton +
   numpy, and its `shellHook` wires triton to the cudatoolkit's `ptxas`
   (`TRITON_PTXAS_PATH` / `TRITON_PTXAS_BLACKWELL_PATH`): nixpkgs' triton ships no
@@ -180,7 +193,7 @@ Instructions for AI coding agents working in this repository.
   - `kernel-aot` = `python -m ferrum_kernel.aot` -- rebuilds `kernel/*.cubin` and
     `kernel/*.ptx`. Those artifacts are committed, so only touch them when the
     kernel itself changes, and note that a full rebuild currently churns the
-    gemv artifacts (TODO.md decision 45).
+    gemv artifacts (DONE.md decision 45).
   Do **not** run the kernel toolchain out of `FreeToken/.venv`: that environment
   is only for the FTW conversion (decision 35) and carries a different
   torch/triton. Use `--interp` before running the gated

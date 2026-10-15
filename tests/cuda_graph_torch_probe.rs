@@ -1,6 +1,6 @@
 // Gated proof that a graph of torch ops can be captured on a driver-created
 // side stream and replayed over freshly written inputs, matching an uncaptured
-// run -- the mempool question TODO.md decision 40 step 2 must settle before the
+// run -- the mempool question DONE.md decision 40 step 2 must settle before the
 // whole decode forward can be captured. Run with:
 //   cargo test --release --features cuda --test cuda_graph_torch_probe -- --ignored --nocapture
 //

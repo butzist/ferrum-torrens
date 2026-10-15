@@ -4,7 +4,7 @@
 // the CUDA graphs and replays them. Nothing here touches device tensors.
 //
 // `DecodeRow` is the per-request staging of one decode step, the same shape
-// FreeToken's `GraphCaptureBuffer` keeps on device (TODO.md decision 49): the
+// FreeToken's `GraphCaptureBuffer` keeps on device (DONE.md decision 49): the
 // token the request advances, its absolute rope position, the GDN state slot it
 // owns and the KV pool location it writes this step's K/V at. One row per live
 // request; a captured batch is padded to its fixed size with a reserved dummy

@@ -1,4 +1,4 @@
-"""Device-side expert staging kernels (TODO.md decision 40, prerequisite 4).
+"""Device-side expert staging kernels (DONE.md decision 40, prerequisite 4).
 
 The MoE offload path used to run its staging on the host: `ExpertCache` in the
 domain picks the miss/victim plan and the FTW bank reader copies expert bytes
@@ -17,7 +17,7 @@ the plan is data-dependent. These two fixed-shape kernels move it to the device:
 
 Both are fixed-shape. The plan count is the only thing that varies per step and
 it lives on the device (`num_ptr`), so a launch's grid and arguments are stable
-and the pair is safe to capture (TODO.md decision 40). The LRU kernel's
+and the pair is safe to capture (DONE.md decision 40). The LRU kernel's
 `BLOCK_K`/`BLOCK_C` and the copy's `GROUPS`/`STEPS` are constexpr, so a new
 serving shape is a recompile; the `n`/`block` fields in the AOT manifest record
 the pinned values.
