@@ -899,16 +899,87 @@ impl CudaMoE {
             req.weights.numel(),
         )?;
         let top_k = req.top_k;
-        let routes = tokens * top_k;
-        // The kernel rewrites this copy in place; narrowing to int32 makes a
-        // fresh buffer, so the router's own `[tokens, top_k]` ids are untouched.
-        let ids = device_tensor(req.experts, "the expert ids")?;
-        let slots = ids
+        let block_k = self.lru_block_k()?;
+        let x = device_tensor(req.x, "the activations")?;
+        let experts = device_tensor(req.experts, "the expert ids")?;
+        let weights = device_tensor(req.weights, "the weights")?;
+        let out_t = out
+            .as_any_mut()
+            .downcast_mut::<DevTensor>()
+            .ok_or_else(|| {
+                MoEError::Bad(
+                    "the device MoE hand-off needs a device tensor for the routed sum".into(),
+                )
+            })?;
+        if out_t.0.size() != [tokens as i64, self.shapes.hidden as i64] {
+            return Err(MoEError::Bad(format!(
+                "grouped_moe_staged: the routed sum is {:?}, wanted [{tokens}, {}]",
+                out_t.0.size(),
+                self.shapes.hidden
+            )));
+        }
+
+        // `lru_ensure` dedups first occurrences inside one CTA, so its committed
+        // `BLOCK_K` is a route cap (decisions 44/48). A prefill's route list is
+        // far larger, so chunk it by tokens: each chunk fits the cap, the device
+        // LRU and the pinned banks carry across the chunks, and each chunk's
+        // reduce lands in its own output rows. An expert an earlier chunk made
+        // resident is a hit here, so the copy is not repeated.
+        if tokens * top_k <= block_k {
+            return self.staged_group(req.layer, x, experts, weights, out_t, top_k);
+        }
+        let chunk = staged_chunk_tokens(block_k, top_k);
+        let mut start = 0usize;
+        while start < tokens {
+            let n = chunk.min(tokens - start);
+            let xc = x.narrow(0, start as i64, n as i64);
+            let ec = experts.narrow(0, start as i64, n as i64);
+            let wc = weights.narrow(0, start as i64, n as i64);
+            let mut oc = DevTensor(out_t.0.narrow(0, start as i64, n as i64));
+            self.staged_group(req.layer, &xc, &ec, &wc, &mut oc, top_k)?;
+            start += n;
+        }
+        Ok(())
+    }
+
+    /// The committed `lru_ensure` `BLOCK_K`: the route cap one launch handles.
+    fn lru_block_k(&self) -> Result<usize, MoEError> {
+        self.staging_abi
+            .kernel(LRU_ENSURE)
+            .map_err(bad_abi)?
+            .constexpr("BLOCK_K")
+            .map(|v| v as usize)
+            .map_err(bad_abi)
+    }
+
+    /// One staged chunk: rewrite the chunk's layer-local ids into slots on the
+    /// device (`lru_ensure`), copy the misses (`index_copy`), then the same three
+    /// pieces as the other hand-offs. The ids never cross to the host.
+    fn staged_group(
+        &mut self,
+        layer: usize,
+        x: &Tensor,
+        experts: &Tensor,
+        weights: &Tensor,
+        out: &mut DevTensor,
+        top_k: usize,
+    ) -> Result<(), MoEError> {
+        let hidden = self.shapes.hidden;
+        let routes = experts.numel();
+        let tokens = x.numel() / hidden;
+        if top_k == 0 || routes != tokens * top_k {
+            return Err(MoEError::Bad(format!(
+                "staged chunk: {routes} routes for {tokens} tokens x top_k {top_k}"
+            )));
+        }
+        // The kernel rewrites this copy in place; the cast makes a fresh buffer,
+        // so the router's own `[tokens, top_k]` ids are untouched.
+        let slots = experts
             .reshape([routes as i64])
             .to_kind(tch::Kind::Int)
             .contiguous();
-        self.ensure_experts(req.layer, &slots)?;
-        self.copy_missing(req.layer)?;
+        self.ensure_experts(layer, &slots)?;
+        self.copy_missing(layer)?;
 
         let dev = self.device.to_tch();
         let token_t = Tensor::arange(tokens as i64, (tch::Kind::Int, dev))
@@ -916,10 +987,19 @@ impl CudaMoE {
             .expand([tokens as i64, top_k as i64], false)
             .contiguous()
             .reshape([routes as i64]);
-        let g = self.group_with_slots(req.x, req.weights, slots, token_t, tokens, top_k)?;
+        let xd = DevTensor(x.shallow_clone());
+        let wd = DevTensor(weights.shallow_clone());
+        let g = self.group_with_slots(&xd, &wd, slots, token_t, tokens, top_k)?;
         self.launch(&g)?;
         self.collect_dev(&g, out)
     }
+}
+
+/// Tokens one staged chunk carries so `tokens * top_k <= block_k`. Floored at
+/// one so a `block_k` smaller than `top_k` still makes progress; `ensure_experts`
+/// then refuses the overflow instead of the loop spinning forever.
+fn staged_chunk_tokens(block_k: usize, top_k: usize) -> usize {
+    (block_k / top_k).max(1)
 }
 
 /// Packed plus scales plus globals for one expert's two slabs.
@@ -1019,6 +1099,19 @@ mod tests {
         fn slab(&self, _: usize, _: u32, _: Part) -> Result<Slab, MoEError> {
             unreachable!("the CPU paths must refuse before staging")
         }
+    }
+
+    /// The prefill chunker keeps every chunk inside the committed route cap, and
+    /// never returns zero (which would loop forever).
+    #[test]
+    fn a_staged_chunk_fits_the_route_cap() {
+        // top_k 8, cap 128 -> 16 tokens per chunk.
+        assert_eq!(staged_chunk_tokens(128, 8), 16);
+        // A cap that is an exact multiple still leaves the last chunk full.
+        assert_eq!(staged_chunk_tokens(64, 8), 8);
+        // A cap smaller than top_k cannot fit one route; the chunk is one token
+        // and `ensure_experts` is what refuses the overflow.
+        assert_eq!(staged_chunk_tokens(2, 8), 1);
     }
 
     /// Staging is byte indexing, so it is checkable on the CPU with the same code
