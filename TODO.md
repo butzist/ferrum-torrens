@@ -639,7 +639,7 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 - [x] P0 `POST /v1/completions` (non-stream, n=1, `cmpl-{uid}` ids, usage block, `spawn_blocking` for the forward), `GET /v1/models`, `GET /health`. (`infrastructure/http.rs`, `main.rs`)
 - [x] P0 SSE framing `data: {json}\n\n` + `data: [DONE]`; usage block. (both `/v1/completions` and `/v1/chat/completions`)
 - [x] P0 streaming (`stream: true`): one frame per sampled token as it is produced (`generation::TokenSink`), a frame with the finish reason and the usage, then `[DONE]`; a bad prompt is still a JSON error with its status, a client that hangs up aborts the run, a slow one holds it back. (`infrastructure/http.rs`)
-- [ ] P1 accept `presence_penalty`/`frequency_penalty`/`best_of`/`user` instead of 400. `deny_unknown_fields` rejects them today, so a drop-in OpenAI client that sends even the defaults fails; `unsupported_openai_fields_return_400_via_deny_unknown_fields` pins the current behavior. Accept `presence_penalty`/`frequency_penalty` and apply them to the logits row before sampling (needs the request's generated history threaded into `SamplingParams`/`sample`), accept-and-ignore `best_of` (n=1) and `user` (logging only). Small, no cross-milestone dependency.
+- [x] P1 accept `presence_penalty`/`frequency_penalty`/`best_of`/`user` instead of 400. Both request structs now carry them and ignore them, which matches the reference: FreeToken declares all four in `api_models.py` and never reads them, so a drop-in client that sends the defaults is served rather than 400'd. `openai_compat_fields_are_accepted_and_ignored` pins acceptance on both endpoints; `unknown_field_is_400` keeps truly unknown fields rejected. (Implementing the penalties for real is deferred: it needs the generated history threaded into `sample`, and no reference behaviour to match.)
 - [x] P0 strict prefill-priority `schedule_next_batch()`; chunked prefill budget `max_prefill_length`; no decode starvation guard in v0 (mirror FreeToken, note as known issue). (simple M1 form in `domain/scheduler.rs`)
 - [x] P0 decode batch sorted by uid (deterministic).
 - [x] P0 per-step `run_forward`: build positions/answers -> model forward -> sample -> `complete_one()` advancement -> next-token for stop/detokenize. (M1 reference form in `application/engine.rs` + `application/generation.rs`; `token_pool` scatter and `out_loc` land with the paged KV pool)
@@ -2176,13 +2176,12 @@ estimate and dependency). Tier 1 is small, self-contained and testable without t
 full checkpoint; Tier 2 is medium and unblocks serving; Tier 3 is the large
 performance work.
 
-**Tier 1 -- small, no cross-milestone dependency (do first):**
-1. Scalar-oracle status comment (Hygiene) -- trivial.
-2. One-stream invariant `debug_assert` (Hygiene) -- small, touches the C++ shim.
-3. Gated-test serialization via `serial_test` (Hygiene) -- small, test-only.
-4. Committed-cubin check script (Hygiene) -- small, devShell-only.
-5. `presence_penalty`/`frequency_penalty`/`best_of`/`user` acceptance (Scheduler)
-   -- small-medium, needs the request history in the sampler.
+**Tier 1 -- small, no cross-milestone dependency: DONE (2026-10-15).**
+1. Scalar-oracle status comment (Hygiene).
+2. One-stream invariant `debug_assert` (Hygiene) -- `ft_get_current_stream`.
+3. Gated-test serialization via `serial_test` (Hygiene).
+4. Committed-cubin check script (Hygiene) -- `scripts/check-kernels.sh`.
+5. `presence_penalty`/`frequency_penalty`/`best_of`/`user` acceptance (Scheduler).
 
 **Tier 2 -- medium, unblocks serving:**
 6. KV dtype serving-safe (KV cache + radix) -- **SERVING BLOCKER**, medium,

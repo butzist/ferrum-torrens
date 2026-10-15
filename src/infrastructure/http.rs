@@ -105,6 +105,17 @@ pub struct CompletionRequest {
     pub stream: Option<bool>,
     #[serde(default)]
     pub n: Option<u32>,
+    // Accepted for OpenAI wire compatibility and ignored, matching the
+    // reference: FreeToken declares these fields and never reads them. Without
+    // this, `deny_unknown_fields` 400s a drop-in client that sends the defaults.
+    #[serde(default)]
+    pub presence_penalty: Option<f32>,
+    #[serde(default)]
+    pub frequency_penalty: Option<f32>,
+    #[serde(default)]
+    pub best_of: Option<i64>,
+    #[serde(default)]
+    pub user: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -210,6 +221,15 @@ pub struct ChatCompletionRequest {
     pub stream: Option<bool>,
     #[serde(default)]
     pub n: Option<u32>,
+    // Accepted and ignored; see `CompletionRequest`.
+    #[serde(default)]
+    pub presence_penalty: Option<f32>,
+    #[serde(default)]
+    pub frequency_penalty: Option<f32>,
+    #[serde(default)]
+    pub best_of: Option<i64>,
+    #[serde(default)]
+    pub user: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1045,29 +1065,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unsupported_openai_fields_return_400_via_deny_unknown_fields() {
-        for field in ["presence_penalty", "frequency_penalty", "best_of", "user"] {
-            let mut comp = serde_json::json!({ "prompt": "hello" });
-            comp[field] = serde_json::json!(1.0);
+    async fn openai_compat_fields_are_accepted_and_ignored() {
+        // FreeToken declares these and never reads them; accepting them keeps a
+        // drop-in client that sends the defaults from getting a 400.
+        for (field, value) in [
+            ("presence_penalty", serde_json::json!(0.0)),
+            ("frequency_penalty", serde_json::json!(0.0)),
+            ("best_of", serde_json::json!(1)),
+            ("user", serde_json::json!("u-1")),
+        ] {
+            let mut comp = serde_json::json!({ "prompt": "ab", "max_tokens": 2 });
+            comp[field] = value.clone();
             let (status, body) = post_json(comp).await;
             assert_eq!(
                 status,
-                StatusCode::BAD_REQUEST,
-                "completions must reject unsupported field '{field}' with 400"
+                StatusCode::OK,
+                "completions must accept OpenAI compat field '{field}'"
             );
-            assert_eq!(body["error"]["code"], "invalid_request");
+            assert_eq!(body["choices"][0]["text"], "cd");
 
             let mut chat = serde_json::json!({
-                "messages": [{ "role": "user", "content": "hello" }]
+                "messages": [{ "role": "user", "content": "ab" }],
+                "max_tokens": 2
             });
-            chat[field] = serde_json::json!(1.0);
-            let (status, body) = post_chat(test_router(), chat).await;
+            chat[field] = value;
+            let (status, _) = post_chat(test_router(), chat).await;
             assert_eq!(
                 status,
-                StatusCode::BAD_REQUEST,
-                "chat completions must reject unsupported field '{field}' with 400"
+                StatusCode::OK,
+                "chat completions must accept OpenAI compat field '{field}'"
             );
-            assert_eq!(body["error"]["code"], "invalid_request");
         }
     }
 
