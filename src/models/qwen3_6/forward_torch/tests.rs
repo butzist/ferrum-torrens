@@ -138,6 +138,39 @@ fn partial_rope_with_no_rotary_dim_is_the_identity() {
 }
 
 #[test]
+fn precomputed_rope_matches_dynamic_partial_rope() {
+    let (t, heads, hd, rd) = (5, 3, 16, 8);
+    let x = data(t * heads * hd, 5);
+    let positions = vec![0u32, 3, 5, 12, 100];
+    let pos_t = index_tensor(&positions, dev().to_tch());
+    let x_t = up(&x, &[t as i64, heads as i64, hd as i64]);
+
+    let (cos_cache, sin_cache) = super::precompute_rope_cache(256, rd, 1e7, dev().to_tch());
+    let cos = cos_cache.index_select(0, &pos_t);
+    let sin = sin_cache.index_select(0, &pos_t);
+    let cached = to_f32_vec(&super::apply_rope_cos_sin(
+        &x_t,
+        heads as i64,
+        hd as i64,
+        rd as i64,
+        &cos,
+        &sin,
+    ));
+    let dynamic = to_f32_vec(&partial_rope(
+        &x_t,
+        heads as i64,
+        hd as i64,
+        rd as i64,
+        1e7,
+        &pos_t,
+    ));
+    assert_eq!(
+        cached, dynamic,
+        "precomputed rope cache matches dynamic partial rope exactly"
+    );
+}
+
+#[test]
 fn causal_attention_matches_the_reference_including_gqa_mapping() {
     // qh=4, kvh=2 exercises the repeat-interleave head mapping; the reference
     // pairs q head h with kv head h*kvh/qh.

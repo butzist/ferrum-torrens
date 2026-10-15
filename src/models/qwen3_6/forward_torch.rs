@@ -392,10 +392,63 @@ fn softplus(x: &Tensor) -> Tensor {
 /// of a `[t, heads, head_dim]` view. Text-only positions make all mrope axes
 /// equal, so the standard half-rotation over the full rotary span applies.
 ///
+/// Precompute partial-Neox RoPE cos and sin tables on device up to `max_len`.
+/// Sized `[max_len, 1, half]` where `half = rotary_dim / 2`.
+fn precompute_rope_cache(
+    max_len: usize,
+    rotary_dim: usize,
+    base: f32,
+    device: tch::Device,
+) -> (Tensor, Tensor) {
+    if rotary_dim == 0 || max_len == 0 {
+        return (
+            Tensor::zeros([0, 1, 0], (Kind::Float, device)),
+            Tensor::zeros([0, 1, 0], (Kind::Float, device)),
+        );
+    }
+    let half = (rotary_dim / 2) as i64;
+    let inv_t = Tensor::arange(half as f64, (Kind::Double, device))
+        .g_mul_scalar(-2.0 * (base as f64).ln() / rotary_dim as f64)
+        .exp()
+        .reshape([1, half]);
+
+    let pos = Tensor::arange(max_len as f64, (Kind::Double, device)).reshape([max_len as i64, 1]);
+    let ang_t = pos.matmul(&inv_t).to_kind(Kind::Float);
+    let cos = ang_t.cos().unsqueeze(1);
+    let sin = ang_t.sin().unsqueeze(1);
+    (cos, sin)
+}
+
+fn apply_rope_cos_sin(
+    x: &Tensor,
+    heads: i64,
+    head_dim: i64,
+    rotary_dim: i64,
+    cos: &Tensor,
+    sin: &Tensor,
+) -> Tensor {
+    if rotary_dim == 0 {
+        return x.shallow_clone();
+    }
+    let half = rotary_dim / 2;
+    let t = x.size()[0];
+    let x3 = x.view([t, heads, head_dim]);
+    let (lo, hi, tail) = (
+        x3.narrow(2, 0, half),
+        x3.narrow(2, half, half),
+        x3.narrow(2, rotary_dim, head_dim - rotary_dim),
+    );
+
+    let rot_lo = &lo * cos - &hi * sin;
+    let rot_hi = &hi * cos + &lo * sin;
+    Tensor::cat(&[&rot_lo, &rot_hi, &tail], 2).reshape([t, heads * head_dim])
+}
+
 /// `positions` is a `[t]` device tensor rather than a host slice (decision 51):
 /// a captured decode step reads the rope position out of its own buffer, so the
 /// angle table is built on the device. The product is done in f64 and rounded
 /// once, exactly as the host table was, so the two agree.
+#[cfg(test)]
 fn partial_rope(
     x: &Tensor,
     heads: i64,
@@ -409,12 +462,6 @@ fn partial_rope(
     }
     let half = rotary_dim / 2;
     let t = positions.size()[0];
-    let x3 = x.view([t, heads, head_dim]);
-    let (lo, hi, tail) = (
-        x3.narrow(2, 0, half),
-        x3.narrow(2, half, half),
-        x3.narrow(2, rotary_dim, head_dim - rotary_dim),
-    );
 
     // inv_freq[i] = base^(-2i/rotary_dim) = exp(-2i/rotary_dim * ln base),
     // built on the device: a decode step replays this in a capture, and a
@@ -432,9 +479,7 @@ fn partial_rope(
     let cos = ang_t.cos().unsqueeze(1);
     let sin = ang_t.sin().unsqueeze(1);
 
-    let rot_lo = &lo * &cos - &hi * &sin;
-    let rot_hi = &hi * &cos + &lo * &sin;
-    Tensor::cat(&[&rot_lo, &rot_hi, &tail], 2).reshape([t, heads * head_dim])
+    apply_rope_cos_sin(x, heads, head_dim, rotary_dim, &cos, &sin)
 }
 
 /// Causal depthwise conv1d then silu. `w` is `[c, 1, k]` and `x` is `[t, c]`.
@@ -916,6 +961,9 @@ pub struct TorchQwen3_6 {
     /// The KV cache this forward reads and writes, when the engine gave it one.
     /// The engine keeps a clone of the same allocation to hand out page tables.
     cache: Option<std::sync::Arc<DeviceCache>>,
+    /// Precomputed partial-Neox RoPE cos/sin tables on device up to max_position_embeddings.
+    rope_cos: SharedTensor,
+    rope_sin: SharedTensor,
 }
 
 struct TorchLayer {
@@ -1057,6 +1105,12 @@ impl TorchQwen3_6 {
         }
 
         let lm_head = ld.dense("lm_head.weight", device)?;
+        let (rope_cos, rope_sin) = precompute_rope_cache(
+            params.max_position_embeddings.max(4096),
+            params.rotary_dim,
+            params.rope_theta,
+            device.to_tch(),
+        );
         Ok(Self {
             params,
             device,
@@ -1069,6 +1123,8 @@ impl TorchQwen3_6 {
             moe,
             attention,
             cache: Some(cache),
+            rope_cos: up(rope_cos),
+            rope_sin: up(rope_sin),
         })
     }
 
@@ -1167,22 +1223,33 @@ impl TorchQwen3_6 {
         let q = rms_norm(&q.reshape([t, qh, hd]), &fa.q_norm, p.rms_norm_eps).reshape([t, qh_dim]);
         let k =
             rms_norm(&k.reshape([t, kvh, hd]), &fa.k_norm, p.rms_norm_eps).reshape([t, kvh * hd]);
-        let q = partial_rope(
+        let (cos, sin) = if p.rotary_dim > 0 && self.rope_cos.size()[0] > 0 {
+            (
+                self.rope_cos.index_select(0, positions),
+                self.rope_sin.index_select(0, positions),
+            )
+        } else {
+            (
+                Tensor::zeros([0, 1, 0], (Kind::Float, x.device())),
+                Tensor::zeros([0, 1, 0], (Kind::Float, x.device())),
+            )
+        };
+        let q = apply_rope_cos_sin(
             &q.reshape([t, qh, hd]),
             qh,
             hd,
             p.rotary_dim as i64,
-            p.rope_theta,
-            positions,
+            &cos,
+            &sin,
         )
         .reshape([t, qh, hd]);
-        let k = partial_rope(
+        let k = apply_rope_cos_sin(
             &k.reshape([t, kvh, hd]),
             kvh,
             hd,
             p.rotary_dim as i64,
-            p.rope_theta,
-            positions,
+            &cos,
+            &sin,
         )
         .reshape([t, kvh, hd]);
         (q, k, v.reshape([t, kvh, hd]), gate)
