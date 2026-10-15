@@ -1045,6 +1045,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unsupported_openai_fields_return_400_via_deny_unknown_fields() {
+        for field in ["presence_penalty", "frequency_penalty", "best_of", "user"] {
+            let mut comp = serde_json::json!({ "prompt": "hello" });
+            comp[field] = serde_json::json!(1.0);
+            let (status, body) = post_json(comp).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "completions must reject unsupported field '{field}' with 400"
+            );
+            assert_eq!(body["error"]["code"], "invalid_request");
+
+            let mut chat = serde_json::json!({
+                "messages": [{ "role": "user", "content": "hello" }]
+            });
+            chat[field] = serde_json::json!(1.0);
+            let (status, body) = post_chat(test_router(), chat).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "chat completions must reject unsupported field '{field}' with 400"
+            );
+            assert_eq!(body["error"]["code"], "invalid_request");
+        }
+    }
+
+    #[tokio::test]
     async fn streaming_sends_one_frame_per_token_then_the_final_frame_and_done() {
         let response = test_router()
             .oneshot(

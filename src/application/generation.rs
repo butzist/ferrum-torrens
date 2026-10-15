@@ -565,6 +565,38 @@ mod tests {
     }
 
     #[test]
+    fn an_aborted_streaming_request_drains_its_in_flight_forward_and_frees_cache_pages() {
+        let (e, rec, cache) = test_cached_engine(limits());
+        let pages_before = cache.pages_left();
+        let mut calls = 0;
+        let mut sink = |_text: &str, _id: u32, index: usize| {
+            calls += 1;
+            Ok(index == 0)
+        };
+        let g = generate_streaming(&e, req(&e, 1, "abcd", params(5)), 0, &mut sink).unwrap();
+        assert_eq!(
+            calls, 2,
+            "prefill token streamed, then 1st decode token streamed before abort"
+        );
+        assert_eq!(
+            g.tokens.len(),
+            2,
+            "in-flight forward completed and token was preserved"
+        );
+        assert_eq!(g.finish_reason, FinishReason::Abort);
+        assert_eq!(
+            rec.cached_calls().len(),
+            2,
+            "prefill + 1 decode step drained, no further steps"
+        );
+        assert_eq!(
+            cache.pages_left(),
+            pages_before,
+            "all cache pages are returned after in-flight forward drains"
+        );
+    }
+
+    #[test]
     fn eos_stops_generation() {
         let (e, _) = test_engine(limits());
         let r = make_request(&e, 1, vec![299], params(5)).unwrap();
