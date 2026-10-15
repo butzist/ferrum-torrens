@@ -133,10 +133,65 @@
           ++ [combinators.gpu]
           ++ cudaDevicePaths;
 
+        # Home-manager surfaces opencode's config as a symlink chain into the
+        # nix store, e.g.
+        #
+        #   ~/.config/opencode/opencode.jsonc
+        #     -> /nix/store/<hash>-home-manager-files/.config/opencode/opencode.jsonc
+        #     -> /nix/store/<hash>-hm_opencodeopencode.jsonc
+        #
+        # The jail binds the config dir (from `configPaths`) but not the host
+        # `/nix` store, so those symlinks dangle and opencode cannot read its
+        # own config. Nix evaluation is pure and has no `readlink`, and the
+        # targets' hashes are not known statically, so resolve the chain at
+        # runtime instead: this script runs on the host in the jail's
+        # `add-runtime` step and prints each `/nix/store/*` hop, which is then
+        # ro-bound at its own location. Every hop is emitted (not just the
+        # final target) so intermediate symlinks such as the
+        # `home-manager-files` path resolve too.
+        opencodeConfigFiles = ["$HOME/.config/opencode/opencode.jsonc"];
+
+        resolveOpencodeStoreSymlinks = pkgs.writeShellApplication {
+          name = "opencode-resolve-store-symlinks";
+          runtimeInputs = [pkgs.coreutils];
+          text = ''
+            collect() {
+              local p="$1" dir
+              dir="$(dirname "$p")"
+              while [ -L "$p" ]; do
+                p="$(readlink "$p")"
+                case "$p" in
+                  /*) ;;
+                  *) p="$dir/$p" ;;
+                esac
+                case "$p" in
+                  /nix/store/*)
+                    if [ -e "$p" ]; then
+                      printf '%s\n' "$p"
+                    fi
+                    ;;
+                esac
+                dir="$(dirname "$p")"
+              done
+            }
+            ${builtins.concatStringsSep "\n" (map (f: ''collect "${f}"'') opencodeConfigFiles)}
+          '';
+        };
+
+        # `--ro-bind-try` so the jail still boots if a target has since been
+        # garbage-collected.
+        bindOpencodeStorePaths = combinators.add-runtime ''
+          while IFS= read -r store_path; do
+            [ -n "$store_path" ] || continue
+            RUNTIME_ARGS+=(--ro-bind-try "$store_path" "$store_path")
+          done < <(${resolveOpencodeStoreSymlinks}/bin/opencode-resolve-store-symlinks)
+        '';
+
         jailedOpencode = jlib.makeJailedOpencode {
           name = "opencode";
           extraPkgs = basePackages;
           baseJailOptions = jailOptions;
+          extraJailOptions = [bindOpencodeStorePaths];
           # Inherit the devshell's build/runtime env (jail.nix `try-fwd-env`:
           # forward if set, ignore otherwise). Launching the agent from a
           # `nix develop` shell then gives it the torch/cuda/python toolchain
