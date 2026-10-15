@@ -45,6 +45,7 @@ pub type CUcontext = *mut c_void;
 pub type CUstream = *mut c_void;
 pub type CUgraph = *mut c_void;
 pub type CUgraphExec = *mut c_void;
+pub type CUevent = *mut c_void;
 
 const RTLD_NOW: c_int = 2;
 const RTLD_GLOBAL: c_int = 0x100;
@@ -57,6 +58,11 @@ pub const CAPTURE_MODE_GLOBAL: u32 = 0;
 /// `CU_MEMHOSTALLOC_DEVICEMAP`: map the page-locked host allocation into the
 /// device address space, which is what gives a pinned buffer a `CUdeviceptr`.
 pub const MEMHOSTALLOC_DEVICEMAP: u32 = 0x02;
+
+/// `CU_STREAM_NON_BLOCKING`: the stream does not implicitly synchronize with the
+/// legacy stream. The prefill overlap needs this so the expert copy can run
+/// concurrently with the compute stream, ordered only by explicit events.
+pub const STREAM_NON_BLOCKING: u32 = 0x01;
 
 /// `libcuda.so.1` is the SONAME every NVIDIA driver ships under, and the stub
 /// `libcuda.so` only exists with the toolkit installed. The devshell puts the
@@ -111,6 +117,10 @@ type GraphDestroyFn = unsafe extern "C" fn(CUgraph) -> CUresult;
 type GraphInstantiateFn = unsafe extern "C" fn(*mut CUgraphExec, CUgraph, u64) -> CUresult;
 type GraphLaunchFn = unsafe extern "C" fn(CUgraphExec, CUstream) -> CUresult;
 type GraphExecDestroyFn = unsafe extern "C" fn(CUgraphExec) -> CUresult;
+type EventCreateFn = unsafe extern "C" fn(*mut CUevent, u32) -> CUresult;
+type EventDestroyFn = unsafe extern "C" fn(CUevent) -> CUresult;
+type EventRecordFn = unsafe extern "C" fn(CUevent, CUstream) -> CUresult;
+type StreamWaitEventFn = unsafe extern "C" fn(CUstream, CUevent, u32) -> CUresult;
 
 struct Fns {
     cu_init: InitFn,
@@ -138,6 +148,10 @@ struct Fns {
     cu_graph_instantiate: GraphInstantiateFn,
     cu_graph_launch: GraphLaunchFn,
     cu_graph_exec_destroy: GraphExecDestroyFn,
+    cu_event_create: EventCreateFn,
+    cu_event_destroy: EventDestroyFn,
+    cu_event_record: EventRecordFn,
+    cu_stream_wait_event: StreamWaitEventFn,
 }
 
 /// A loaded `libcuda`, plus whatever context the caller made current.
@@ -234,6 +248,12 @@ impl Driver {
             cu_graph_instantiate: sym!("cuGraphInstantiateWithFlags", GraphInstantiateFn),
             cu_graph_launch: sym!("cuGraphLaunch", GraphLaunchFn),
             cu_graph_exec_destroy: sym!("cuGraphExecDestroy", GraphExecDestroyFn),
+            // Events order the prefill copy stream against the compute stream
+            // (item 8 slice 2). `cuEventDestroy_v2` is the driver's export.
+            cu_event_create: sym!("cuEventCreate", EventCreateFn),
+            cu_event_destroy: sym!("cuEventDestroy_v2", EventDestroyFn),
+            cu_event_record: sym!("cuEventRecord", EventRecordFn),
+            cu_stream_wait_event: sym!("cuStreamWaitEvent", StreamWaitEventFn),
         };
         Ok(Self { _lib: lib, fns })
     }
@@ -382,10 +402,41 @@ impl Driver {
     /// The caller must have a CUDA context current; the returned stream
     /// belongs to that context and must be destroyed with `destroy_stream`.
     pub unsafe fn create_stream(&self) -> Result<CUstream, CudaError> {
+        // SAFETY: the caller guarantees a current context.
+        unsafe { self.create_stream_with_flags(0) }
+    }
+
+    /// # Safety
+    /// A CUDA context must be current; the returned stream belongs to it.
+    pub unsafe fn create_stream_with_flags(&self, flags: u32) -> Result<CUstream, CudaError> {
         let mut stream: CUstream = std::ptr::null_mut();
-        // SAFETY: `stream` is a valid out pointer; 0 flags create a regular stream.
-        self.check(unsafe { (self.fns.cu_stream_create)(&raw mut stream, 0) })?;
+        // SAFETY: `stream` is a valid out pointer; `flags` is a stream flag bit.
+        self.check(unsafe { (self.fns.cu_stream_create)(&raw mut stream, flags) })?;
         Ok(stream)
+    }
+
+    /// An owned stream (destroyed on drop), for a stream that outlives the call
+    /// that made it. `flags` is a `CUstream_flags` bit set; pass
+    /// `STREAM_NON_BLOCKING` for a copy stream that must not serialize with the
+    /// legacy stream.
+    pub fn owned_stream(self: &Arc<Self>, flags: u32) -> Result<OwnedStream, CudaError> {
+        // SAFETY: the adapter that calls this runs with its context current,
+        // which is the invariant `create_stream_with_flags` documents.
+        let raw = unsafe { self.create_stream_with_flags(flags) }?;
+        Ok(OwnedStream {
+            driver: Arc::clone(self),
+            raw,
+        })
+    }
+
+    /// An owned event (destroyed on drop), with timing disabled.
+    pub fn owned_event(self: &Arc<Self>) -> Result<OwnedEvent, CudaError> {
+        // SAFETY: as `owned_stream`, the caller's context is current.
+        let raw = unsafe { self.create_event() }?;
+        Ok(OwnedEvent {
+            driver: Arc::clone(self),
+            raw,
+        })
     }
 
     /// Destroy a stream created by `create_stream`.
@@ -400,6 +451,57 @@ impl Driver {
         }
         // SAFETY: `stream` is owned by the caller and belongs to current context.
         self.check(unsafe { (self.fns.cu_stream_destroy)(stream) })
+    }
+
+    /// Create an event with timing disabled (`CU_EVENT_DISABLE_TIMING`): the
+    /// prefill overlap only needs ordering, not durations, and a timing event
+    /// costs a device timestamp per record.
+    ///
+    /// # Safety
+    /// The caller must have a CUDA context current; the returned event belongs
+    /// to it and must be destroyed with `destroy_event`.
+    pub unsafe fn create_event(&self) -> Result<CUevent, CudaError> {
+        let mut event: CUevent = std::ptr::null_mut();
+        // SAFETY: `event` is a live out slot; bit 1 is CU_EVENT_DISABLE_TIMING.
+        self.check(unsafe { (self.fns.cu_event_create)(&raw mut event, 0x2) })?;
+        Ok(event)
+    }
+
+    /// Destroy an event created by `create_event`.
+    ///
+    /// # Safety
+    /// `event` must be a valid event of the current context with no record
+    /// still being waited on.
+    pub unsafe fn destroy_event(&self, event: CUevent) -> Result<(), CudaError> {
+        if event.is_null() {
+            return Err(CudaError::Driver("destroy_event called with null".into()));
+        }
+        // SAFETY: the caller owns the event and it belongs to the current context.
+        self.check(unsafe { (self.fns.cu_event_destroy)(event) })
+    }
+
+    /// Record `event` on `stream`: it completes when every launch queued on
+    /// `stream` before this call has completed.
+    ///
+    /// # Safety
+    /// `event` and `stream` must belong to the current context.
+    pub unsafe fn record_event(&self, event: CUevent, stream: CUstream) -> Result<(), CudaError> {
+        // SAFETY: both handles are the caller's live objects in this context.
+        self.check(unsafe { (self.fns.cu_event_record)(event, stream) })
+    }
+
+    /// Make every later launch on `stream` wait for `event` to complete.
+    ///
+    /// # Safety
+    /// `event` and `stream` must belong to the current context; `event` must
+    /// have been recorded (or be about to be) so the wait can resolve.
+    pub unsafe fn stream_wait_event(
+        &self,
+        stream: CUstream,
+        event: CUevent,
+    ) -> Result<(), CudaError> {
+        // SAFETY: both handles are the caller's live objects in this context.
+        self.check(unsafe { (self.fns.cu_stream_wait_event)(stream, event, 0) })
     }
 
     /// Record everything launched on `stream` into a graph instead of running
@@ -627,6 +729,81 @@ impl PinnedBuf {
         // SAFETY: `host` is this struct's live allocation of `bytes`, and
         // `&mut self` rules out another live slice into it.
         unsafe { std::slice::from_raw_parts_mut(self.host.cast(), self.bytes) }
+    }
+}
+
+/// Owns a CUDA stream and destroys it on drop. Unlike `DeviceBuf` it holds an
+/// `Arc<Driver>`, because the prefill copy stream outlives the call that made
+/// it. Dropping is best-effort: a driver already gone needs no cleanup.
+pub struct OwnedStream {
+    driver: Arc<Driver>,
+    raw: CUstream,
+}
+
+// SAFETY: a stream handle is a plain driver object reached through the
+// thread-safe `Arc<Driver>`, and the driver API itself is thread-safe.
+unsafe impl Send for OwnedStream {}
+unsafe impl Sync for OwnedStream {}
+
+impl Drop for OwnedStream {
+    fn drop(&mut self) {
+        let _ = self
+            .driver
+            .check(unsafe { (self.driver.fns.cu_stream_destroy)(self.raw) });
+    }
+}
+
+impl OwnedStream {
+    pub fn raw(&self) -> CUstream {
+        self.raw
+    }
+}
+
+/// Owns a CUDA event and destroys it on drop. The prefill overlap records and
+/// waits on these to order its copy stream against the compute stream.
+pub struct OwnedEvent {
+    driver: Arc<Driver>,
+    raw: CUevent,
+}
+
+// SAFETY: as `OwnedStream`: a driver object behind a thread-safe `Arc<Driver>`.
+unsafe impl Send for OwnedEvent {}
+unsafe impl Sync for OwnedEvent {}
+
+impl Drop for OwnedEvent {
+    fn drop(&mut self) {
+        let _ = self
+            .driver
+            .check(unsafe { (self.driver.fns.cu_event_destroy)(self.raw) });
+    }
+}
+
+impl OwnedEvent {
+    pub fn raw(&self) -> CUevent {
+        self.raw
+    }
+
+    /// Record on `stream`: the event completes once every launch queued on
+    /// `stream` before this call has completed.
+    ///
+    /// # Safety
+    /// `stream` must be a live stream of this event's context, which must be
+    /// current.
+    pub unsafe fn record(&self, stream: CUstream) -> Result<(), CudaError> {
+        // SAFETY: the caller guarantees a live stream in the current context.
+        self.driver
+            .check(unsafe { (self.driver.fns.cu_event_record)(self.raw, stream) })
+    }
+
+    /// Make every later launch on `stream` wait for this event to complete.
+    ///
+    /// # Safety
+    /// `stream` must be a live stream of this event's context, which must be
+    /// current.
+    pub unsafe fn wait_on(&self, stream: CUstream) -> Result<(), CudaError> {
+        // SAFETY: the caller guarantees a live stream in the current context.
+        self.driver
+            .check(unsafe { (self.driver.fns.cu_stream_wait_event)(stream, self.raw, 0) })
     }
 }
 
@@ -919,6 +1096,7 @@ impl StagingKernels {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     /// The GEMV pair shares one Triton entry, so the table has to key on the
     /// manifest name. Handles here are fabricated integers, never dereferenced:
@@ -1007,6 +1185,7 @@ mod tests {
     /// hangs on capture needing a real side stream, and a null stream that
     /// silently reached the driver would blur where the rule is enforced.
     #[test]
+    #[serial]
     fn the_legacy_stream_is_refused_as_a_capture_target() {
         let Ok(driver) = Driver::open() else {
             eprintln!("no libcuda on this box, skipping");
@@ -1025,6 +1204,7 @@ mod tests {
     /// harness provides -- so what this proves is the FFI plumbing itself,
     /// every step, on a device. Skips (loudly) without libcuda or a device.
     #[test]
+    #[serial]
     fn a_side_stream_round_trips_through_capture() {
         let Ok(driver) = Driver::open() else {
             eprintln!("no libcuda on this box, skipping");
@@ -1055,12 +1235,88 @@ mod tests {
         unsafe { driver.destroy_stream(stream) }.expect("destroy stream");
     }
 
+    /// The prefill overlap's ordering primitive: an event recorded on one
+    /// stream and waited on by another, then both synchronized and torn down.
+    /// Skips (loudly) without libcuda or a device.
+    #[test]
+    #[serial]
+    fn an_event_orders_two_streams_and_round_trips() {
+        let Ok(driver) = Driver::open() else {
+            eprintln!("no libcuda on this box, skipping");
+            return;
+        };
+        if driver.init().is_err() || driver.device_count().unwrap_or(0) == 0 {
+            eprintln!("no CUDA device, skipping");
+            return;
+        }
+        driver.attach_primary_context(0).expect("primary context");
+        // SAFETY: the context is current and both streams/events are created
+        // here, so they are ours to destroy.
+        let a = unsafe { driver.create_stream() }.expect("stream a");
+        let b = unsafe { driver.create_stream() }.expect("stream b");
+        let event = unsafe { driver.create_event() }.expect("event");
+        assert!(!event.is_null());
+        unsafe { driver.record_event(event, a) }.expect("record on a");
+        unsafe { driver.stream_wait_event(b, event) }.expect("b waits the event");
+        unsafe { driver.synchronize(a) }.expect("sync a");
+        unsafe { driver.synchronize(b) }.expect("sync b");
+        unsafe { driver.destroy_event(event) }.expect("destroy event");
+        unsafe { driver.destroy_stream(a) }.expect("destroy a");
+        unsafe { driver.destroy_stream(b) }.expect("destroy b");
+        // A null handle is an error rather than a silent no-op.
+        assert!(unsafe { driver.destroy_event(std::ptr::null_mut()) }.is_err());
+    }
+
+    /// The owned wrappers create, order and drop their resources through RAII.
+    /// Two copies of each on one driver prove the Drop impls do not disturb the
+    /// others (a double-free or a stale handle would show as a later failure).
+    /// Skips (loudly) without libcuda or a device.
+    #[test]
+    #[serial]
+    fn owned_streams_and_events_round_trip_and_drop() {
+        let Ok(driver) = Driver::open() else {
+            eprintln!("no libcuda on this box, skipping");
+            return;
+        };
+        if driver.init().is_err() || driver.device_count().unwrap_or(0) == 0 {
+            eprintln!("no CUDA device, skipping");
+            return;
+        }
+        driver.attach_primary_context(0).expect("primary context");
+        let driver = Arc::new(driver);
+        {
+            let stream = driver
+                .owned_stream(STREAM_NON_BLOCKING)
+                .expect("copy stream");
+            assert!(!stream.raw().is_null());
+            let ready = driver.owned_event().expect("ready event");
+            let begin = driver.owned_event().expect("begin event");
+            // SAFETY: `stream` is live in the current context.
+            unsafe {
+                begin.record(stream.raw()).expect("record begin");
+                ready.wait_on(stream.raw()).expect("stream waits ready");
+                ready.record(stream.raw()).expect("record ready");
+            }
+            unsafe { driver.synchronize(stream.raw()) }.expect("sync");
+        }
+        // A second pair, made after the first dropped, must be equally usable.
+        let stream = driver.owned_stream(0).expect("blocking stream");
+        let event = driver.owned_event().expect("event");
+        // SAFETY: `stream` is live in the current context.
+        unsafe {
+            event.record(stream.raw()).expect("record");
+            event.wait_on(stream.raw()).expect("wait");
+        }
+        unsafe { driver.synchronize(stream.raw()) }.expect("sync");
+    }
+
     /// The pinned host banks are the source side of the copy kernel, which
     /// reaches them through their device alias, so that alias has to be a real,
     /// readable `CUdeviceptr`. Filling from the host and reading back through
     /// `cuMemcpyDtoH` at the device address only succeeds if `DEVICEMAP` mapped
     /// it. Skips (loudly) without libcuda or a device.
     #[test]
+    #[serial]
     fn a_pinned_buffer_has_a_readable_device_alias() {
         let Ok(driver) = Driver::open() else {
             eprintln!("no libcuda on this box, skipping");
