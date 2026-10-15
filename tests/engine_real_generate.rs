@@ -11,6 +11,7 @@
 // port 1919) for the same prompt: "The capital of France is" -> " Paris, a" with
 // greedy sampling. Use the same oracle to re-check after touching the forward.
 
+use serial_test::serial;
 use std::time::Instant;
 
 use ferrum_torrens::application::engine::{BatchRow, load_engine};
@@ -63,6 +64,7 @@ fn greedy(max_tokens: u32) -> SamplingParams {
 /// rules, detokenize) with a one-token budget: exactly one forward pass.
 #[test]
 #[ignore = "requires converted checkpoint in .model-cache"]
+#[serial]
 fn one_token_prediction_matches_the_oracle() {
     let engine = load_engine(&config(1)).unwrap();
     let ids = engine.encode(PROMPT).unwrap();
@@ -95,6 +97,7 @@ fn one_token_prediction_matches_the_oracle() {
 ///     a_chat_request_answers_from_the_rendered_template --ignored --nocapture
 #[test]
 #[ignore = "requires converted checkpoint in .model-cache"]
+#[serial]
 fn a_chat_request_answers_from_the_rendered_template() {
     let engine = load_engine(&config(1)).unwrap();
     let conversation = [
@@ -131,6 +134,7 @@ fn a_chat_request_answers_from_the_rendered_template() {
 ///     one_token_through_the_kernel_matches_the_oracle --ignored --nocapture
 #[test]
 #[ignore = "requires the converted checkpoint and a cuda device"]
+#[serial]
 fn one_token_through_the_kernel_matches_the_oracle() {
     // Without the `cuda` feature there is no libtorch forward, so no MoE port,
     // and the gate would quietly measure the inline host path instead.
@@ -173,6 +177,7 @@ fn one_token_through_the_kernel_matches_the_oracle() {
 
 #[test]
 #[ignore = "requires the converted checkpoint and a cuda device"]
+#[serial]
 fn a_captured_engine_decodes_on_its_graphs() {
     if !cfg!(feature = "cuda") {
         panic!("this gate needs --features cuda; without it there is no capture");
@@ -216,6 +221,7 @@ fn a_captured_engine_decodes_on_its_graphs() {
 /// Separate from the oracle gate because it is a diagnostic, not a pass/fail.
 #[test]
 #[ignore = "requires converted checkpoint in .model-cache"]
+#[serial]
 fn logit_lens_locates_the_first_bad_layer() {
     const EVERY: usize = 1;
     let engine = load_engine(&config(1)).unwrap();
@@ -251,6 +257,7 @@ fn logit_lens_locates_the_first_bad_layer() {
 /// which is what makes this measurable.
 #[test]
 #[ignore = "requires converted checkpoint in .model-cache"]
+#[serial]
 fn per_step_cost_scales_with_prefix_length() {
     let engine = load_engine(&config(4)).unwrap();
     let mut ids = engine.encode(PROMPT).unwrap();

@@ -31,6 +31,8 @@ minijinja = { version = "2.24.0", features = ["serde"] }
 
 [dev-dependencies]
 mockall = "0.13"
+# `#[serial]` only; the async/logging features pull tokio-duplicated deps.
+serial_test = { version = "4.0.1", default-features = false }
 tower = { version = "0.5", features = ["util"] }
 
 [build-dependencies]

@@ -21,6 +21,7 @@
 
 #![cfg(feature = "cuda")]
 
+use serial_test::serial;
 use std::sync::{Arc, Mutex};
 
 use ferrum_torrens::application::run_experts::CachedExperts;
@@ -196,6 +197,7 @@ fn logits(bufs: &DecodeBuffers) -> Vec<f32> {
 
 #[test]
 #[ignore = "needs a CUDA device and the FTW checkpoint"]
+#[serial]
 fn a_captured_decode_step_replays_equal_to_an_uncaptured_step() {
     let b = build(PROMPT.len() + DECODE_STEPS + 16, 4);
     let device = auto_device();
@@ -339,6 +341,7 @@ fn prefill_set(b: &Built, prompts: &[Vec<u32>]) -> (Vec<SequenceCache>, Vec<u32>
 /// buffers and replays; the logits must match the uncaptured twin row by row.
 #[test]
 #[ignore = "needs a CUDA device and the FTW checkpoint"]
+#[serial]
 fn a_captured_batch_decode_step_replays_equal_to_an_uncaptured_step() {
     const L: usize = 3;
     let max_bs = *BATCHES.iter().max().unwrap();

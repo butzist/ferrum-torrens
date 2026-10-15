@@ -17,6 +17,7 @@ use ferrum_torrens::infrastructure::kernel_abi::{
     Abi, GEMV_DOWN, GEMV_GATE_UP, MoEArgs, SILU_MUL, SUM_REDUCE, grid, silu_mul_args,
     sum_reduce_args,
 };
+use serial_test::serial;
 
 /// bf16 round-to-nearest-even, the same rounding the conversion does.
 fn to_bf16(v: f32) -> u16 {
@@ -82,6 +83,7 @@ fn check(name: &str, got: &[f32], want: &[f32]) {
 
 #[test]
 #[ignore = "needs a CUDA device"]
+#[serial]
 fn the_committed_cubins_match_a_cpu_reference_through_the_driver_api() {
     let driver = std::sync::Arc::new(Driver::open().expect("libcuda"));
     driver.init().expect("cuInit");
@@ -182,6 +184,7 @@ fn the_committed_cubins_match_a_cpu_reference_through_the_driver_api() {
 /// identity check rather than a tolerance.
 #[test]
 #[ignore = "needs a CUDA device"]
+#[serial]
 fn every_committed_kernel_resolves_to_its_own_function() {
     let driver = std::sync::Arc::new(Driver::open().expect("libcuda"));
     driver.init().expect("cuInit");

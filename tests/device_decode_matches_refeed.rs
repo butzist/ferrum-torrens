@@ -14,6 +14,7 @@
 
 #![cfg(feature = "cuda")]
 
+use serial_test::serial;
 use std::sync::Arc;
 
 use ferrum_torrens::domain::kvcache::{CachedModel, KvCache, SequenceCache};
@@ -139,6 +140,7 @@ fn assert_close(dev: &[f32], whole: &[f32], at: usize) {
 
 #[test]
 #[ignore = "requires converted checkpoint in .model-cache"]
+#[serial]
 fn a_device_decode_step_matches_refeeding_the_whole_prefix() {
     let (m, cache, vocab) = model(PROMPT.len() + DECODE_STEPS + 8, 4);
     // The window has to hold every location a compared step gathers, sentinel
@@ -185,6 +187,7 @@ fn a_device_decode_step_matches_refeeding_the_whole_prefix() {
 /// compared row by row.
 #[test]
 #[ignore = "requires converted checkpoint in .model-cache"]
+#[serial]
 fn a_batched_decode_step_matches_n_single_row_steps() {
     const ROWS: usize = 3;
     const L: usize = 3;

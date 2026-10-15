@@ -16,6 +16,7 @@
 
 #![cfg(feature = "cuda")]
 
+use serial_test::serial;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -306,6 +307,7 @@ fn the_scalar_oracle_runs_on_the_real_expert_slabs() {
 
 #[test]
 #[ignore = "needs a CUDA device and the converted checkpoint in .model-cache"]
+#[serial]
 fn the_committed_cubins_match_the_scalar_oracle_on_real_expert_slabs() {
     println!(
         "GATE env: cwd={} ftw={}",
@@ -404,6 +406,7 @@ fn the_committed_cubins_match_the_scalar_oracle_on_real_expert_slabs() {
 /// overwrite bytes at the same addresses instead of allocating new ones.
 #[test]
 #[ignore = "needs a CUDA device and the converted checkpoint in .model-cache"]
+#[serial]
 fn the_bank_addresses_survive_a_layer_switch() {
     let Some((index, reader)) = open_checkpoint() else {
         panic!("gate needs the checkpoint in {FTW_DIR}");
@@ -441,6 +444,7 @@ fn the_bank_addresses_survive_a_layer_switch() {
 /// the one every tower now takes.
 #[test]
 #[ignore = "needs a CUDA device and the converted checkpoint in .model-cache"]
+#[serial]
 fn the_device_handoff_agrees_with_the_host_handoff() {
     let Some((index, reader)) = open_checkpoint() else {
         panic!("gate needs the checkpoint in {FTW_DIR}");
