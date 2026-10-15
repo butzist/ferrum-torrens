@@ -1541,6 +1541,39 @@ settled.
       for byte the host plan's. `cargo test` 264, `--features cuda` 355 + the
       real-checkpoint CPU test, `fmt`/`clippy` clean.
 
+67. **Prefill overlap is whole-layer materialize over two half-cache buffers, not
+    in-layer chunk pipelining** (2026-10-15) -- the design for item 8 slice 2.
+    - **The choice.** When `cache_size_slots >= 2*num_experts`, a prefill
+      materializes each layer's *whole* expert set (FreeToken's
+      `materialize_layer`) into one of two half-cache buffers (`num_experts`
+      slots each) and copies layer `l+1` into the other half on a copy stream
+      while layer `l`'s GEMV runs on the compute stream. The route mapping is
+      deterministic (`expert e -> half*num_experts + e`), so a whole-layer prefill
+      needs no `lru_ensure` and launches **one** GEMV per layer over all routes,
+      instead of slice 1's per-chunk launches. Below `2*num_experts` slots,
+      prefill keeps slice 1's chunked LRU path.
+    - **Why not in-layer chunk pipelining.** The GEMV reads the flat LRU slots;
+      overlapping chunk `k+1`'s `index_copy` with chunk `k`'s GEMV lets the LRU
+      evict a slot chunk `k` is still reading, so it needs per-chunk events and a
+      partition of the slot space to protect it -- more machinery for a copy that
+      is smaller (misses only) but still pays slice 1's per-chunk launch overhead.
+      The whole-layer copy is larger, but it is exactly the part that must be
+      hidden, and its static plan, fixed addresses and deterministic mapping keep
+      the residency simple. It also matches the reference.
+    - **Where the halves come from.** They are the existing `2*num_experts` slots,
+      not new VRAM, which is why the config already conditions `prefill_overlap`
+      on `cache_size_slots >= 512`. With the 4.51 GiB tower, `cache_size_slots =
+      512` (0.87 GiB) and a bf16 pool at `num_tokens = 65536` (1.25 GiB) the total
+      is ~6.6 GiB of the 7.53 GiB device, so the design fits.
+    - **Residency.** Materialize and the decode LRU are two mappings over the same
+      banks, so a prefill<->decode transition resets the entered path (the
+      decision-48 rule, moved back into the adapter now that prefill stays
+      staged). During one prefill the two halves are the whole residency.
+    - **Slicing.** (a) whole-layer materialize + the deterministic route remap +
+      the residency reset, gated by output parity with the host plan; (b) the copy
+      stream, ready/release events and the per-layer prefetch, gated by equality
+      with the un-overlapped materialize; then the `begin_prefill` fence and a
+      budget guard that falls back to slice 1 below `2*num_experts` slots.
 
 ---
 

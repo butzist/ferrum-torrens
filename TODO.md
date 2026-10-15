@@ -205,7 +205,7 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 
 ### MoE offload cache
 
-- [ ] P0 **prefill overlap (slice 2).** Two full-layer buffers + a copy stream and ready/release events so layer `l+1`'s whole-layer expert stream overlaps layer `l`'s compute (FreeToken's `materialize_layer` + `prefill_overlap`), guarded by `cache_size_slots >= 2*num_experts`. Budget note: two 256-expert buffers are ~0.85 GiB, which does not fit the 8 GiB target beside the resident tower and the bf16 KV default, so this needs either a smaller KV pool or a shared-buffer design; decide before building. Also the `begin_prefill` fence so a prefill buffer swap and the decode path cannot clobber each other. Large; depends on decisions 44/46/48 and slice 1 above.
+- [ ] P0 **prefill overlap (item 8 slice 2), design decided: decision 67.** Whole-layer `materialize_layer` over the two halves of a `2*num_experts`-slot cache, with layer `l+1`'s copy on a copy stream overlapping layer `l`'s GEMV (`cache_size_slots >= 2*num_experts`; below that, keep slice 1's chunked LRU). Slices: (a) whole-layer materialize + deterministic route remap + prefill/decode residency reset, gated by host-plan parity; (b) the copy stream, ready/release events and per-layer prefetch, gated by equality with the un-overlapped materialize; then the `begin_prefill` fence and the no-overlap fallback. Large; depends on decisions 44/46/48/66.
 
 ### KV cache + radix
 
@@ -264,8 +264,9 @@ history.
 - **64** -- KV defaults to bf16 and gathers always return f32. `[kv] dtype`
   selects it; `fp8` is refused until a path exists.
 - **66** -- prefill chunks the staged route list instead of falling back to the
-  host plan. Slice 2 (copy/compute overlap) is open, and is budget-blocked on
-  the 8 GiB target.
+  host plan.
+- **67** -- the prefill copy/compute overlap is whole-layer `materialize_layer`
+  over two half-cache buffers, not in-layer chunk pipelining (item 8 slice 2).
 - The capture/offload contracts (**40**-**61**) are DONE but still bind the
   decode path; see `DONE.md`.
 
@@ -297,10 +298,12 @@ performance work.
 
 **Tier 3 -- large performance (the only actionable remaining tier):**
 8. Prefill MoE path (MoE offload cache) -- **slice 1 DONE (2026-10-15)**, the
-   chunked staged prefill (decision 66). Prefill no longer falls back to the host
-   plan. **Slice 2 remaining:** the copy/compute `prefill_overlap` (two full-layer
-   buffers + a copy stream + events), which needs a VRAM decision first (two
-   ~0.43 GiB buffers do not fit the 8 GiB target beside the tower and bf16 KV).
+   chunked staged prefill (decision 66). **Slice 2 decided (decision 67):**
+   whole-layer `materialize_layer` over the two halves of a `2*num_experts` slot
+   cache, with the next layer's copy on a copy stream overlapping the current
+   layer's GEMV. It fits the 8 GiB target at 512 slots with a bf16 pool of
+   `num_tokens = 65536`; no new VRAM (the halves are the existing slots).
+   Implement in two slices (materialize, then the overlap + events), each gated.
    Large; depends on the landed staging infra (decisions 44/46/48).
 
 ### State of play
