@@ -38,10 +38,12 @@ feature. Open work: tool calling, the `[opt] /v1/responses` surface, server-side
 batching, the bf16-attention/remaining decode gap (items 14, 17), and the
 section 8 experiments.
 The decode gap is now pursued by **vendoring FreeToken's own Triton kernels**
-(decision 82, plan in `FUSED_GDN.md`): bf16 paged attention first, then the W8A16
-FP8 projections, then bf16 mixer activations + a fused conv, then the prefill
-chunk kernels -- libtorch stays the generic/CPU fallback.
-Progress history and the full decision log (numbers 1..82) live in `DONE.md`;
+(decision 82, plan in `FUSED_GDN.md`). Slices 1-2 landed: bf16 paged attention
+(decision 83) and the W8A16 FP8 projections (decision 84), which with the packed
+NVFP4 lm_head (decision 79) take decode **tg 8.2 -> 10.9 tok/s** and VRAM
+**7.9 -> 4.83 GiB**. Next: bf16 mixer activations + a fused conv (slice 3), then
+the prefill chunk kernels (slice 4); libtorch stays the generic/CPU fallback.
+Progress history and the full decision log (numbers 1..84) live in `DONE.md`;
 read that for the "why" behind any decision number referenced in code or tests.
 
 Goal: a **minimal, fast, single-GPU** Rust serving engine for **one model** --
@@ -308,6 +310,14 @@ The full log of confirmed decisions (numbers 1..76, stable -- code, tests and
 lists only the decisions that still bind open work; everything else there is
 history.
 
+- **84** -- the FP8 projections are the vendored W8A16 kernels
+  (`fp8_gemv`/`fp8_splitk_reduce`/`fp8_gemm`, decision 82 slice 2), reading the
+  resident e4m3 weight + per-row scale directly; `Dense` holds either a bf16
+  weight or the packed FP8 bytes, and the launcher lives in the `Dense` so the
+  dispatch needs no new call-site argument. The W8A8 `torch._scaled_mm` path is
+  dropped (`tch` does not expose it; W8A16 at M=1 is within ~0.5%). tg 10.3 ->
+  10.9, VRAM -1.22 GiB. Growing the cache past 512 slots is blocked by the
+  staging kernel's baked `BLOCK_C`.
 - **82** -- the decode gap is closed by **vendoring FreeToken's own Triton
   kernels** into `python/ferrum_kernel/` (FLA MIT, FreeToken Apache-2.0;
   attributed) and AOT-compiling them through our pipeline, with **libtorch kept
@@ -540,15 +550,16 @@ performance work.
 16. Decode "rest" ~25% -- **OPEN.** The re-profile (decision 81) leaves ~30 ms/token
     outside attention/head/GDN/MoE: input/post norms (80/layer), embed gather,
     residual adds, sampling (+ its D2H). Fold the norms into adjacent kernels.
-17. FP8 linear projections -- **OPEN, the top compute lever via decision 82 (E1
-    vendored).** FreeToken's own `fp8_pertensor_linear` docstring records the exact
-    path we are on -- FP8 widened to bf16, run through cuBLAS bf16 GEMV -- as
-    **~54% of their decode step**, halved by a W8A16 kernel (weight fp8-e4m3 +
-    per-row scale, e4m3->f32 convert in-register, f32 accumulate). Our own E2
-    lm_head experiment (decision 79) came out neutral only because its 4-bit LUT
-    unpack is arithmetic-heavy; W8A16 is a per-byte convert, so the win lands.
-    Vendor their Triton kernel, keep FP8 projections resident for the decode
-    dispatch (bf16 kinds stay cuBLAS; prefill covered too), and re-measure.
+17. FP8 linear projections -- **DONE (decision 84, vendored W8A16).** FreeToken's
+    `fp8_pertensor_linear` (split-K GEMV at M=1, tiled GEMM above) is vendored into
+    `python/ferrum_kernel/fp8_linear.py`, AOT'd into the `linear` section and wired
+    through `Fp8Linear` + a `Dense` that keeps the resident e4m3 bytes. Correct
+    (CUDA cross-check argmax 11751, 6.6% shift); tg 10.3 -> 10.9 and VRAM 6.05 ->
+    4.83 GiB. Smaller than FreeToken's ~54% claim because our step is spread across
+    attention and norms. **E4 (grow the expert cache into the freed VRAM) is
+    blocked**: device staging bakes `BLOCK_C 512` (`cuda_moe.rs:438`); raising it
+    is part of item 12. Note the E2 cautionary case no longer applies: W8A16 is a
+    per-byte e4m3 convert, where the NVFP4 lm_head's LUT unpack ate its win.
 18. Dense NVFP4 lm_head GEMV -- **DONE (decision 79).** `_nvfp4_dense_gemv_kernel`
     + `DenseGemv` launcher + `Head` storage: the packed checkpoint head stays
     resident and is streamed once per token. Correct (CUDA cross-check argmax

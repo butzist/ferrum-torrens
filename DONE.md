@@ -2044,6 +2044,43 @@ settled.
     - **Kept both variants.** `[kv] dtype = "f32"` still selects the f32 cubin;
       `check_geometry` validates both at construction.
 
+84. **Vendored W8A16 FP8 projections** (2026-10-16, implemented) -- decision 82
+    slice 2, TODO item 17.
+    - **Why.** The attention/GatedDeltaNet projections are per-tensor FP8 in the
+      checkpoint; we widened them to bf16 and ran cuBLAS, reading 2x the resident
+      bytes. FreeToken's own `fp8_pertensor_linear` docstring records this exact
+      path as "the dominant decode cost (~54% of the step)" and fixes it with a
+      W8A16 kernel that reads the FP8 weight directly.
+    - **What was vendored.** `python/ferrum_kernel/fp8_linear.py`: their
+      `_gemv_splitk_kernel` (M == 1, split-K, the `(cdiv(N,16), split_k)` grid),
+      `_splitk_reduce_kernel` (per-row scale at reduce; `SPLIT_K` made a runtime
+      arg so one cubin covers every projection shape) and `_gemm_kernel` (M > 1,
+      tiled, `tl.dot` on the fp8->bf16 in-register upcast). The W8A8
+      `torch._scaled_mm` path was dropped: `tch` does not expose it and FreeToken
+      measures W8A16 at M=1 within ~0.5%. AOT'd into the `linear` section;
+      `LinearAbi` gains `fp8_gemv`/`fp8_splitk_reduce`/`fp8_gemm` + args/grids;
+      `Fp8Linear` (`cuda_linear.rs`) launches them; `Dense` now holds either a
+      bf16 weight or the resident e4m3 bytes + scale, with the launcher in the
+      `Dense` so `apply` needs no new argument (the CPU/no-launcher path still
+      widens to bf16). `Fp8Linear::gemv` allocates its own `[split_k, N]` scratch
+      (graph-pool safe).
+    - **Deliberate divergences.** The weight pointer is declared `fp8e4nv`
+      directly (sm_120 has native fp8) instead of FreeToken's `e4m3_compat` u8
+      shim; the GEMM loads the weight K-major to avoid `tl.trans`.
+    - **A wrong first cut, caught by the interp gate.** The M>1 GEMM looked
+      garbage (rel ~1e11). Isolation showed triton's *interpreter* miscomputes
+      `tl.dot` (a plain bf16 dot gave rel 3e9), not the kernel, so `--interp`
+      covers only the GEMV and the device gate covers the GEMM.
+    - **Result.** Correct: `--interp` GEMV ~3e-7; the CUDA cross-check lands on
+      oracle token 11751, top-5 identical, 6.6% shift. **tg 10.3 -> 10.9 tok/s**
+      and VRAM **6.05 -> 4.83 GiB** (-1.22, the FP8 halving of 2.57 GB of
+      projections). Cumulative with decisions 79 and 83: **tg 8.2 -> 10.9** and
+      **VRAM 7.9 -> 4.83 GiB**. Less than FreeToken's share because our decode is
+      spread across attention/norms, but it frees the memory budget.
+    - **E4 still blocked.** A load past 512 slots fails: the device-staging
+      `lru_ensure` bakes `BLOCK_C 512` and refuses more
+      (`cuda_moe.rs:438`). Raising `BLOCK_C` is the item-12/13 follow-up.
+
 ---
 
 ## Progress log (narrative, pre-2026-10-15 compaction)

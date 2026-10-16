@@ -387,13 +387,16 @@ of decision 80 already anticipate it).
 1. **E3: bf16 paged attention** (this change; half-wired). q/output stay f32
    (the mixer activation), K/V read bf16 from the pool. One extra signature +
    cubin, dispatch on `pool.dtype()`.
-2. **E1: vendor `fp8_pertensor_linear` (W8A16).** Keep the FP8 projections
-   resident, dequant e4m3->f32 in-register, f32 accumulate. Their docstring
-   records this exact path (bf16-widened weights through cuBLAS) as **~54% of
-   their step**, halved by the W8A16 kernel. **This corrects the E2-based doubt
-   above**: our lm_head kernel was neutral because its 4-bit LUT unpack is
-   arithmetic-heavy; W8A16 is a trivial per-byte convert, so its bandwidth win
-   lands. Dispatch: fp8 kinds -> kernel, bf16 -> cuBLAS (also covers prefill).
+2. **E1: vendor `fp8_pertensor_linear` (W8A16). DONE (decision 84).** Keep the FP8
+   projections resident, dequant e4m3->f32 in-register, f32 accumulate. Their
+   docstring records this exact path (bf16-widened weights through cuBLAS) as
+   **~54% of their step**, halved by the W8A16 kernel. Landed: `fp8_linear.py`
+   (split-K GEMV + reduce + tiled GEMM), AOT'd into `linear`, `Fp8Linear` +
+   a resident-FP8 `Dense`. tg 10.3 -> 10.9, VRAM -1.22 GiB. **This corrects the
+   E2-based doubt above**: our lm_head kernel was neutral because its 4-bit LUT
+   unpack is arithmetic-heavy; W8A16 is a trivial per-byte convert, so its
+   bandwidth win lands (smaller than FreeToken's share because our step is spread
+   across attention and norms, not projection-dominated).
 3. **bf16 mixer activations + vendor `causal_conv1d_decode`.** Run norm/conv/qkv
    in bf16 like the reference; replace `conv1d_silu_step_batch` with their fused
    conv+silu (in-place slot state).
