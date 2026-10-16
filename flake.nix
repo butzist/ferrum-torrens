@@ -115,6 +115,15 @@
           # the default output's runtime closure, so it must be listed here to
           # reach the jail (which binds only its packages' closures).
           libtorchCuda.dev
+          # CUDA profiling for the decode-throughput work (the expert staging
+          # copy is ~81% of decode time, see TODO.md section 8). `nsys` gives the
+          # copy/compute/wait timeline; `ncu` gives kernel-level counters (needs
+          # the driver to allow non-admin profiling). Unfree; allowUnfree is on.
+          pkgs.cudaPackages.nsight_systems
+          pkgs.cudaPackages.nsight_compute
+          # A live GPU monitor (loads the host's libnvidia-ml, on LD_LIBRARY_PATH
+          # via /run/opengl-driver/lib).
+          pkgs.nvtopPackages.nvidia
         ];
 
         cudaDevicePaths = with combinators; [
