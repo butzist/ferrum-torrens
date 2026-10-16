@@ -59,9 +59,18 @@ fn prompt_of(engine: &Engine, target: usize) -> Vec<u32> {
     ids
 }
 
-/// Time one request with `generate_streaming`, returning (prompt_tokens,
-/// generated, time_to_first_token, decode_span).
-fn time_request(engine: &Engine, ids: Vec<u32>, max_tokens: u32) -> (usize, usize, f64, f64) {
+/// Time one request with `generate_streaming`: prompt tokens, generated count,
+/// time to first token, decode span, and the per-token gaps.
+struct Timing {
+    prompt_tokens: usize,
+    generated: usize,
+    first_s: f64,
+    decode_s: f64,
+    /// Seconds between consecutive decoded tokens (`generated - 1` values).
+    gaps: Vec<f64>,
+}
+
+fn time_request(engine: &Engine, ids: Vec<u32>, max_tokens: u32) -> Timing {
     let prompt_tokens = ids.len();
     let request = make_request(engine, 1, ids, greedy(max_tokens)).unwrap();
     let mut stamps: Vec<std::time::Duration> = Vec::with_capacity(max_tokens as usize);
@@ -78,7 +87,17 @@ fn time_request(engine: &Engine, ids: Vec<u32>, max_tokens: u32) -> (usize, usiz
     );
     let first = stamps.first().copied().unwrap_or_default().as_secs_f64();
     let last = stamps.last().copied().unwrap_or_default().as_secs_f64();
-    (prompt_tokens, g.tokens.len(), first, last - first)
+    let gaps = stamps
+        .windows(2)
+        .map(|w| (w[1] - w[0]).as_secs_f64())
+        .collect();
+    Timing {
+        prompt_tokens,
+        generated: g.tokens.len(),
+        first_s: first,
+        decode_s: last - first,
+        gaps,
+    }
 }
 
 #[test]
@@ -95,17 +114,35 @@ fn single_request_throughput_smoke() {
     let _ = time_request(&engine, prompt_of(&engine, 64), 8);
     assert!(engine.expert_steps() > 0, "the kernel path must have run");
 
-    let (pp_tokens, tg_tokens, prefill_s, decode_s) = time_request(
+    let t = time_request(
         &engine,
         prompt_of(&engine, PREFILL_TARGET_TOKENS),
         DECODE_TOKENS,
     );
+    let Timing {
+        prompt_tokens: pp_tokens,
+        generated: tg_tokens,
+        first_s: prefill_s,
+        decode_s,
+        gaps,
+    } = t;
 
     let pp = pp_tokens as f64 / prefill_s;
     let decoded = tg_tokens.saturating_sub(1);
     let tg = decoded as f64 / decode_s;
     eprintln!("pp: {pp_tokens} prompt tokens in {prefill_s:.2}s = {pp:.1} tok/s");
     eprintln!("tg: {tg_tokens} tokens, {decoded} decoded in {decode_s:.2}s = {tg:.1} tok/s");
+    // Steady per-token cost means a fixed per-step cost (staging/graph); a
+    // growing cost means decode is re-reading prefix state.
+    let (min, max) = (
+        gaps.iter().copied().fold(f64::INFINITY, f64::min),
+        gaps.iter().copied().fold(0.0_f64, f64::max),
+    );
+    eprintln!(
+        "per-token: first {:.3}s, gaps min {min:.3}s max {max:.3}s over {}",
+        gaps.first().copied().unwrap_or_default(),
+        gaps.len()
+    );
     eprintln!(
         "{} expert steps; paper target 77-83 tok/s on an RTX 5090",
         engine.expert_steps()

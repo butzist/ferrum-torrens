@@ -394,11 +394,28 @@ performance work.
 9. Decode throughput -- **OPEN, the current performance blocker.** tg is ~0.9
    tok/s vs pp ~34 tok/s, ~28x under the measured 13.4 GB/s pinned H2D ceiling,
    and the expert banks are pinned host-resident, so the cost is the per-token
-   expert staging (serial per-expert copies / LRU misses), not PCIe (decision 73).
-   Investigate: is the device-staged miss path serial and latency-bound, what is
-   the slot-cache hit rate at `cache_size_slots = 512` (~2 layers) with ~320
-   experts/token over 40 layers, and whether the copy kernel or a batch/fused
-   staging (the deferred `moe_prefill_hit_d2d`-style path) closes it.
+   expert staging, not PCIe (decision 73).
+   **Root cause narrowed (2026-10-16).** Per-token time is constant (~1.08 s;
+   gaps 1.063-1.110 s over 127 tokens), so decode is not re-feeding the prefix --
+   it is a fixed per-step cost. Reverting `O_DIRECT` to page-cache reads changes
+   nothing (pp 34.6 vs 34.5, tg 0.9 vs 0.9), so the FTW reader is not in this
+   path. Ablating the staging copy (temporarily returning early from
+   `copy_missing`) lifts tg to **5.0 tok/s** (per-token 1.08 s -> 0.20 s), so the
+   copy is **~81% of decode time**; plan+GEMV alone is ~5 tok/s. The copy moves
+   ~540 MiB/token at ~0.6 GB/s, and it is not PCIe-bound: `cuMemcpyHtoD` measures
+   13.4 GB/s and the reference's own copy kernel (`fast_index_copy.cuh`, 16-byte
+   `ld.global.L1::no_allocate.v4` streaming loads + `.wt` stores, 8192 threads/bank)
+   documents **~31 GB/s zero-copy**. Our `_index_copy_multi_kernel`
+   (`python/ferrum_kernel/offload.py`) instead does **1-byte `uint8` loads**
+   (`tl.arange(0, COPY_BLOCK_BYTES)` over a `uint8` pointer) with per-byte
+   `//`/`%` index math -- ~50x off the reference. Fix: rewrite INDEX_COPY to
+   vectorize (16-byte loads, streaming/no-allocate, uniform row index per vector)
+   and raise in-flight parallelism; this is a `python/ferrum_kernel` + `kernel-aot`
+   task. Decode also has **no cross-layer prefetch** (unlike prefill's
+   double-buffer), so the GEMV waits on each layer's copy; overlapping copy and
+   compute (reference uses priority streams + a sync flag) is a second lever.
+   Decode batches only across concurrent requests, not across output tokens
+   (no speculative decoding), so a single request pays the whole fetch.
 10. GDN state-slot sizing -- **OPEN.** The pool is `max_running_requests (+1 for
     the captured graph's padding row)`, which leaves no room for hybrid-radix
     prefix snapshots: at `max_running_requests = 1` the second request panics with
