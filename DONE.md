@@ -1870,6 +1870,31 @@ settled.
       torch is cu13; `CPATH`/`LIBRARY_PATH` because the merged toolkit is `lib/`,
       not CUDA's `lib64/` (flashinfer and FreeToken's kernel JIT both need it).
       `pkgs.ninja` was added to the flake for the flashinfer JIT.
+    - **Batching.** FreeToken batches server-side: the HTTP frontend enqueues
+      (`submit_generation` -> `state.send_one`, `server/generation.py`) and one
+      shared `Scheduler.run_forever` admits a chunked-prefill batch from
+      `prefill_manager.pending_list` / `decode_manager.running_reqs`. The bench set
+      `--max-running-requests 1`, so this did not influence the numbers above.
+    - **VRAM layout.** `engine/cache_budget.py`: `budget = memory_ratio *
+      free_before_model - weights - fixed_caches` (the `1-memory_ratio` remainder
+      is CUDA-graph/activation headroom), split MoE-first (reserve
+      `kv_reserve_tokens` KV pages, experts greedily take the rest, clamped to
+      `[2*num_experts, min(total_experts, max_slots)]`). All 16.9 GiB of expert
+      banks stay in pinned host RAM; only `moe_cache_size` slots are on GPU.
+      Measured auto run: free-before 7.35 GiB -> weights + fixed ~4.6 GiB, slots
+      1900 x 1.13 MiB ~ 2.1 GiB, KV 8274 tokens 0.16 GiB, graphs ~0.01 GiB,
+      free-after 0.44 GiB. Ours spends ~7.3 GiB outside the 512 slots.
+    - **Caching strategies.** Prefix cache via `kvcache/` + `create_prefix_cache`:
+      `radix`, `hybrid_radix` (KV + GDN state snapshots -- what we ported,
+      decisions 68-71), `swa_radix` (sliding-window attention), `naive`; backed by
+      `mha_pool` (attention KV), `linear_state_pool` (GDN recurrent state,
+      `linear_state_cache_ratio`), `hybrid_swa_pool`. Agentic:
+      `snapshot_toolcall_anchor` (`scheduler/cache.py:148`) freezes a decoding
+      request's GDN state at the tool-call token (and retains the SWA window
+      ending there), so a follow-up turn that forks after the echoed tool call
+      resumes from the anchor without re-prefilling. Live pool resize via
+      `POST /v1/cache/rebuild` (`cache --moe/--kv/--mamba/--swa`), and
+      `--enable-cache-report` surfaces prefix hits.
 
 ---
 

@@ -436,6 +436,11 @@ performance work.
    footprint outside the expert cache is ~2.5 GiB larger (candidates: the on-device
    bf16 tower / lm_head / embed, GDN state slabs, graph pools). Cache size helps
    (~35% going 512 -> 1900 at bs=1) but is secondary to the ~5x compute gap.
+   FreeToken's VRAM layout (auto run): free-before-model 7.35 GiB, budget =
+   `0.9 * free`, weights + fixed caches ~4.6 GiB, expert slots 2.1 GiB, KV
+   0.16 GiB, graphs ~0.01 GiB, free-after 0.44 GiB. It batches server-side (shared
+   `Scheduler`), but the bench pinned `--max-running-requests 1`, so the numbers
+   above are pure bs=1 (batching did not influence the test).
 10. GDN state-slot sizing -- **OPEN.** The pool is `max_running_requests (+1 for
     the captured graph's padding row)`, which leaves no room for hybrid-radix
     prefix snapshots: at `max_running_requests = 1` the second request panics with
@@ -447,11 +452,18 @@ performance work.
     central dispatcher that admits concurrent requests into one `generate_batch`
     so decode batches, then re-measure. This is the main utilization lever before
     any kernel rewrite.
-10. GDN state-slot sizing -- **OPEN.** The pool is `max_running_requests (+1 for
-    the captured graph's padding row)`, which leaves no room for hybrid-radix
-    prefix snapshots: at `max_running_requests = 1` the second request panics with
-    "state slots exhausted" (decision 73). Either size the pool with headroom for
-    cached prefixes or make snapshots reclaimable under that pressure.
+12. VRAM budget planner -- **OPEN (from the FreeToken comparison, decision 76).**
+    FreeToken sizes pools from `memory_ratio * free_before_model - weights -
+    fixed_caches`, MoE-priority (reserve KV, experts take the rest), and gets 1900
+    slots in 6.85 GiB. We hardcode `cache_size_slots` and sit at 7.9 GiB with 512
+    slots; our non-slot GPU footprint is ~2.5 GiB larger. Adopt a budget planner
+    and audit what holds that 2.5 GiB (on-device bf16 tower / lm_head / embed, GDN
+    state slabs, graph pools) -- this both frees memory and auto-sizes the cache.
+13. Tool-call anchor (agentic) -- **OPEN, pairs with tool calling (decision 74).**
+    FreeToken freezes the hybrid GDN state and retains the SWA window at the
+    tool-call token, so a multi-turn loop (tool call -> result -> continue) reuses
+    the pre-call prefix instead of re-prefilling. Add the analogous snapshot point
+    when the tool-call feature lands; it is the agentic-session cache.
 
 ### Experiments to try (not on the critical path)
 
