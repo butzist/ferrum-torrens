@@ -1408,17 +1408,21 @@ impl TorchQwen3_6 {
             } => {
                 pool.store_at(layer, out_locs, &k, &v);
                 // The paged kernel reads each row's window straight out of the
-                // pool; the dense gather is the fallback for a CPU device or a
-                // pool dtype the cubin was not built for.
+                // pool; the dense gather is the fallback for a CPU device. Both
+                // pool dtypes run it (the bf16 cubin, TODO.md item 14), so the
+                // default bf16 KV no longer takes the libtorch gather.
                 match (&self.attention, pool.dtype()) {
-                    (Some(attn), KvDType::F32) => {
+                    (Some(attn), KvDType::F32) | (Some(attn), KvDType::BFloat16) => {
                         let (qh, hd) = (q.size()[1], q.size()[2]);
                         let out = Tensor::zeros([t, qh, hd], (Kind::Float, q.device()));
                         let (k_ptr, v_ptr) = pool.kv_slab_ptrs(layer);
+                        let kv_bf16 = pool.dtype() == KvDType::BFloat16;
                         // SAFETY: every address is a live device allocation in
                         // the launcher's context (the pool and the step's own
                         // buffers), and `locs` names the tokens the pool holds.
-                        unsafe { attn.decode(&q, &out, k_ptr, v_ptr, kv_locs, positions) }?;
+                        unsafe {
+                            attn.decode(&q, &out, k_ptr, v_ptr, kv_locs, positions, kv_bf16)
+                        }?;
                         out.reshape([t, qh * hd])
                     }
                     _ => {

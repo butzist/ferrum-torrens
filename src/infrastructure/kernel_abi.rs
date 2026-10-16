@@ -406,7 +406,10 @@ fn staging_ptx(name: &str) -> &'static str {
 /// The paged GQA decode attention kernel `MhaPool` launches.
 pub const PAGED_ATTENTION: &str = "paged_attention";
 
-const ATTENTION_NAMES: [&str; 1] = [PAGED_ATTENTION];
+/// The bf16-KV pool variant (TODO.md item 14): same body, bf16 K/V pointers.
+pub const PAGED_ATTENTION_BF16: &str = "paged_attention_bf16";
+
+const ATTENTION_NAMES: [&str; 2] = [PAGED_ATTENTION, PAGED_ATTENTION_BF16];
 
 #[derive(Debug, Deserialize)]
 struct AttentionEntry {
@@ -531,6 +534,7 @@ impl AttentionAbi {
 pub fn attention_cubin(name: &str) -> Result<&'static [u8], MoEError> {
     Ok(match name {
         PAGED_ATTENTION => include_bytes!("../../kernel/paged_attention.cubin"),
+        PAGED_ATTENTION_BF16 => include_bytes!("../../kernel/paged_attention_bf16.cubin"),
         other => return Err(MoEError::Bad(format!("no committed cubin for {other}"))),
     })
 }
@@ -540,6 +544,7 @@ pub fn attention_cubin(name: &str) -> Result<&'static [u8], MoEError> {
 fn attention_ptx(name: &str) -> &'static str {
     match name {
         PAGED_ATTENTION => include_str!("../../kernel/paged_attention.ptx"),
+        PAGED_ATTENTION_BF16 => include_str!("../../kernel/paged_attention_bf16.ptx"),
         other => panic!("no committed ptx for {other}"),
     }
 }
@@ -1077,8 +1082,13 @@ pub struct AttentionArgs {
 }
 
 /// The paged attention launch argument pack, in the cubin's declared order.
-pub fn paged_attention_args(abi: &AttentionAbi, a: &AttentionArgs) -> Result<ArgPack, MoEError> {
-    let kernel = abi.kernel(PAGED_ATTENTION)?;
+/// `name` selects the f32 or bf16-pool cubin.
+pub fn paged_attention_args(
+    abi: &AttentionAbi,
+    name: &str,
+    a: &AttentionArgs,
+) -> Result<ArgPack, MoEError> {
+    let kernel = abi.kernel(name)?;
     let mut p = ArgPack::for_attention(kernel);
     p.ptr(a.q)?;
     p.ptr(a.k)?;
@@ -1567,13 +1577,33 @@ mod tests {
             out: 0x6000,
             window: 7,
         };
-        let pack = paged_attention_args(&abi, &args).unwrap();
+        let pack = paged_attention_args(&abi, PAGED_ATTENTION, &args).unwrap();
         let kernel = abi.kernel(PAGED_ATTENTION).unwrap();
         let params = pack.kernel_params().unwrap();
         assert_eq!(params.len(), kernel.args.len() + kernel.scratch_params);
         for slot in &pack.slots()[kernel.args.len()..] {
             assert_eq!(*slot, 0, "scratch slot is not null");
         }
+    }
+
+    #[test]
+    fn the_bf16_attention_variant_packs_like_the_f32_one() {
+        // Same body, only the K/V pointer types differ, so the arg kinds match.
+        let abi = AttentionAbi::committed().unwrap();
+        let args = AttentionArgs {
+            q: 0x1000,
+            k: 0x2000,
+            v: 0x3000,
+            locs: 0x4000,
+            positions: 0x5000,
+            out: 0x6000,
+            window: 7,
+        };
+        let f32 = paged_attention_args(&abi, PAGED_ATTENTION, &args).unwrap();
+        let bf16 = paged_attention_args(&abi, PAGED_ATTENTION_BF16, &args).unwrap();
+        assert_eq!(f32.slots(), bf16.slots());
+        let kernel = abi.kernel(PAGED_ATTENTION_BF16).unwrap();
+        assert_eq!(kernel.constexpr("NUM_KV_HEADS").unwrap(), 2);
     }
 
     #[test]

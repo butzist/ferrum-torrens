@@ -21,7 +21,8 @@ use crate::domain::expert_kernel::MoEError;
 use crate::domain::model::ModelParams;
 use crate::infrastructure::cuda_driver::{AttentionKernels, CUstream, CudaError, Driver};
 use crate::infrastructure::kernel_abi::{
-    AttentionAbi, AttentionArgs, PAGED_ATTENTION, attention_grid, paged_attention_args,
+    AttentionAbi, AttentionArgs, PAGED_ATTENTION, PAGED_ATTENTION_BF16, attention_grid,
+    paged_attention_args,
 };
 use crate::infrastructure::torch::Device;
 
@@ -92,11 +93,13 @@ impl PagedAttention {
     /// the `[rows, window]` i32 pool-location buffer the engine staged (decision
     /// 55) and `positions` the rows' newest absolute positions `[rows]` i32.
     /// `k_ptr`/`v_ptr` are the layer's slab base addresses from
-    /// `MhaPool::kv_slab_ptrs`. `out` is fully overwritten.
+    /// `MhaPool::kv_slab_ptrs`. `kv_bf16` picks the bf16-pool cubin (TODO.md item
+    /// 14); the f32 cubin otherwise. `out` is fully overwritten.
     ///
     /// # Safety
     /// Every address must be a live device allocation in this launcher's
     /// context, and the K/V slabs must hold the tokens `locs` names.
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn decode(
         &self,
         q: &Tensor,
@@ -105,8 +108,14 @@ impl PagedAttention {
         v_ptr: u64,
         locs: &Tensor,
         positions: &Tensor,
+        kv_bf16: bool,
     ) -> Result<(), MoEError> {
-        let kernel = self.abi.kernel(PAGED_ATTENTION).map_err(bad_abi)?;
+        let name = if kv_bf16 {
+            PAGED_ATTENTION_BF16
+        } else {
+            PAGED_ATTENTION
+        };
+        let kernel = self.abi.kernel(name).map_err(bad_abi)?;
         let c = |name: &str| kernel.constexpr(name).map_err(bad_abi);
         let (q_heads, head_dim) = (c("NUM_Q_HEADS")?, c("HEAD_DIM")?);
         let q_size = q.size();
@@ -154,7 +163,7 @@ impl PagedAttention {
             out: out.data_ptr() as u64,
             window: window as u32,
         };
-        let pack = paged_attention_args(&self.abi, &args).map_err(bad_abi)?;
+        let pack = paged_attention_args(&self.abi, name, &args).map_err(bad_abi)?;
         let mut params = pack.kernel_params().map_err(bad_abi)?;
         let grid = attention_grid(rows as usize, kernel).map_err(bad_abi)?;
         // SAFETY: the caller guarantees every address is live in this context;
@@ -166,21 +175,24 @@ impl PagedAttention {
 
 /// The cubin bakes the head geometry, so a checkpoint whose attention shape
 /// differs would launch a kernel walking the wrong strides. Fail at construction
-/// instead, the same way `CudaMoE` checks its `ExpertShapes`.
+/// instead, the same way `CudaMoE` checks its `ExpertShapes`. Both pool-dtype
+/// variants are checked: a stream picks one per layer, so both must match.
 fn check_geometry(params: &ModelParams, abi: &AttentionAbi) -> Result<(), MoEError> {
-    let kernel = abi.kernel(PAGED_ATTENTION).map_err(bad_abi)?;
-    let c = |name: &str| kernel.constexpr(name).map_err(bad_abi);
-    let want = [
-        ("NUM_Q_HEADS", params.num_q_heads as u64),
-        ("NUM_KV_HEADS", params.num_kv_heads as u64),
-        ("HEAD_DIM", params.head_dim as u64),
-    ];
-    for (name, value) in want {
-        let built = c(name)?;
-        if built != value {
-            return Err(MoEError::Bad(format!(
-                "the paged kernel was built with {name} = {built}, but the model has {value}"
-            )));
+    for name in [PAGED_ATTENTION, PAGED_ATTENTION_BF16] {
+        let kernel = abi.kernel(name).map_err(bad_abi)?;
+        let c = |name_const: &str| kernel.constexpr(name_const).map_err(bad_abi);
+        let want = [
+            ("NUM_Q_HEADS", params.num_q_heads as u64),
+            ("NUM_KV_HEADS", params.num_kv_heads as u64),
+            ("HEAD_DIM", params.head_dim as u64),
+        ];
+        for (const_name, value) in want {
+            let built = c(const_name)?;
+            if built != value {
+                return Err(MoEError::Bad(format!(
+                    "the paged kernel {name} was built with {const_name} = {built}, but the model has {value}"
+                )));
+            }
         }
     }
     Ok(())

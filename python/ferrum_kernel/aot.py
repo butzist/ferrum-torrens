@@ -144,6 +144,11 @@ ATTENTION_KERNELS: dict[str, dict] = {
         "signature": paged_attention(),
         "constexprs": paged_attention_constexprs(),
     },
+    "paged_attention_bf16": {
+        "fn": _paged_attention_decode_kernel,
+        "signature": paged_attention(kv_dtype=SERVING_DTYPE),
+        "constexprs": paged_attention_constexprs(),
+    },
 }
 
 # The fused GDN decode step (TODO.md M5). Like attention it is one program per

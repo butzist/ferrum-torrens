@@ -60,6 +60,67 @@
       "profile_scratch_size": 0,
       "scratch_params": 2,
       "shared": 1024
+    },
+    "paged_attention_bf16": {
+      "constexprs": {
+        "BLOCK_N": 64,
+        "HEAD_DIM": 256,
+        "NUM_KV_HEADS": 2,
+        "NUM_Q_HEADS": 16
+      },
+      "declared_args": [
+        "q_ptr",
+        "k_ptr",
+        "v_ptr",
+        "locs_ptr",
+        "positions_ptr",
+        "out_ptr",
+        "window"
+      ],
+      "entry": "_paged_attention_decode_kernel",
+      "global_scratch_size": 0,
+      "num_warps": 4,
+      "params": [
+        {
+          "index": 0,
+          "kind": "ptr"
+        },
+        {
+          "index": 1,
+          "kind": "ptr"
+        },
+        {
+          "index": 2,
+          "kind": "ptr"
+        },
+        {
+          "index": 3,
+          "kind": "ptr"
+        },
+        {
+          "index": 4,
+          "kind": "ptr"
+        },
+        {
+          "index": 5,
+          "kind": "ptr"
+        },
+        {
+          "index": 6,
+          "kind": "u32"
+        },
+        {
+          "index": 7,
+          "kind": "ptr"
+        },
+        {
+          "index": 8,
+          "kind": "ptr"
+        }
+      ],
+      "profile_scratch_size": 0,
+      "scratch_params": 2,
+      "shared": 1024
     }
   },
   "kernels": {

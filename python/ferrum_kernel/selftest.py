@@ -257,7 +257,8 @@ def random_attention_case(
 
 
 def check_paged_attention(device: torch.device, tol: float) -> int:
-    """Paged GQA decode: the kernel against the plain-torch oracle."""
+    """Paged GQA decode: the kernel against the plain-torch oracle, for an f32 and
+    a bf16 K/V pool (the kernel casts K/V to f32 in-register either way)."""
     cases = [
         ("small", {"rows": 3, "q_heads": 4, "kv_heads": 2, "head_dim": 64}, 16),
         ("single", {"rows": 1, "q_heads": 4, "kv_heads": 2, "head_dim": 64}, 32),
@@ -267,17 +268,21 @@ def check_paged_attention(device: torch.device, tol: float) -> int:
         ("qwen-shape", {"rows": 2, "q_heads": 16, "kv_heads": 2, "head_dim": 256}, 64),
     ]
     failures = 0
-    for label, shape, block_n in cases:
-        for seed in range(2):
-            q, k, v, locs, positions = random_attention_case(str(device), seed=seed, **shape)
-            want = attn.paged_attention_reference(q, k, v, locs, positions)
-            got = torch.empty_like(q)
-            attn.paged_attention_decode(q, k, v, locs, positions, got, block_n=block_n)
-            rel = (got - want).abs().max().item() / want.abs().max().clamp(min=1e-6).item()
-            print(f"attention {label} seed {seed}: rel {rel:.3e}")
-            if rel > tol:
-                failures += 1
-                print(f"attention {label} seed {seed}: FAIL", file=sys.stderr)
+    # A bf16 pool loses mantissa bits, so its own looser bound.
+    for kv_dtype, bound in ((torch.float32, tol), (torch.bfloat16, 5e-2)):
+        for label, shape, block_n in cases:
+            for seed in range(2):
+                q, k, v, locs, positions = random_attention_case(str(device), seed=seed, **shape)
+                k = k.to(kv_dtype)
+                v = v.to(kv_dtype)
+                want = attn.paged_attention_reference(q, k, v, locs, positions)
+                got = torch.empty_like(q)
+                attn.paged_attention_decode(q, k, v, locs, positions, got, block_n=block_n)
+                rel = (got - want).abs().max().item() / want.abs().max().clamp(min=1e-6).item()
+                print(f"attention {label} [{kv_dtype}] seed {seed}: rel {rel:.3e}")
+                if rel > bound:
+                    failures += 1
+                    print(f"attention {label} [{kv_dtype}] seed {seed}: FAIL", file=sys.stderr)
     return failures
 
 

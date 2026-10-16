@@ -122,6 +122,17 @@ def main() -> int:
     except Exception as e:  # noqa: BLE001
         failures += 1
         print(f"paged_attention FAILED: {type(e).__name__}: {str(e)[:200]}")
+    # The bf16-KV pool variant (TODO.md item 14): same body, bf16 K/V pointers.
+    try:
+        check(
+            "paged_attention_bf16",
+            _paged_attention_decode_kernel,
+            _paged_attention_sig(kv_dtype="bf16"),
+            paged_attention_constexprs(),
+        )
+    except Exception as e:  # noqa: BLE001
+        failures += 1
+        print(f"paged_attention_bf16 FAILED: {type(e).__name__}: {str(e)[:200]}")
     # The fused GDN decode step (TODO.md M5), one warp like the FLA reference.
     try:
         check(

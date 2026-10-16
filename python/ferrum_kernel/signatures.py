@@ -200,15 +200,22 @@ def index_copy_constexprs(num_banks: int = SERVING_NUM_BANKS) -> dict:
     }
 
 
-def paged_attention() -> dict:
-    """Paged GQA decode attention (TODO.md M3 paged attention)."""
+def paged_attention(dtype: str = "fp32", kv_dtype: str | None = None) -> dict:
+    """Paged GQA decode attention (TODO.md M3 paged attention).
+
+    `dtype` is the query/output activation type (f32: the mixer runs f32); `kv_dtype`
+    the pool's K/V element type, defaulting to `dtype`. The kernel reduces in f32
+    after casting whatever it loads, so a bf16 pool shares the body and only the
+    pointer types move (TODO.md item 14).
+    """
+    kv = kv_dtype or dtype
     return {
-        "q_ptr": "*fp32",
-        "k_ptr": "*fp32",
-        "v_ptr": "*fp32",
+        "q_ptr": f"*{dtype}",
+        "k_ptr": f"*{kv}",
+        "v_ptr": f"*{kv}",
         "locs_ptr": "*i32",
         "positions_ptr": "*i32",
-        "out_ptr": "*fp32",
+        "out_ptr": f"*{dtype}",
         "window": "i32",
         "NUM_Q_HEADS": "constexpr",
         "NUM_KV_HEADS": "constexpr",
