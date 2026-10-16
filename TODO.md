@@ -37,7 +37,11 @@ Tool calling on `/v1/chat/completions` was brought into scope
 feature. Open work: tool calling, the `[opt] /v1/responses` surface, server-side
 batching, the bf16-attention/remaining decode gap (items 14, 17), and the
 section 8 experiments.
-Progress history and the full decision log (numbers 1..81) live in `DONE.md`;
+The decode gap is now pursued by **vendoring FreeToken's own Triton kernels**
+(decision 82, plan in `FUSED_GDN.md`): bf16 paged attention first, then the W8A16
+FP8 projections, then bf16 mixer activations + a fused conv, then the prefill
+chunk kernels -- libtorch stays the generic/CPU fallback.
+Progress history and the full decision log (numbers 1..82) live in `DONE.md`;
 read that for the "why" behind any decision number referenced in code or tests.
 
 Goal: a **minimal, fast, single-GPU** Rust serving engine for **one model** --
@@ -304,6 +308,22 @@ The full log of confirmed decisions (numbers 1..76, stable -- code, tests and
 lists only the decisions that still bind open work; everything else there is
 history.
 
+- **82** -- the decode gap is closed by **vendoring FreeToken's own Triton
+  kernels** into `python/ferrum_kernel/` (FLA MIT, FreeToken Apache-2.0;
+  attributed) and AOT-compiling them through our pipeline, with **libtorch kept
+  as the generic/CPU fallback** and our own paged-attention + NVFP4-MoE kernels
+  kept. The formats already match (same FTW weights, GDN state `[slots, NV, K, V]`
+  f32, conv state `[slots, dim, K-1]`, per-row FP8 scales); the one real
+  divergence is that our mixer runs **f32 activations where FreeToken runs bf16**.
+  `flashinfer` (C++/CUDA extension) and `torch._scaled_mm` (libtorch op) are not
+  vendorable; the Triton `fp8_pertensor_linear` is the W8A16 kernel we want
+  anyway. Ordered slices: (1) bf16 paged attention, (2) vendor `fp8_pertensor_linear`
+  for the FP8 projections, (3) bf16 mixer activations + `causal_conv1d_decode`,
+  (4) prefill chunk kernels (`chunk_gated_delta_rule`, `causal_conv1d_varlen`).
+  See `FUSED_GDN.md` "Plan". This supersedes the E1-deprioritization that rested
+  on the E2 result: our lm_head GEMV was neutral because its 4-bit LUT unpack is
+  arithmetic-heavy, where W8A16 is a trivial per-byte convert (FreeToken measured
+  the bf16-widened cuBLAS path as ~54% of their step before W8A16).
 - **78** -- `linear` and `lm_head_logits_into` matmul in bf16 (tensor-core, f32
   accumulate) instead of upcasting every weight to f32 per step: tg 4.7 -> 8.8
   tok/s. It binds open work because bf16 cuBLAS GEMM is **shape-dependent** (its
@@ -520,21 +540,28 @@ performance work.
 16. Decode "rest" ~25% -- **OPEN.** The re-profile (decision 81) leaves ~30 ms/token
     outside attention/head/GDN/MoE: input/post norms (80/layer), embed gather,
     residual adds, sampling (+ its D2H). Fold the norms into adjacent kernels.
-17. FP8 linear projections -- **OPEN, but the byte model over-estimated it
-    (decision 81).** The review predicted the FP8 projections were ~58% of the
-    per-token weight bytes; the ablation shows the whole linear mixer is only ~35%
-    of decode and decode is latency/launch-bound (~28 GB/s effective), not
-    bandwidth-bound. The lm_head experiment (decision 79) halved-to-quartered the
-    head bytes for **zero** throughput change, which is the cautionary case. A
-    fused FP8 GEMV (E1) would cut resident projection bytes ~1.3 GiB and restore
-    shape-invariant gates (decision 80), but the speed win is unproven -- measure
-    `Dense::apply` on the FP8 kinds before writing it.
+17. FP8 linear projections -- **OPEN, the top compute lever via decision 82 (E1
+    vendored).** FreeToken's own `fp8_pertensor_linear` docstring records the exact
+    path we are on -- FP8 widened to bf16, run through cuBLAS bf16 GEMV -- as
+    **~54% of their decode step**, halved by a W8A16 kernel (weight fp8-e4m3 +
+    per-row scale, e4m3->f32 convert in-register, f32 accumulate). Our own E2
+    lm_head experiment (decision 79) came out neutral only because its 4-bit LUT
+    unpack is arithmetic-heavy; W8A16 is a per-byte convert, so the win lands.
+    Vendor their Triton kernel, keep FP8 projections resident for the decode
+    dispatch (bf16 kinds stay cuBLAS; prefill covered too), and re-measure.
 18. Dense NVFP4 lm_head GEMV -- **DONE (decision 79).** `_nvfp4_dense_gemv_kernel`
     + `DenseGemv` launcher + `Head` storage: the packed checkpoint head stays
     resident and is streamed once per token. Correct (CUDA cross-check argmax
     11751, 0.21% shift); VRAM -0.81 GiB; throughput neutral. The reusable pattern
     for E1; the freed VRAM is blocked from the expert cache by the load-time peak
     (item 12).
+19. bf16 mixer activations + fused conv -- **OPEN (decision 82, slice 3).** Run the
+    mixer in bf16 (rms_norm/conv/attention outputs) to match FreeToken and let
+    their kernels drop in; vendor `causal_conv1d_decode` (fused conv+silu, in-place
+    slot state) to replace `conv1d_silu_step_batch`. Tower-wide numerics change.
+20. Prefill chunk kernels -- **OPEN (decision 82, slice 4).** Vendor FLA
+    `chunk_gated_delta_rule` + `causal_conv1d_varlen`; our prefill is still
+    libtorch op soup with no FLA chunk kernel.
 
 ### Experiments to try (not on the critical path)
 

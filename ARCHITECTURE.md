@@ -206,7 +206,8 @@ flowchart LR
   `manifest.json`. The engine never runs an interpreter; `kernel_abi.rs` parses
   the manifest and `cuda_driver.rs` launches the cubins. The manifest has four
   launch contracts, one section each: `kernels` (the four grouped-MoE passes),
-  `staging` (`lru_ensure`, `index_copy`), `attention` (`paged_attention`) and
+  `staging` (`lru_ensure`, `index_copy`), `attention` (`paged_attention` f32 and
+  `paged_attention_bf16`, the pool-dtype variants) and
   `linear` (`gdn_decode`, the fused GDN decode, and `nvfp4_dense_gemv`, the lm_head
   tail). The devshell aliases
   `kernel-aot`, `kernel-selftest` (CPU interpreter gate) and

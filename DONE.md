@@ -2005,6 +2005,45 @@ settled.
     halving projection *bytes* (E1) is not expected to pay off proportionally, and
     the bf16-KV attention fallback (E3 / item 14) is the top remaining lever.
 
+82. **Vendor FreeToken's kernels; bf16 activations** (2026-10-16, plan) -- the
+    direction for the decode gap (TODO section 7, `FUSED_GDN.md` "Plan"). It is a
+    substrate difference, not a missing trick: FreeToken authors the mixer as a
+    handful of Triton kernels, we compose libtorch ops. Auditing `FreeToken/`
+    shows the formats already match (same FTW weights, GDN state
+    `[slots, NV, K, V]` fp32, conv state `[slots, dim, K-1]`, per-row FP8
+    `weight_scale [N]` = our `Dense.row_scale`), so the path is to vendor their
+    Triton sources into `python/ferrum_kernel/` (FLA MIT, FreeToken Apache-2.0;
+    attributed) and AOT them through our pipeline, keeping libtorch as the
+    generic/CPU fallback and our paged-attention + NVFP4-MoE kernels. The one real
+    divergence is activation dtype: our mixer runs f32, FreeToken bf16. Non-Triton
+    exceptions: `flashinfer` (C++/CUDA extension) and `torch._scaled_mm` (libtorch
+    op) -- the latter's Triton fallback (`fp8_pertensor_linear`) is what we want
+    anyway. Ordered slices: (1) bf16 paged attention, (2) W8A16 FP8 projections,
+    (3) bf16 mixer activations + `causal_conv1d_decode`, (4) prefill chunk kernels.
+    It supersedes the E1 deprioritization of decision 81: the E2 neutral result
+    was an artifact of the NVFP4 kernel's arithmetic-heavy LUT unpack; FreeToken
+    measured the bf16-widened cuBLAS path itself as ~54% of its step.
+
+83. **bf16 paged attention** (2026-10-16, implemented) -- decision 82 slice 1,
+    TODO item 14. The committed `paged_attention` cubin was f32-only, so the
+    default bf16 KV fell back to a libtorch `gather_rows` + masked softmax.
+    - **Shape.** The kernel body already casts whatever it loads to f32, so the
+      bf16 variant is a second AOT signature on the same `_paged_attention_decode_kernel`
+      (`q`/`out` f32, `k`/`v` bf16), a second `attention` manifest entry,
+      `PAGED_ATTENTION_BF16` in `AttentionAbi`, `paged_attention_args(abi, name, ..)`,
+      and a `kv_bf16` flag on `PagedAttention::decode`; `full_attention_cached`
+      dispatches on `pool.dtype()`.
+    - **Result.** Correct: `--interp` ~1e-7 for both dtypes (the bf16 case feeds
+      identical bf16 values to kernel and oracle); the gated
+      `a_bf16_pool_device_decode_matches_refeeding_the_whole_prefix` now runs the
+      kernel against the libtorch host oracle (argmax exact, ~9% drift at the
+      decision-80 bound). **tg 8.2 -> 10.3 tok/s (+25%)** and VRAM **7.1 -> 6.05
+      GiB**: the dense fallback had baked a `[rows, window, kv_heads, head_dim]`
+      materialization (up to `max_seq_len`) into the captured graph's pool, so
+      removing it freed ~1 GiB -- a second reason the f32-kernel path was faster.
+    - **Kept both variants.** `[kv] dtype = "f32"` still selects the f32 cubin;
+      `check_geometry` validates both at construction.
+
 ---
 
 ## Progress log (narrative, pre-2026-10-15 compaction)

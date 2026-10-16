@@ -341,3 +341,61 @@ before E1/E2 free the VRAM (item 12).
   ~30 ms "rest" (fuse the 82 norms), then MoE/GDN. E1 drops to last: implement it
   only if a measured `Dense::apply` profile shows the projection GEMVs dominate,
   which the ablation argues against.
+
+## Plan (2026-10-16, decision 82): vendor FreeToken's kernels, bf16 activations
+
+The gap is a **substrate difference**, not a missing trick: FreeToken authors the
+mixer as a handful of Triton kernels, we compose libtorch ops. Auditing
+`FreeToken/` against this repo shows the formats already line up, so the path is
+to **vendor FreeToken's own Triton sources** into `python/ferrum_kernel/` and AOT
+them through our pipeline (FLA is MIT, FreeToken Apache-2.0; attribute the
+origin), keeping libtorch as the generic/CPU fallback and our own paged-attention
+and NVFP4-MoE kernels.
+
+### What already matches (nothing to change)
+
+- **Checkpoint/weights**: we read FreeToken's own FTW output. Their W8A16 linear
+  expects `weight` fp8-e4m3 + a per-output-row `weight_scale [N]` -- exactly the
+  `Dense { w, row_scale }` we already keep.
+- **GDN state**: their `state_source` is `[num_slots, NV, K, V]` **fp32**, the same
+  as `LinearStateSlabs`. (The "FLA stores `[V, K]`" note earlier was about the
+  kernel's internal tile, not the wrapper ABI.)
+- **Conv state**: `[slots, dim, K-1]` in both.
+- **GDN kernel shape**: our `gdn.py` is already ~FLA's
+  `fused_sigmoid_gating_delta_rule_update` (non-GQA-expanded q/k, in-place indexed
+  state, fused gating + l2norm).
+- **NVFP4 experts**: our grouped kernels are equivalent; keep them.
+
+### The one real divergence: activation dtype
+
+Our mixer runs **f32** (rms_norm/conv/attention outputs); FreeToken runs **bf16**.
+That is the only format change needed for their kernels to drop in with
+signature-only edits, and it converges our numerics with the reference. It does
+mean a tower-wide numerics change, so the gates are re-measured (the bf16 bounds
+of decision 80 already anticipate it).
+
+### Not vendorable (keep ours)
+
+- **flashinfer attention** is a C++/CUDA extension, not Triton. Keep our paged
+  kernel (E3); an FFI bind is a separate project.
+- **`torch._scaled_mm`** is a libtorch op (CUTLASS/cuBLASLt); tch does not expose
+  it. FreeToken uses it when available and their Triton `fp8_pertensor_linear`
+  otherwise -- so the Triton kernel is our route anyway.
+
+### Ordered slices
+
+1. **E3: bf16 paged attention** (this change; half-wired). q/output stay f32
+   (the mixer activation), K/V read bf16 from the pool. One extra signature +
+   cubin, dispatch on `pool.dtype()`.
+2. **E1: vendor `fp8_pertensor_linear` (W8A16).** Keep the FP8 projections
+   resident, dequant e4m3->f32 in-register, f32 accumulate. Their docstring
+   records this exact path (bf16-widened weights through cuBLAS) as **~54% of
+   their step**, halved by the W8A16 kernel. **This corrects the E2-based doubt
+   above**: our lm_head kernel was neutral because its 4-bit LUT unpack is
+   arithmetic-heavy; W8A16 is a trivial per-byte convert, so its bandwidth win
+   lands. Dispatch: fp8 kinds -> kernel, bf16 -> cuBLAS (also covers prefill).
+3. **bf16 mixer activations + vendor `causal_conv1d_decode`.** Run norm/conv/qkv
+   in bf16 like the reference; replace `conv1d_silu_step_batch` with their fused
+   conv+silu (in-place slot state).
+4. **Prefill chunk kernels** (`chunk_gated_delta_rule`, `causal_conv1d_varlen`):
+   our prefill is still op soup and has no FLA chunk kernel at all.
