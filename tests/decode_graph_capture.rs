@@ -36,7 +36,7 @@ use ferrum_torrens::infrastructure::cuda_graph::{self, GraphPool};
 use ferrum_torrens::infrastructure::cuda_moe::CudaMoE;
 use ferrum_torrens::infrastructure::decode_buffers::{DecodeBuffers, DecodeRow};
 use ferrum_torrens::infrastructure::decode_graph::DecodeGraph;
-use ferrum_torrens::infrastructure::ftw::{FtwIndex, MmapFtwReader};
+use ferrum_torrens::infrastructure::ftw::{FtwIndex, FtwReader};
 use ferrum_torrens::infrastructure::kvcache_dev::{DeviceCache, KvDType};
 use ferrum_torrens::infrastructure::torch::{Device, auto_device, to_f32_vec};
 use ferrum_torrens::models::qwen3_6::config::parse_text_config;
@@ -83,7 +83,7 @@ fn build(num_pages: usize, num_slots: usize) -> Built {
         .unwrap(),
     );
     let reader: Arc<dyn WeightsReader> =
-        Arc::new(MmapFtwReader::open(std::path::Path::new(FTW_DIR)).unwrap());
+        Arc::new(FtwReader::open(std::path::Path::new(FTW_DIR)).unwrap());
 
     let shapes = ExpertShapes::new(params.hidden_size, params.moe_intermediate_size).unwrap();
     let mut adapter = CudaMoE::new_with_stream(

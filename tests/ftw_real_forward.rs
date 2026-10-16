@@ -7,7 +7,7 @@
 
 use ferrum_torrens::application::registry::build_scalar;
 use ferrum_torrens::domain::model::ForwardInput;
-use ferrum_torrens::infrastructure::ftw::{FtwIndex, MmapFtwReader};
+use ferrum_torrens::infrastructure::ftw::{FtwIndex, FtwReader};
 
 const FTW_DIR: &str = ".model-cache/Qwen3.6-35B-A3B-NVFP4.ftw";
 
@@ -16,7 +16,7 @@ fn model() -> Box<dyn ferrum_torrens::domain::model::Model> {
     let ix =
         FtwIndex::parse(&std::fs::read_to_string(format!("{dir}/freetoken_weight.json")).unwrap())
             .unwrap();
-    let reader = MmapFtwReader::open(std::path::Path::new(dir)).unwrap();
+    let reader = FtwReader::open(std::path::Path::new(dir)).unwrap();
     let config: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(format!("{dir}/config.json")).unwrap())
             .unwrap();

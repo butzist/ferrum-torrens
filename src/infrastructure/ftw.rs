@@ -9,12 +9,13 @@
 // block-aligned.
 
 use crate::domain::weights::{DType, QuantFormat, TensorDesc, TensorKind, WeightsReader};
-use memmap2::Mmap;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::Mutex;
 
 pub const INDEX_NAME: &str = "freetoken_weight.json";
 pub const FORMAT_TAG: &str = "freetoken_weight";
@@ -333,45 +334,169 @@ fn parse_shard(v: &Value) -> Result<ShardDesc, FtwError> {
     })
 }
 
-/// WeightsReader over mmap'd FTW shard files. Shard paths are resolved against
-/// the FTW directory the index was loaded from.
-pub struct MmapFtwReader {
+/// O_DIRECT is a Linux open flag; the value is stable across architectures.
+const O_DIRECT: i32 = 0o40000;
+
+/// Payload bytes per `O_DIRECT` request. Reads are chunked to this so the
+/// aligned scratch buffer stays a few MiB no matter how large a tensor is.
+const DIRECT_CHUNK: usize = 4 << 20;
+
+/// WeightsReader over FTW shard files.
+///
+/// Reads are `pread` (`read_at`) into the caller's buffer. When the shard
+/// filesystem accepts `O_DIRECT`, a read goes straight from disk into an
+/// aligned scratch buffer and is copied out, so it never populates the page
+/// cache: the dense startup load stays disk-bound (measured ~6x faster cold
+/// than an mmap page-in) and streaming expert slabs does not push everything
+/// else out of memory. On a filesystem that rejects `O_DIRECT` (tmpfs, some
+/// network mounts) the reader falls back to buffered reads.
+pub struct FtwReader {
     index: FtwIndex,
-    #[allow(dead_code)]
-    _maps: HashMap<String, Mmap>,
+    shards: HashMap<String, Shard>,
+    direct: bool,
+    scratch: Mutex<Scratch>,
 }
 
-impl MmapFtwReader {
-    /// Load ``path/freetoken_weight.json``, mmap every referenced shard.
+struct Shard {
+    file: File,
+    nbytes: u64,
+}
+
+/// A `DIRECT_CHUNK + ALIGN` byte buffer whose start is `ALIGN`-aligned, so one
+/// allocation can back every `O_DIRECT` read.
+struct Scratch {
+    buf: Vec<u8>,
+    off: usize,
+}
+
+impl Scratch {
+    fn new() -> Self {
+        let size = DIRECT_CHUNK + ALIGN as usize;
+        let buf = vec![0u8; size + ALIGN as usize];
+        let off = (ALIGN as usize - (buf.as_ptr() as usize % ALIGN as usize)) % ALIGN as usize;
+        Self { buf, off }
+    }
+
+    fn aligned(&mut self, need: usize) -> &mut [u8] {
+        debug_assert!(need <= DIRECT_CHUNK + ALIGN as usize);
+        let s = self.off;
+        &mut self.buf[s..s + need]
+    }
+}
+
+impl FtwReader {
+    /// Load ``path/freetoken_weight.json`` and open every referenced shard.
     pub fn open(path: &Path) -> Result<Self, FtwError> {
+        Self::open_mode(path, None)
+    }
+
+    /// ``force_direct`` overrides the `O_DIRECT` probe (tests); ``None`` chooses
+    /// `O_DIRECT` when the first shard accepts it and buffered reads otherwise.
+    fn open_mode(path: &Path, force_direct: Option<bool>) -> Result<Self, FtwError> {
         let index_path = path.join(INDEX_NAME);
         let doc = std::fs::read_to_string(index_path)?;
         let index = FtwIndex::parse(&doc)?;
         if index.shards.is_empty() {
             return Err(FtwError::Invalid("index has no shards".into()));
         }
-        let mut maps = HashMap::new();
+        let direct = force_direct.unwrap_or_else(|| {
+            OpenOptions::new()
+                .read(true)
+                .custom_flags(O_DIRECT)
+                .open(path.join(&index.shards[0].file))
+                .is_ok()
+        });
+        let mut shards = HashMap::new();
         for sh in &index.shards {
-            let mmap = unsafe { Mmap::map(&File::open(path.join(&sh.file))?)? };
-            if mmap.len() < sh.nbytes as usize {
+            let file = OpenOptions::new()
+                .read(true)
+                .custom_flags(if direct { O_DIRECT } else { 0 })
+                .open(path.join(&sh.file))?;
+            let len = file.metadata()?.len();
+            if len < sh.nbytes {
                 return Err(FtwError::Invalid(format!(
-                    "shard {} is {} bytes but index claims {}",
-                    sh.file,
-                    mmap.len(),
-                    sh.nbytes
+                    "shard {} is {len} bytes but index claims {}",
+                    sh.file, sh.nbytes
                 )));
             }
-            maps.insert(sh.file.clone(), mmap);
+            shards.insert(
+                sh.file.clone(),
+                Shard {
+                    file,
+                    nbytes: sh.nbytes,
+                },
+            );
         }
-        Ok(Self { index, _maps: maps })
+        Ok(Self {
+            index,
+            shards,
+            direct,
+            scratch: Mutex::new(Scratch::new()),
+        })
     }
 
     pub fn index(&self) -> &FtwIndex {
         &self.index
     }
+
+    /// Whether reads bypass the page cache (`O_DIRECT`).
+    pub fn direct(&self) -> bool {
+        self.direct
+    }
 }
 
-impl WeightsReader for MmapFtwReader {
+/// The `[off, off + want)` request widened to a block-aligned `O_DIRECT` read:
+/// `(aligned_off, padded_len, delta)`, the wanted bytes starting `delta` into
+/// the read. Errors when the request runs past `file_len`.
+fn aligned_span(off: u64, want: u64, file_len: u64) -> Result<(u64, usize, usize), String> {
+    let aligned_off = off & !(ALIGN - 1);
+    let delta = (off - aligned_off) as usize;
+    let need = delta as u64 + want;
+    let mut padded = need.div_ceil(ALIGN) * ALIGN;
+    let available = file_len.saturating_sub(aligned_off);
+    if padded > available {
+        padded = available & !(ALIGN - 1);
+    }
+    if padded < need {
+        return Err(format!("read past end of shard: {off}+{want} > {file_len}"));
+    }
+    Ok((aligned_off, padded as usize, delta))
+}
+
+fn read_exact_at(file: &File, off: u64, buf: &mut [u8]) -> Result<(), String> {
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        let n = file
+            .read_at(&mut buf[filled..], off + filled as u64)
+            .map_err(|e| format!("io failure: {e}"))?;
+        if n == 0 {
+            return Err(format!("short read at {off}+{filled}"));
+        }
+        filled += n;
+    }
+    Ok(())
+}
+
+fn read_piece_direct(
+    shard: &Shard,
+    piece: &Piece,
+    dst: &mut [u8],
+    scratch: &mut Scratch,
+) -> Result<(), String> {
+    let mut done = 0u64;
+    while done < piece.length {
+        let want = (piece.length - done).min(DIRECT_CHUNK as u64);
+        let (aligned_off, padded, delta) = aligned_span(piece.file_off + done, want, shard.nbytes)?;
+        let buf = scratch.aligned(padded);
+        read_exact_at(&shard.file, aligned_off, buf)?;
+        let d0 = piece.dest_off as usize + done as usize;
+        dst[d0..d0 + want as usize].copy_from_slice(&buf[delta..delta + want as usize]);
+        done += want;
+    }
+    Ok(())
+}
+
+impl WeightsReader for FtwReader {
     fn read_range(&self, global_off: u64, nbytes: u64, dst: &mut [u8]) -> Result<(), String> {
         if dst.len() < nbytes as usize {
             return Err(format!(
@@ -383,18 +508,19 @@ impl WeightsReader for MmapFtwReader {
             .index
             .pieces(global_off, nbytes)
             .map_err(|e| e.to_string())?;
+        let mut scratch = self.scratch.lock().unwrap();
         for piece in &pieces {
-            let mmap = self
-                ._maps
+            let shard = self
+                .shards
                 .get(&piece.file)
-                .ok_or_else(|| format!("shard {} not mapped", piece.file))?;
-            let start = piece.file_off as usize;
-            let end = start + piece.length as usize;
-            let src = mmap
-                .get(start..end)
-                .ok_or_else(|| format!("out of range in shard {}", piece.file))?;
-            let d0 = piece.dest_off as usize;
-            dst[d0..d0 + piece.length as usize].copy_from_slice(src);
+                .ok_or_else(|| format!("shard {} not opened", piece.file))?;
+            if self.direct {
+                read_piece_direct(shard, piece, dst, &mut scratch)?;
+            } else {
+                let d0 = piece.dest_off as usize;
+                let n = piece.length as usize;
+                read_exact_at(&shard.file, piece.file_off, &mut dst[d0..d0 + n])?;
+            }
         }
         Ok(())
     }
@@ -422,8 +548,53 @@ mod reader_tests {
         dir
     }
 
+    /// A scratch dir on the workspace filesystem, which (unlike `/tmp`) supports
+    /// `O_DIRECT`, so the direct read path can be exercised.
+    fn mktemp_workspace() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tmp/ftw_read");
+        std::fs::create_dir_all(&base).unwrap();
+        let dir = base.join(format!(
+            "{}_{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A one-shard index over `nbytes` of a byte ramp, written to `dir`.
+    fn write_ramp(dir: &Path, nbytes: usize) {
+        let data: Vec<u8> = (0..nbytes).map(|i| (i & 0xff) as u8).collect();
+        std::fs::write(dir.join("t-00000.ftw"), data).unwrap();
+        let doc = format!(
+            r#"{{
+              "format": "freetoken_weight", "version": 1, "align": 4096,
+              "shard_limit": {nbytes}, "total_bytes": {nbytes},
+              "tensors": [
+                {{"name": "w", "kind": "weight", "dtype": "uint8",
+                  "shape": [{nbytes}], "global_off": 0, "nbytes": {nbytes}}}
+              ],
+              "shards": [
+                {{"file": "t-00000.ftw", "global_off": 0, "nbytes": {nbytes}}}
+              ]
+            }}"#
+        );
+        write_index(dir, &doc);
+    }
+
     #[test]
-    fn read_across_shard_boundary_from_mmap() {
+    fn aligned_span_rounds_out_and_reports_delta() {
+        assert_eq!(aligned_span(4096, 192, 8192).unwrap(), (4096, 4096, 0));
+        assert_eq!(aligned_span(4100, 100, 8192).unwrap(), (4096, 4096, 4));
+        assert_eq!(aligned_span(4000, 200, 8192).unwrap(), (0, 8192, 4000));
+        assert!(aligned_span(8000, 4096, 8192).is_err(), "past end");
+    }
+
+    #[test]
+    fn read_across_shard_boundary() {
         const N0: usize = 4096;
         const N1: usize = 4096;
         let dir = mktemp();
@@ -456,7 +627,7 @@ mod reader_tests {
             }}"#
         );
         write_index(&dir, &doc);
-        let reader = MmapFtwReader::open(&dir).unwrap();
+        let reader = FtwReader::open(&dir).unwrap();
         let mut buf = vec![0u8; 4912];
         reader.read_range(0, 4912, &mut buf).unwrap();
         for (i, x) in buf.iter().enumerate() {
@@ -482,10 +653,44 @@ mod reader_tests {
             }"#
         .to_string();
         write_index(&dir, &doc);
-        let reader = MmapFtwReader::open(&dir).unwrap();
+        let reader = FtwReader::open(&dir).unwrap();
         let mut buf = vec![0u8; 4096];
         assert!(reader.read_range(0, 8192, &mut buf).is_err());
         assert!(reader.read_range(0, 4096, &mut buf[..100]).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unaligned_window_read_returns_the_right_bytes() {
+        let dir = mktemp();
+        write_ramp(&dir, 8192);
+        let reader = FtwReader::open(&dir).unwrap();
+        let mut buf = vec![0u8; 5000];
+        reader.read_range(1000, 5000, &mut buf).unwrap();
+        for (i, x) in buf.iter().enumerate() {
+            assert_eq!(*x, ((1000 + i) & 0xff) as u8, "byte {i}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn direct_and_buffered_reads_agree() {
+        let dir = mktemp_workspace();
+        write_ramp(&dir, 16384);
+        let buffered = FtwReader::open_mode(&dir, Some(false)).unwrap();
+        assert!(!buffered.direct());
+        let Ok(direct) = FtwReader::open_mode(&dir, Some(true)) else {
+            eprintln!("skip: O_DIRECT unsupported on the workspace filesystem");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+        for (off, len) in [(1000u64, 5000usize), (0, 16384), (4096, 4096), (8191, 2)] {
+            let mut a = vec![0u8; len];
+            let mut b = vec![0u8; len];
+            direct.read_range(off, len as u64, &mut a).unwrap();
+            buffered.read_range(off, len as u64, &mut b).unwrap();
+            assert_eq!(a, b, "off {off} len {len}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

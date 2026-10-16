@@ -21,7 +21,7 @@ use ferrum_torrens::domain::kvcache::{CachedModel, KvCache, SequenceCache};
 use ferrum_torrens::domain::model::{ForwardInput, Model};
 use ferrum_torrens::infrastructure::cuda_attention::PagedAttention;
 use ferrum_torrens::infrastructure::decode_buffers::{DecodeBuffers, DecodeRow};
-use ferrum_torrens::infrastructure::ftw::{FtwIndex, MmapFtwReader};
+use ferrum_torrens::infrastructure::ftw::{FtwIndex, FtwReader};
 use ferrum_torrens::infrastructure::kvcache_dev::{DeviceCache, KvDType};
 use ferrum_torrens::infrastructure::torch::{Device, auto_device, to_f32_vec};
 use ferrum_torrens::models::qwen3_6::config::parse_text_config;
@@ -60,7 +60,7 @@ fn model_with_dtype(
         )
         .unwrap(),
     );
-    let reader = Arc::new(MmapFtwReader::open(std::path::Path::new(FTW_DIR)).unwrap());
+    let reader = Arc::new(FtwReader::open(std::path::Path::new(FTW_DIR)).unwrap());
     // On a CUDA device the device step runs the paged kernel, so this becomes the
     // paged-vs-re-fed numeric gate; on the CPU backend it falls back to the dense
     // gather, exactly as `registry` chooses.

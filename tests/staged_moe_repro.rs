@@ -17,7 +17,7 @@ use ferrum_torrens::domain::expert_kernel::{
 use ferrum_torrens::domain::weights::WeightsReader;
 use ferrum_torrens::infrastructure::banks::{FtwBanks, FtwPinnedBanks};
 use ferrum_torrens::infrastructure::cuda_moe::CudaMoE;
-use ferrum_torrens::infrastructure::ftw::{FtwIndex, MmapFtwReader};
+use ferrum_torrens::infrastructure::ftw::{FtwIndex, FtwReader};
 use ferrum_torrens::infrastructure::torch::{DevTensor, Device, to_f32_vec};
 
 const FTW_DIR: &str = ".model-cache/Qwen3.6-35B-A3B-NVFP4.ftw";
@@ -38,7 +38,7 @@ fn staged_moe_step_does_not_fault() {
         )
         .unwrap(),
     );
-    let reader: Arc<dyn WeightsReader> = Arc::new(MmapFtwReader::open(Path::new(FTW_DIR)).unwrap());
+    let reader: Arc<dyn WeightsReader> = Arc::new(FtwReader::open(Path::new(FTW_DIR)).unwrap());
     let shapes = ExpertShapes::new(HIDDEN, INTER).unwrap();
 
     let source: Arc<dyn ExpertSlabSource> = Arc::new(FtwBanks::new(reader.clone(), index.clone()));

@@ -37,7 +37,7 @@ Instructions for AI coding agents working in this repository.
 - Clean architecture, hexagonal, domain-driven. `TODO.md` section 3 groups code
   into a pure domain core (no CUDA, no IO), an application layer of use-cases
   (scheduler, generation, `run_experts`), and infrastructure adapters (libtorch
-  compute runtime, the CUDA driver-API MoE adapter, FTW/mmap reader, axum
+  compute runtime, the CUDA driver-API MoE adapter, FTW reader, axum
   server) that implement domain ports.
 - Ports are Rust traits defined in the domain core. Adapters depend on the core;
   the core never imports an adapter. Keep infra types (device tensors, mmap
@@ -73,7 +73,7 @@ Instructions for AI coding agents working in this repository.
 - Strict TDD: write the failing test first (red), then the minimal
   implementation (green), then refactor. No production code without its test.
 - Every module is covered by unit tests. Mock external boundaries with
-  `mockall`: the FTW/mmap reader, CUDA device, clock, scheduler interaction, and
+  `mockall`: the FTW reader, CUDA device, clock, scheduler interaction, and
   any other trait boundary.
 - Port FreeToken python tests that are relevant (`FreeToken/tests/` mirrors the
   subsystems). The numeric oracles live in this repo as Rust counterparts:

@@ -69,7 +69,7 @@ flowchart TB
     end
 
     subgraph Infra["infrastructure/ -- adapters"]
-      Ftw["ftw\nmmap reader + index"]
+      Ftw["ftw\nO_DIRECT pread reader + index"]
       Banks["banks\nhost + pinned expert banks"]
       TorchRt["torch\ndevice + tensor helpers"]
       CudaDrv["cuda_driver\nlibcuda FFI, cubin launch, pinned mem"]
@@ -141,7 +141,7 @@ stays pure: `Tensor` and CUDA handles never cross it (section 4).
 | Tokenize / detokenize, chat template | Host | `infrastructure/tokenizers_hf.rs`, via `Engine::encode/decode` |
 | Sampling (temperature/top-k/top-p/penalties) | Host | `domain/sampling.rs`, over f32 logits copied D2H |
 | Generation loop + KV page-table bookkeeping (`SequenceCache`) | Host | `domain/kvcache.rs`, `application/engine.rs` |
-| FTW index parse + mmap of the checkpoint | Host | `infrastructure/ftw.rs` |
+| FTW index parse + O_DIRECT pread of the checkpoint | Host | `infrastructure/ftw.rs` |
 | Pinned expert banks (17.3 GiB, page-locked, device-mapped) | Host memory | `infrastructure/banks.rs` (`FtwPinnedBanks`) |
 | Dense weights: embedding + all projections + `lm_head` (4.51 GiB bf16) | Device | `models/qwen3_6/forward_torch.rs` |
 | Embedding gather, RMSNorm, RoPE, attention (GQA), GDN recurrence, `lm_head` | Device | `models/qwen3_6/forward_torch.rs` (libtorch) |
@@ -237,13 +237,13 @@ sequenceDiagram
   participant Main as main.rs
   participant Cfg as config
   participant Eng as load_engine
-  participant FTW as ftw (index+mmap)
+  participant FTW as ftw (index+pread)
   participant Reg as registry
   participant Dev as torch::probe
   participant Http as http::serve_forever
   Main->>Cfg: parse TOML
   Main->>Eng: load_engine(config)
-  Eng->>FTW: parse freetoken_weight.json + mmap shards
+  Eng->>FTW: parse freetoken_weight.json + O_DIRECT pread shards
   Eng->>Dev: resolve_compute_device (probe_cuda)
   Eng->>Reg: build(config_json, index, reader, device, config)
   Note over Reg: reads architectures[0],<br/>builds MoE port + KV cache,<br/>then TorchQwen3_6::load
@@ -278,7 +278,7 @@ classDiagram
   class Qwen3_6
   class TorchQwen3_6
   class HfTokenizer
-  class MmapFtwReader
+  class FtwReader
   class DeviceCache
   class FtwBanks
   class FtwPinnedBanks
@@ -290,7 +290,7 @@ classDiagram
   Qwen3_6 ..|> CachedModel
   TorchQwen3_6 ..|> CachedModel
   HfTokenizer ..|> Tokenizer
-  MmapFtwReader ..|> WeightsReader
+  FtwReader ..|> WeightsReader
   DeviceCache ..|> KvCache
   FtwBanks ..|> ExpertSlabSource
   FtwPinnedBanks ..|> PinnedBankSource
@@ -318,7 +318,7 @@ Note the two deliberate non-obvious shapes:
 ```mermaid
 flowchart LR
   Idx["FtwIndex\nparse freetoken_weight.json"] --> Ent["TensorDesc\nname/kind/dtype/shape/off"]
-  Mm["MmapFtwReader"] -- "WeightsReader::read_range" --> Shards[("shards, mmap")]
+  Mm["FtwReader"] -- "WeightsReader::read_range" --> Shards[("shards, O_DIRECT pread")]
   Ent --> Mm
   Mm --> PWiden["Loader (forward_torch)\ndense widen: NVFP4/FP8/bf16 -> resident bf16"]
   Mm --> FtwBanks["FtwBanks (ExpertSlabSource)\nper-expert slab reads"]
@@ -329,13 +329,19 @@ Key conventions: the FTW holds **post-loader** weights, so Gemma `1+w` norms are
 already folded and must not be folded again; NVFP4 per-row globals are f16 while
 FP8 scales are f32.
 
+Reads are `pread` (`FileExt::read_at`). When the shard filesystem accepts
+`O_DIRECT` the `FtwReader` reads disk straight into an aligned scratch buffer
+(one `DIRECT_CHUNK` block at a time, rounded to `ALIGN`), so the dense load never
+populates the page cache and stays disk-bound; on a filesystem without `O_DIRECT`
+(tmpfs, some network mounts) it falls back to buffered reads. See decision 72.
+
 **Dynamic -- dense load and resident widening.**
 
 ```mermaid
 sequenceDiagram
   participant Reg as registry::build
   participant Ld as TorchQwen3_6::load
-  participant Rd as MmapFtwReader
+  participant Rd as FtwReader
   participant Dev as device
   participant MoE as registry::moe_port
   Reg->>Ld: load(params, device, index, reader, moe, cache)
@@ -719,7 +725,6 @@ reaches the oracle token through the captured graph.
 | `c10_cuda` (torch C++) | runtime, via `build.rs` shim | `shim/c10_graph_shim.cpp`, `infrastructure/cuda_graph.rs`, `infrastructure/decode_graph.rs` | The torch current-stream set and the graph memory pool that `tch` does not expose; needed for CUDA-graph capture of torch ops |
 | `axum` + `tokio` | runtime | `infrastructure/http.rs`, `main.rs` | HTTP server, SSE streaming, and the async runtime that offloads forwards to blocking threads |
 | `tokenizers` + `minijinja` | runtime | `infrastructure/tokenizers_hf.rs` | HF byte-level BPE tokenizer and the checkpoint's chat template (Python string methods rewritten to filters) |
-| `memmap2` | runtime | `infrastructure/ftw.rs` | mmap the FTW shards for zero-copy weight access |
 | Python + `uv` (FreeToken venv) | build-time only | `scripts/convert_hf_to_ftw.py`, `FreeToken/` | The one-time HF -> FTW conversion via `ft checkpoint`; never in the serving process |
 
 Boundary note: `tch`/`Tensor` and the CUDA driver handles live entirely in

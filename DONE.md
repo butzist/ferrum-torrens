@@ -1730,6 +1730,40 @@ settled.
       seed parity), `a_non_final_chunk_never_emits_a_token`. Cache:
       `a_chunk_boundary_commit_is_reusable_mid_prompt`.
 
+72. **The FTW reader is `pread` with `O_DIRECT`, not mmap** (2026-10-16,
+    implemented) -- the P1 "load dense weights via an O_DIRECT-friendly path, or
+    rely on mmap page-in; decide" item.
+    - **Why.** `mmap` page-in of the 3.35 GiB dense set (1148 tensors) cold-read at
+      ~250 MB/s because of per-4K-page major-fault and readahead overhead, not
+      disk bandwidth: a raw `dd iflag=direct` on a shard is ~1.6 GB/s. Measured on
+      this box, warm/cold: mmap 374 ms / 13.6 s; buffered `pread` 295 ms / 6.4 s;
+      `O_DIRECT pread` ~2.0 s / **2.06 s** (disk-bound). So O_DIRECT is ~6.6x the
+      mmap cold path and ~3x buffered. `madvise(Sequential)` made mmap *worse*
+      (~47 s) and `WillNeed` did nothing, so readahead was not a usable fix.
+    - **Shape.** `FtwReader::read_range` issues `FileExt::read_at` per piece.
+      `O_DIRECT` requires an aligned file offset, length and buffer, while
+      `read_range(off, n, dst)` guarantees none, so the reader aligns internally:
+      `aligned_span` widens each request to `ALIGN` blocks, reads into an
+      `ALIGN`-aligned `Scratch` (a `DIRECT_CHUNK` = 4 MiB block at a time, bounded
+      regardless of tensor size) and copies the wanted bytes out. On a filesystem
+      that rejects `O_DIRECT` (`tmpfs`, some network mounts) `open` probes the
+      first shard and falls back to buffered `pread`. `memmap2` is dropped.
+    - **Trade-off.** O_DIRECT keeps the dense set and the lazily-streamed expert
+      banks out of the page cache -- on a 32 GiB host that is 3.35 GiB and up to
+      16.9 GiB not competing with the KV/state and pinned banks. The cost is that
+      a *warm* restart re-reads from disk (~2 s vs ~0.3 s); the first cold boot is
+      the win. This is a decision about the startup/dense load; the two follow-ups
+      (zero-copy mmap, and an O_DIRECT-dense / mmap-expert hybrid) are recorded as
+      experiments in `TODO.md` section 8.
+    - **Tests.** `aligned_span_rounds_out_and_reports_delta` (block math, incl.
+      past-EOF), `an_unaligned_window_read_returns_the_right_bytes` and
+      `read_across_shard_boundary` (buffered path; `/tmp` is tmpfs),
+      `direct_and_buffered_reads_agree` (forces both modes on the workspace ext4
+      scratch and compares, skipping if the fs has no O_DIRECT),
+      `read_out_of_range_errors`. The gated `engine_real_load` loads the real
+      checkpoint end to end through the new reader (CPU + libtorch, ~25 s, I/O
+      now ~2 s of it).
+
 ---
 
 ## Progress log (narrative, pre-2026-10-15 compaction)

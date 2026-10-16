@@ -242,7 +242,7 @@ pub fn load_engine(config: &crate::config::Config) -> Result<Engine, LoadError> 
     let index_text = std::fs::read_to_string(dir.join("freetoken_weight.json"))
         .map_err(|e| LoadError::Io(format!("{}/freetoken_weight.json: {e}", dir.display())))?;
     let index = crate::infrastructure::ftw::FtwIndex::parse(&index_text)?;
-    let reader = std::sync::Arc::new(crate::infrastructure::ftw::MmapFtwReader::open(dir)?);
+    let reader = std::sync::Arc::new(crate::infrastructure::ftw::FtwReader::open(dir)?);
     let config_json_text = std::fs::read_to_string(dir.join("config.json"))
         .map_err(|e| LoadError::Io(format!("{}/config.json: {e}", dir.display())))?;
     let config_json: serde_json::Value = serde_json::from_str(&config_json_text)

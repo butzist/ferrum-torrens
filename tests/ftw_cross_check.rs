@@ -17,7 +17,7 @@ use ferrum_torrens::application::registry::{build, build_scalar};
 use ferrum_torrens::domain::model::ForwardInput;
 use ferrum_torrens::domain::tokenizer::Tokenizer;
 use ferrum_torrens::domain::weights::WeightsReader;
-use ferrum_torrens::infrastructure::ftw::{FtwIndex, MmapFtwReader};
+use ferrum_torrens::infrastructure::ftw::{FtwIndex, FtwReader};
 use ferrum_torrens::infrastructure::tokenizers_hf::HfTokenizer;
 use ferrum_torrens::infrastructure::torch::Device;
 use std::str::FromStr;
@@ -36,7 +36,7 @@ fn index() -> Arc<FtwIndex> {
 }
 
 fn reader() -> Arc<dyn WeightsReader> {
-    Arc::new(MmapFtwReader::open(std::path::Path::new(FTW_DIR)).unwrap())
+    Arc::new(FtwReader::open(std::path::Path::new(FTW_DIR)).unwrap())
 }
 
 /// Server config for the cross-check: the kernel stays off, so both towers run

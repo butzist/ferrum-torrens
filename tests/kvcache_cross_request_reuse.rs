@@ -23,7 +23,7 @@ use std::sync::Arc;
 use ferrum_torrens::application::registry::build;
 use ferrum_torrens::domain::kvcache::CachedModel;
 use ferrum_torrens::domain::model::ForwardInput;
-use ferrum_torrens::infrastructure::ftw::{FtwIndex, MmapFtwReader};
+use ferrum_torrens::infrastructure::ftw::{FtwIndex, FtwReader};
 
 const FTW_DIR: &str = ".model-cache/Qwen3.6-35B-A3B-NVFP4.ftw";
 
@@ -46,7 +46,7 @@ fn model() -> Box<dyn CachedModel> {
         )
         .unwrap(),
     );
-    let reader = Arc::new(MmapFtwReader::open(std::path::Path::new(FTW_DIR)).unwrap());
+    let reader = Arc::new(FtwReader::open(std::path::Path::new(FTW_DIR)).unwrap());
     let cfg: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(format!("{FTW_DIR}/config.json")).unwrap())
             .unwrap();

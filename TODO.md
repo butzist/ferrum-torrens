@@ -13,9 +13,12 @@ the generation loop's commit boundaries with dual-eviction triggers. Cross-reque
 prefix reuse is now real, the gated end-to-end oracle against the real checkpoint
 (`tests/kvcache_cross_request_reuse.rs`, decision 70) passes, and prefill is now
 **chunked**: a non-final chunk snapshots its boundary (`commit(finished=false)`,
-no sample), so mid-prompt prefixes are reusable too (decision 71). Open work is
-the remaining M5 items in the section 8 backlog.
-Progress history and the full decision log (numbers 1..71) live in `DONE.md`;
+no sample), so mid-prompt prefixes are reusable too (decision 71). The FTW reader
+is now `pread` with `O_DIRECT` (buffered fallback), cutting the cold dense-load
+read ~6.6x (13.6 s -> 2.06 s) and keeping the weights out of the page cache
+(decision 72). Open work is the remaining M5 items: the `[opt] /v1/responses`
+surface, the throughput smoke, and the section 8 experiments.
+Progress history and the full decision log (numbers 1..72) live in `DONE.md`;
 read that for the "why" behind any decision number referenced in code or tests.
 
 Goal: a **minimal, fast, single-GPU** Rust serving engine for **one model** --
@@ -208,7 +211,11 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 
 ### Weights / model load
 
-- [ ] P1 load dense weights via the 4096-aligned O_DIRECT-friendly path (preadv) to cut startup, or rely on mmap page-in; decide.
+- [x] P1 **dense weight load path -- DONE (2026-10-16), decision 72.** The FTW
+  reader is `pread` with `O_DIRECT` (buffered fallback): the 3.35 GiB dense cold
+  read drops from 13.6 s (mmap page-in) to 2.06 s (disk-bound), warm is a wash,
+  and the page cache is not polluted. Zero-copy mmap and an O_DIRECT-dense /
+  mmap-expert hybrid are recorded as experiments in section 8.
 
 ### MoE offload cache
 
@@ -261,7 +268,8 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
   what makes the radix prefix cache real, decision 65) -- domain core, device
   primitive, generation-loop wiring, chunked prefill with mid-prefill snapshots,
   and the gated cross-request oracle DONE (decisions 68, 69, 70, 71); startup
-  load tuning open.
+  load tuning DONE (decision 72); `[opt] /v1/responses` and the throughput smoke
+  remain, plus the section 8 experiments.
 
 ## 7. Decisions
 
@@ -293,6 +301,17 @@ history.
   adoption. Repeated non-finished commits advance `reused` without freeing a page,
   so mid-prompt prefixes are reusable. The no-cache reference path stays
   single-shot (it must re-feed the whole prefix anyway).
+- **72** -- the FTW reader is `pread` (`FileExt::read_at`), not mmap, and uses
+  `O_DIRECT` when the shard filesystem accepts it (buffered fallback on tmpfs /
+  network mounts). Measured on the 3.35 GiB dense set: cold read 13.6 s (mmap
+  page-in) vs 6.4 s (buffered pread) vs 2.06 s (O_DIRECT, disk-bound at the raw
+  ~1.6 GB/s); warm is a wash (mmap 374 ms vs pread 295 ms). O_DIRECT also keeps
+  the dense set and expert banks out of the page cache. Cost: a warm restart
+  re-reads from disk (~2 s vs ~0.3 s). The reader handles `O_DIRECT` alignment
+  internally (aligned scratch, `DIRECT_CHUNK` blocks) because `read_range` gives
+  no alignment guarantee; `memmap2` is dropped. `madvise(Sequential)` made mmap
+  worse (~47 s), so it is not a fix. Zero-copy mmap and an O_DIRECT-dense /
+  mmap-expert hybrid are recorded as experiments in section 8.
 - **68** -- the `hybrid_radix` domain core (`HybridRadixIndex`, dual refcounts,
   tombstones, deepest-live-snapshot match, dual eviction) and
   `LinearStateSlabs::copy_slot` landed first; the generation-loop wiring landed
@@ -346,6 +365,29 @@ performance work.
    whole-layer streaming with a double-buffered copy/compute overlap at
    `cache_size_slots >= 2*num_experts`, gated by
    `a_whole_layer_prefill_overlap_matches_the_host_plan`.
+
+### Experiments to try (not on the critical path)
+
+- **Zero-copy mmap weights.** `WeightsReader::read_range(off, n, dst)` is
+  copy-inherent: it writes into a caller buffer, so even an mmap adapter must
+  `memcpy`. Try a port that returns a borrowed `&[u8]` into the mapping (a single
+  shard-local range) so the dense `Loader` dequants straight out of the map with
+  no intermediate copy. Two blockers: (a) a tensor that spans a shard boundary
+  cannot be one slice -- the FTW cuts shards at aligned boundaries and some
+  tensors span them; (b) `O_DIRECT` can never be zero-copy. A format tweak (one
+  shard per tensor, or a shard-local copy) removes (a). But mmap cold-read cost
+  6.6x the O_DIRECT path (decision 72), so this only pays if the saved copy
+  dominates -- and the dense `Loader` always transforms (NVFP4/FP8 -> bf16)
+  anyway, so the copy is one of several passes.
+- **Hybrid reader: O_DIRECT for dense, mmap/buffered for expert streaming.** The
+  dense startup load is one-shot and sequential: O_DIRECT is disk-bound and does
+  not pollute the page cache (decision 72). Expert slabs are re-read on LRU
+  misses across the whole serving lifetime, where a warm page cache could serve
+  repeats -- that argues for mmap (or buffered reads) on the expert path only.
+  Shape: two `WeightsReader`s chosen per call site (`dense` vs `expert_rows`), or
+  one reader with a per-range hint. Measure the expert-miss re-read rate first;
+  if the LRU rarely revisits an evicted expert, O_DIRECT-everywhere stays simpler
+  and strictly better.
 
 ### State of play
 
