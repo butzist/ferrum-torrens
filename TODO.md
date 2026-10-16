@@ -23,14 +23,21 @@ was then found to be ~81% of decode and vectorized (decision 75): **tg is now
 The fused GDN decode kernel landed (decision 77): one Triton kernel per layer for
 the recurrence, AOT'd and wired into the device path, correct at ~1e-6 -- but it
 is only ~3 ms/token, because the linear mixer's cost is the FP8 projections
-(~86 ms/token total for the mixer), not the recurrence. FreeToken on the same
-GPU/FTW does **22.5-30.3 tok/s** (decision 76), so the compute path and the GPU
-memory budget are both open. Tool calling on
-`/v1/chat/completions` was brought into scope
+(~86 ms/token total for the mixer), not the recurrence. A bf16 tensor-core GEMM
+in `linear`/`lm_head_logits_into` removed the per-step f32 upcast of every weight
+(decision 78): **tg 4.7 -> 8.8 tok/s**. A dense NVFP4 GEMV for the lm_head
+(decision 79) cut resident VRAM 7.9 -> 7.1 GiB at neutral speed. A re-profile
+(decision 81, ablate-and-diff) now splits decode (~0.12 s/token) as **attention
+~29%, lm_head ~17%, MoE ~17%, GDN ~15%, rest ~30%** -- decode is latency/launch
+bound, so the next lever is the **bf16-KV attention fallback** (item 14), not the
+projection bytes. FreeToken on the same GPU/FTW does **22.5-30.3 tok/s**
+(decision 76), so both the compute path and the GPU memory budget remain open.
+Tool calling on `/v1/chat/completions` was brought into scope
 (decision 74) so the server can drive opencode/agentic clients; it is the next
 feature. Open work: tool calling, the `[opt] /v1/responses` surface, server-side
-batching, the FP8-projection decode gap (item 17), and the section 8 experiments.
-Progress history and the full decision log (numbers 1..76) live in `DONE.md`;
+batching, the bf16-attention/remaining decode gap (items 14, 17), and the
+section 8 experiments.
+Progress history and the full decision log (numbers 1..81) live in `DONE.md`;
 read that for the "why" behind any decision number referenced in code or tests.
 
 Goal: a **minimal, fast, single-GPU** Rust serving engine for **one model** --
@@ -297,6 +304,24 @@ The full log of confirmed decisions (numbers 1..76, stable -- code, tests and
 lists only the decisions that still bind open work; everything else there is
 history.
 
+- **78** -- `linear` and `lm_head_logits_into` matmul in bf16 (tensor-core, f32
+  accumulate) instead of upcasting every weight to f32 per step: tg 4.7 -> 8.8
+  tok/s. It binds open work because bf16 cuBLAS GEMM is **shape-dependent** (its
+  tiling moves with `M`), which is why decision 80 loosened the shape-invariance
+  gates to an argmax-pinned 0.2 bound. Restoring a 1e-3 bound needs fixed-order
+  hand kernels that also cover the prefill `M > 1` shape.
+- **80** -- the `device_decode_matches_refeed` and `kvcache_cross_request_reuse`
+  logit bounds are 0.2 of scale (was 1e-3, f32-SGEMM-calibrated); argmax equality
+  is the exact check each still makes. Same property FreeToken's bf16/quantized
+  GEMMs have.
+- **79** -- the lm_head is resident NVFP4 with a dense GEMV kernel (`Head` +
+  `DenseGemv`, `kernel/nvfp4_dense_gemv.cubin`), not a widened bf16 matmul. VRAM
+  -0.81 GiB, throughput neutral; it is the reusable dense-quant-GEMV pattern and
+  its freed VRAM is currently blocked from the cache by the load-time peak.
+- **81** -- decode is profiled by ablation (`FT_ABLATE`), not `nsys`/`ncu`.
+  Post-bf16 bs=1: attention ~29%, head ~17%, MoE ~17%, GDN ~15%, rest ~30%; a
+  latency/launch-bound step, so byte cuts are secondary to fusing and to the
+  bf16 attention kernel (item 14).
 - **70** -- the cross-request reuse gate drives the wired path on the real
   checkpoint directly (`tests/kvcache_cross_request_reuse.rs`), because
   `generation` exposes no way to observe a request's reused length. It is the
@@ -477,31 +502,39 @@ performance work.
     tool-call token, so a multi-turn loop (tool call -> result -> continue) reuses
     the pre-call prefix instead of re-prefilling. Add the analogous snapshot point
     when the tool-call feature lands; it is the agentic-session cache.
-14. bf16 paged attention -- **OPEN.** The committed `paged_attention` cubin is
-    wired only for `KvDType::F32`; the default bf16 KV falls back to a libtorch
-    `gather_rows` + `attention_cached_pos` masked softmax (~20 ms/token, 10%).
-    Add the bf16 variant so the fast path is the default. Attention is ~25% of
-    decode, so this plus freeing the fallback is worth it.
+14. bf16 paged attention -- **OPEN, the top remaining lever (decision 81).** The
+    committed `paged_attention` cubin is wired only for `KvDType::F32`; the
+    default bf16 KV falls back to a libtorch `gather_rows` +
+    `attention_cached_pos` masked softmax. The re-profile puts the whole
+    full-attention block at **~30-35 ms/token (~29%)** at bs=1, the single
+    largest block. Add the bf16 variant (q f32 activation, bf16 K/V pool, f32
+    out) so the fast path is the default; the f32 pool + our kernel is already
+    ~11% faster end to end.
 15. Fused GDN decode kernel -- **DONE (decision 77).** One `gdn_decode` Triton
     kernel per layer replaces the ~15-op GDN recurrence (gating + q/k L2-norm +
     delta-rule update + state), AOT'd and wired into the device decode path; the
-    device-decode gate matches the re-fed reference at ~1e-6 and tg moved
-    4.7 -> 4.7 tok/s. Measured win is only **~3 ms/token (~1.4%)**: the recurrence
-    was never the cost. Isolating the whole linear mixer (**~86 ms/token, 40% of
-    decode**) showed the conv and recurrence are ~0-3 ms, so item 17 (the FP8
-    projections) is the real lever, not the recurrence.
-16. Decode "rest" ~31% -- **OPEN.** ~59 ms/token outside mixer+MoE: input/post
-    norms (80/layer), embed gather, lm_head GEMV (vocab 248320 x hidden bf16),
-    sampling (+ its D2H). Profile which dominates once the kernels above land.
-17. FP8 linear projections -- **OPEN, the real mixer cost (from decision 77).**
-    Isolating the linear mixer at bs=1 put ~80 of its ~86 ms/token in the
-    `in_proj_qkvz` / `in_proj_ba` / `out_proj` projections and the norm, not the
-    conv or the recurrence (both ~0-3 ms; the fused GDN kernel barely moved tg).
-    Those are FP8 `Dense` GEMMs; at one row they are GEMVs, and the whole decode
-    already runs at ~8% of HBM peak (item 9), so they are latency/dequant-bound.
-    Profile `Dense::apply` on the FP8 kinds (per-step dequant vs a cached widened
-    copy) before writing another kernel; a fused FP8 GEMV is the eventual lever,
-    the same one FreeToken pulls with its quantized projections.
+    device-decode gate matches the re-fed reference and the `--interp` selftest is
+    ~1e-7. Measured win is only **~3 ms/token**: the recurrence was never the
+    cost. The separate f32-upcast of every widened weight was (decision 78, tg
+    4.7 -> 8.8 tok/s). A later ablation (decision 81) puts GDN at ~15 ms.
+16. Decode "rest" ~25% -- **OPEN.** The re-profile (decision 81) leaves ~30 ms/token
+    outside attention/head/GDN/MoE: input/post norms (80/layer), embed gather,
+    residual adds, sampling (+ its D2H). Fold the norms into adjacent kernels.
+17. FP8 linear projections -- **OPEN, but the byte model over-estimated it
+    (decision 81).** The review predicted the FP8 projections were ~58% of the
+    per-token weight bytes; the ablation shows the whole linear mixer is only ~35%
+    of decode and decode is latency/launch-bound (~28 GB/s effective), not
+    bandwidth-bound. The lm_head experiment (decision 79) halved-to-quartered the
+    head bytes for **zero** throughput change, which is the cautionary case. A
+    fused FP8 GEMV (E1) would cut resident projection bytes ~1.3 GiB and restore
+    shape-invariant gates (decision 80), but the speed win is unproven -- measure
+    `Dense::apply` on the FP8 kinds before writing it.
+18. Dense NVFP4 lm_head GEMV -- **DONE (decision 79).** `_nvfp4_dense_gemv_kernel`
+    + `DenseGemv` launcher + `Head` storage: the packed checkpoint head stays
+    resident and is streamed once per token. Correct (CUDA cross-check argmax
+    11751, 0.21% shift); VRAM -0.81 GiB; throughput neutral. The reusable pattern
+    for E1; the freed VRAM is blocked from the expert cache by the load-time peak
+    (item 12).
 
 ### Experiments to try (not on the critical path)
 

@@ -207,3 +207,137 @@ swapping the recurrence for the kernel saved only ~3 ms. The cost is the **FP8
 conv or the recurrence (TODO.md item 17). The kernel is kept (correct, fewer
 temporaries/graph nodes); the next lever is the FP8 projection path, so the
 `gdn_decode` conv-fusion follow-up below is **not** on the critical path.
+
+## Decode-gap review (2026-10-16): why we are still ~3x slower and what to try
+
+Standing numbers: FreeToken does 22.5 tok/s (44.4 ms/token) at 512 slots and
+30.3 tok/s (33.3 ms/token) at 1900 slots (decision 76). We did 4.7 tok/s
+(213 ms/token); the bf16-GEMM `linear` fix (uncommitted, decision 78 candidate)
+takes it to **8.8 tok/s (~114 ms/token)**, leaving a **2.6-3.4x** gap at bs=1.
+That gap decomposes exactly into two factors: **bytes x efficiency**.
+
+### Factor 1 (2.0x): every quantized weight is widened to bf16 and re-read each token
+
+The loader widens FP8 and NVFP4 weights to bf16 (lossless, scale applied after
+the matmul -- see the `linear` docstring). Lossless means the widened bytes
+carry **zero extra information**, but decode reads the whole resident tower
+every token, so we pay 2x (FP8) to 3.5x (NVFP4) the checkpoint bytes for
+nothing. Per-token weight traffic at bs=1, straight from the FTW index:
+
+| block (per token) | ours, bf16 resident | FreeToken, native quant |
+|---|---|---|
+| 30 GDN `in_proj_qkvz`+`ba`+`out_proj` | 2.02 GB | 1.01 GB (FP8) |
+| 10 attn `qkv_proj`+`o_proj` | 0.55 GB | 0.27 GB (FP8) |
+| 40 shared expert + router | 0.29 GB | 0.11 GB (NVFP4) |
+| `lm_head` | 1.02 GB | 0.29 GB (NVFP4) |
+| 8 routed experts x 40 layers | 0.54 GB | 0.54 GB (NVFP4, same) |
+| **total** | **~4.4 GB** | **~2.2 GB** |
+
+The routed-expert row is already optimal (our own NVFP4 kernel), and the
+embed table is prompt-only, so the whole difference is the widened dense
+set: GDN/attention projections and `lm_head`.
+
+### Factor 2 (1.3-1.7x): effective read rate
+
+Ours: 4.4 GB / 114 ms = **~39 GB/s**. FreeToken: 2.2 GB / 33-44 ms =
+**50-67 GB/s**. Same GPU, same bs=1, peak ~250 GB/s (item 9) -- both are
+latency-bound at one row, but its dequant GEMV kernels (multi-row programs,
+fused scales) stream better than our cuBLAS M=1 bf16 GEMV plus per-op norm and
+cast kernels. 2.0 x 1.3-1.7 = the measured 2.6-3.4x.
+
+### What already landed, in order
+
+1. **FIXED (uncommitted, decision 78 candidate)**: `linear` upcast every
+   weight (up to the 2 GB `lm_head`) to f32 on every step. bf16 GEMM with f32
+   accumulation: tg 4.7 -> 8.8 tok/s, ~1.9x. Side effect: cuBLAS bf16 GEMM is
+   **shape-dependent** (batched-vs-single 3.2e-2 of scale, device-vs-refeed
+   9.6e-2; argmax stable in both) so the f32-calibrated 1e-3 shape gates in
+   `tests/device_decode_matches_refeed.rs` fail. Any tensor-core path has this
+   property; FreeToken lives with it. Resolution below (E1 restores it).
+
+### Suggested experiments, ranked by expected effect / cost
+
+- **E1: FP8 weight-only dequant GEMV for the FP8 projections** (GDN
+  `in_proj_qkvz`/`out_proj`, attn `qkv_proj`/`o_proj`). Keep the FP8 bytes +
+  per-row f32 scale resident, dequant in-kernel, f32 accumulate. Bytes:
+  4.4 -> 3.1 GB/token (-30%) and resident VRAM -1.3 GiB (item 12's audit).
+  Numerics: identical to the current path (the bf16 widen is lossless; the
+  kernel reads the same values, applies the same scale). A hand GEMV also
+  computes each output row as one fixed-order K dot, so **row results are
+  batch-shape-invariant** -- it fixes the broken 1e-3 gates that cuBLAS bf16
+  GEMM breaks, and it is where FreeToken's 50-67 GB/s comes from (multi-row
+  programs per launch). Decode-only dispatch (rows small); prefill keeps
+  cuBLAS. Expected: the FP8 projections are the bulk of the mixer, so
+  **tg 8.8 -> ~12-16 tok/s**; measure, do not trust the estimate. Cost: one
+  Triton kernel + ABI entry + a quant-kind dispatch in `linear` -- all the
+  AOT machinery exists (`kernel_abi.rs`, `check-kernels.sh`, `--interp`
+  selftest). This is TODO item 17's "eventual lever".
+- **E2: `lm_head` NVFP4 GEMV.** The head is the single largest per-token read
+  (1.02 GB, a quarter of all traffic) and a quarter of the VRAM gap. The
+  dequant inner loop is the same as the NVFP4 expert GEMV; a single-matrix
+  variant is a small kernel. Bytes 1.02 -> 0.29 GB/token, VRAM -0.73 GiB.
+  Expected: **~10-18 ms/token** off the "rest" block (item 16), tg +1-2.
+  Also makes the fp8-vs-bf16 sampler input identical to FreeToken's.
+- **E3: bf16 paged attention** (item 14, already planned). The default bf16
+  KV takes the libtorch dense-gather + masked-softmax fallback, ~20 ms/token
+  (18% of decode post-bf16). A bf16 variant of our own f32 paged GQA cubin.
+  Expected ~10-15 ms/token. Independent of E1/E2.
+- **E4: spend the freed VRAM on expert slots** (item 12). E1+E2 free ~2 GiB,
+  which is exactly the 512 -> ~1900 slot growth FreeToken uses; it measured
+  ~35% from cache size at bs=1 (22.5 -> 30.3). For us MoE is only ~9-15% of
+  decode, so expect a few ms; still, it is free once E1/E2 land.
+- **E5: norm/cast fusion** (only after re-profiling). ~82 small rms_norm +
+  f32-cast kernels per token; inside the graph each is a few us of launch and
+  a redundant re-read of x. Folding input/post norms into the adjacent E1 GEMV
+  (read x once, normalize in-kernel) is worth single-digit ms. Do not do this
+  before E1-E3 are measured; the current split is stale (it predates the
+  bf16-GEMM fix).
+- **E0 (first): re-run the ablate-and-diff profile post-bf16.** The 68/49/17/59
+  ms GDN/attention/MoE/rest split was measured before the bf16 GEMM fix; it is
+  stale. Re-measure so E1-E5 are ranked by data, not by this estimate.
+
+**Not worth trying** (measured or reasoned elsewhere): fusing the conv into
+`gdn_decode` (~0-3 ms, above); mmap zero-copy dense loads (decision 72
+experiments; the loader always dequant-transforms anyway); speculative/multi-
+token decode (FreeToken has none for this model, item 9); growing the MoE cache
+before E1/E2 free the VRAM (item 12).
+
+### Evaluation for each experiment
+
+- Correctness: `kernel-selftest --interp` vs the widened-bf16 libtorch
+  reference (E1/E2 should match to FP8-exactness, ~1e-3 relative), then the
+  gated GPU test on the real checkpoint. **E1/E2 should bring the
+  `device_decode_matches_refeed` gates back under ~1e-2 with exact argmax**
+  (fixed-order rows); if they stay at 1e-1 the kernel is wrong, not the gate.
+- End to end: `tests/throughput_smoke.rs` tg before/after, recorded here;
+  VRAM via the smoke's NVML sampler (E1: -1.3 GiB, E2: -0.73 GiB).
+- Oracle: `tests/ftw_cross_check.rs` argmax/top-5 stable (bf16 tolerance, 8%).
+- Ceiling check: after E1+E2, per-token traffic ~2.4 GB ~= FreeToken's 2.2; if
+  tg lands at 50-67 GB/s effective (33-44 ms/token) we are at parity and the
+  remaining lever is serving-level (batching, item 11), not kernels.
+
+### Results (2026-10-16, decisions 78-81)
+
+- **The byte model was wrong; decode is latency/launch-bound.** E0's
+  ablate-and-diff (`FT_ABLATE=mixer,attn,gdn,moe,head`, decision 81) puts bs=1
+  decode at ~0.12 s/token as **attention ~30-35 ms (29%), lm_head ~20 ms (17%),
+  MoE ~17 ms, GDN ~15 ms, rest ~30 ms**. Effective weight traffic is ~28 GB/s,
+  far under HBM peak, so cutting *bytes* does not pay off proportionally.
+- **E2 (dense NVFP4 lm_head) is done (decision 79) and did not speed anything
+  up.** The kernel is correct (CUDA cross-check: argmax 11751, top-5 identical,
+  0.21% logit shift) and cut resident VRAM 7.9 -> 7.1 GiB, but tg stayed flat:
+  the dequant-in-K GEMV is arithmetic/issue-bound, so reading 3.5x fewer bytes
+  is a wash. The head costs ~20 ms either way. This is the direct evidence that
+  **E1's predicted win is doubtful** for the same reason. E2 is kept for the
+  footprint and as the reusable dense-quant-GEMV pattern.
+- **The freed VRAM cannot grow the expert cache yet.** A load at 768 slots OOMs
+  on the load-time peak (transient widen buffers), so item 12's audit comes
+  before E4.
+- **Gate recalibration (decision 80).** The f32-calibrated 1e-3 shape gates now
+  pass at an argmax-pinned 0.2 bound; a fixed-order kernel is what would restore
+  the tight bound, but E1/E3 must handle the prefill `M > 1` shape to do that
+  (a per-row GEMV is O(M x weight) and wrong for prefill).
+- **Revised priority: E3 (bf16 paged attention) is the top lever**, then the
+  ~30 ms "rest" (fuse the 82 norms), then MoE/GDN. E1 drops to last: implement it
+  only if a measured `Dense::apply` profile shows the projection GEMVs dominate,
+  which the ablation argues against.

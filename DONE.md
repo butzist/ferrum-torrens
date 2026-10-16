@@ -1943,6 +1943,68 @@ settled.
       a stashed pre-change tree (TODO item 10). The direct device-decode gate is
       the numeric proof here.
 
+78. **bf16 tensor-core GEMM in `linear` / `lm_head_logits_into`** (2026-10-16,
+    implemented) -- the per-step f32 upcast of every widened weight was the decode
+    bottleneck.
+    - **Why.** `linear` computed `f32_(x).matmul(&f32_(w).transpose(0,1))`,
+      materializing an f32 copy of every bf16 weight (up to the 1 GiB `lm_head`)
+      every step. The weight is already bf16 and its f32 upcast adds no
+      information: cuBLAS accumulates a bf16 matmul in f32 anyway.
+    - **Change.** `linear` and the block loop in `lm_head_logits_into` cast only
+      the activation to bf16 and matmul bf16 x bf16 (f32 accumulate), applying the
+      per-row `row_scale` after. The weight is never re-uploaded.
+    - **Result.** tg **4.7 -> 8.8 tok/s** (~1.87x; 213 -> 114 ms/token). The oracle
+      token and top-5 are unchanged (`ftw_cross_check`, decision 80 tolerances).
+    - **Cost.** bf16 tensor-core GEMM is **shape-dependent** (its tiling moves with
+      `M`), so the f32-calibrated 1e-3 shape-invariance gates drift to ~1e-1
+      (decision 80). The block-split exactness is still proven for a fixed shape
+      (`the_lm_head_block_split_is_exact`).
+
+79. **Dense NVFP4 GEMV for the lm_head** (2026-10-16, implemented) -- E2 of the
+    decode-gap review in `FUSED_GDN.md`.
+    - **Why.** The lm_head is the single largest per-token weight read (1.02 GiB
+      bf16 at vocab 248320 x hidden 2048) and the checkpoint stores it NVFP4;
+      widening it to bf16 at load tripled every step's read for zero information.
+    - **Shape.** `python/ferrum_kernel/linear.py` `_nvfp4_dense_gemv_kernel`
+      (grid `(M, cdiv(N, 128))`, `BLOCK_N = 128`, `BLOCK_KB = 64`, 4 warps),
+      AOT'd into the `linear` manifest section; `LinearAbi` gains
+      `NVFP4_DENSE_GEMV` + `DenseGemvArgs`; `DenseGemv` launcher
+      (`infrastructure/cuda_linear.rs`); `TorchQwen3_6` holds a `Head` (packed
+      NVFP4 on CUDA, widened bf16 on CPU) and an optional `head_gemv`. The head is
+      always applied to one row (a prefill answers only its last token), so a
+      plain weight-stationary GEMV is optimal and the fixed K-order dot is
+      batch-shape-invariant.
+    - **Result.** Correct: `--interp` selftest ~3e-7; the gated CUDA cross-check
+      (`FT_CROSS_DEVICE=cuda ftw_cross_check`) lands on the oracle token 11751 with
+      top-5 identical and a 0.21% logit shift. VRAM after load **7908 -> 7096 MiB**
+      (-0.81 GiB). But **throughput is neutral** (8.2-8.3 tok/s): the dequant-in-K
+      GEMV is arithmetic/latency-bound, not bandwidth-bound, so reading 3.5x fewer
+      bytes does not help (the profile puts the head at ~20 ms either way). Kept
+      for the resident footprint and as the reusable dense-quant-GEMV pattern for
+      the FP8 projections. The freed VRAM cannot yet grow the expert cache: a
+      load at 768 slots OOMs on the load-time peak, so item 12's audit has to come
+      first.
+
+80. **Shape-invariance gates recalibrated for bf16** (2026-10-16, implemented).
+    The 1e-3 logit bounds in `tests/device_decode_matches_refeed.rs` and
+    `tests/kvcache_cross_request_reuse.rs` were calibrated for f32 SGEMM, which is
+    bit-shape-invariant; decision 78's bf16 tensor-core GEMM is not (the K
+    reduction is tiled by `M`). Each gate's exact check is the argmax equality it
+    already makes, so the logit bound moved to **0.2 of scale** (measured
+    1e-2..1.3e-1 across the gates). This is the property FreeToken's
+    bf16/quantized GEMMs live with; returning to a 1e-3 bound needs fixed-order
+    hand kernels (E1/E3 of the review).
+
+81. **Decode re-profile via ablation** (2026-10-16, measurement). `run_tower` now
+    honors `FT_ABLATE=mixer,attn,gdn,moe,head` (a profiling aid, like `FT_TRACE`),
+    because `nsys`' report importer is broken in-jail and `ncu` lacks counter
+    permission. Post-bf16, bs=1, ~0.120 s/token: **attention ~30-35 ms (29%), head
+    ~20 ms (17%), MoE ~17 ms, GDN ~15 ms, rest (82 norms + embed + residual adds)
+    ~30 ms**. The GDN recurrence stays cheap (the fused kernel, decision 77). This
+    corrects the byte-only model in the review: decode is latency/launch-bound, so
+    halving projection *bytes* (E1) is not expected to pay off proportionally, and
+    the bf16-KV attention fallback (E3 / item 14) is the top remaining lever.
+
 ---
 
 ## Progress log (narrative, pre-2026-10-15 compaction)

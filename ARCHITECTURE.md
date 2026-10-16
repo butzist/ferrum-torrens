@@ -76,6 +76,7 @@ flowchart TB
       CudaMoe["cuda_moe\nNVFP4 slot cache + grouped GEMM"]
       CudaAttn["cuda_attention\npaged GQA decode launcher"]
       CudaGdn["cuda_gdn\nfused GDN decode launcher"]
+      CudaLin["cuda_linear\ndense NVFP4 lm_head GEMV"]
       Abi["kernel_abi\ncubin manifest + arg packing"]
       Graph["cuda_graph\ntorch stream + graph pool bridge"]
       KvcDev["kvcache_dev\nMHA pool + GDN state slabs"]
@@ -144,8 +145,8 @@ stays pure: `Tensor` and CUDA handles never cross it (section 4).
 | Generation loop + KV page-table bookkeeping (`SequenceCache`) | Host | `domain/kvcache.rs`, `application/engine.rs` |
 | FTW index parse + O_DIRECT pread of the checkpoint | Host | `infrastructure/ftw.rs` |
 | Pinned expert banks (17.3 GiB, page-locked, device-mapped) | Host memory | `infrastructure/banks.rs` (`FtwPinnedBanks`) |
-| Dense weights: embedding + all projections + `lm_head` (4.51 GiB bf16) | Device | `models/qwen3_6/forward_torch.rs` |
-| Embedding gather, RMSNorm, RoPE, attention (GQA), GDN recurrence, `lm_head` | Device | `models/qwen3_6/forward_torch.rs` (libtorch) |
+| Dense weights: embedding + all projections + `lm_head` (4.51 GiB bf16; the lm_head kept packed NVFP4 on CUDA) | Device | `models/qwen3_6/forward_torch.rs` |
+| Embedding gather, RMSNorm, RoPE, attention (GQA), GDN recurrence, `lm_head` | Device | `models/qwen3_6/forward_torch.rs` (libtorch) + `infrastructure/cuda_linear.rs` (dense NVFP4 head) |
 | Router: gate matmul + softmax + top-8 | Device | `forward_torch.rs::moe` (ids stay device) |
 | Routed experts: slot cache + grouped GEMV | Device | `infrastructure/cuda_moe.rs` (driver-API cubins) |
 | Slot residency plan (`lru_ensure` / whole-layer) | Device (host plan fallback) | `python/ferrum_kernel/offload.py`, `application/run_experts.rs` |
@@ -182,7 +183,7 @@ flowchart LR
 
   subgraph KernelAOT["kernel toolchain (devshell, hermetic python)"]
     direction TB
-    K1["python/ferrum_kernel/\nnvfp4_moe.py, offload.py,\nattention.py, gdn.py, signatures.py"]
+    K1["python/ferrum_kernel/\nnvfp4_moe.py, offload.py,\nattention.py, gdn.py, linear.py,\nsignatures.py"]
     K2["aot.py: triton.compile\nGPUTarget cuda sm_120"]
     K3[("kernel/*.cubin + *.ptx\n+ manifest.json (committed)")]
     K1 --> K2 --> K3
@@ -206,7 +207,8 @@ flowchart LR
   the manifest and `cuda_driver.rs` launches the cubins. The manifest has four
   launch contracts, one section each: `kernels` (the four grouped-MoE passes),
   `staging` (`lru_ensure`, `index_copy`), `attention` (`paged_attention`) and
-  `linear` (`gdn_decode`, the fused GDN decode). The devshell aliases
+  `linear` (`gdn_decode`, the fused GDN decode, and `nvfp4_dense_gemv`, the lm_head
+  tail). The devshell aliases
   `kernel-aot`, `kernel-selftest` (CPU interpreter gate) and
   `kernel-compile-check` are the kernel inner loop.
 - **The devshell exports the roots** `LIBTORCH`, `LIBTORCH_INCLUDE`,
