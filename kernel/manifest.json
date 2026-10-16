@@ -473,6 +473,91 @@
       "shared": 0
     }
   },
+  "linear": {
+    "gdn_decode": {
+      "constexprs": {
+        "BK": 128,
+        "BV": 32,
+        "K": 128,
+        "NUM_K_HEADS": 16,
+        "NUM_V_HEADS": 32,
+        "V": 128
+      },
+      "declared_args": [
+        "ba_ptr",
+        "a_log_ptr",
+        "dt_bias_ptr",
+        "q_ptr",
+        "k_ptr",
+        "v_ptr",
+        "state_ptr",
+        "out_ptr",
+        "stride_q",
+        "stride_k",
+        "stride_v"
+      ],
+      "entry": "_gdn_decode_kernel",
+      "global_scratch_size": 0,
+      "num_warps": 4,
+      "params": [
+        {
+          "index": 0,
+          "kind": "ptr"
+        },
+        {
+          "index": 1,
+          "kind": "ptr"
+        },
+        {
+          "index": 2,
+          "kind": "ptr"
+        },
+        {
+          "index": 3,
+          "kind": "ptr"
+        },
+        {
+          "index": 4,
+          "kind": "ptr"
+        },
+        {
+          "index": 5,
+          "kind": "ptr"
+        },
+        {
+          "index": 6,
+          "kind": "ptr"
+        },
+        {
+          "index": 7,
+          "kind": "ptr"
+        },
+        {
+          "index": 8,
+          "kind": "u32"
+        },
+        {
+          "index": 9,
+          "kind": "u32"
+        },
+        {
+          "index": 10,
+          "kind": "u32"
+        },
+        {
+          "index": 11,
+          "kind": "ptr"
+        },
+        {
+          "index": 12,
+          "kind": "ptr"
+        }
+      ],
+      "profile_scratch_size": 0,
+      "scratch_params": 2,
+      "shared": 512
+    }
+  },
   "shapes": {
     "dtype": "bf16",
     "hidden": 2048,

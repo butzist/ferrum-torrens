@@ -75,6 +75,7 @@ flowchart TB
       CudaDrv["cuda_driver\nlibcuda FFI, cubin launch, pinned mem"]
       CudaMoe["cuda_moe\nNVFP4 slot cache + grouped GEMM"]
       CudaAttn["cuda_attention\npaged GQA decode launcher"]
+      CudaGdn["cuda_gdn\nfused GDN decode launcher"]
       Abi["kernel_abi\ncubin manifest + arg packing"]
       Graph["cuda_graph\ntorch stream + graph pool bridge"]
       KvcDev["kvcache_dev\nMHA pool + GDN state slabs"]
@@ -181,7 +182,7 @@ flowchart LR
 
   subgraph KernelAOT["kernel toolchain (devshell, hermetic python)"]
     direction TB
-    K1["python/ferrum_kernel/\nnvfp4_moe.py, offload.py, signatures.py"]
+    K1["python/ferrum_kernel/\nnvfp4_moe.py, offload.py,\nattention.py, gdn.py, signatures.py"]
     K2["aot.py: triton.compile\nGPUTarget cuda sm_120"]
     K3[("kernel/*.cubin + *.ptx\n+ manifest.json (committed)")]
     K1 --> K2 --> K3
@@ -202,7 +203,10 @@ flowchart LR
 - **Kernels are authored in Triton, compiled ahead of time, and committed.**
   `python/ferrum_kernel/aot.py` emits `kernel/*.cubin`, `*.ptx` and
   `manifest.json`. The engine never runs an interpreter; `kernel_abi.rs` parses
-  the manifest and `cuda_driver.rs` launches the cubins. The devshell aliases
+  the manifest and `cuda_driver.rs` launches the cubins. The manifest has four
+  launch contracts, one section each: `kernels` (the four grouped-MoE passes),
+  `staging` (`lru_ensure`, `index_copy`), `attention` (`paged_attention`) and
+  `linear` (`gdn_decode`, the fused GDN decode). The devshell aliases
   `kernel-aot`, `kernel-selftest` (CPU interpreter gate) and
   `kernel-compile-check` are the kernel inner loop.
 - **The devshell exports the roots** `LIBTORCH`, `LIBTORCH_INCLUDE`,
@@ -687,7 +691,13 @@ runs the paged GQA kernel through `infrastructure/cuda_attention.rs`
 committed cubin on the capture's stream, reading the row's KV straight out of the
 `MhaPool` slabs (`kv_slab_ptrs`) through the staged `DecodeBuffers` location
 window; when the launcher is absent or the pool is not f32 the arm falls back to
-the dense padded-window gather (decision 55). The forward's tail is
+the dense padded-window gather (decision 55). The device GDN arm runs the fused
+decode kernel through `infrastructure/cuda_gdn.rs` (`GdnDecode`): it loads the
+`linear` manifest section and launches the committed cubin on the capture's
+stream, folding the gating, the q/k L2-norm and the delta-rule update into one
+launch per layer and reading/writing the row's `LinearStateSlabs` recurrent state
+in place; when the launcher is absent (CPU, decision 21) the arm keeps the
+op-by-op `gdn_core_batch` (decision 77). The forward's tail is
 device-local: `TorchQwen3_6::forward_cached_into` writes the `lm_head` block pass
 straight into a caller-owned `[rows, vocab]` device logits buffer with no host
 round-trip, and `forward_decode_into` addresses the same forward entirely from a

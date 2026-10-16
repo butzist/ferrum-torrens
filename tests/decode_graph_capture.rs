@@ -32,6 +32,7 @@ use ferrum_torrens::domain::weights::WeightsReader;
 use ferrum_torrens::infrastructure::banks::{FtwBanks, FtwPinnedBanks};
 use ferrum_torrens::infrastructure::cuda_attention::PagedAttention;
 use ferrum_torrens::infrastructure::cuda_driver::{CAPTURE_MODE_GLOBAL, Driver};
+use ferrum_torrens::infrastructure::cuda_gdn::GdnDecode;
 use ferrum_torrens::infrastructure::cuda_graph::{self, GraphPool};
 use ferrum_torrens::infrastructure::cuda_moe::CudaMoE;
 use ferrum_torrens::infrastructure::decode_buffers::{DecodeBuffers, DecodeRow};
@@ -125,6 +126,7 @@ fn build(num_pages: usize, num_slots: usize) -> Built {
     let attention = Arc::new(
         PagedAttention::new(device, &params, stream).expect("the paged attention launcher"),
     );
+    let gdn = Arc::new(GdnDecode::new(device, &params, stream).expect("the fused gdn launcher"));
     let model = TorchQwen3_6::load(
         params,
         device,
@@ -132,6 +134,7 @@ fn build(num_pages: usize, num_slots: usize) -> Built {
         reader,
         Some(port),
         Some(attention),
+        Some(gdn),
         cache.clone(),
     )
     .unwrap();

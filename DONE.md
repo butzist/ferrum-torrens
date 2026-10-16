@@ -1896,6 +1896,53 @@ settled.
       `POST /v1/cache/rebuild` (`cache --moe/--kv/--mamba/--swa`), and
       `--enable-cache-report` surfaces prefix hits.
 
+77. **Fused GDN decode kernel** (2026-10-16, implemented) -- the FreeToken-style
+    fused workflow for the linear-attention mixer (TODO item 15, spec
+    `FUSED_GDN.md`).
+    - **Why.** `gdn_core_batch` ran the recurrence as ~15 libtorch ops/layer
+      (separate gating, q/k L2-norm, decay, `kv_mem` reduce, outer product, second
+      reduce), each an allocation plus an `f32_` cast, 30x per decode step. The
+      goal was one kernel per layer, the way FreeToken runs FLA
+      `fused_sigmoid_gating_delta_rule_update`.
+    - **Shape.** `python/ferrum_kernel/gdn.py` authors `_gdn_decode_kernel`; it
+      AOTs like the others into a **new `linear` manifest section** (fourth
+      contract): `LinearAbi`/`LinearKernel` + `GdnKernels` (`kernel_abi.rs`,
+      `cuda_driver.rs`), a `GdnDecode` launcher (`cuda_gdn.rs`), and
+      `gdn_core_batch_fused` on the device decode path. Grid is
+      `(1, cdiv(V, BV), rows * NUM_V_HEADS)`, `BV = 32`, `num_warps = 4`. It
+      fuses gating (sigmoid `beta`, `-exp(A_log) * softplus(a + dt_bias)` with the
+      forward's branch-free softplus), the in-kernel q/k L2-norm (`eps 1e-6`) and
+      the delta-rule update, reading and writing the per-row state in place. GQA
+      is in-kernel (q/k at `NUM_K_HEADS`; value-head `hv` reads key-head
+      `hv // (HV/K)`).
+    - **Divergences (deliberate).** Our state is `[rows, HV, K, V]` with `K` outer
+      / `V` inner (`LinearStateSlabs`), where FLA stores the head `[V, K]`; we keep
+      our layout. q/k/v are the forward's **f32** conv output, so there is no bf16
+      cast or contiguous copy: the kernel takes their (strided) row strides as
+      runtime args and reads them as f32. `a_log`/`dt_bias` stay the checkpoint
+      dtype (bf16) and are upcast in-kernel, matching `f32_(&gdn.a_log)`.
+    - **A wrong first cut, caught by the gate.** The first build declared q/k/v
+      bf16 (assuming the model dtype); but `conv1d_silu_step_batch` runs in f32,
+      so q/k/v/out are f32. The kernel read f32 bytes as bf16 and the device gate
+      produced NaN logits. Declaring q/k/v/out/state f32 fixed it.
+    - **Result.** Correct: the gated `device_decode_matches_refeed` matches the
+      re-fed reference (argmax exact, `max|dlogit|/scale ~1e-6`) for f32 and bf16
+      pools and for the batched (rows>1) case; the `--interp` selftest is ~1e-7;
+      `scripts/check-kernels.sh` passes. But **throughput is flat: tg 4.7 -> 4.7
+      tok/s** (~3 ms/token, ~1.4%). Isolating the whole linear mixer (a temporary
+      skip probe) put it at **~86 ms/token (40% of decode)**, while skipping the
+      conv alone changed nothing and swapping the recurrence for the kernel saved
+      only ~3 ms -- so the conv and the recurrence are ~0-3 ms each and the cost
+      is the **FP8 `in_proj_qkvz` / `in_proj_ba` / `out_proj` projections plus the
+      norm**. The recurrence was never the bottleneck (item 17). The kernel is
+      kept: it is correct, removes a dozen temporaries/layer, and is the cheaper
+      graph node.
+    - **Pre-existing blocker, not from this change.** The end-to-end greedy-parity
+      gate (`tests/engine_real_generate.rs`) panics "state slots exhausted"
+      (`kvcache_dev.rs:479`) at `max_running_requests = 1`; confirmed identical on
+      a stashed pre-change tree (TODO item 10). The direct device-decode gate is
+      the numeric proof here.
+
 ---
 
 ## Progress log (narrative, pre-2026-10-15 compaction)

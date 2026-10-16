@@ -27,6 +27,7 @@ use crate::domain::kvcache::{CachedModel, KvCache, KvcacheError, SequenceCache};
 use crate::domain::model::{ForwardInput, LayerType, Model, ModelParams};
 use crate::domain::weights::{DType, TensorDesc, TensorKind, WeightsReader};
 use crate::infrastructure::cuda_attention::PagedAttention;
+use crate::infrastructure::cuda_gdn::GdnDecode;
 use crate::infrastructure::decode_buffers::DecodeBuffers;
 use crate::infrastructure::ftw::FtwIndex;
 use crate::infrastructure::kvcache_dev::{DeviceCache, KvDType, LinearStateSlabs, MhaPool};
@@ -958,6 +959,11 @@ pub struct TorchQwen3_6 {
     /// this instead of materializing it; `None` keeps the dense gather, which is
     /// what a CPU device (decision 21) and a bf16 pool use.
     attention: Option<std::sync::Arc<PagedAttention>>,
+    /// The fused GDN decode launcher, when this device can run it. The device
+    /// decode path folds the linear-attention mixer's gating, L2-norm and
+    /// recurrent update into one kernel per layer through this; `None` keeps the
+    /// op-by-op libtorch path, which is what a CPU device (decision 21) runs.
+    gdn: Option<std::sync::Arc<GdnDecode>>,
     /// The KV cache this forward reads and writes, when the engine gave it one.
     /// The engine keeps a clone of the same allocation to hand out page tables.
     cache: Option<std::sync::Arc<DeviceCache>>,
@@ -983,6 +989,7 @@ impl TorchQwen3_6 {
     /// embedding and `lm_head`. The checkpoint stays mapped for the routed
     /// expert banks alone (16.93 GiB), which are widened per use behind the MoE
     /// port and cannot be resident on an 8 GB device.
+    #[allow(clippy::too_many_arguments)]
     pub fn load(
         params: ModelParams,
         device: Device,
@@ -990,6 +997,7 @@ impl TorchQwen3_6 {
         reader: std::sync::Arc<dyn WeightsReader>,
         moe: Option<std::sync::Arc<dyn MoEExecutor>>,
         attention: Option<std::sync::Arc<PagedAttention>>,
+        gdn: Option<std::sync::Arc<GdnDecode>>,
         cache: std::sync::Arc<DeviceCache>,
     ) -> Result<Self> {
         let ld = Loader {
@@ -1122,6 +1130,7 @@ impl TorchQwen3_6 {
             reader,
             moe,
             attention,
+            gdn,
             cache: Some(cache),
             rope_cos: up(rope_cos),
             rope_sin: up(rope_sin),
@@ -1380,13 +1389,19 @@ impl TorchQwen3_6 {
                 o
             }
             CacheAccess::Device { slots, .. } => {
-                let (o, conv, rec) = self.gdn_core_batch(
-                    layer,
-                    gdn,
-                    x,
-                    &state.conv_state_rows(slots, layer),
-                    &state.recurrent_state_rows(slots, layer),
-                );
+                let conv_state = state.conv_state_rows(slots, layer);
+                let recurrent_state = state.recurrent_state_rows(slots, layer);
+                let (o, conv, rec) = match &self.gdn {
+                    Some(kernel) => self.gdn_core_batch_fused(
+                        kernel,
+                        layer,
+                        gdn,
+                        x,
+                        &conv_state,
+                        &recurrent_state,
+                    ),
+                    None => self.gdn_core_batch(layer, gdn, x, &conv_state, &recurrent_state),
+                };
                 state.set_conv_state_rows(slots, layer, &conv);
                 state.set_recurrent_state_rows(slots, layer, &rec);
                 o
@@ -1507,6 +1522,78 @@ impl TorchQwen3_6 {
         let o = gdn.o.apply(&out);
         trace_tensor("gdn.out", layer, &o);
         (o, conv_out, rec)
+    }
+
+    /// `gdn_core_batch` with the recurrence replaced by the fused kernel: the
+    /// projections, the conv and the norm are unchanged, but the gating, the q/k
+    /// L2-norm and the delta-rule update are one launch per layer. q/k enter at
+    /// the key-head count (the kernel does the GQA mapping itself) and the state
+    /// is updated in place in `recurrent_state`.
+    fn gdn_core_batch_fused(
+        &self,
+        kernel: &GdnDecode,
+        layer: usize,
+        gdn: &GatedDeltaNet,
+        x: &Tensor,
+        conv_state: &Tensor,
+        recurrent_state: &Tensor,
+    ) -> (Tensor, Tensor, Tensor) {
+        let p = &self.params;
+        let (kb, dk, dv) = (
+            p.linear_num_key_heads as i64,
+            p.linear_key_head_dim as i64,
+            p.linear_value_head_dim as i64,
+        );
+        let vb = p.linear_num_value_heads as i64;
+        let key_dim = kb * dk;
+        let value_dim = vb * dv;
+        let conv_dim = 2 * key_dim + value_dim;
+        let n = x.size()[0];
+
+        let qkvz = gdn.qkvz.apply(x);
+        trace_tensor("gdn.qkvz", layer, &qkvz);
+        let (conv_in, z) = two(qkvz, [conv_dim, value_dim], 1);
+        let ba = f32_(x).matmul(&f32_(&gdn.ba).transpose(0, 1));
+
+        let (mixed, conv_out) = conv1d_silu_step_batch(
+            &conv_in,
+            &f32_(&gdn.conv),
+            conv_dim,
+            p.linear_conv_kernel_dim as i64,
+            conv_state,
+        );
+        trace_tensor("gdn.conv", layer, &mixed);
+        // q/k/v are narrows of `mixed`: strided rows, head-major within a row.
+        // The kernel takes the row strides, so no contiguous copy is needed.
+        let (qf, kf, vf) = three(mixed, [key_dim, key_dim, value_dim], 1);
+        let q = qf.view([n, kb, dk]);
+        let k = kf.view([n, kb, dk]);
+        let v = vf.view([n, vb, dv]);
+        let out = Tensor::empty([n, vb, dv], (q.kind(), q.device()));
+
+        // SAFETY: the tensors are live allocations on this model's device, the
+        // shapes were checked when the launcher was built, and `recurrent_state`
+        // is the layer slab's contiguous f32 row gather.
+        unsafe {
+            kernel.decode(
+                &ba,
+                &gdn.a_log,
+                &gdn.dt_bias,
+                &q,
+                &k,
+                &v,
+                recurrent_state,
+                &out,
+            )
+        }
+        .expect("gdn decode kernel");
+        trace_tensor("gdn.core", layer, &out);
+
+        let core_n =
+            rms_norm(&out.reshape([n, vb, dv]), &gdn.norm, p.rms_norm_eps).reshape([n, value_dim]);
+        let o = gdn.o.apply(&(core_n * z.silu()));
+        trace_tensor("gdn.out", layer, &o);
+        (o, conv_out, recurrent_state.shallow_clone())
     }
 
     /// Everything up to the recurrence: the conv projection (carried, not

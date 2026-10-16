@@ -12,6 +12,7 @@ baked into the cubin rather than passed at launch.
 
 from __future__ import annotations
 
+from .gdn import GDN_BV
 from .nvfp4_moe import DECODE_BLOCK_KB, DECODE_BLOCK_N
 from .offload import COPY_SEG_I32, USAGE_MAX, copy_splits
 
@@ -226,4 +227,59 @@ def paged_attention_constexprs(
         "NUM_KV_HEADS": kv_heads,
         "HEAD_DIM": head_dim,
         "BLOCK_N": block_n,
+    }
+
+
+# The GDN geometry of the serving checkpoint: 16 key heads of 128 dims feeding 32
+# value heads of 128. `BK` is `next_power_of_2(K)`, so one program covers all key
+# heads; all six are constexpr, so the committed cubin is specialized (DONE.md
+# decision 36).
+SERVING_GDN_K_HEADS = 16
+SERVING_GDN_V_HEADS = 32
+SERVING_GDN_K = 128
+SERVING_GDN_V = 128
+
+
+def gdn_decode(dtype: str = SERVING_DTYPE) -> dict:
+    """The fused GDN decode step (TODO.md M5 fused GDN decode).
+
+    `ba`, `q`, `k`, `v`, `state` and `out` are f32: the conv runs in f32 and the
+    whole linear mixer is f32 in the forward. `a_log`/`dt_bias` are the model
+    dtype, loaded bf16 in the checkpoint.
+    """
+    return {
+        "ba_ptr": "*fp32",
+        "a_log_ptr": f"*{dtype}",
+        "dt_bias_ptr": f"*{dtype}",
+        "q_ptr": "*fp32",
+        "k_ptr": "*fp32",
+        "v_ptr": "*fp32",
+        "state_ptr": "*fp32",
+        "out_ptr": "*fp32",
+        "stride_q": "i32",
+        "stride_k": "i32",
+        "stride_v": "i32",
+        "NUM_K_HEADS": "constexpr",
+        "NUM_V_HEADS": "constexpr",
+        "K": "constexpr",
+        "V": "constexpr",
+        "BK": "constexpr",
+        "BV": "constexpr",
+    }
+
+
+def gdn_decode_constexprs(
+    k_heads: int = SERVING_GDN_K_HEADS,
+    v_heads: int = SERVING_GDN_V_HEADS,
+    k: int = SERVING_GDN_K,
+    v: int = SERVING_GDN_V,
+    bv: int = GDN_BV,
+) -> dict:
+    return {
+        "NUM_K_HEADS": k_heads,
+        "NUM_V_HEADS": v_heads,
+        "K": k,
+        "V": v,
+        "BK": 1 << (k - 1).bit_length(),
+        "BV": bv,
     }

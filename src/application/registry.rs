@@ -89,6 +89,7 @@ pub fn build(
                     stream,
                 )?;
                 let attention = attention_port(&params, device, stream)?;
+                let gdn = gdn_port(&params, device, stream)?;
                 let cache = Arc::new(kv_cache(config, &params, device, capture));
                 let model = crate::models::qwen3_6::forward_torch::TorchQwen3_6::load(
                     params,
@@ -97,6 +98,7 @@ pub fn build(
                     reader,
                     moe,
                     attention,
+                    gdn,
                     cache.clone(),
                 )
                 .map_err(|e| RegistryError::Build(e.to_string()))?;
@@ -358,6 +360,26 @@ fn attention_port(
     match device {
         Device::Cuda(_) => Ok(Some(Arc::new(
             PagedAttention::new(device, params, stream)
+                .map_err(|e| RegistryError::Build(e.to_string()))?,
+        ))),
+        _ => Ok(None),
+    }
+}
+
+/// The fused GDN decode launcher, when the engine runs on a CUDA device. The
+/// device decode path folds the linear-attention mixer into one kernel per layer
+/// through it; a CPU device gets `None` and keeps the op-by-op libtorch path
+/// (decision 21), the same shape as `attention_port`.
+#[cfg(feature = "cuda")]
+fn gdn_port(
+    params: &ModelParams,
+    device: Device,
+    stream: crate::infrastructure::cuda_driver::CUstream,
+) -> Result<Option<Arc<crate::infrastructure::cuda_gdn::GdnDecode>>, RegistryError> {
+    use crate::infrastructure::cuda_gdn::GdnDecode;
+    match device {
+        Device::Cuda(_) => Ok(Some(Arc::new(
+            GdnDecode::new(device, params, stream)
                 .map_err(|e| RegistryError::Build(e.to_string()))?,
         ))),
         _ => Ok(None),

@@ -18,7 +18,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::infrastructure::kernel_abi::{
-    Abi, AttentionAbi, AttentionKernel, Kernel, StagingAbi, StagingKernel,
+    Abi, AttentionAbi, AttentionKernel, Kernel, LinearAbi, LinearKernel, StagingAbi, StagingKernel,
 };
 
 #[derive(Debug, Error)]
@@ -994,6 +994,91 @@ impl AttentionKernels {
     pub unsafe fn launch(
         &self,
         kernel: &AttentionKernel,
+        grid: (u32, u32, u32),
+        params: &mut [*mut c_void],
+        stream: CUstream,
+    ) -> Result<(), CudaError> {
+        let f = self.function(kernel)?;
+        // SAFETY: `f` came from this type's own `load`, so it is live in the
+        // driver's current context, and the grid comes from `kernel_abi`.
+        unsafe {
+            self.driver.launch(
+                f,
+                grid,
+                (kernel.block_threads(), 1, 1),
+                kernel.shared,
+                stream,
+                params,
+            )
+        }
+    }
+}
+
+/// The committed fused GDN decode cubin, loaded and ready to launch. A fourth
+/// contract (decision 60 pattern): `num_warps = 1` and a grid computed per call
+/// from the baked GDN geometry, so its launch shape cannot come from the cubin
+/// alone.
+pub struct GdnKernels {
+    driver: Arc<Driver>,
+    abi: LinearAbi,
+    loaded: Vec<(CUmodule, FunctionTable)>,
+}
+
+// SAFETY: as `CudaKernels`: the handles are immutable once `load` returns and
+// the driver behind them is thread-safe.
+unsafe impl Send for GdnKernels {}
+unsafe impl Sync for GdnKernels {}
+
+impl GdnKernels {
+    /// Load every linear-attention kernel in `abi` from the committed cubins.
+    pub fn load(driver: Arc<Driver>, abi: LinearAbi) -> Result<Self, CudaError> {
+        let mut loaded = Vec::new();
+        for name in LinearAbi::kernel_names() {
+            let image = crate::infrastructure::kernel_abi::linear_cubin(name)
+                .map_err(|e| CudaError::Driver(format!("cubin: {e}")))?;
+            let module = driver.load_module(image)?;
+            let kernel = abi
+                .kernel(name)
+                .map_err(|e| CudaError::Driver(format!("linear abi: {e}")))?;
+            // SAFETY: `module` was just loaded by `driver`, whose context is
+            // current on this thread.
+            let f = unsafe { driver.function(module, &kernel.entry)? };
+            let mut table = FunctionTable::default();
+            table.push(kernel.name, f);
+            loaded.push((module, table));
+        }
+        Ok(Self {
+            driver,
+            abi,
+            loaded,
+        })
+    }
+
+    pub fn abi(&self) -> &LinearAbi {
+        &self.abi
+    }
+
+    fn function(&self, kernel: &LinearKernel) -> Result<CUfunction, CudaError> {
+        for (_, table) in &self.loaded {
+            if let Some(f) = table.get(kernel.name) {
+                return Ok(f);
+            }
+        }
+        Err(CudaError::Driver(format!(
+            "no loaded function for {}",
+            kernel.name
+        )))
+    }
+
+    /// Launch a linear-attention kernel on `grid` with the block its manifest
+    /// entry recorded.
+    ///
+    /// # Safety
+    /// `stream` must belong to the context that is current on this thread, and
+    /// `params` must be the `kernel_abi` pack for this same kernel.
+    pub unsafe fn launch(
+        &self,
+        kernel: &LinearKernel,
         grid: (u32, u32, u32),
         params: &mut [*mut c_void],
         stream: CUstream,

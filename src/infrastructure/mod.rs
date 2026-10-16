@@ -7,6 +7,8 @@ pub mod cuda_attention;
 #[cfg(feature = "cuda")]
 pub mod cuda_driver;
 #[cfg(feature = "cuda")]
+pub mod cuda_gdn;
+#[cfg(feature = "cuda")]
 pub mod cuda_graph;
 #[cfg(feature = "cuda")]
 pub mod cuda_moe;

@@ -179,3 +179,31 @@ Follow the existing kernel pattern (see `python/ferrum_kernel/offload.py`,
   kernel gate them), it is free throughput.
 - Licensing: FLA is MIT; if we port its kernel rather than write from scratch,
   note the origin in a comment and keep it in `python/ferrum_kernel/`.
+
+## Result (implemented -- see DONE.md decision 77)
+
+Landed as `python/ferrum_kernel/gdn.py` `_gdn_decode_kernel`, AOT'd into a new
+`linear` manifest section, launched by `infrastructure/cuda_gdn.rs` (`GdnDecode`)
+via `GdnKernels`/`LinearAbi`, and wired into `gdn_core_batch_fused` on the device
+decode path. Grid `(1, cdiv(V, BV), rows * NUM_V_HEADS)`, `BV = 32`,
+`num_warps = 4`. It is **correct**: the gated `tests/device_decode_matches_refeed`
+matches the re-fed reference (argmax exact, `max|dlogit|/scale ~1e-6`) for f32 and
+bf16 pools and for `rows > 1`; the `--interp` selftest is ~1e-7;
+`scripts/check-kernels.sh` passes.
+
+**Contract notes vs this spec:**
+- q/k/v/state/out are **f32** (the forward's conv and recurrence are f32), not
+  bf16; q/k/v are strided row-views of one conv buffer, so the kernel takes their
+  row strides as runtime args and needs no contiguous copy. `a_log`/`dt_bias` stay
+  bf16 (the checkpoint dtype) and are upcast in-kernel.
+- State is our `[rows, HV, K, V]` layout (`K` outer, `V` inner), not FLA's
+  transposed `[V, K]` storage.
+
+**Throughput: flat -- the recurrence was never the bottleneck.** tg stayed at
+`4.7 tok/s` (~3 ms/token, ~1.4%). Isolating the whole linear mixer put it at
+**~86 ms/token (40% of decode)**; skipping the conv alone changed nothing and
+swapping the recurrence for the kernel saved only ~3 ms. The cost is the **FP8
+`in_proj_qkvz` / `in_proj_ba` / `out_proj` projections plus the norm**, not the
+conv or the recurrence (TODO.md item 17). The kernel is kept (correct, fewer
+temporaries/graph nodes); the next lever is the FP8 projection path, so the
+`gdn_decode` conv-fusion follow-up below is **not** on the critical path.

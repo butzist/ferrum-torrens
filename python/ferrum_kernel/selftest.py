@@ -20,6 +20,7 @@ import sys
 import torch
 
 from . import attention as attn
+from . import gdn as gdn_mod
 from . import offload as off
 from .nvfp4_moe import _check_constexprs, grouped_moe, require_native_e4m3
 
@@ -279,6 +280,75 @@ def check_paged_attention(device: torch.device, tol: float) -> int:
     return failures
 
 
+def random_gdn_case(
+    device: str,
+    rows: int = 2,
+    k_heads: int = 2,
+    v_heads: int = 4,
+    kd: int = 32,
+    vdim: int = 32,
+    seed: int = 0,
+):
+    """A fused-GDN decode case: `rows` sequences, GQA from `k_heads` to
+    `v_heads`, a non-trivial state so the decay and delta terms both bite."""
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    dev = torch.device(device)
+
+    def f32(shape):
+        return torch.randn(shape, generator=g, dtype=torch.float32).to(dev)
+
+    def bf16(shape):
+        return f32(shape).to(torch.bfloat16)
+
+    # The forward's conv runs f32, so q/k/v are f32; a_log/dt_bias are the model
+    # dtype (bf16) and ba the f32 projection output.
+    q = f32((rows, k_heads, kd))
+    k = f32((rows, k_heads, kd))
+    v = f32((rows, v_heads, vdim))
+    ba = (torch.randn((rows, 2 * v_heads), generator=g, dtype=torch.float32) * 0.5).to(dev)
+    a_log = bf16((v_heads,))
+    dt_bias = bf16((v_heads,))
+    state = (torch.randn((rows, v_heads, kd, vdim), generator=g, dtype=torch.float32) * 0.5).to(dev)
+    return ba, a_log, dt_bias, q, k, v, state
+
+
+def check_gdn(device: torch.device, tol: float, full: bool) -> int:
+    """Fused GDN decode: the kernel against the plain-torch recurrence.
+
+    The output and the written-back state are both checked; the state is the
+    part a broken in-place update would leave subtly wrong. `full` adds the
+    serving geometry, which `--interp` skips because its tile is 128x32.
+    """
+    cases = [
+        ("small", {"rows": 2, "k_heads": 2, "v_heads": 4, "kd": 32, "vdim": 32}),
+        ("gqa-1", {"rows": 1, "k_heads": 1, "v_heads": 4, "kd": 16, "vdim": 16}),
+    ]
+    if full:
+        cases.append(("qwen-shape", {"rows": 2, "k_heads": 16, "v_heads": 32, "kd": 128, "vdim": 128}))
+    failures = 0
+    for label, shape in cases:
+        for seed in range(2):
+            ba, a_log, dt_bias, q, k, v, state = random_gdn_case(str(device), seed=seed, **shape)
+            want_out, want_state = gdn_mod.gdn_decode_reference(ba, a_log, dt_bias, q, k, v, state)
+            got_out = torch.empty(
+                (state.shape[0], state.shape[1], state.shape[3]), dtype=q.dtype, device=device
+            )
+            state_in = state.clone()
+            gdn_mod.gdn_decode(ba, a_log, dt_bias, q, k, v, state_in, got_out)
+            rel_out = (
+                (got_out.to(torch.float32) - want_out).abs().max()
+                / want_out.abs().max().clamp(min=1e-6)
+            ).item()
+            rel_state = (
+                (state_in - want_state).abs().max() / want_state.abs().max().clamp(min=1e-6)
+            ).item()
+            print(f"gdn {label} seed {seed}: out rel {rel_out:.3e}, state rel {rel_state:.3e}")
+            if rel_out > tol or rel_state > tol:
+                failures += 1
+                print(f"gdn {label} seed {seed}: FAIL", file=sys.stderr)
+    return failures
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--device", default="cpu")
@@ -344,6 +414,12 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     attention_failures = check_paged_attention(torch.device(args.device), args.tol)
     if offload_failures or attention_failures:
+        print("FAIL", file=sys.stderr)
+        return 1
+    gdn_failures = check_gdn(
+        torch.device(args.device), args.tol, full=args.device != "cpu"
+    )
+    if gdn_failures:
         print("FAIL", file=sys.stderr)
         return 1
     print("PASS")

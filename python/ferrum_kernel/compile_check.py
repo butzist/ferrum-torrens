@@ -34,6 +34,9 @@ from .nvfp4_moe import (
 )
 from .offload import _ensure_experts_kernel, _index_copy_multi_kernel
 from .attention import _paged_attention_decode_kernel
+from .gdn import _gdn_decode_kernel
+from .signatures import gdn_decode as _gdn_decode_sig
+from .signatures import gdn_decode_constexprs
 from .signatures import gemv as _gemv_sig
 from .signatures import index_copy as _index_copy_sig
 from .signatures import index_copy_constexprs, lru_constexprs
@@ -116,6 +119,17 @@ def main() -> int:
     except Exception as e:  # noqa: BLE001
         failures += 1
         print(f"paged_attention FAILED: {type(e).__name__}: {str(e)[:200]}")
+    # The fused GDN decode step (TODO.md M5), one warp like the FLA reference.
+    try:
+        check(
+            "gdn_decode",
+            _gdn_decode_kernel,
+            _gdn_decode_sig(),
+            gdn_decode_constexprs(),
+        )
+    except Exception as e:  # noqa: BLE001
+        failures += 1
+        print(f"gdn_decode FAILED: {type(e).__name__}: {str(e)[:200]}")
     print("FAIL" if failures else "PASS")
     return 1 if failures else 0
 

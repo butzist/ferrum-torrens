@@ -20,12 +20,16 @@ read ~6.6x (13.6 s -> 2.06 s) and keeping the weights out of the page cache
 RTX 5060 Laptop it first measured pp ~34 tok/s, tg ~0.9 tok/s. The staging copy
 was then found to be ~81% of decode and vectorized (decision 75): **tg is now
 4.7 tok/s** (5.2x), and decode is plan+GEMV-bound (~0.20 s/token), the open gap.
-FreeToken on the same GPU/FTW does **22.5-30.3 tok/s** (decision 76), so the
-compute path and the GPU memory budget are both open. Tool calling on
+The fused GDN decode kernel landed (decision 77): one Triton kernel per layer for
+the recurrence, AOT'd and wired into the device path, correct at ~1e-6 -- but it
+is only ~3 ms/token, because the linear mixer's cost is the FP8 projections
+(~86 ms/token total for the mixer), not the recurrence. FreeToken on the same
+GPU/FTW does **22.5-30.3 tok/s** (decision 76), so the compute path and the GPU
+memory budget are both open. Tool calling on
 `/v1/chat/completions` was brought into scope
 (decision 74) so the server can drive opencode/agentic clients; it is the next
 feature. Open work: tool calling, the `[opt] /v1/responses` surface, server-side
-batching, the decode plan+GEMV gap, and the section 8 experiments.
+batching, the FP8-projection decode gap (item 17), and the section 8 experiments.
 Progress history and the full decision log (numbers 1..76) live in `DONE.md`;
 read that for the "why" behind any decision number referenced in code or tests.
 
@@ -478,16 +482,26 @@ performance work.
     `gather_rows` + `attention_cached_pos` masked softmax (~20 ms/token, 10%).
     Add the bf16 variant so the fast path is the default. Attention is ~25% of
     decode, so this plus freeing the fallback is worth it.
-15. Fused GDN decode kernel -- **OPEN, the biggest single win (GDN ~35%).**
-    `gdn_core_batch` is ~15 libtorch ops/layer, including per-step `f32_` casts of
-    weights and activations. Write a fused Triton decode kernel (FLA
-    `fused_sigmoid_gating_recurrent` + `causal_conv1d` are the reference) and AOT
-    it like the others. Do not pull in flashinfer: it is attention-only (a quarter
-    of decode), a heavy C++/Python dependency, and would not touch GDN. **Spec:
-    `FUSED_GDN.md`** (dtypes, grid, math, ABI/AOT steps, tests).
+15. Fused GDN decode kernel -- **DONE (decision 77).** One `gdn_decode` Triton
+    kernel per layer replaces the ~15-op GDN recurrence (gating + q/k L2-norm +
+    delta-rule update + state), AOT'd and wired into the device decode path; the
+    device-decode gate matches the re-fed reference at ~1e-6 and tg moved
+    4.7 -> 4.7 tok/s. Measured win is only **~3 ms/token (~1.4%)**: the recurrence
+    was never the cost. Isolating the whole linear mixer (**~86 ms/token, 40% of
+    decode**) showed the conv and recurrence are ~0-3 ms, so item 17 (the FP8
+    projections) is the real lever, not the recurrence.
 16. Decode "rest" ~31% -- **OPEN.** ~59 ms/token outside mixer+MoE: input/post
     norms (80/layer), embed gather, lm_head GEMV (vocab 248320 x hidden bf16),
     sampling (+ its D2H). Profile which dominates once the kernels above land.
+17. FP8 linear projections -- **OPEN, the real mixer cost (from decision 77).**
+    Isolating the linear mixer at bs=1 put ~80 of its ~86 ms/token in the
+    `in_proj_qkvz` / `in_proj_ba` / `out_proj` projections and the norm, not the
+    conv or the recurrence (both ~0-3 ms; the fused GDN kernel barely moved tg).
+    Those are FP8 `Dense` GEMMs; at one row they are GEMVs, and the whole decode
+    already runs at ~8% of HBM peak (item 9), so they are latency/dequant-bound.
+    Profile `Dense::apply` on the FP8 kinds (per-step dequant vs a cached widened
+    copy) before writing another kernel; a fused FP8 GEMV is the eventual lever,
+    the same one FreeToken pulls with its quantized projections.
 
 ### Experiments to try (not on the critical path)
 

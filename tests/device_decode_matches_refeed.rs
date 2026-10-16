@@ -20,6 +20,7 @@ use std::sync::Arc;
 use ferrum_torrens::domain::kvcache::{CachedModel, KvCache, SequenceCache};
 use ferrum_torrens::domain::model::{ForwardInput, Model};
 use ferrum_torrens::infrastructure::cuda_attention::PagedAttention;
+use ferrum_torrens::infrastructure::cuda_gdn::GdnDecode;
 use ferrum_torrens::infrastructure::decode_buffers::{DecodeBuffers, DecodeRow};
 use ferrum_torrens::infrastructure::ftw::{FtwIndex, FtwReader};
 use ferrum_torrens::infrastructure::kvcache_dev::{DeviceCache, KvDType};
@@ -70,7 +71,25 @@ fn model_with_dtype(
         )),
         _ => None,
     };
-    let m = TorchQwen3_6::load(params, device, ix, reader, None, attention, cache.clone()).unwrap();
+    // The fused GDN decode launcher, so this gate exercises the kernel the
+    // serving path runs, not the op-by-op fallback.
+    let gdn = match device {
+        Device::Cuda(_) => Some(Arc::new(
+            GdnDecode::new(device, &params, std::ptr::null_mut()).unwrap(),
+        )),
+        _ => None,
+    };
+    let m = TorchQwen3_6::load(
+        params,
+        device,
+        ix,
+        reader,
+        None,
+        attention,
+        gdn,
+        cache.clone(),
+    )
+    .unwrap();
     (m, cache, vocab)
 }
 

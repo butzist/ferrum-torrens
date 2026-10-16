@@ -34,6 +34,7 @@ from triton.backends.compiler import GPUTarget
 from triton.backends.nvidia.compiler import CUDAOptions
 from triton.compiler import ASTSource, compile as triton_compile
 
+from .gdn import _gdn_decode_kernel
 from .nvfp4_moe import (
     DECODE_BLOCK_N,
     _nvfp4_gemv_kernel,
@@ -56,6 +57,8 @@ from .signatures import (
     SERVING_TOP_K,
     down_constexprs,
     gate_up_constexprs,
+    gdn_decode,
+    gdn_decode_constexprs,
     gemv,
     index_copy,
     index_copy_constexprs,
@@ -140,6 +143,19 @@ ATTENTION_KERNELS: dict[str, dict] = {
     },
 }
 
+# The fused GDN decode step (TODO.md M5). Like attention it is one program per
+# (something, head) with a baked geometry, but it is a fourth contract: the grid
+# is `(1, cdiv(V, BV), rows * NUM_V_HEADS)`. It lives in its own manifest section
+# so a grouped, staging or attention change cannot move a GDN launch.
+LINEAR_KERNELS: dict[str, dict] = {
+    "gdn_decode": {
+        "fn": _gdn_decode_kernel,
+        "signature": gdn_decode(),
+        "constexprs": gdn_decode_constexprs(),
+        "num_warps": 4,
+    },
+}
+
 # Triton bakes absolute source paths into the PTX `.file` directives and the
 # cubin debug info -- including the nix store path of the python env it ran in.
 # A rebuilt-but-identical closure gets a different store hash, so two builds of
@@ -186,6 +202,8 @@ def _compile_one(spec: dict) -> dict:
     options["arch"] = "sm120"
     # sm_89+ has the fp8e4nv unit the scale pointers need.
     options["supported_fp8_dtypes"] = ("fp8e5", "fp8e4b15", "fp8e4nv")
+    if "num_warps" in spec:
+        options["num_warps"] = spec["num_warps"]
     src = ASTSource(fn=spec["fn"], signature=spec["signature"], constexprs=spec["constexprs"])
     kern = triton_compile(src, target=TARGET, options=options)
     params = _entry_params(kern.asm["ptx"])
@@ -247,6 +265,7 @@ def emit() -> Artifacts:
         ("kernels", KERNELS),
         ("staging", STAGING_KERNELS),
         ("attention", ATTENTION_KERNELS),
+        ("linear", LINEAR_KERNELS),
     ):
         manifest[section] = {}
         for name, spec in specs.items():

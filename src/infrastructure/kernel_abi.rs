@@ -544,6 +544,146 @@ fn attention_ptx(name: &str) -> &'static str {
     }
 }
 
+/// The fused GDN decode kernel the linear-attention mixer launches.
+pub const GDN_DECODE: &str = "gdn_decode";
+
+const LINEAR_NAMES: [&str; 1] = [GDN_DECODE];
+
+#[derive(Debug, Deserialize)]
+struct LinearEntry {
+    entry: String,
+    params: Vec<Param>,
+    declared_args: Vec<String>,
+    scratch_params: usize,
+    num_warps: u32,
+    shared: u32,
+    global_scratch_size: u32,
+    profile_scratch_size: u32,
+    /// The constexprs baked into the cubin, by name: the GDN head geometry and
+    /// the key/value tiles. All are non-negative counts, so `u64` is natural.
+    constexprs: BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LinearManifest {
+    linear: BTreeMap<String, LinearEntry>,
+}
+
+/// One linear-attention kernel as its launcher sees it.
+#[derive(Debug, Clone)]
+pub struct LinearKernel {
+    pub name: &'static str,
+    pub entry: String,
+    pub args: Vec<ArgKind>,
+    pub scratch_params: usize,
+    pub num_warps: u32,
+    pub shared: u32,
+    constexprs: BTreeMap<String, u64>,
+}
+
+impl LinearKernel {
+    /// Threads per block: one warp per `num_warps`, NVIDIA warp size 32.
+    pub fn block_threads(&self) -> u32 {
+        self.num_warps * 32
+    }
+
+    /// A constexpr baked into the cubin, by name. The launcher reads the GDN
+    /// geometry from here so it cannot drift from the build.
+    pub fn constexpr(&self, name: &str) -> Result<u64, MoEError> {
+        self.constexprs
+            .get(name)
+            .copied()
+            .ok_or_else(|| MoEError::Bad(format!("kernel {}: no constexpr {name}", self.name)))
+    }
+}
+
+/// The committed linear-attention kernels, parsed from the manifest's `linear`
+/// section.
+///
+/// Separate from `AttentionAbi`: the fused GDN decode is a fourth contract, with
+/// `num_warps = 1` and a `(1, cdiv(V, BV), rows * NUM_V_HEADS)` grid, and keeping
+/// it apart means an attention change cannot silently move a GDN launch.
+#[derive(Debug, Clone)]
+pub struct LinearAbi {
+    kernels: BTreeMap<&'static str, LinearKernel>,
+}
+
+impl LinearAbi {
+    pub fn parse(json: &str) -> Result<Self, MoEError> {
+        let m: LinearManifest = serde_json::from_str(json)
+            .map_err(|e| MoEError::Bad(format!("kernel manifest: {e}")))?;
+        let mut kernels = BTreeMap::new();
+        for (name, entry) in m.linear {
+            let args = parse_args(
+                &name,
+                &entry.params,
+                entry.scratch_params,
+                entry.declared_args.len(),
+                entry.global_scratch_size,
+                entry.profile_scratch_size,
+            )?;
+            let name: &'static str = LINEAR_NAMES
+                .iter()
+                .copied()
+                .find(|n| *n == name)
+                .ok_or_else(|| MoEError::Bad(format!("unknown linear kernel {name}")))?;
+            kernels.insert(
+                name,
+                LinearKernel {
+                    name,
+                    entry: entry.entry,
+                    args,
+                    scratch_params: entry.scratch_params,
+                    num_warps: entry.num_warps,
+                    shared: entry.shared,
+                    constexprs: entry.constexprs,
+                },
+            );
+        }
+        for name in LINEAR_NAMES {
+            if !kernels.contains_key(name) {
+                return Err(MoEError::Bad(format!(
+                    "manifest is missing linear kernel {name}"
+                )));
+            }
+        }
+        Ok(Self { kernels })
+    }
+
+    /// The manifest as committed.
+    pub fn committed() -> Result<Self, MoEError> {
+        Self::parse(MANIFEST_JSON)
+    }
+
+    /// The linear kernel names, in launch order.
+    pub fn kernel_names() -> &'static [&'static str] {
+        &LINEAR_NAMES
+    }
+
+    pub fn kernel(&self, name: &str) -> Result<&LinearKernel, MoEError> {
+        self.kernels
+            .get(name)
+            .ok_or_else(|| MoEError::Bad(format!("no committed linear kernel {name}")))
+    }
+}
+
+/// The linear-attention cubin bytes, by name.
+pub fn linear_cubin(name: &str) -> Result<&'static [u8], MoEError> {
+    Ok(match name {
+        GDN_DECODE => include_bytes!("../../kernel/gdn_decode.cubin"),
+        other => return Err(MoEError::Bad(format!("no committed cubin for {other}"))),
+    })
+}
+
+/// The committed linear-attention PTX, by name. Only the ABI tests read this.
+#[cfg(test)]
+fn linear_ptx(name: &str) -> &'static str {
+    match name {
+        GDN_DECODE => include_str!("../../kernel/gdn_decode.ptx"),
+        other => panic!("no committed ptx for {other}"),
+    }
+}
+
 /// The committed PTX, by name. Only the ABI tests read this.
 #[cfg(test)]
 fn ptx(name: &str) -> &'static str {
@@ -649,6 +789,11 @@ impl ArgPack {
 
     /// Sized for an attention `kernel`, scratch pointers already zeroed.
     pub fn for_attention(kernel: &AttentionKernel) -> Self {
+        Self::with_args(&kernel.args, kernel.scratch_params)
+    }
+
+    /// Sized for a linear-attention `kernel`, scratch pointers already zeroed.
+    pub fn for_linear(kernel: &LinearKernel) -> Self {
         Self::with_args(&kernel.args, kernel.scratch_params)
     }
 
@@ -945,6 +1090,56 @@ pub fn paged_attention_args(abi: &AttentionAbi, a: &AttentionArgs) -> Result<Arg
 /// cannot come from the cubin alone.
 pub fn attention_grid(rows: usize, kernel: &AttentionKernel) -> Result<(u32, u32, u32), MoEError> {
     Ok((rows as u32, kernel.constexpr("NUM_Q_HEADS")? as u32, 1))
+}
+
+/// Device addresses for one fused GDN decode launch. `ba` is `[rows, 2 * v_heads]`
+/// f32 (`b` then `a`), `a_log`/`dt_bias` are `[v_heads]`, `q`/`k` are
+/// `[rows, k_heads, K]`, `v` is `[rows, v_heads, V]`, `state` is
+/// `[rows, v_heads, K, V]` f32 (updated in place) and `out` is
+/// `[rows, v_heads, V]`. The three strides are the q/k/v row strides: the forward
+/// slices q/k/v out of one conv buffer, so their rows are not packed.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GdnArgs {
+    pub ba: u64,
+    pub a_log: u64,
+    pub dt_bias: u64,
+    pub q: u64,
+    pub k: u64,
+    pub v: u64,
+    pub state: u64,
+    pub out: u64,
+    pub stride_q: u32,
+    pub stride_k: u32,
+    pub stride_v: u32,
+}
+
+/// The GDN decode launch argument pack, in the cubin's declared order.
+pub fn gdn_decode_args(abi: &LinearAbi, a: &GdnArgs) -> Result<ArgPack, MoEError> {
+    let kernel = abi.kernel(GDN_DECODE)?;
+    let mut p = ArgPack::for_linear(kernel);
+    p.ptr(a.ba)?;
+    p.ptr(a.a_log)?;
+    p.ptr(a.dt_bias)?;
+    p.ptr(a.q)?;
+    p.ptr(a.k)?;
+    p.ptr(a.v)?;
+    p.ptr(a.state)?;
+    p.ptr(a.out)?;
+    p.u32(a.stride_q)?;
+    p.u32(a.stride_k)?;
+    p.u32(a.stride_v)?;
+    Ok(p)
+}
+
+/// The GDN decode launch grid: `(NK, cdiv(V, BV), rows * NUM_V_HEADS)`. `NK` is
+/// always 1 because `BK = next_power_of_2(K)` covers every key head at once, so
+/// the x extent is the value tiling and the z extent the (row, value-head) pairs.
+pub fn gdn_grid(rows: usize, kernel: &LinearKernel) -> Result<(u32, u32, u32), MoEError> {
+    let v = kernel.constexpr("V")?;
+    let bv = kernel.constexpr("BV")?;
+    let v_heads = kernel.constexpr("NUM_V_HEADS")?;
+    let tiles = v.div_ceil(bv) as u32;
+    Ok((1, tiles, (rows as u64 * v_heads) as u32))
 }
 
 /// The launch grid for a kernel: one program per row (a route, or a token for
@@ -1340,13 +1535,89 @@ mod tests {
     }
 
     #[test]
-    fn the_three_sections_are_disjoint() {
+    fn the_manifest_sections_are_disjoint() {
         let abi = abi();
         assert!(abi.kernel(PAGED_ATTENTION).is_err());
+        assert!(abi.kernel(GDN_DECODE).is_err());
         let staging = StagingAbi::committed().unwrap();
         assert!(staging.kernel(PAGED_ATTENTION).is_err());
+        assert!(staging.kernel(GDN_DECODE).is_err());
         let attention = AttentionAbi::committed().unwrap();
         assert!(attention.kernel(GEMV_GATE_UP).is_err());
         assert!(attention.kernel(LRU_ENSURE).is_err());
+        assert!(attention.kernel(GDN_DECODE).is_err());
+        let linear = LinearAbi::committed().unwrap();
+        assert!(linear.kernel(GEMV_GATE_UP).is_err());
+        assert!(linear.kernel(PAGED_ATTENTION).is_err());
+        assert!(linear.kernel(LRU_ENSURE).is_err());
+    }
+
+    #[test]
+    fn the_linear_manifest_records_the_gdn_geometry() {
+        let abi = LinearAbi::committed().unwrap();
+        let kernel = abi.kernel(GDN_DECODE).unwrap();
+        assert_eq!(kernel.constexpr("NUM_K_HEADS").unwrap(), 16);
+        assert_eq!(kernel.constexpr("NUM_V_HEADS").unwrap(), 32);
+        assert_eq!(kernel.constexpr("K").unwrap(), 128);
+        assert_eq!(kernel.constexpr("V").unwrap(), 128);
+        assert_eq!(kernel.constexpr("BV").unwrap(), 32);
+        assert_eq!(kernel.num_warps, 4);
+    }
+
+    #[test]
+    fn the_linear_manifest_agrees_with_the_committed_ptx() {
+        let abi = LinearAbi::committed().unwrap();
+        for name in LINEAR_NAMES {
+            let kernel = abi.kernel(name).unwrap();
+            let from_ptx = ptx_entry_args(linear_ptx(name));
+            let mut want = kernel.args.clone();
+            want.extend(std::iter::repeat_n(ArgKind::Ptr, kernel.scratch_params));
+            assert_eq!(
+                from_ptx, want,
+                "{name}: manifest does not match the PTX entry"
+            );
+            assert!(!from_ptx.is_empty());
+        }
+    }
+
+    #[test]
+    fn the_gdn_argument_builder_matches_its_kernel_signature() {
+        let abi = LinearAbi::committed().unwrap();
+        let args = GdnArgs {
+            ba: 0x1000,
+            a_log: 0x2000,
+            dt_bias: 0x3000,
+            q: 0x4000,
+            k: 0x5000,
+            v: 0x6000,
+            state: 0x7000,
+            out: 0x8000,
+            stride_q: 8192,
+            stride_k: 8192,
+            stride_v: 8192,
+        };
+        let pack = gdn_decode_args(&abi, &args).unwrap();
+        let kernel = abi.kernel(GDN_DECODE).unwrap();
+        let params = pack.kernel_params().unwrap();
+        assert_eq!(params.len(), kernel.args.len() + kernel.scratch_params);
+        for slot in &pack.slots()[kernel.args.len()..] {
+            assert_eq!(*slot, 0, "scratch slot is not null");
+        }
+    }
+
+    #[test]
+    fn the_gdn_grid_tiles_the_value_heads() {
+        let abi = LinearAbi::committed().unwrap();
+        let kernel = abi.kernel(GDN_DECODE).unwrap();
+        // 128 value dims / BV 32 = 4 tiles in y; 2 rows * 32 value heads = 64 in z.
+        assert_eq!(gdn_grid(2, kernel).unwrap(), (1, 4, 64));
+    }
+
+    #[test]
+    fn a_manifest_missing_the_gdn_kernel_is_rejected() {
+        let mut v: serde_json::Value = serde_json::from_str(MANIFEST_JSON).unwrap();
+        v["linear"].as_object_mut().unwrap().remove(GDN_DECODE);
+        let err = LinearAbi::parse(&v.to_string()).unwrap_err().to_string();
+        assert!(err.contains("missing linear kernel gdn_decode"), "{err}");
     }
 }
