@@ -535,6 +535,238 @@
     }
   },
   "linear": {
+    "fp8_gemm": {
+      "constexprs": {
+        "BLOCK_K": 64,
+        "BLOCK_M": 64,
+        "BLOCK_N": 128
+      },
+      "declared_args": [
+        "a_ptr",
+        "w_ptr",
+        "scale_ptr",
+        "c_ptr",
+        "M",
+        "N",
+        "K",
+        "stride_am",
+        "stride_ak",
+        "stride_wn",
+        "stride_wk",
+        "stride_cm",
+        "stride_cn"
+      ],
+      "entry": "_fp8_gemm_kernel",
+      "global_scratch_size": 0,
+      "num_warps": 4,
+      "params": [
+        {
+          "index": 0,
+          "kind": "ptr"
+        },
+        {
+          "index": 1,
+          "kind": "ptr"
+        },
+        {
+          "index": 2,
+          "kind": "ptr"
+        },
+        {
+          "index": 3,
+          "kind": "ptr"
+        },
+        {
+          "index": 4,
+          "kind": "u32"
+        },
+        {
+          "index": 5,
+          "kind": "u32"
+        },
+        {
+          "index": 6,
+          "kind": "u32"
+        },
+        {
+          "index": 7,
+          "kind": "u32"
+        },
+        {
+          "index": 8,
+          "kind": "u32"
+        },
+        {
+          "index": 9,
+          "kind": "u32"
+        },
+        {
+          "index": 10,
+          "kind": "u32"
+        },
+        {
+          "index": 11,
+          "kind": "u32"
+        },
+        {
+          "index": 12,
+          "kind": "u32"
+        },
+        {
+          "index": 13,
+          "kind": "ptr"
+        },
+        {
+          "index": 14,
+          "kind": "ptr"
+        }
+      ],
+      "profile_scratch_size": 0,
+      "scratch_params": 2,
+      "shared": 16384
+    },
+    "fp8_gemv": {
+      "constexprs": {
+        "BLOCK_K": 128,
+        "BLOCK_N": 16
+      },
+      "declared_args": [
+        "a_ptr",
+        "w_ptr",
+        "part_ptr",
+        "N",
+        "K",
+        "n_kb",
+        "kb_per",
+        "stride_ak",
+        "stride_wn",
+        "stride_wk",
+        "stride_pk",
+        "stride_pn"
+      ],
+      "entry": "_fp8_gemv_splitk_kernel",
+      "global_scratch_size": 0,
+      "num_warps": 1,
+      "params": [
+        {
+          "index": 0,
+          "kind": "ptr"
+        },
+        {
+          "index": 1,
+          "kind": "ptr"
+        },
+        {
+          "index": 2,
+          "kind": "ptr"
+        },
+        {
+          "index": 3,
+          "kind": "u32"
+        },
+        {
+          "index": 4,
+          "kind": "u32"
+        },
+        {
+          "index": 5,
+          "kind": "u32"
+        },
+        {
+          "index": 6,
+          "kind": "u32"
+        },
+        {
+          "index": 7,
+          "kind": "u32"
+        },
+        {
+          "index": 8,
+          "kind": "u32"
+        },
+        {
+          "index": 9,
+          "kind": "u32"
+        },
+        {
+          "index": 10,
+          "kind": "u32"
+        },
+        {
+          "index": 11,
+          "kind": "u32"
+        },
+        {
+          "index": 12,
+          "kind": "ptr"
+        },
+        {
+          "index": 13,
+          "kind": "ptr"
+        }
+      ],
+      "profile_scratch_size": 0,
+      "scratch_params": 2,
+      "shared": 64
+    },
+    "fp8_splitk_reduce": {
+      "constexprs": {
+        "BLOCK": 256
+      },
+      "declared_args": [
+        "part_ptr",
+        "scale_ptr",
+        "out_ptr",
+        "N",
+        "SPLIT_K",
+        "stride_pk",
+        "stride_pn"
+      ],
+      "entry": "_fp8_splitk_reduce_kernel",
+      "global_scratch_size": 0,
+      "num_warps": 2,
+      "params": [
+        {
+          "index": 0,
+          "kind": "ptr"
+        },
+        {
+          "index": 1,
+          "kind": "ptr"
+        },
+        {
+          "index": 2,
+          "kind": "ptr"
+        },
+        {
+          "index": 3,
+          "kind": "u32"
+        },
+        {
+          "index": 4,
+          "kind": "u32"
+        },
+        {
+          "index": 5,
+          "kind": "u32"
+        },
+        {
+          "index": 6,
+          "kind": "u32"
+        },
+        {
+          "index": 7,
+          "kind": "ptr"
+        },
+        {
+          "index": 8,
+          "kind": "ptr"
+        }
+      ],
+      "profile_scratch_size": 0,
+      "scratch_params": 2,
+      "shared": 0
+    },
     "gdn_decode": {
       "constexprs": {
         "BK": 128,

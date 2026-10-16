@@ -13,6 +13,14 @@ baked into the cubin rather than passed at launch.
 from __future__ import annotations
 
 from .gdn import GDN_BV
+from .fp8_linear import (
+    GEMM_BLOCK_K as FP8_GEMM_BLOCK_K,
+    GEMM_BLOCK_M as FP8_GEMM_BLOCK_M,
+    GEMM_BLOCK_N as FP8_GEMM_BLOCK_N,
+    GEMV_BLOCK_K as FP8_GEMV_BLOCK_K,
+    GEMV_BLOCK_N as FP8_GEMV_BLOCK_N,
+    GEMV_REDUCE_BLOCK as FP8_GEMV_REDUCE_BLOCK,
+)
 from .linear import DENSE_BLOCK_KB, DENSE_BLOCK_N
 from .nvfp4_moe import DECODE_BLOCK_KB, DECODE_BLOCK_N
 from .offload import COPY_SEG_I32, USAGE_MAX, copy_splits
@@ -330,4 +338,76 @@ def nvfp4_dense_gemv_constexprs(k: int = SERVING_HIDDEN) -> dict:
         "K_BYTES": k // 2,
         "BLOCK_N": DENSE_BLOCK_N,
         "BLOCK_KB": DENSE_BLOCK_KB,
+    }
+
+
+def fp8_gemv() -> dict:
+    """The W8A16 split-K GEMV (M == 1) vendored from FreeToken."""
+    return {
+        "a_ptr": f"*{SERVING_DTYPE}",
+        "w_ptr": "*fp8e4nv",
+        "part_ptr": "*fp32",
+        "N": "i32",
+        "K": "i32",
+        "n_kb": "i32",
+        "kb_per": "i32",
+        "stride_ak": "i32",
+        "stride_wn": "i32",
+        "stride_wk": "i32",
+        "stride_pk": "i32",
+        "stride_pn": "i32",
+        "BLOCK_N": "constexpr",
+        "BLOCK_K": "constexpr",
+    }
+
+
+def fp8_gemv_constexprs() -> dict:
+    return {"BLOCK_N": FP8_GEMV_BLOCK_N, "BLOCK_K": FP8_GEMV_BLOCK_K}
+
+
+def fp8_splitk_reduce() -> dict:
+    """The split-K partial reduce (its `SPLIT_K` is runtime: it varies per shape)."""
+    return {
+        "part_ptr": "*fp32",
+        "scale_ptr": "*fp32",
+        "out_ptr": "*fp32",
+        "N": "i32",
+        "SPLIT_K": "i32",
+        "stride_pk": "i32",
+        "stride_pn": "i32",
+        "BLOCK": "constexpr",
+    }
+
+
+def fp8_splitk_reduce_constexprs() -> dict:
+    return {"BLOCK": FP8_GEMV_REDUCE_BLOCK}
+
+
+def fp8_gemm() -> dict:
+    """The W8A16 tiled GEMM (M > 1) vendored from FreeToken."""
+    return {
+        "a_ptr": f"*{SERVING_DTYPE}",
+        "w_ptr": "*fp8e4nv",
+        "scale_ptr": "*fp32",
+        "c_ptr": "*fp32",
+        "M": "i32",
+        "N": "i32",
+        "K": "i32",
+        "stride_am": "i32",
+        "stride_ak": "i32",
+        "stride_wn": "i32",
+        "stride_wk": "i32",
+        "stride_cm": "i32",
+        "stride_cn": "i32",
+        "BLOCK_M": "constexpr",
+        "BLOCK_N": "constexpr",
+        "BLOCK_K": "constexpr",
+    }
+
+
+def fp8_gemm_constexprs() -> dict:
+    return {
+        "BLOCK_M": FP8_GEMM_BLOCK_M,
+        "BLOCK_N": FP8_GEMM_BLOCK_N,
+        "BLOCK_K": FP8_GEMM_BLOCK_K,
     }

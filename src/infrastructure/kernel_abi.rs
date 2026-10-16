@@ -555,7 +555,18 @@ pub const GDN_DECODE: &str = "gdn_decode";
 /// The dense NVFP4 GEMV the lm_head runs (TODO.md section 8 item 18).
 pub const NVFP4_DENSE_GEMV: &str = "nvfp4_dense_gemv";
 
-const LINEAR_NAMES: [&str; 2] = [GDN_DECODE, NVFP4_DENSE_GEMV];
+/// The vendored W8A16 FP8 projection kernels (TODO.md item 17).
+pub const FP8_GEMV: &str = "fp8_gemv";
+pub const FP8_SPLITK_REDUCE: &str = "fp8_splitk_reduce";
+pub const FP8_GEMM: &str = "fp8_gemm";
+
+const LINEAR_NAMES: [&str; 5] = [
+    GDN_DECODE,
+    NVFP4_DENSE_GEMV,
+    FP8_GEMV,
+    FP8_SPLITK_REDUCE,
+    FP8_GEMM,
+];
 
 #[derive(Debug, Deserialize)]
 struct LinearEntry {
@@ -680,6 +691,9 @@ pub fn linear_cubin(name: &str) -> Result<&'static [u8], MoEError> {
     Ok(match name {
         GDN_DECODE => include_bytes!("../../kernel/gdn_decode.cubin"),
         NVFP4_DENSE_GEMV => include_bytes!("../../kernel/nvfp4_dense_gemv.cubin"),
+        FP8_GEMV => include_bytes!("../../kernel/fp8_gemv.cubin"),
+        FP8_SPLITK_REDUCE => include_bytes!("../../kernel/fp8_splitk_reduce.cubin"),
+        FP8_GEMM => include_bytes!("../../kernel/fp8_gemm.cubin"),
         other => return Err(MoEError::Bad(format!("no committed cubin for {other}"))),
     })
 }
@@ -690,6 +704,9 @@ fn linear_ptx(name: &str) -> &'static str {
     match name {
         GDN_DECODE => include_str!("../../kernel/gdn_decode.ptx"),
         NVFP4_DENSE_GEMV => include_str!("../../kernel/nvfp4_dense_gemv.ptx"),
+        FP8_GEMV => include_str!("../../kernel/fp8_gemv.ptx"),
+        FP8_SPLITK_REDUCE => include_str!("../../kernel/fp8_splitk_reduce.ptx"),
+        FP8_GEMM => include_str!("../../kernel/fp8_gemm.ptx"),
         other => panic!("no committed ptx for {other}"),
     }
 }
@@ -1213,6 +1230,139 @@ pub fn nvfp4_dense_gemv_grid(
 ) -> Result<(u32, u32, u32), MoEError> {
     let block_n = kernel.constexpr("BLOCK_N")?;
     Ok((m as u32, n.div_ceil(block_n as usize) as u32, 1))
+}
+
+/// Device addresses and shapes for the W8A16 split-K GEMV (M == 1). `a` is
+/// `[K]` bf16, `w` `[N, K]` e4m3 bytes, `part` `[split_k, N]` fp32 scratch.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Fp8GemvArgs {
+    pub a: u64,
+    pub w: u64,
+    pub part: u64,
+    pub n: u32,
+    pub k: u32,
+    pub n_kb: u32,
+    pub kb_per: u32,
+    pub stride_ak: u32,
+    pub stride_wn: u32,
+    pub stride_wk: u32,
+    pub stride_pk: u32,
+    pub stride_pn: u32,
+}
+
+/// The messages are in the cubin's declared order.
+pub fn fp8_gemv_args(abi: &LinearAbi, a: &Fp8GemvArgs) -> Result<ArgPack, MoEError> {
+    let kernel = abi.kernel(FP8_GEMV)?;
+    let mut p = ArgPack::for_linear(kernel);
+    p.ptr(a.a)?;
+    p.ptr(a.w)?;
+    p.ptr(a.part)?;
+    p.u32(a.n)?;
+    p.u32(a.k)?;
+    p.u32(a.n_kb)?;
+    p.u32(a.kb_per)?;
+    p.u32(a.stride_ak)?;
+    p.u32(a.stride_wn)?;
+    p.u32(a.stride_wk)?;
+    p.u32(a.stride_pk)?;
+    p.u32(a.stride_pn)?;
+    Ok(p)
+}
+
+/// The split-K reduce launch args ([part], [scale], [out]).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Fp8ReduceArgs {
+    pub part: u64,
+    pub scale: u64,
+    pub out: u64,
+    pub n: u32,
+    pub split_k: u32,
+    pub stride_pk: u32,
+    pub stride_pn: u32,
+}
+
+pub fn fp8_splitk_reduce_args(abi: &LinearAbi, a: &Fp8ReduceArgs) -> Result<ArgPack, MoEError> {
+    let kernel = abi.kernel(FP8_SPLITK_REDUCE)?;
+    let mut p = ArgPack::for_linear(kernel);
+    p.ptr(a.part)?;
+    p.ptr(a.scale)?;
+    p.ptr(a.out)?;
+    p.u32(a.n)?;
+    p.u32(a.split_k)?;
+    p.u32(a.stride_pk)?;
+    p.u32(a.stride_pn)?;
+    Ok(p)
+}
+
+/// Device addresses and shapes for the W8A16 tiled GEMM (M > 1).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Fp8GemmArgs {
+    pub a: u64,
+    pub w: u64,
+    pub scale: u64,
+    pub c: u64,
+    pub m: u32,
+    pub n: u32,
+    pub k: u32,
+    pub stride_am: u32,
+    pub stride_ak: u32,
+    pub stride_wn: u32,
+    pub stride_wk: u32,
+    pub stride_cm: u32,
+    pub stride_cn: u32,
+}
+
+pub fn fp8_gemm_args(abi: &LinearAbi, a: &Fp8GemmArgs) -> Result<ArgPack, MoEError> {
+    let kernel = abi.kernel(FP8_GEMM)?;
+    let mut p = ArgPack::for_linear(kernel);
+    p.ptr(a.a)?;
+    p.ptr(a.w)?;
+    p.ptr(a.scale)?;
+    p.ptr(a.c)?;
+    p.u32(a.m)?;
+    p.u32(a.n)?;
+    p.u32(a.k)?;
+    p.u32(a.stride_am)?;
+    p.u32(a.stride_ak)?;
+    p.u32(a.stride_wn)?;
+    p.u32(a.stride_wk)?;
+    p.u32(a.stride_cm)?;
+    p.u32(a.stride_cn)?;
+    Ok(p)
+}
+
+/// FreeToken's split-K choice: fill up to 1536 CTAs, rounded down to a power of
+/// two so the reduction order is stable.
+pub fn fp8_split_k(n_tiles: usize, n_kb: usize) -> usize {
+    let split = (1536 / n_tiles.max(1)).min(n_kb).max(1);
+    1usize << (usize::BITS - 1 - split.leading_zeros())
+}
+
+/// The split-K GEMV grid: `(cdiv(N, BLOCK_N), split_k)`.
+pub fn fp8_gemv_grid(
+    n: usize,
+    split_k: usize,
+    kernel: &LinearKernel,
+) -> Result<(u32, u32, u32), MoEError> {
+    let block_n = kernel.constexpr("BLOCK_N")? as usize;
+    Ok((n.div_ceil(block_n) as u32, split_k as u32, 1))
+}
+
+/// The split-K reduce grid: one `BLOCK`-wide program per output slice.
+pub fn fp8_reduce_grid(n: usize, kernel: &LinearKernel) -> Result<(u32, u32, u32), MoEError> {
+    let block = kernel.constexpr("BLOCK")? as usize;
+    Ok((n.div_ceil(block) as u32, 1, 1))
+}
+
+/// The W8A16 GEMM grid: one program per `(m, n)` tile.
+pub fn fp8_gemm_grid(
+    m: usize,
+    n: usize,
+    kernel: &LinearKernel,
+) -> Result<(u32, u32, u32), MoEError> {
+    let bm = kernel.constexpr("BLOCK_M")? as usize;
+    let bn = kernel.constexpr("BLOCK_N")? as usize;
+    Ok((m.div_ceil(bm) as u32, n.div_ceil(bn) as u32, 1))
 }
 
 /// The launch grid for a kernel: one program per row (a route, or a token for
@@ -1762,6 +1912,98 @@ mod tests {
         assert_eq!(
             nvfp4_dense_gemv_grid(1, 248320, kernel).unwrap(),
             (1, 1940, 1)
+        );
+    }
+
+    #[test]
+    fn the_fp8_manifest_records_the_tiles() {
+        let abi = LinearAbi::committed().unwrap();
+        let g = abi.kernel(FP8_GEMV).unwrap();
+        assert_eq!(g.constexpr("BLOCK_N").unwrap(), 16);
+        assert_eq!(g.constexpr("BLOCK_K").unwrap(), 128);
+        assert_eq!(g.num_warps, 1);
+        let r = abi.kernel(FP8_SPLITK_REDUCE).unwrap();
+        assert_eq!(r.constexpr("BLOCK").unwrap(), 256);
+        let gm = abi.kernel(FP8_GEMM).unwrap();
+        assert_eq!(gm.constexpr("BLOCK_M").unwrap(), 64);
+    }
+
+    #[test]
+    fn the_fp8_split_k_matches_freetoken() {
+        // qkvz: N=12288 -> 768 tiles of 16, K=2048 -> 16 chunks, min(2, 16) -> 2.
+        assert_eq!(fp8_split_k(768, 16), 2);
+        // out_proj: N=2048 -> 128 tiles, K=4096 -> 32 chunks, min(12, 32) -> 8.
+        assert_eq!(fp8_split_k(128, 32), 8);
+        assert_eq!(fp8_split_k(1024, 1), 1);
+    }
+
+    #[test]
+    fn the_fp8_argument_builders_match_their_kernel_signatures() {
+        let abi = LinearAbi::committed().unwrap();
+        let g = fp8_gemv_args(
+            &abi,
+            &Fp8GemvArgs {
+                a: 0x1,
+                w: 0x2,
+                part: 0x3,
+                n: 2048,
+                k: 2048,
+                n_kb: 16,
+                kb_per: 8,
+                stride_ak: 1,
+                stride_wn: 2048,
+                stride_wk: 1,
+                stride_pk: 2048,
+                stride_pn: 1,
+            },
+        )
+        .unwrap();
+        let kg = abi.kernel(FP8_GEMV).unwrap();
+        assert_eq!(
+            g.kernel_params().unwrap().len(),
+            kg.args.len() + kg.scratch_params
+        );
+        let r = fp8_splitk_reduce_args(
+            &abi,
+            &Fp8ReduceArgs {
+                part: 0x1,
+                scale: 0x2,
+                out: 0x3,
+                n: 2048,
+                split_k: 8,
+                stride_pk: 2048,
+                stride_pn: 1,
+            },
+        )
+        .unwrap();
+        let kr = abi.kernel(FP8_SPLITK_REDUCE).unwrap();
+        assert_eq!(
+            r.kernel_params().unwrap().len(),
+            kr.args.len() + kr.scratch_params
+        );
+        let gm = fp8_gemm_args(
+            &abi,
+            &Fp8GemmArgs {
+                a: 0x1,
+                w: 0x2,
+                scale: 0x3,
+                c: 0x4,
+                m: 64,
+                n: 2048,
+                k: 2048,
+                stride_am: 2048,
+                stride_ak: 1,
+                stride_wn: 2048,
+                stride_wk: 1,
+                stride_cm: 2048,
+                stride_cn: 1,
+            },
+        )
+        .unwrap();
+        let kgm = abi.kernel(FP8_GEMM).unwrap();
+        assert_eq!(
+            gm.kernel_params().unwrap().len(),
+            kgm.args.len() + kgm.scratch_params
         );
     }
 }

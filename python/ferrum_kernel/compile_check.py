@@ -35,7 +35,17 @@ from .nvfp4_moe import (
 from .offload import _ensure_experts_kernel, _index_copy_multi_kernel
 from .attention import _paged_attention_decode_kernel
 from .gdn import _gdn_decode_kernel
+from .fp8_linear import (
+    _fp8_gemm_kernel,
+    _fp8_gemv_splitk_kernel,
+    _fp8_splitk_reduce_kernel,
+)
 from .linear import _nvfp4_dense_gemv_kernel
+from .signatures import fp8_gemm as _fp8_gemm_sig
+from .signatures import fp8_gemm_constexprs
+from .signatures import fp8_gemv as _fp8_gemv_sig
+from .signatures import fp8_gemv_constexprs, fp8_splitk_reduce_constexprs
+from .signatures import fp8_splitk_reduce as _fp8_splitk_reduce_sig
 from .signatures import gdn_decode as _gdn_decode_sig
 from .signatures import gdn_decode_constexprs
 from .signatures import gemv as _gemv_sig
@@ -155,6 +165,22 @@ def main() -> int:
     except Exception as e:  # noqa: BLE001
         failures += 1
         print(f"nvfp4_dense_gemv FAILED: {type(e).__name__}: {str(e)[:200]}")
+    # The vendored W8A16 FP8 projections (TODO.md item 17, decision 82 slice 2).
+    for label, fn, sig, consts in (
+        ("fp8_gemv", _fp8_gemv_splitk_kernel, _fp8_gemv_sig(), fp8_gemv_constexprs()),
+        (
+            "fp8_splitk_reduce",
+            _fp8_splitk_reduce_kernel,
+            _fp8_splitk_reduce_sig(),
+            fp8_splitk_reduce_constexprs(),
+        ),
+        ("fp8_gemm", _fp8_gemm_kernel, _fp8_gemm_sig(), fp8_gemm_constexprs()),
+    ):
+        try:
+            check(label, fn, sig, consts)
+        except Exception as e:  # noqa: BLE001
+            failures += 1
+            print(f"{label} FAILED: {type(e).__name__}: {str(e)[:200]}")
     print("FAIL" if failures else "PASS")
     return 1 if failures else 0
 

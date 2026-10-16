@@ -21,7 +21,7 @@ use ferrum_torrens::domain::kvcache::{CachedModel, KvCache, SequenceCache};
 use ferrum_torrens::domain::model::{ForwardInput, Model};
 use ferrum_torrens::infrastructure::cuda_attention::PagedAttention;
 use ferrum_torrens::infrastructure::cuda_gdn::GdnDecode;
-use ferrum_torrens::infrastructure::cuda_linear::DenseGemv;
+use ferrum_torrens::infrastructure::cuda_linear::{DenseGemv, Fp8Linear};
 use ferrum_torrens::infrastructure::decode_buffers::{DecodeBuffers, DecodeRow};
 use ferrum_torrens::infrastructure::ftw::{FtwIndex, FtwReader};
 use ferrum_torrens::infrastructure::kvcache_dev::{DeviceCache, KvDType};
@@ -86,6 +86,12 @@ fn model_with_dtype(
         )),
         _ => None,
     };
+    let fp8_linear = match device {
+        Device::Cuda(_) => Some(Arc::new(
+            Fp8Linear::new(device, std::ptr::null_mut()).unwrap(),
+        )),
+        _ => None,
+    };
     let m = TorchQwen3_6::load(
         params,
         device,
@@ -95,6 +101,7 @@ fn model_with_dtype(
         attention,
         gdn,
         head_gemv,
+        fp8_linear,
         cache.clone(),
     )
     .unwrap();

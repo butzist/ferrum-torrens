@@ -91,6 +91,7 @@ pub fn build(
                 let attention = attention_port(&params, device, stream)?;
                 let gdn = gdn_port(&params, device, stream)?;
                 let head_gemv = head_port(device, stream)?;
+                let fp8_linear = fp8_port(device, stream)?;
                 let cache = Arc::new(kv_cache(config, &params, device, capture));
                 let model = crate::models::qwen3_6::forward_torch::TorchQwen3_6::load(
                     params,
@@ -101,6 +102,7 @@ pub fn build(
                     attention,
                     gdn,
                     head_gemv,
+                    fp8_linear,
                     cache.clone(),
                 )
                 .map_err(|e| RegistryError::Build(e.to_string()))?;
@@ -401,6 +403,23 @@ fn head_port(
     match device {
         Device::Cuda(_) => Ok(Some(Arc::new(
             DenseGemv::new(device, stream).map_err(|e| RegistryError::Build(e.to_string()))?,
+        ))),
+        _ => Ok(None),
+    }
+}
+
+/// The vendored W8A16 FP8 projection launcher (decision 82 slice 2), when the
+/// engine runs on a CUDA device. With it an FP8 weight stays packed and the
+/// kernel reads it; a CPU device gets `None` and widens every projection to bf16.
+#[cfg(feature = "cuda")]
+fn fp8_port(
+    device: Device,
+    stream: crate::infrastructure::cuda_driver::CUstream,
+) -> Result<Option<Arc<crate::infrastructure::cuda_linear::Fp8Linear>>, RegistryError> {
+    use crate::infrastructure::cuda_linear::Fp8Linear;
+    match device {
+        Device::Cuda(_) => Ok(Some(Arc::new(
+            Fp8Linear::new(device, stream).map_err(|e| RegistryError::Build(e.to_string()))?,
         ))),
         _ => Ok(None),
     }

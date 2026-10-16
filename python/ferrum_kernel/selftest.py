@@ -20,6 +20,7 @@ import sys
 import torch
 
 from . import attention as attn
+from . import fp8_linear as fp8_mod
 from . import gdn as gdn_mod
 from . import linear as linear_mod
 from . import offload as off
@@ -388,6 +389,42 @@ def check_nvfp4_dense(device: torch.device, tol: float) -> int:
     return failures
 
 
+def random_fp8_case(device: str, m: int, n: int, k: int, seed: int):
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    dev = torch.device(device)
+    a = (torch.randn((m, k), generator=g) * 0.5).to(dev).to(torch.bfloat16)
+    w = (torch.randn((n, k), generator=g) * 0.5).to(torch.float8_e4m3fn).to(dev)
+    scale = (torch.rand((n,), generator=g) * 1.5 + 0.25).to(dev)
+    return a, w, scale
+
+
+def check_fp8_linear(device: torch.device, tol: float, interp: bool) -> int:
+    """W8A16 FP8 projections (decision 82 slice 2): split-K GEMV at M==1, GEMM above.
+
+    The M>1 GEMM uses `tl.dot`, which triton's interpreter miscomputes (verified
+    on a plain bf16 dot), so `--interp` covers only the GEMV; the device numeric
+    gate is the GEMM's check.
+    """
+    failures = 0
+    shapes = [("small", 128, 256), ("serving-k", 2048, 2048), ("qkvz", 1024, 2048)]
+    for m in ((1,) if interp else (1, 4, 64)):
+        for label, n, k in shapes:
+            for seed in range(2):
+                a, w, scale = random_fp8_case(str(device), m, n, k, seed)
+                want = fp8_mod.fp8_linear_reference(a, w, scale)
+                got = torch.empty((m, n), dtype=torch.float32, device=device)
+                if m == 1:
+                    fp8_mod.fp8_gemv(a.reshape(k), w, scale, got.reshape(n))
+                else:
+                    fp8_mod.fp8_gemm(a, w, scale, got)
+                rel = (got - want).abs().max().item() / want.abs().max().clamp(min=1e-6).item()
+                print(f"fp8 [M={m}] {label} seed {seed}: rel {rel:.3e}")
+                if rel > tol:
+                    failures += 1
+                    print(f"fp8 [M={m}] {label} seed {seed}: FAIL", file=sys.stderr)
+    return failures
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--device", default="cpu")
@@ -463,6 +500,10 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     dense_failures = check_nvfp4_dense(torch.device(args.device), args.tol)
     if dense_failures:
+        print("FAIL", file=sys.stderr)
+        return 1
+    fp8_failures = check_fp8_linear(torch.device(args.device), args.tol, args.interp_child)
+    if fp8_failures:
         print("FAIL", file=sys.stderr)
         return 1
     print("PASS")

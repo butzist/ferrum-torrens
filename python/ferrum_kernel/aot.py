@@ -35,6 +35,11 @@ from triton.backends.nvidia.compiler import CUDAOptions
 from triton.compiler import ASTSource, compile as triton_compile
 
 from .gdn import _gdn_decode_kernel
+from .fp8_linear import (
+    _fp8_gemm_kernel,
+    _fp8_gemv_splitk_kernel,
+    _fp8_splitk_reduce_kernel,
+)
 from .linear import DENSE_WARPS, _nvfp4_dense_gemv_kernel
 from .nvfp4_moe import (
     DECODE_BLOCK_N,
@@ -67,6 +72,12 @@ from .signatures import (
     lru_ensure,
     nvfp4_dense_gemv,
     nvfp4_dense_gemv_constexprs,
+    fp8_gemm,
+    fp8_gemm_constexprs,
+    fp8_gemv,
+    fp8_gemv_constexprs,
+    fp8_splitk_reduce,
+    fp8_splitk_reduce_constexprs,
     paged_attention,
     paged_attention_constexprs,
     reduce,
@@ -167,6 +178,24 @@ LINEAR_KERNELS: dict[str, dict] = {
         "signature": nvfp4_dense_gemv(),
         "constexprs": nvfp4_dense_gemv_constexprs(),
         "num_warps": DENSE_WARPS,
+    },
+    "fp8_gemv": {
+        "fn": _fp8_gemv_splitk_kernel,
+        "signature": fp8_gemv(),
+        "constexprs": fp8_gemv_constexprs(),
+        "num_warps": 1,
+    },
+    "fp8_splitk_reduce": {
+        "fn": _fp8_splitk_reduce_kernel,
+        "signature": fp8_splitk_reduce(),
+        "constexprs": fp8_splitk_reduce_constexprs(),
+        "num_warps": 2,
+    },
+    "fp8_gemm": {
+        "fn": _fp8_gemm_kernel,
+        "signature": fp8_gemm(),
+        "constexprs": fp8_gemm_constexprs(),
+        "num_warps": 4,
     },
 }
 

@@ -28,7 +28,7 @@ use crate::domain::model::{ForwardInput, LayerType, Model, ModelParams};
 use crate::domain::weights::{DType, TensorDesc, TensorKind, WeightsReader};
 use crate::infrastructure::cuda_attention::PagedAttention;
 use crate::infrastructure::cuda_gdn::GdnDecode;
-use crate::infrastructure::cuda_linear::DenseGemv;
+use crate::infrastructure::cuda_linear::{DenseGemv, Fp8Linear};
 use crate::infrastructure::decode_buffers::DecodeBuffers;
 use crate::infrastructure::ftw::FtwIndex;
 use crate::infrastructure::kvcache_dev::{DeviceCache, KvDType, LinearStateSlabs, MhaPool};
@@ -72,6 +72,10 @@ const LOAD_BLOCK_ROWS: usize = 4_096;
 struct Loader<'a> {
     index: &'a FtwIndex,
     reader: &'a dyn WeightsReader,
+    /// The W8A16 FP8 projection launcher, when this device runs one. With it an
+    /// FP8 weight stays packed and the kernel reads it (decision 82 slice 2);
+    /// without it the weight is widened to bf16 like every other kind.
+    fp8: Option<&'a std::sync::Arc<Fp8Linear>>,
 }
 
 impl<'a> Loader<'a> {
@@ -282,6 +286,23 @@ impl<'a> Loader<'a> {
     /// every later `Dense::apply` a device-local operation (decision 40).
     fn dense(&self, name: &str, device: Device) -> Result<Dense> {
         let d = self.dense_desc(name)?;
+        if matches!(device, Device::Cuda(_))
+            && d.kind == DenseKind::Fp8
+            && let Some(launcher) = self.fp8
+        {
+            // Keep the checkpoint's own e4m3 bytes and the per-row scale: the
+            // W8A16 kernel reads them directly, halving the resident bytes and
+            // every step's read against the widened-bf16 path (decision 82).
+            let bytes = self.bytes_device(&d.name, &[d.rows as i64, d.cols as i64], device)?;
+            let scale = self.scale_device(&d.name, d.rows, device)?;
+            return Ok(Dense {
+                w: DenseWeight::Fp8(bytes),
+                row_scale: Some(scale),
+                rows: d.rows,
+                cols: d.cols,
+                fp8: Some(launcher.clone()),
+            });
+        }
         let dev = device.to_tch();
         let w = Tensor::zeros([d.rows as i64, d.cols as i64], (Kind::BFloat16, dev));
         let mut scale: Option<Vec<f32>> = if d.kind == DenseKind::Bf16 {
@@ -301,10 +322,30 @@ impl<'a> Loader<'a> {
             r0 += n;
         }
         Ok(Dense {
-            w: up(w),
+            w: DenseWeight::Bf16(up(w)),
             row_scale: scale.map(|s| up(f32_tensor(&s, &[d.rows as i64], device))),
             rows: d.rows,
+            cols: d.cols,
+            fp8: None,
         })
+    }
+
+    /// The `<name>_scale` tensor (f32, one per output row) as a device tensor.
+    fn scale_device(&self, name: &str, rows: usize, device: Device) -> Result<SharedTensor> {
+        let raw = self.raw(&format!("{name}_scale"))?;
+        let vals: Vec<f32> = raw
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect();
+        if vals.len() != rows {
+            return Err(TorchError::Bad(
+                "scale",
+                format!("{name}_scale has {} rows, want {rows}", vals.len()),
+            ));
+        }
+        Ok(up(f32_tensor(&vals, &[rows as i64], device)))
     }
 
     /// A whole tensor's raw bytes as a uint8 device tensor of `shape`. The dense
@@ -351,10 +392,13 @@ impl<'a> Loader<'a> {
             });
         }
         let dense = self.dense(name, device)?;
+        let DenseWeight::Bf16(w) = dense.w else {
+            unreachable!("the head is widened to bf16 on this path");
+        };
         Ok(Head {
             rows: dense.rows,
             weight: HeadWeight::Bf16 {
-                w: dense.w,
+                w,
                 row_scale: dense.row_scale,
             },
         })
@@ -942,15 +986,61 @@ struct DenseDesc {
 /// forward off the host and what gives a CUDA graph stable addresses to bake
 /// (decision 40).
 struct Dense {
-    w: SharedTensor,
+    w: DenseWeight,
     row_scale: Option<SharedTensor>,
     rows: usize,
+    cols: usize,
+    /// The W8A16 launcher, present iff `w` is FP8. Held per projection so
+    /// `apply` needs no launcher argument, the same shape as `Head` + its gemv.
+    fp8: Option<std::sync::Arc<Fp8Linear>>,
+}
+
+/// A projection's resident weight: bf16 for every kind wide enough, or the
+/// checkpoint's own e4m3 bytes when a device launcher can read them (decision 82).
+enum DenseWeight {
+    Bf16(SharedTensor),
+    Fp8(SharedTensor),
 }
 
 impl Dense {
     /// `x @ w.T` with the per-row scale applied after the matmul (see `linear`).
+    /// An FP8 weight runs the vendored W8A16 kernel (split-K GEMV at one row,
+    /// tiled GEMM above); everything else is cuBLAS bf16.
     fn apply(&self, x: &Tensor) -> Tensor {
-        linear(x, &self.w, self.row_scale.as_deref())
+        if let (DenseWeight::Fp8(bytes), Some(launcher)) = (&self.w, &self.fp8) {
+            let cols = self.cols as i64;
+            let m = (x.numel() / self.cols) as i64;
+            let a = x.reshape([m, cols]).to_kind(Kind::BFloat16).contiguous();
+            let out = Tensor::zeros([m, self.rows as i64], (Kind::Float, x.device()));
+            let scale = self
+                .row_scale
+                .as_deref()
+                .expect("an fp8 weight has a scale");
+            // SAFETY: the resident weight, its scale and `out` are live device
+            // allocations, and the launcher runs on the step's own stream.
+            unsafe {
+                if m == 1 {
+                    let a_row = a.reshape([cols]);
+                    launcher.gemv(&a_row, bytes, scale, &out.reshape([self.rows as i64]))
+                } else {
+                    launcher.gemm(&a, bytes, scale, &out)
+                }
+            }
+            .expect("fp8 projection launch");
+            let mut shape = x.size();
+            shape.pop();
+            shape.push(self.rows as i64);
+            return out.reshape(shape);
+        }
+        linear(x, self.bf16(), self.row_scale.as_deref())
+    }
+
+    /// The bf16 weight; only the embedding gathers, and it is always bf16.
+    fn bf16(&self) -> &Tensor {
+        match &self.w {
+            DenseWeight::Bf16(w) => w,
+            DenseWeight::Fp8(_) => panic!("this weight is FP8; only the bf16 embedding gathers"),
+        }
     }
 
     /// `[len(rows), cols]` for arbitrary rows, off the resident weight rather
@@ -960,14 +1050,14 @@ impl Dense {
         let idx: Vec<i64> = rows.iter().map(|&r| r as i64).collect();
         let index = Tensor::from_slice(&idx)
             .view([idx.len() as i64])
-            .to_device(self.w.device());
-        self.w.index_select(0, &index)
+            .to_device(self.bf16().device());
+        self.bf16().index_select(0, &index)
     }
 
     /// `gather` for a `[n]` device row index, so a captured decode step reads
     /// its token out of `DecodeBuffers` rather than a host slice (decision 51).
     fn gather_dev(&self, rows: &Tensor) -> Tensor {
-        self.w.index_select(0, &rows.to_kind(Kind::Int64))
+        self.bf16().index_select(0, &rows.to_kind(Kind::Int64))
     }
 }
 
@@ -1089,11 +1179,13 @@ impl TorchQwen3_6 {
         attention: Option<std::sync::Arc<PagedAttention>>,
         gdn: Option<std::sync::Arc<GdnDecode>>,
         head_gemv: Option<std::sync::Arc<DenseGemv>>,
+        fp8_linear: Option<std::sync::Arc<Fp8Linear>>,
         cache: std::sync::Arc<DeviceCache>,
     ) -> Result<Self> {
         let ld = Loader {
             index: &index,
             reader: reader.as_ref(),
+            fp8: fp8_linear.as_ref(),
         };
         let h = params.hidden_size;
 
@@ -1818,6 +1910,7 @@ impl TorchQwen3_6 {
         let ld = Loader {
             index: &self.index,
             reader: self.reader.as_ref(),
+            fp8: None,
         };
 
         let (gu, gu_g) = ld.expert_slab("gate_up", layer_idx, expert, 2 * i, p.hidden_size, dev)?;
