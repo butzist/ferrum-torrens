@@ -406,16 +406,33 @@ performance work.
    (one program per (bank, row, segment), uniform scalar row index, 16-byte
    vectors, `.cg`/`.cs` streaming) cut the per-token copy to ~0.013 s: **tg 0.9 ->
    4.7 tok/s** (5.2x), and the copy is now ~6% of decode -- at the copy-removed
-   floor. So B (overlap decode copy/compute) is now moot. **Remaining gap:** the
-   plan+GEMV path is ~0.20 s/token (5 tok/s, the copy-removed floor), ~3-4x under
-   the paper target; investigate the per-layer plan (`lru_ensure`) + grouped GEMV
-   + reduces, whether the captured decode graph is engaged, and host syncs. The
-   deferred `moe_prefill_hit_d2d` / `cudaMemcpyBatchAsync` path is CUDA>=13.
+   floor. So B (overlap decode copy/compute) is now moot.
+   **Profiled (2026-10-16, ablate-and-diff, since `nsys`'s report importer is
+   broken in-jail and `ncu` lacks counter permission).** At bs=1 a 100-token
+   decode is ~200 ms/token, split: **mixer (attention+GDN) ~114 ms (59%)**, MoE
+   (plan+copy+gemm) ~17 ms (9%), the rest (norms, embed, lm_head, sampling) ~63 ms
+   (32%). NVML samples the GPU **100% busy (mean and max)**: no idle/launch
+   bubbles, so it is not overhead-bound. But NVML only means "a kernel was
+   resident"; the achieved rate is ~4 GB of weight traffic/token in 200 ms = ~8%
+   of the ~250 GB/s HBM peak, i.e. latency-bound at one row, not throughput-bound.
+   **Root lever: the serving path never batches.** `generate`/`generate_streaming`
+   both call `run_batch(engine, vec![request])` (generation.rs:114/127), one HTTP
+   request per loop, so `max_running_requests` and the per-batch-size decode
+   graphs are never engaged. Batching concurrent requests would both raise
+   occupancy and amortize the per-token weight read. VRAM is nearly full
+   (**7908/8151 MiB**), so a server-side batch queue is also the cheap fix vs.
+   growing the MoE cache (which is 9% of decode and has ~243 MiB of room).
 10. GDN state-slot sizing -- **OPEN.** The pool is `max_running_requests (+1 for
     the captured graph's padding row)`, which leaves no room for hybrid-radix
     prefix snapshots: at `max_running_requests = 1` the second request panics with
     "state slots exhausted" (decision 73). Either size the pool with headroom for
     cached prefixes or make snapshots reclaimable under that pressure.
+11. Server-side batching -- **OPEN (new, from the decode profile).** The server
+    runs one `run_batch` per request (batch size always 1), so the GPU is latched
+    at low occupancy and `max_running_requests` is dead in the serving path. Add a
+    central dispatcher that admits concurrent requests into one `generate_batch`
+    so decode batches, then re-measure. This is the main utilization lever before
+    any kernel rewrite.
 10. GDN state-slot sizing -- **OPEN.** The pool is `max_running_requests (+1 for
     the captured graph's padding row)`, which leaves no room for hybrid-radix
     prefix snapshots: at `max_running_requests = 1` the second request panics with
