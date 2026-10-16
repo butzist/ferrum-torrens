@@ -187,6 +187,31 @@ def check_offload(device: torch.device) -> int:
     print("offload copy: " + ("ok" if ok else "FAIL"))
     if not ok:
         failures += 1
+
+    # A row wider than one program segment: the copy must tile the row across
+    # `splits` programs and mask the ragged tail (`wide` is not a multiple of the
+    # 16 KiB segment). Untouched rows must stay zero.
+    wide = 200_000
+    src = torch.randint(0, 256, (4, wide), generator=g, dtype=torch.uint8, device=device)
+    dst = torch.zeros((4, wide), dtype=torch.uint8, device=device)
+    off.index_copy_multi(
+        torch.tensor([dst.data_ptr()], dtype=torch.int64, device=device),
+        torch.tensor([src.data_ptr()], dtype=torch.int64, device=device),
+        torch.tensor([wide], dtype=torch.int64, device=device),
+        torch.tensor([0, 2], dtype=torch.int32, device=device),
+        torch.tensor([3, 0], dtype=torch.int32, device=device),
+        torch.tensor([2], dtype=torch.int64, device=device),
+        plan_cap=4,
+    )
+    ok_wide = (
+        torch.equal(dst[0], src[3])
+        and torch.equal(dst[2], src[0])
+        and torch.count_nonzero(dst[1]) == 0
+        and torch.count_nonzero(dst[3]) == 0
+    )
+    print("offload copy wide: " + ("ok" if ok_wide else "FAIL"))
+    if not ok_wide:
+        failures += 1
     return failures
 
 

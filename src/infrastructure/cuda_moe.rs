@@ -239,7 +239,7 @@ enum Residency {
 /// the half waits the release. `begin` fences the copy stream behind everything
 /// already enqueued on the compute stream when a prefill starts.
 ///
-/// The copy reuses the committed `index_copy` cubin, whose `STEPS` covers one
+/// The copy reuses the committed `index_copy` cubin, whose grid takes one
 /// `BLOCK_K`-row plan, so a whole layer is copied in `BLOCK_K`-row groups with
 /// precomputed row indices -- the prefetch does no per-layer host work.
 struct PrefillHarness {

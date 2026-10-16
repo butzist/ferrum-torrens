@@ -17,13 +17,14 @@ no sample), so mid-prompt prefixes are reusable too (decision 71). The FTW reade
 is now `pread` with `O_DIRECT` (buffered fallback), cutting the cold dense-load
 read ~6.6x (13.6 s -> 2.06 s) and keeping the weights out of the page cache
 (decision 72). The single-request throughput smoke landed (decision 73): on the
-RTX 5060 Laptop it measures pp ~34 tok/s, tg ~0.9 tok/s -- well under the paper
-target and ~28x under the measured 13.4 GB/s H2D ceiling, so **decode throughput
-is an open gap**. Tool calling on `/v1/chat/completions` was brought into scope
+RTX 5060 Laptop it first measured pp ~34 tok/s, tg ~0.9 tok/s. The staging copy
+was then found to be ~81% of decode and vectorized (decision 75): **tg is now
+4.7 tok/s** (5.2x), and decode is plan+GEMV-bound (~0.20 s/token), the open gap.
+Tool calling on `/v1/chat/completions` was brought into scope
 (decision 74) so the server can drive opencode/agentic clients; it is the next
 feature. Open work: tool calling, the `[opt] /v1/responses` surface, the decode
-throughput gap, and the section 8 experiments.
-Progress history and the full decision log (numbers 1..74) live in `DONE.md`;
+plan+GEMV gap, and the section 8 experiments.
+Progress history and the full decision log (numbers 1..75) live in `DONE.md`;
 read that for the "why" behind any decision number referenced in code or tests.
 
 Goal: a **minimal, fast, single-GPU** Rust serving engine for **one model** --
@@ -280,12 +281,12 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
   load tuning DONE (decision 72); throughput smoke DONE (decision 73);
   `[opt] /v1/responses` remains, plus the section 8 experiments.
 - **M6 (CURRENT): agentic serving.** Tool calling on `/v1/chat/completions` so
-  opencode/agentic clients can drive the model (decision 74); the decode
-  throughput gap (decision 73) is the performance counterpart.
+  opencode/agentic clients can drive the model (decision 74); the staging copy is
+  vectorized (decision 75) and the remaining decode gap is plan+GEMV-bound.
 
 ## 7. Decisions
 
-The full log of confirmed decisions (numbers 1..74, stable -- code, tests and
+The full log of confirmed decisions (numbers 1..75, stable -- code, tests and
 `ARCHITECTURE.md` reference them by number) lives in `DONE.md`. This section
 lists only the decisions that still bind open work; everything else there is
 history.
@@ -330,12 +331,16 @@ history.
   the model. It is not a new endpoint (`/v1/responses` is for Codex, not
   opencode) and not Anthropic (decision 38); reasoning stays out of scope. Next
   feature; see `DONE.md`.
+- **75** -- the expert-staging copy kernel is vectorized. One program per
+  `(bank, row, segment)` with a scalar row index per program, so each 16 KiB
+  segment is a contiguous run that Triton emits as 16-byte streaming loads
+  (`.cg`/`.cs`); grid `(6, 128, 64)`, constexprs `NUM_BANKS`/`SEG_I32`. Replaces
+  the flat-byte gather (`GROUPS`/`STEPS`/`BLOCK_BYTES`). Decode tg 0.9 -> 4.7
+  tok/s; the copy is now ~6% of decode, so decoding is plan+GEMV-bound (item 9).
 - **73** -- the gated single-request throughput smoke (`tests/throughput_smoke.rs`)
-  measures pp ~34 tok/s and tg ~0.9 tok/s on the RTX 5060 Laptop. Decode is
-  ~28x under the measured 13.4 GB/s H2D ceiling and the expert banks are pinned
-  host-resident, so the bottleneck is the per-token expert staging path, not
-  PCIe; the decode gap is a section 8 backlog item. Floor is loose (a printer,
-  not a gate).
+  measures pp ~34 tok/s and tg ~0.9 tok/s on the RTX 5060 Laptop; the staging
+  copy turned out to be ~81% of decode (decision 75), not PCIe. Floor is loose
+  (a printer, not a gate).
 - **68** -- the `hybrid_radix` domain core (`HybridRadixIndex`, dual refcounts,
   tombstones, deepest-live-snapshot match, dual eviction) and
   `LinearStateSlabs::copy_slot` landed first; the generation-loop wiring landed
@@ -391,31 +396,26 @@ performance work.
    `a_whole_layer_prefill_overlap_matches_the_host_plan`.
 
 **Tier 4 -- open gaps found by the 2026-10-16 throughput smoke:**
-9. Decode throughput -- **OPEN, the current performance blocker.** tg is ~0.9
-   tok/s vs pp ~34 tok/s, ~28x under the measured 13.4 GB/s pinned H2D ceiling,
-   and the expert banks are pinned host-resident, so the cost is the per-token
-   expert staging, not PCIe (decision 73).
-   **Root cause narrowed (2026-10-16).** Per-token time is constant (~1.08 s;
-   gaps 1.063-1.110 s over 127 tokens), so decode is not re-feeding the prefix --
-   it is a fixed per-step cost. Reverting `O_DIRECT` to page-cache reads changes
-   nothing (pp 34.6 vs 34.5, tg 0.9 vs 0.9), so the FTW reader is not in this
-   path. Ablating the staging copy (temporarily returning early from
-   `copy_missing`) lifts tg to **5.0 tok/s** (per-token 1.08 s -> 0.20 s), so the
-   copy is **~81% of decode time**; plan+GEMV alone is ~5 tok/s. The copy moves
-   ~540 MiB/token at ~0.6 GB/s, and it is not PCIe-bound: `cuMemcpyHtoD` measures
-   13.4 GB/s and the reference's own copy kernel (`fast_index_copy.cuh`, 16-byte
-   `ld.global.L1::no_allocate.v4` streaming loads + `.wt` stores, 8192 threads/bank)
-   documents **~31 GB/s zero-copy**. Our `_index_copy_multi_kernel`
-   (`python/ferrum_kernel/offload.py`) instead does **1-byte `uint8` loads**
-   (`tl.arange(0, COPY_BLOCK_BYTES)` over a `uint8` pointer) with per-byte
-   `//`/`%` index math -- ~50x off the reference. Fix: rewrite INDEX_COPY to
-   vectorize (16-byte loads, streaming/no-allocate, uniform row index per vector)
-   and raise in-flight parallelism; this is a `python/ferrum_kernel` + `kernel-aot`
-   task. Decode also has **no cross-layer prefetch** (unlike prefill's
-   double-buffer), so the GEMV waits on each layer's copy; overlapping copy and
-   compute (reference uses priority streams + a sync flag) is a second lever.
-   Decode batches only across concurrent requests, not across output tokens
-   (no speculative decoding), so a single request pays the whole fetch.
+9. Decode throughput -- **copy fixed (decision 75); now compute/plan-bound.**
+   The staging copy was ~81% of decode (tg 0.9 tok/s, 1.08 s/token): the FTW
+   reader was exonerated (reverting `O_DIRECT` to page-cache reads changed
+   nothing) and the copy moved ~540 MiB/token at ~0.6 GB/s -- not PCIe-bound
+   (`cuMemcpyHtoD` 13.4 GB/s; the reference's `fast_index_copy.cuh` documents
+   ~31 GB/s) but because `_index_copy_multi_kernel` did **1-byte `uint8` loads**
+   with per-lane `//`/`%` row math, which Triton cannot vectorize. Rewriting it
+   (one program per (bank, row, segment), uniform scalar row index, 16-byte
+   vectors, `.cg`/`.cs` streaming) cut the per-token copy to ~0.013 s: **tg 0.9 ->
+   4.7 tok/s** (5.2x), and the copy is now ~6% of decode -- at the copy-removed
+   floor. So B (overlap decode copy/compute) is now moot. **Remaining gap:** the
+   plan+GEMV path is ~0.20 s/token (5 tok/s, the copy-removed floor), ~3-4x under
+   the paper target; investigate the per-layer plan (`lru_ensure`) + grouped GEMV
+   + reduces, whether the captured decode graph is engaged, and host syncs. The
+   deferred `moe_prefill_hit_d2d` / `cudaMemcpyBatchAsync` path is CUDA>=13.
+10. GDN state-slot sizing -- **OPEN.** The pool is `max_running_requests (+1 for
+    the captured graph's padding row)`, which leaves no room for hybrid-radix
+    prefix snapshots: at `max_running_requests = 1` the second request panics with
+    "state slots exhausted" (decision 73). Either size the pool with headroom for
+    cached prefixes or make snapshots reclaimable under that pressure.
 10. GDN state-slot sizing -- **OPEN.** The pool is `max_running_requests (+1 for
     the captured graph's padding row)`, which leaves no room for hybrid-radix
     prefix snapshots: at `max_running_requests = 1` the second request panics with

@@ -573,7 +573,7 @@ mod tests {
         assert_eq!(s.bank_row_bytes(Bank::DownScale), 2048 * 512 / 16);
         assert_eq!(s.bank_row_bytes(Bank::DownGlobal), 2048 * 2);
         // The FTW `gate_up_packed#L*` bank is [experts, 1024, 1024]: one expert
-        // row is 1 MiB, the number the copy's STEPS was derived from.
+        // row is 1 MiB, the number the copy's `splits` is derived from.
         assert_eq!(s.bank_row_bytes(Bank::GateUpPacked), 1024 * 1024);
     }
 

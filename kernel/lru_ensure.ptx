@@ -29,25 +29,25 @@
 	.reg .pred 	%p<1393>;
 	.reg .b32 	%r<2037>;
 	.reg .b64 	%rd<541>;
-	.loc	1 50 0                          // offload.py:50:0
+	.loc	1 52 0                          // offload.py:52:0
 $L__func_begin0:
-	.loc	1 50 0                          // offload.py:50:0
+	.loc	1 52 0                          // offload.py:52:0
 
 // %bb.0:
 	ld.param.b64 	%rd126, [_ensure_experts_kernel_param_0];
 	ld.param.b64 	%rd3, [_ensure_experts_kernel_param_4];
 $L__tmp0:
-	.loc	1 67 19                         // offload.py:67:19
+	.loc	1 69 19                         // offload.py:69:19
 	// begin inline asm
 	mov.u64 %rd1, 0x0;
 	ld.global.b64 { %rd1 }, [ %rd3 + 0 ];
 	// end inline asm
 	ld.param.b64 	%rd127, [_ensure_experts_kernel_param_1];
-	.loc	1 67 31                         // offload.py:67:31
+	.loc	1 69 31                         // offload.py:69:31
 	add.s64 	%rd2, %rd1, 1;
 	ld.param.b64 	%rd128, [_ensure_experts_kernel_param_2];
 	ld.param.b64 	%rd129, [_ensure_experts_kernel_param_3];
-	.loc	1 68 23                         // offload.py:68:23
+	.loc	1 70 23                         // offload.py:70:23
 	mov.u32 	%r728, %tid.x;
 	and.b32 	%r729, %r728, 127;
 	and.b32 	%r730, %r728, 31;
@@ -64,7 +64,7 @@ $L__tmp0:
 	@%p1 st.global.b64 [ %rd3 + 0 ], { %rd2 };
 	// end inline asm
 	ld.param.b32 	%r735, [_ensure_experts_kernel_param_10];
-	.loc	1 71 13                         // offload.py:71:13
+	.loc	1 73 13                         // offload.py:73:13
 	setp.gt.s32 	%p23, %r733, 1;
 	setp.gt.s32 	%p24, %r733, 2;
 	setp.gt.s32 	%p25, %r733, 3;
@@ -193,31 +193,31 @@ $L__tmp0:
 	setp.gt.s32 	%p148, %r733, 126;
 	setp.gt.s32 	%p149, %r733, 127;
 	setp.lt.s32 	%p2, %r729, %r733;
-	.loc	1 74 30                         // offload.py:74:30
+	.loc	1 76 30                         // offload.py:76:30
 	cvt.u64.u32 	%rd132, %r729;
 	mul.wide.u32 	%rd133, %r729, 4;
 	add.s64 	%rd4, %rd126, %rd133;
-	.loc	1 74 16                         // offload.py:74:16
+	.loc	1 76 16                         // offload.py:76:16
 	// begin inline asm
 	mov.u32 %r697, 0xffffffffffffffff;
 	@%p2 ld.global.b32 { %r697 }, [ %rd4 + 0 ];
 	// end inline asm
-	.loc	1 74 54                         // offload.py:74:54
+	.loc	1 76 54                         // offload.py:76:54
 	add.s32 	%r736, %r697, %r735;
-	.loc	1 75 37                         // offload.py:75:37
+	.loc	1 77 37                         // offload.py:77:37
 	mad.wide.s32 	%rd5, %r736, 4, %rd127;
-	.loc	1 75 19                         // offload.py:75:19
+	.loc	1 77 19                         // offload.py:77:19
 	// begin inline asm
 	mov.u32 %r1, 0xffffffffffffffff;
 	@%p2 ld.global.b32 { %r1 }, [ %rd5 + 0 ];
 	// end inline asm
-	.loc	1 76 24                         // offload.py:76:24
+	.loc	1 78 24                         // offload.py:78:24
 	setp.gt.s32 	%p150, %r1, -1;
-	.loc	1 76 16                         // offload.py:76:16
+	.loc	1 78 16                         // offload.py:78:16
 	and.pred 	%p8, %p2, %p150;
-	.loc	1 77 25                         // offload.py:77:25
+	.loc	1 79 25                         // offload.py:79:25
 	setp.eq.b32 	%p151, %r1, -1;
-	.loc	1 81 26                         // offload.py:81:26
+	.loc	1 83 26                         // offload.py:83:26
 	shl.b32 	%r737, %r731, 7;
 	shl.b32 	%r738, %r728, 4;
 	or.b32 	%r739, %r737, %r738;
@@ -416,7 +416,7 @@ $L__tmp0:
 	setp.eq.b32 	%p276, %r867, %r736;
 	setp.eq.b32 	%p277, %r868, %r736;
 	setp.eq.b32 	%p278, %r869, %r736;
-	.loc	1 81 54                         // offload.py:81:54
+	.loc	1 83 54                         // offload.py:83:54
 	setp.eq.b32 	%p279, %r729, 0;
 	setp.lt.u32 	%p280, %r729, 2;
 	setp.lt.u32 	%p281, %r729, 3;
@@ -544,7 +544,7 @@ $L__tmp0:
 	setp.lt.u32 	%p402, %r729, 125;
 	setp.lt.u32 	%p403, %r729, 126;
 	setp.ne.b32 	%p404, %r729, 127;
-	.loc	1 81 41                         // offload.py:81:41
+	.loc	1 83 41                         // offload.py:83:41
 	and.pred 	%p405, %p279, %p152;
 	and.pred 	%p406, %p280, %p153;
 	and.pred 	%p407, %p281, %p154;
@@ -671,7 +671,7 @@ $L__tmp0:
 	and.pred 	%p528, %p402, %p276;
 	and.pred 	%p529, %p403, %p277;
 	and.pred 	%p530, %p404, %p278;
-	.loc	1 81 68                         // offload.py:81:68
+	.loc	1 83 68                         // offload.py:83:68
 	and.pred 	%p531, %p23, %p405;
 	and.pred 	%p532, %p24, %p406;
 	and.pred 	%p533, %p25, %p407;
@@ -800,7 +800,7 @@ $L__tmp0:
 	and.pred 	%p656, %p147, %p528;
 	and.pred 	%p657, %p148, %p529;
 	and.pred 	%p658, %p149, %p530;
-	.loc	1 81 82                         // offload.py:81:82
+	.loc	1 83 82                         // offload.py:83:82
 	and.pred 	%p659, %p2, %p532;
 	and.pred 	%p660, %p2, %p533;
 	and.pred 	%p661, %p2, %p535;
@@ -926,7 +926,7 @@ $L__tmp0:
 	and.pred 	%p781, %p2, %p655;
 	and.pred 	%p782, %p2, %p656;
 	and.pred 	%p783, %p2, %p657;
-	.loc	1 82 33                         // offload.py:82:33
+	.loc	1 84 33                         // offload.py:84:33
 	selp.b32 	%r870, 1, 0, %p531;
 	selp.b32 	%r871, 1, 0, %p659;
 	selp.b32 	%r872, 1, 0, %p660;
@@ -1055,7 +1055,7 @@ $L__tmp0:
 	selp.b32 	%r995, 1, 0, %p783;
 	selp.b32 	%r996, 1, 0, %p658;
 $L__tmp1:
-	.loc	2 293 36                        // standard.py:293:36 @[ offload.py:82:25 ]
+	.loc	2 293 36                        // standard.py:293:36 @[ offload.py:84:25 ]
 	bar.sync 	0;
 	mov.b32 	%r718, -1;
 	mov.b32 	%r997, 0;
@@ -1726,16 +1726,16 @@ $L__tmp1:
 	// end inline asm
 	shfl.sync.bfly.b32 	%r1017, %r258, 2, 31, -1;
 $L__tmp2:
-	.loc	2 263 15                        // standard.py:263:15 @[ standard.py:293:36 @[ offload.py:82:25 ] ]
+	.loc	2 263 15                        // standard.py:263:15 @[ standard.py:293:36 @[ offload.py:84:25 ] ]
 	add.s32 	%r1018, %r1017, %r258;
 $L__tmp3:
-	.loc	2 293 36                        // standard.py:293:36 @[ offload.py:82:25 ]
+	.loc	2 293 36                        // standard.py:293:36 @[ offload.py:84:25 ]
 	shfl.sync.bfly.b32 	%r1019, %r1018, 1, 31, -1;
 $L__tmp4:
-	.loc	2 263 15                        // standard.py:263:15 @[ standard.py:293:36 @[ offload.py:82:25 ] ]
+	.loc	2 263 15                        // standard.py:263:15 @[ standard.py:293:36 @[ offload.py:84:25 ] ]
 	add.s32 	%r260, %r1018, %r1019;
 $L__tmp5:
-	.loc	2 293 36                        // standard.py:293:36 @[ offload.py:82:25 ]
+	.loc	2 293 36                        // standard.py:293:36 @[ offload.py:84:25 ]
 	and.b32 	%r1020, %r728, 3;
 	setp.eq.b32 	%p5, %r1020, 0;
 	// begin inline asm
@@ -1748,16 +1748,16 @@ $L__tmp5:
 	// end inline asm
 	shfl.sync.bfly.b32 	%r1022, %r261, 2, 31, -1;
 $L__tmp6:
-	.loc	2 263 15                        // standard.py:263:15 @[ standard.py:293:36 @[ offload.py:82:25 ] ]
+	.loc	2 263 15                        // standard.py:263:15 @[ standard.py:293:36 @[ offload.py:84:25 ] ]
 	add.s32 	%r1023, %r1022, %r261;
 $L__tmp7:
-	.loc	2 293 36                        // standard.py:293:36 @[ offload.py:82:25 ]
+	.loc	2 293 36                        // standard.py:293:36 @[ offload.py:84:25 ]
 	shfl.sync.bfly.b32 	%r1024, %r1023, 1, 31, -1;
 $L__tmp8:
-	.loc	2 263 15                        // standard.py:263:15 @[ standard.py:293:36 @[ offload.py:82:25 ] ]
+	.loc	2 263 15                        // standard.py:263:15 @[ standard.py:293:36 @[ offload.py:84:25 ] ]
 	add.s32 	%r263, %r1023, %r1024;
 $L__tmp9:
-	.loc	2 293 36                        // standard.py:293:36 @[ offload.py:82:25 ]
+	.loc	2 293 36                        // standard.py:293:36 @[ offload.py:84:25 ]
 	// begin inline asm
 	@%p5 st.shared.b32 [ %r262 + 0 ], %r263;
 	// end inline asm
@@ -1768,16 +1768,16 @@ $L__tmp9:
 	// end inline asm
 	shfl.sync.bfly.b32 	%r1026, %r264, 2, 31, -1;
 $L__tmp10:
-	.loc	2 263 15                        // standard.py:263:15 @[ standard.py:293:36 @[ offload.py:82:25 ] ]
+	.loc	2 263 15                        // standard.py:263:15 @[ standard.py:293:36 @[ offload.py:84:25 ] ]
 	add.s32 	%r1027, %r1026, %r264;
 $L__tmp11:
-	.loc	2 293 36                        // standard.py:293:36 @[ offload.py:82:25 ]
+	.loc	2 293 36                        // standard.py:293:36 @[ offload.py:84:25 ]
 	shfl.sync.bfly.b32 	%r1028, %r1027, 1, 31, -1;
 $L__tmp12:
-	.loc	2 263 15                        // standard.py:263:15 @[ standard.py:293:36 @[ offload.py:82:25 ] ]
+	.loc	2 263 15                        // standard.py:263:15 @[ standard.py:293:36 @[ offload.py:84:25 ] ]
 	add.s32 	%r266, %r1027, %r1028;
 $L__tmp13:
-	.loc	2 293 36                        // standard.py:293:36 @[ offload.py:82:25 ]
+	.loc	2 293 36                        // standard.py:293:36 @[ offload.py:84:25 ]
 	// begin inline asm
 	@%p5 st.shared.b32 [ %r265 + 0 ], %r266;
 	// end inline asm
@@ -1788,16 +1788,16 @@ $L__tmp13:
 	// end inline asm
 	shfl.sync.bfly.b32 	%r1030, %r267, 2, 31, -1;
 $L__tmp14:
-	.loc	2 263 15                        // standard.py:263:15 @[ standard.py:293:36 @[ offload.py:82:25 ] ]
+	.loc	2 263 15                        // standard.py:263:15 @[ standard.py:293:36 @[ offload.py:84:25 ] ]
 	add.s32 	%r1031, %r1030, %r267;
 $L__tmp15:
-	.loc	2 293 36                        // standard.py:293:36 @[ offload.py:82:25 ]
+	.loc	2 293 36                        // standard.py:293:36 @[ offload.py:84:25 ]
 	shfl.sync.bfly.b32 	%r1032, %r1031, 1, 31, -1;
 $L__tmp16:
-	.loc	2 263 15                        // standard.py:263:15 @[ standard.py:293:36 @[ offload.py:82:25 ] ]
+	.loc	2 263 15                        // standard.py:263:15 @[ standard.py:293:36 @[ offload.py:84:25 ] ]
 	add.s32 	%r269, %r1031, %r1032;
 $L__tmp17:
-	.loc	2 293 36                        // standard.py:293:36 @[ offload.py:82:25 ]
+	.loc	2 293 36                        // standard.py:293:36 @[ offload.py:84:25 ]
 	// begin inline asm
 	@%p5 st.shared.b32 [ %r268 + 0 ], %r269;
 	// end inline asm
@@ -1931,7 +1931,7 @@ $L__tmp17:
 	ld.shared.b32 	%r428, [global_smem+2016];
 	ld.shared.b32 	%r429, [global_smem+2032];
 $L__tmp18:
-	.loc	1 82 55                         // offload.py:82:55
+	.loc	1 84 55                         // offload.py:84:55
 	bar.sync 	0;
 	// begin inline asm
 	st.shared.v4.b32 [ %r270 + 0 ], { %r271, %r272, %r273, %r274 };
@@ -2032,10 +2032,10 @@ $L__tmp18:
 	bar.sync 	0;
 	ldmatrix.sync.aligned.m8n8.x1.shared.b16 {%r1033}, [%r741];
 	setp.eq.b32 	%p784, %r1033, 0;
-	.loc	1 83 24                         // offload.py:83:24
+	.loc	1 85 24                         // offload.py:85:24
 	and.pred 	%p785, %p151, %p784;
 	and.pred 	%p9, %p2, %p785;
-	.loc	1 84 28                         // offload.py:84:28
+	.loc	1 86 28                         // offload.py:86:28
 	setp.lt.s32 	%p786, %r736, %r742;
 	setp.lt.s32 	%p787, %r736, %r743;
 	setp.lt.s32 	%p788, %r736, %r744;
@@ -2164,7 +2164,7 @@ $L__tmp18:
 	setp.lt.s32 	%p911, %r736, %r867;
 	setp.lt.s32 	%p912, %r736, %r868;
 	setp.lt.s32 	%p913, %r736, %r869;
-	.loc	1 84 42                         // offload.py:84:42
+	.loc	1 86 42                         // offload.py:86:42
 	and.pred 	%p914, %p786, %p9;
 	and.pred 	%p915, %p787, %p9;
 	and.pred 	%p916, %p788, %p9;
@@ -2293,7 +2293,7 @@ $L__tmp18:
 	and.pred 	%p1039, %p911, %p9;
 	and.pred 	%p1040, %p912, %p9;
 	and.pred 	%p1041, %p913, %p9;
-	.loc	1 85 29                         // offload.py:85:29
+	.loc	1 87 29                         // offload.py:87:29
 	selp.b32 	%r1034, 1, 0, %p914;
 	selp.b32 	%r1035, 1, 0, %p915;
 	selp.b32 	%r1036, 1, 0, %p916;
@@ -2423,7 +2423,7 @@ $L__tmp18:
 	selp.b32 	%r1160, 1, 0, %p1040;
 	selp.b32 	%r1161, 1, 0, %p1041;
 $L__tmp19:
-	.loc	2 293 36                        // standard.py:293:36 @[ offload.py:85:18 ]
+	.loc	2 293 36                        // standard.py:293:36 @[ offload.py:87:18 ]
 	bar.sync 	0;
 	redux.sync.add.s32 	%r430, %r1034, %r718;
 	redux.sync.add.s32 	%r431, %r1035, %r718;
@@ -2943,16 +2943,16 @@ $L__tmp19:
 	// end inline asm
 	shfl.sync.bfly.b32 	%r1162, %r558, 2, 31, -1;
 $L__tmp20:
-	.loc	2 263 15                        // standard.py:263:15 @[ standard.py:293:36 @[ offload.py:85:18 ] ]
+	.loc	2 263 15                        // standard.py:263:15 @[ standard.py:293:36 @[ offload.py:87:18 ] ]
 	add.s32 	%r1163, %r1162, %r558;
 $L__tmp21:
-	.loc	2 293 36                        // standard.py:293:36 @[ offload.py:85:18 ]
+	.loc	2 293 36                        // standard.py:293:36 @[ offload.py:87:18 ]
 	shfl.sync.bfly.b32 	%r1164, %r1163, 1, 31, -1;
 $L__tmp22:
-	.loc	2 263 15                        // standard.py:263:15 @[ standard.py:293:36 @[ offload.py:85:18 ] ]
+	.loc	2 263 15                        // standard.py:263:15 @[ standard.py:293:36 @[ offload.py:87:18 ] ]
 	add.s32 	%r559, %r1163, %r1164;
 $L__tmp23:
-	.loc	2 293 36                        // standard.py:293:36 @[ offload.py:85:18 ]
+	.loc	2 293 36                        // standard.py:293:36 @[ offload.py:87:18 ]
 	// begin inline asm
 	@%p5 st.shared.b32 [ %r259 + 0 ], %r559;
 	// end inline asm
@@ -2961,16 +2961,16 @@ $L__tmp23:
 	// end inline asm
 	shfl.sync.bfly.b32 	%r1165, %r560, 2, 31, -1;
 $L__tmp24:
-	.loc	2 263 15                        // standard.py:263:15 @[ standard.py:293:36 @[ offload.py:85:18 ] ]
+	.loc	2 263 15                        // standard.py:263:15 @[ standard.py:293:36 @[ offload.py:87:18 ] ]
 	add.s32 	%r1166, %r1165, %r560;
 $L__tmp25:
-	.loc	2 293 36                        // standard.py:293:36 @[ offload.py:85:18 ]
+	.loc	2 293 36                        // standard.py:293:36 @[ offload.py:87:18 ]
 	shfl.sync.bfly.b32 	%r1167, %r1166, 1, 31, -1;
 $L__tmp26:
-	.loc	2 263 15                        // standard.py:263:15 @[ standard.py:293:36 @[ offload.py:85:18 ] ]
+	.loc	2 263 15                        // standard.py:263:15 @[ standard.py:293:36 @[ offload.py:87:18 ] ]
 	add.s32 	%r561, %r1166, %r1167;
 $L__tmp27:
-	.loc	2 293 36                        // standard.py:293:36 @[ offload.py:85:18 ]
+	.loc	2 293 36                        // standard.py:293:36 @[ offload.py:87:18 ]
 	// begin inline asm
 	@%p5 st.shared.b32 [ %r262 + 0 ], %r561;
 	// end inline asm
@@ -2979,16 +2979,16 @@ $L__tmp27:
 	// end inline asm
 	shfl.sync.bfly.b32 	%r1168, %r562, 2, 31, -1;
 $L__tmp28:
-	.loc	2 263 15                        // standard.py:263:15 @[ standard.py:293:36 @[ offload.py:85:18 ] ]
+	.loc	2 263 15                        // standard.py:263:15 @[ standard.py:293:36 @[ offload.py:87:18 ] ]
 	add.s32 	%r1169, %r1168, %r562;
 $L__tmp29:
-	.loc	2 293 36                        // standard.py:293:36 @[ offload.py:85:18 ]
+	.loc	2 293 36                        // standard.py:293:36 @[ offload.py:87:18 ]
 	shfl.sync.bfly.b32 	%r1170, %r1169, 1, 31, -1;
 $L__tmp30:
-	.loc	2 263 15                        // standard.py:263:15 @[ standard.py:293:36 @[ offload.py:85:18 ] ]
+	.loc	2 263 15                        // standard.py:263:15 @[ standard.py:293:36 @[ offload.py:87:18 ] ]
 	add.s32 	%r563, %r1169, %r1170;
 $L__tmp31:
-	.loc	2 293 36                        // standard.py:293:36 @[ offload.py:85:18 ]
+	.loc	2 293 36                        // standard.py:293:36 @[ offload.py:87:18 ]
 	// begin inline asm
 	@%p5 st.shared.b32 [ %r265 + 0 ], %r563;
 	// end inline asm
@@ -2997,16 +2997,16 @@ $L__tmp31:
 	// end inline asm
 	shfl.sync.bfly.b32 	%r1171, %r564, 2, 31, -1;
 $L__tmp32:
-	.loc	2 263 15                        // standard.py:263:15 @[ standard.py:293:36 @[ offload.py:85:18 ] ]
+	.loc	2 263 15                        // standard.py:263:15 @[ standard.py:293:36 @[ offload.py:87:18 ] ]
 	add.s32 	%r1172, %r1171, %r564;
 $L__tmp33:
-	.loc	2 293 36                        // standard.py:293:36 @[ offload.py:85:18 ]
+	.loc	2 293 36                        // standard.py:293:36 @[ offload.py:87:18 ]
 	shfl.sync.bfly.b32 	%r1173, %r1172, 1, 31, -1;
 $L__tmp34:
-	.loc	2 263 15                        // standard.py:263:15 @[ standard.py:293:36 @[ offload.py:85:18 ] ]
+	.loc	2 263 15                        // standard.py:263:15 @[ standard.py:293:36 @[ offload.py:87:18 ] ]
 	add.s32 	%r565, %r1172, %r1173;
 $L__tmp35:
-	.loc	2 293 36                        // standard.py:293:36 @[ offload.py:85:18 ]
+	.loc	2 293 36                        // standard.py:293:36 @[ offload.py:87:18 ]
 	// begin inline asm
 	@%p5 st.shared.b32 [ %r268 + 0 ], %r565;
 	// end inline asm
@@ -3140,7 +3140,7 @@ $L__tmp35:
 	ld.shared.b32 	%r692, [global_smem+2016];
 	ld.shared.b32 	%r693, [global_smem+2032];
 $L__tmp36:
-	.loc	1 92 26                         // offload.py:92:26
+	.loc	1 94 26                         // offload.py:94:26
 	bar.sync 	0;
 	// begin inline asm
 	st.shared.v4.b32 [ %r270 + 0 ], { %r566, %r567, %r568, %r569 };
@@ -3240,10 +3240,10 @@ $L__tmp36:
 	// end inline asm
 	bar.sync 	0;
 	ldmatrix.sync.aligned.m8n8.x1.shared.b16 {%r1174}, [%r741];
-	.loc	1 86 39                         // offload.py:86:39
+	.loc	1 88 39                         // offload.py:88:39
 	selp.b32 	%r1175, 1, 0, %p9;
 $L__tmp37:
-	.loc	2 293 36                        // standard.py:293:36 @[ offload.py:86:25 ]
+	.loc	2 293 36                        // standard.py:293:36 @[ offload.py:88:25 ]
 	bar.sync 	0;
 	redux.sync.add.s32 	%r694, %r1175, %r718;
 	// begin inline asm
@@ -3255,16 +3255,16 @@ $L__tmp37:
 	// end inline asm
 	shfl.sync.bfly.b32 	%r1176, %r695, 2, 31, -1;
 $L__tmp38:
-	.loc	2 263 15                        // standard.py:263:15 @[ standard.py:293:36 @[ offload.py:86:25 ] ]
+	.loc	2 263 15                        // standard.py:263:15 @[ standard.py:293:36 @[ offload.py:88:25 ] ]
 	add.s32 	%r1177, %r1176, %r695;
 $L__tmp39:
-	.loc	2 293 36                        // standard.py:293:36 @[ offload.py:86:25 ]
+	.loc	2 293 36                        // standard.py:293:36 @[ offload.py:88:25 ]
 	shfl.sync.bfly.b32 	%r1178, %r1177, 1, 31, -1;
 $L__tmp40:
-	.loc	2 263 15                        // standard.py:263:15 @[ standard.py:293:36 @[ offload.py:86:25 ] ]
+	.loc	2 263 15                        // standard.py:263:15 @[ standard.py:293:36 @[ offload.py:88:25 ] ]
 	add.s32 	%r696, %r1177, %r1178;
 $L__tmp41:
-	.loc	2 293 36                        // standard.py:293:36 @[ offload.py:86:25 ]
+	.loc	2 293 36                        // standard.py:293:36 @[ offload.py:88:25 ]
 	and.pred 	%p7, %p6, %p5;
 	// begin inline asm
 	@%p7 st.shared.b32 [ %r259 + 0 ], %r696;
@@ -3272,32 +3272,32 @@ $L__tmp41:
 	bar.sync 	0;
 	ld.shared.b32 	%r1179, [global_smem];
 $L__tmp42:
-	.loc	1 87 37                         // offload.py:87:37
+	.loc	1 89 37                         // offload.py:89:37
 	cvt.s64.s32 	%rd6, %r1179;
-	.loc	1 87 22                         // offload.py:87:22
+	.loc	1 89 22                         // offload.py:89:22
 	// begin inline asm
 	@%p1 st.global.b64 [ %rd7 + 0 ], { %rd6 };
 	// end inline asm
-	.loc	1 90 25                         // offload.py:90:25
+	.loc	1 92 25                         // offload.py:92:25
 	mad.wide.s32 	%rd8, %r1, 8, %rd129;
-	.loc	1 90 31                         // offload.py:90:31
+	.loc	1 92 31                         // offload.py:92:31
 	// begin inline asm
 	@%p8 st.global.b64 [ %rd8 + 0 ], { %rd2 };
 	// end inline asm
-	.loc	1 92 26                         // offload.py:92:26
+	.loc	1 94 26                         // offload.py:94:26
 	mad.wide.s32 	%rd9, %r1174, 4, %rd130;
-	.loc	1 92 32                         // offload.py:92:32
+	.loc	1 94 32                         // offload.py:94:32
 	// begin inline asm
 	@%p9 st.global.b32 [ %rd9 + 0 ], { %r697 };
 	// end inline asm
-	.loc	1 93 4                          // offload.py:93:4
+	.loc	1 95 4                          // offload.py:95:4
 	bar.sync 	0;
-	.loc	1 96 13                         // offload.py:96:13
+	.loc	1 98 13                         // offload.py:98:13
 	setp.lt.s32 	%p10, %r729, %r734;
 	setp.lt.s32 	%p11, %r1021, %r734;
 	setp.lt.s32 	%p12, %r1025, %r734;
 	setp.lt.s32 	%p13, %r1029, %r734;
-	.loc	1 97 28                         // offload.py:97:28
+	.loc	1 99 28                         // offload.py:99:28
 	mad.wide.u32 	%rd11, %r729, 8, %rd129;
 	cvt.u64.u32 	%rd134, %r1021;
 	add.s64 	%rd13, %rd11, 1024;
@@ -3305,7 +3305,7 @@ $L__tmp42:
 	add.s64 	%rd15, %rd11, 2048;
 	cvt.u64.u32 	%rd136, %r1029;
 	add.s64 	%rd17, %rd11, 3072;
-	.loc	1 97 16                         // offload.py:97:16
+	.loc	1 99 16                         // offload.py:99:16
 	// begin inline asm
 	mov.u64 %rd10, 0x7fffffffffffff;
 	@%p10 ld.global.b64 { %rd10 }, [ %rd11 + 0 ];
@@ -3322,22 +3322,22 @@ $L__tmp42:
 	mov.u64 %rd16, 0x7fffffffffffff;
 	@%p13 ld.global.b64 { %rd16 }, [ %rd17 + 0 ];
 	// end inline asm
-	.loc	1 103 19                        // offload.py:103:19
+	.loc	1 105 19                        // offload.py:105:19
 	setp.ne.b64 	%p1042, %rd10, %rd2;
 	setp.ne.b64 	%p1043, %rd12, %rd2;
 	setp.ne.b64 	%p1044, %rd14, %rd2;
 	setp.ne.b64 	%p1045, %rd16, %rd2;
-	.loc	1 104 27                        // offload.py:104:27
+	.loc	1 106 27                        // offload.py:106:27
 	shl.b64 	%rd137, %rd10, 9;
 	shl.b64 	%rd138, %rd12, 9;
 	shl.b64 	%rd139, %rd14, 9;
 	shl.b64 	%rd140, %rd16, 9;
-	.loc	1 104 40                        // offload.py:104:40
+	.loc	1 106 40                        // offload.py:106:40
 	or.b64 	%rd141, %rd137, %rd132;
 	or.b64 	%rd142, %rd138, %rd134;
 	or.b64 	%rd143, %rd139, %rd135;
 	or.b64 	%rd144, %rd140, %rd136;
-	.loc	1 105 8                         // offload.py:105:8
+	.loc	1 107 8                         // offload.py:107:8
 	selp.b64 	%rd145, %rd141, 9223372036854775807, %p1042;
 	selp.b64 	%rd146, %rd145, 9223372036854775807, %p10;
 	selp.b64 	%rd147, %rd142, 9223372036854775807, %p1043;
@@ -3347,7 +3347,7 @@ $L__tmp42:
 	selp.b64 	%rd151, %rd144, 9223372036854775807, %p1045;
 	selp.b64 	%rd152, %rd151, 9223372036854775807, %p13;
 $L__tmp43:
-	.loc	2 368 24                        // standard.py:368:24 @[ standard.py:405:42 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 368 24                        // standard.py:368:24 @[ standard.py:405:42 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	shr.u32 	%r1180, %r728, 2;
 	bfe.u32 	%r1181, %r728, 2, 1;
 	shr.u32 	%r1182, %r728, 3;
@@ -3361,7 +3361,7 @@ $L__tmp43:
 	bfe.u32 	%r1190, %r728, 1, 1;
 	and.b32 	%r1191, %r728, 1;
 $L__tmp44:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	mov.b64 	{_, %r1192}, %rd146;
 	cvt.u32.u64 	%r1193, %rd146;
 	shfl.sync.bfly.b32 	%r1194, %r1193, 1, 31, -1;
@@ -3383,14 +3383,14 @@ $L__tmp44:
 	shfl.sync.bfly.b32 	%r1207, %r1204, 1, 31, -1;
 	mov.b64 	%rd156, {%r1206, %r1207};
 $L__tmp45:
-	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	setp.gt.s64 	%p1046, %rd146, %rd153;
 	setp.gt.s64 	%p1047, %rd148, %rd154;
 	setp.gt.s64 	%p1048, %rd150, %rd155;
 	setp.gt.s64 	%p1049, %rd152, %rd156;
-	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	xor.b32 	%r1208, %r1190, %r1191;
-	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b32 	%r1209, 1, 0, %p1046;
 	selp.b32 	%r1210, 1, 0, %p1047;
 	selp.b32 	%r1211, 1, 0, %p1048;
@@ -3399,13 +3399,13 @@ $L__tmp45:
 	setp.eq.b32 	%p1051, %r1208, %r1210;
 	setp.eq.b32 	%p1052, %r1208, %r1211;
 	setp.eq.b32 	%p1053, %r1208, %r1212;
-	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b64 	%rd157, %rd146, %rd153, %p1050;
 	selp.b64 	%rd158, %rd148, %rd154, %p1051;
 	selp.b64 	%rd159, %rd150, %rd155, %p1052;
 	selp.b64 	%rd160, %rd152, %rd156, %p1053;
 $L__tmp46:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	mov.b64 	{_, %r1213}, %rd157;
 	cvt.u32.u64 	%r1214, %rd157;
 	shfl.sync.bfly.b32 	%r1215, %r1214, 2, 31, -1;
@@ -3427,14 +3427,14 @@ $L__tmp46:
 	shfl.sync.bfly.b32 	%r1228, %r1225, 2, 31, -1;
 	mov.b64 	%rd164, {%r1227, %r1228};
 $L__tmp47:
-	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	setp.gt.s64 	%p1054, %rd157, %rd161;
 	setp.gt.s64 	%p1055, %rd158, %rd162;
 	setp.gt.s64 	%p1056, %rd159, %rd163;
 	setp.gt.s64 	%p1057, %rd160, %rd164;
-	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	xor.b32 	%r1229, %r1181, %r1190;
-	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b32 	%r1230, 1, 0, %p1054;
 	selp.b32 	%r1231, 1, 0, %p1055;
 	selp.b32 	%r1232, 1, 0, %p1056;
@@ -3443,13 +3443,13 @@ $L__tmp47:
 	setp.eq.b32 	%p1059, %r1229, %r1231;
 	setp.eq.b32 	%p1060, %r1229, %r1232;
 	setp.eq.b32 	%p1061, %r1229, %r1233;
-	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b64 	%rd165, %rd157, %rd161, %p1058;
 	selp.b64 	%rd166, %rd158, %rd162, %p1059;
 	selp.b64 	%rd167, %rd159, %rd163, %p1060;
 	selp.b64 	%rd168, %rd160, %rd164, %p1061;
 $L__tmp48:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	mov.b64 	{_, %r1234}, %rd165;
 	cvt.u32.u64 	%r1235, %rd165;
 	shfl.sync.bfly.b32 	%r1236, %r1235, 1, 31, -1;
@@ -3471,14 +3471,14 @@ $L__tmp48:
 	shfl.sync.bfly.b32 	%r1249, %r1246, 1, 31, -1;
 	mov.b64 	%rd172, {%r1248, %r1249};
 $L__tmp49:
-	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	setp.gt.s64 	%p1062, %rd165, %rd169;
 	setp.gt.s64 	%p1063, %rd166, %rd170;
 	setp.gt.s64 	%p1064, %rd167, %rd171;
 	setp.gt.s64 	%p1065, %rd168, %rd172;
-	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	xor.b32 	%r1250, %r1181, %r1191;
-	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b32 	%r1251, 1, 0, %p1062;
 	selp.b32 	%r1252, 1, 0, %p1063;
 	selp.b32 	%r1253, 1, 0, %p1064;
@@ -3487,13 +3487,13 @@ $L__tmp49:
 	setp.eq.b32 	%p1067, %r1250, %r1252;
 	setp.eq.b32 	%p1068, %r1250, %r1253;
 	setp.eq.b32 	%p1069, %r1250, %r1254;
-	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b64 	%rd173, %rd165, %rd169, %p1066;
 	selp.b64 	%rd174, %rd166, %rd170, %p1067;
 	selp.b64 	%rd175, %rd167, %rd171, %p1068;
 	selp.b64 	%rd176, %rd168, %rd172, %p1069;
 $L__tmp50:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	mov.b64 	{_, %r1255}, %rd173;
 	cvt.u32.u64 	%r1256, %rd173;
 	shfl.sync.bfly.b32 	%r1257, %r1256, 4, 31, -1;
@@ -3515,14 +3515,14 @@ $L__tmp50:
 	shfl.sync.bfly.b32 	%r1270, %r1267, 4, 31, -1;
 	mov.b64 	%rd180, {%r1269, %r1270};
 $L__tmp51:
-	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	setp.gt.s64 	%p1070, %rd173, %rd177;
 	setp.gt.s64 	%p1071, %rd174, %rd178;
 	setp.gt.s64 	%p1072, %rd175, %rd179;
 	setp.gt.s64 	%p1073, %rd176, %rd180;
-	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	xor.b32 	%r1271, %r1183, %r1181;
-	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b32 	%r1272, 1, 0, %p1070;
 	selp.b32 	%r1273, 1, 0, %p1071;
 	selp.b32 	%r1274, 1, 0, %p1072;
@@ -3531,13 +3531,13 @@ $L__tmp51:
 	setp.eq.b32 	%p1075, %r1271, %r1273;
 	setp.eq.b32 	%p1076, %r1271, %r1274;
 	setp.eq.b32 	%p1077, %r1271, %r1275;
-	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b64 	%rd181, %rd173, %rd177, %p1074;
 	selp.b64 	%rd182, %rd174, %rd178, %p1075;
 	selp.b64 	%rd183, %rd175, %rd179, %p1076;
 	selp.b64 	%rd184, %rd176, %rd180, %p1077;
 $L__tmp52:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	mov.b64 	{_, %r1276}, %rd181;
 	cvt.u32.u64 	%r1277, %rd181;
 	shfl.sync.bfly.b32 	%r1278, %r1277, 2, 31, -1;
@@ -3559,14 +3559,14 @@ $L__tmp52:
 	shfl.sync.bfly.b32 	%r1291, %r1288, 2, 31, -1;
 	mov.b64 	%rd188, {%r1290, %r1291};
 $L__tmp53:
-	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	setp.gt.s64 	%p1078, %rd181, %rd185;
 	setp.gt.s64 	%p1079, %rd182, %rd186;
 	setp.gt.s64 	%p1080, %rd183, %rd187;
 	setp.gt.s64 	%p1081, %rd184, %rd188;
-	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	xor.b32 	%r1292, %r1183, %r1190;
-	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b32 	%r1293, 1, 0, %p1078;
 	selp.b32 	%r1294, 1, 0, %p1079;
 	selp.b32 	%r1295, 1, 0, %p1080;
@@ -3575,13 +3575,13 @@ $L__tmp53:
 	setp.eq.b32 	%p1083, %r1292, %r1294;
 	setp.eq.b32 	%p1084, %r1292, %r1295;
 	setp.eq.b32 	%p1085, %r1292, %r1296;
-	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b64 	%rd189, %rd181, %rd185, %p1082;
 	selp.b64 	%rd190, %rd182, %rd186, %p1083;
 	selp.b64 	%rd191, %rd183, %rd187, %p1084;
 	selp.b64 	%rd192, %rd184, %rd188, %p1085;
 $L__tmp54:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	mov.b64 	{_, %r1297}, %rd189;
 	cvt.u32.u64 	%r1298, %rd189;
 	shfl.sync.bfly.b32 	%r1299, %r1298, 1, 31, -1;
@@ -3603,14 +3603,14 @@ $L__tmp54:
 	shfl.sync.bfly.b32 	%r1312, %r1309, 1, 31, -1;
 	mov.b64 	%rd196, {%r1311, %r1312};
 $L__tmp55:
-	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	setp.gt.s64 	%p1086, %rd189, %rd193;
 	setp.gt.s64 	%p1087, %rd190, %rd194;
 	setp.gt.s64 	%p1088, %rd191, %rd195;
 	setp.gt.s64 	%p1089, %rd192, %rd196;
-	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	xor.b32 	%r1313, %r1183, %r1191;
-	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b32 	%r1314, 1, 0, %p1086;
 	selp.b32 	%r1315, 1, 0, %p1087;
 	selp.b32 	%r1316, 1, 0, %p1088;
@@ -3619,13 +3619,13 @@ $L__tmp55:
 	setp.eq.b32 	%p1091, %r1313, %r1315;
 	setp.eq.b32 	%p1092, %r1313, %r1316;
 	setp.eq.b32 	%p1093, %r1313, %r1317;
-	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b64 	%rd197, %rd189, %rd193, %p1090;
 	selp.b64 	%rd198, %rd190, %rd194, %p1091;
 	selp.b64 	%rd199, %rd191, %rd195, %p1092;
 	selp.b64 	%rd200, %rd192, %rd196, %p1093;
 $L__tmp56:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	mov.b64 	{_, %r1318}, %rd197;
 	cvt.u32.u64 	%r1319, %rd197;
 	shfl.sync.bfly.b32 	%r1320, %r1319, 8, 31, -1;
@@ -3647,14 +3647,14 @@ $L__tmp56:
 	shfl.sync.bfly.b32 	%r1333, %r1330, 8, 31, -1;
 	mov.b64 	%rd204, {%r1332, %r1333};
 $L__tmp57:
-	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	setp.gt.s64 	%p1094, %rd197, %rd201;
 	setp.gt.s64 	%p1095, %rd198, %rd202;
 	setp.gt.s64 	%p1096, %rd199, %rd203;
 	setp.gt.s64 	%p1097, %rd200, %rd204;
-	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	xor.b32 	%r1334, %r1185, %r1183;
-	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b32 	%r1335, 1, 0, %p1094;
 	selp.b32 	%r1336, 1, 0, %p1095;
 	selp.b32 	%r1337, 1, 0, %p1096;
@@ -3663,13 +3663,13 @@ $L__tmp57:
 	setp.eq.b32 	%p1099, %r1334, %r1336;
 	setp.eq.b32 	%p1100, %r1334, %r1337;
 	setp.eq.b32 	%p1101, %r1334, %r1338;
-	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b64 	%rd205, %rd197, %rd201, %p1098;
 	selp.b64 	%rd206, %rd198, %rd202, %p1099;
 	selp.b64 	%rd207, %rd199, %rd203, %p1100;
 	selp.b64 	%rd208, %rd200, %rd204, %p1101;
 $L__tmp58:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	mov.b64 	{_, %r1339}, %rd205;
 	cvt.u32.u64 	%r1340, %rd205;
 	shfl.sync.bfly.b32 	%r1341, %r1340, 4, 31, -1;
@@ -3691,14 +3691,14 @@ $L__tmp58:
 	shfl.sync.bfly.b32 	%r1354, %r1351, 4, 31, -1;
 	mov.b64 	%rd212, {%r1353, %r1354};
 $L__tmp59:
-	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	setp.gt.s64 	%p1102, %rd205, %rd209;
 	setp.gt.s64 	%p1103, %rd206, %rd210;
 	setp.gt.s64 	%p1104, %rd207, %rd211;
 	setp.gt.s64 	%p1105, %rd208, %rd212;
-	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	xor.b32 	%r1355, %r1185, %r1181;
-	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b32 	%r1356, 1, 0, %p1102;
 	selp.b32 	%r1357, 1, 0, %p1103;
 	selp.b32 	%r1358, 1, 0, %p1104;
@@ -3707,13 +3707,13 @@ $L__tmp59:
 	setp.eq.b32 	%p1107, %r1355, %r1357;
 	setp.eq.b32 	%p1108, %r1355, %r1358;
 	setp.eq.b32 	%p1109, %r1355, %r1359;
-	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b64 	%rd213, %rd205, %rd209, %p1106;
 	selp.b64 	%rd214, %rd206, %rd210, %p1107;
 	selp.b64 	%rd215, %rd207, %rd211, %p1108;
 	selp.b64 	%rd216, %rd208, %rd212, %p1109;
 $L__tmp60:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	mov.b64 	{_, %r1360}, %rd213;
 	cvt.u32.u64 	%r1361, %rd213;
 	shfl.sync.bfly.b32 	%r1362, %r1361, 2, 31, -1;
@@ -3735,14 +3735,14 @@ $L__tmp60:
 	shfl.sync.bfly.b32 	%r1375, %r1372, 2, 31, -1;
 	mov.b64 	%rd220, {%r1374, %r1375};
 $L__tmp61:
-	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	setp.gt.s64 	%p1110, %rd213, %rd217;
 	setp.gt.s64 	%p1111, %rd214, %rd218;
 	setp.gt.s64 	%p1112, %rd215, %rd219;
 	setp.gt.s64 	%p1113, %rd216, %rd220;
-	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	xor.b32 	%r1376, %r1185, %r1190;
-	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b32 	%r1377, 1, 0, %p1110;
 	selp.b32 	%r1378, 1, 0, %p1111;
 	selp.b32 	%r1379, 1, 0, %p1112;
@@ -3751,13 +3751,13 @@ $L__tmp61:
 	setp.eq.b32 	%p1115, %r1376, %r1378;
 	setp.eq.b32 	%p1116, %r1376, %r1379;
 	setp.eq.b32 	%p1117, %r1376, %r1380;
-	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b64 	%rd221, %rd213, %rd217, %p1114;
 	selp.b64 	%rd222, %rd214, %rd218, %p1115;
 	selp.b64 	%rd223, %rd215, %rd219, %p1116;
 	selp.b64 	%rd224, %rd216, %rd220, %p1117;
 $L__tmp62:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	mov.b64 	{_, %r1381}, %rd221;
 	cvt.u32.u64 	%r1382, %rd221;
 	shfl.sync.bfly.b32 	%r1383, %r1382, 1, 31, -1;
@@ -3779,14 +3779,14 @@ $L__tmp62:
 	shfl.sync.bfly.b32 	%r1396, %r1393, 1, 31, -1;
 	mov.b64 	%rd228, {%r1395, %r1396};
 $L__tmp63:
-	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	setp.gt.s64 	%p1118, %rd221, %rd225;
 	setp.gt.s64 	%p1119, %rd222, %rd226;
 	setp.gt.s64 	%p1120, %rd223, %rd227;
 	setp.gt.s64 	%p1121, %rd224, %rd228;
-	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	xor.b32 	%r1397, %r1185, %r1191;
-	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b32 	%r1398, 1, 0, %p1118;
 	selp.b32 	%r1399, 1, 0, %p1119;
 	selp.b32 	%r1400, 1, 0, %p1120;
@@ -3795,13 +3795,13 @@ $L__tmp63:
 	setp.eq.b32 	%p1123, %r1397, %r1399;
 	setp.eq.b32 	%p1124, %r1397, %r1400;
 	setp.eq.b32 	%p1125, %r1397, %r1401;
-	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b64 	%rd229, %rd221, %rd225, %p1122;
 	selp.b64 	%rd230, %rd222, %rd226, %p1123;
 	selp.b64 	%rd231, %rd223, %rd227, %p1124;
 	selp.b64 	%rd232, %rd224, %rd228, %p1125;
 $L__tmp64:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	mov.b64 	{_, %r1402}, %rd229;
 	cvt.u32.u64 	%r1403, %rd229;
 	shfl.sync.bfly.b32 	%r1404, %r1403, 16, 31, -1;
@@ -3823,14 +3823,14 @@ $L__tmp64:
 	shfl.sync.bfly.b32 	%r1417, %r1414, 16, 31, -1;
 	mov.b64 	%rd236, {%r1416, %r1417};
 $L__tmp65:
-	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	setp.gt.s64 	%p1126, %rd229, %rd233;
 	setp.gt.s64 	%p1127, %rd230, %rd234;
 	setp.gt.s64 	%p1128, %rd231, %rd235;
 	setp.gt.s64 	%p1129, %rd232, %rd236;
-	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	xor.b32 	%r1418, %r1186, %r1185;
-	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b32 	%r1419, 1, 0, %p1126;
 	selp.b32 	%r1420, 1, 0, %p1127;
 	selp.b32 	%r1421, 1, 0, %p1128;
@@ -3839,13 +3839,13 @@ $L__tmp65:
 	setp.eq.b32 	%p1131, %r1418, %r1420;
 	setp.eq.b32 	%p1132, %r1418, %r1421;
 	setp.eq.b32 	%p1133, %r1418, %r1422;
-	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b64 	%rd237, %rd229, %rd233, %p1130;
 	selp.b64 	%rd238, %rd230, %rd234, %p1131;
 	selp.b64 	%rd239, %rd231, %rd235, %p1132;
 	selp.b64 	%rd240, %rd232, %rd236, %p1133;
 $L__tmp66:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	mov.b64 	{_, %r1423}, %rd237;
 	cvt.u32.u64 	%r1424, %rd237;
 	shfl.sync.bfly.b32 	%r1425, %r1424, 8, 31, -1;
@@ -3867,14 +3867,14 @@ $L__tmp66:
 	shfl.sync.bfly.b32 	%r1438, %r1435, 8, 31, -1;
 	mov.b64 	%rd244, {%r1437, %r1438};
 $L__tmp67:
-	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	setp.gt.s64 	%p1134, %rd237, %rd241;
 	setp.gt.s64 	%p1135, %rd238, %rd242;
 	setp.gt.s64 	%p1136, %rd239, %rd243;
 	setp.gt.s64 	%p1137, %rd240, %rd244;
-	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	xor.b32 	%r1439, %r1186, %r1183;
-	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b32 	%r1440, 1, 0, %p1134;
 	selp.b32 	%r1441, 1, 0, %p1135;
 	selp.b32 	%r1442, 1, 0, %p1136;
@@ -3883,13 +3883,13 @@ $L__tmp67:
 	setp.eq.b32 	%p1139, %r1439, %r1441;
 	setp.eq.b32 	%p1140, %r1439, %r1442;
 	setp.eq.b32 	%p1141, %r1439, %r1443;
-	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b64 	%rd245, %rd237, %rd241, %p1138;
 	selp.b64 	%rd246, %rd238, %rd242, %p1139;
 	selp.b64 	%rd247, %rd239, %rd243, %p1140;
 	selp.b64 	%rd248, %rd240, %rd244, %p1141;
 $L__tmp68:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	mov.b64 	{_, %r1444}, %rd245;
 	cvt.u32.u64 	%r1445, %rd245;
 	shfl.sync.bfly.b32 	%r1446, %r1445, 4, 31, -1;
@@ -3911,14 +3911,14 @@ $L__tmp68:
 	shfl.sync.bfly.b32 	%r1459, %r1456, 4, 31, -1;
 	mov.b64 	%rd252, {%r1458, %r1459};
 $L__tmp69:
-	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	setp.gt.s64 	%p1142, %rd245, %rd249;
 	setp.gt.s64 	%p1143, %rd246, %rd250;
 	setp.gt.s64 	%p1144, %rd247, %rd251;
 	setp.gt.s64 	%p1145, %rd248, %rd252;
-	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	xor.b32 	%r1460, %r1186, %r1181;
-	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b32 	%r1461, 1, 0, %p1142;
 	selp.b32 	%r1462, 1, 0, %p1143;
 	selp.b32 	%r1463, 1, 0, %p1144;
@@ -3927,13 +3927,13 @@ $L__tmp69:
 	setp.eq.b32 	%p1147, %r1460, %r1462;
 	setp.eq.b32 	%p1148, %r1460, %r1463;
 	setp.eq.b32 	%p1149, %r1460, %r1464;
-	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b64 	%rd253, %rd245, %rd249, %p1146;
 	selp.b64 	%rd254, %rd246, %rd250, %p1147;
 	selp.b64 	%rd255, %rd247, %rd251, %p1148;
 	selp.b64 	%rd256, %rd248, %rd252, %p1149;
 $L__tmp70:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	mov.b64 	{_, %r1465}, %rd253;
 	cvt.u32.u64 	%r1466, %rd253;
 	shfl.sync.bfly.b32 	%r1467, %r1466, 2, 31, -1;
@@ -3955,14 +3955,14 @@ $L__tmp70:
 	shfl.sync.bfly.b32 	%r1480, %r1477, 2, 31, -1;
 	mov.b64 	%rd260, {%r1479, %r1480};
 $L__tmp71:
-	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	setp.gt.s64 	%p1150, %rd253, %rd257;
 	setp.gt.s64 	%p1151, %rd254, %rd258;
 	setp.gt.s64 	%p1152, %rd255, %rd259;
 	setp.gt.s64 	%p1153, %rd256, %rd260;
-	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	xor.b32 	%r1481, %r1186, %r1190;
-	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b32 	%r1482, 1, 0, %p1150;
 	selp.b32 	%r1483, 1, 0, %p1151;
 	selp.b32 	%r1484, 1, 0, %p1152;
@@ -3971,13 +3971,13 @@ $L__tmp71:
 	setp.eq.b32 	%p1155, %r1481, %r1483;
 	setp.eq.b32 	%p1156, %r1481, %r1484;
 	setp.eq.b32 	%p1157, %r1481, %r1485;
-	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b64 	%rd261, %rd253, %rd257, %p1154;
 	selp.b64 	%rd262, %rd254, %rd258, %p1155;
 	selp.b64 	%rd263, %rd255, %rd259, %p1156;
 	selp.b64 	%rd264, %rd256, %rd260, %p1157;
 $L__tmp72:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	mov.b64 	{_, %r1486}, %rd261;
 	cvt.u32.u64 	%r1487, %rd261;
 	shfl.sync.bfly.b32 	%r1488, %r1487, 1, 31, -1;
@@ -3999,14 +3999,14 @@ $L__tmp72:
 	shfl.sync.bfly.b32 	%r1501, %r1498, 1, 31, -1;
 	mov.b64 	%rd268, {%r1500, %r1501};
 $L__tmp73:
-	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	setp.gt.s64 	%p1158, %rd261, %rd265;
 	setp.gt.s64 	%p1159, %rd262, %rd266;
 	setp.gt.s64 	%p1160, %rd263, %rd267;
 	setp.gt.s64 	%p1161, %rd264, %rd268;
-	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	xor.b32 	%r1502, %r1186, %r1191;
-	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b32 	%r1503, 1, 0, %p1158;
 	selp.b32 	%r1504, 1, 0, %p1159;
 	selp.b32 	%r1505, 1, 0, %p1160;
@@ -4015,13 +4015,13 @@ $L__tmp73:
 	setp.eq.b32 	%p1163, %r1502, %r1504;
 	setp.eq.b32 	%p1164, %r1502, %r1505;
 	setp.eq.b32 	%p1165, %r1502, %r1506;
-	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b64 	%rd18, %rd261, %rd265, %p1162;
 	selp.b64 	%rd19, %rd262, %rd266, %p1163;
 	selp.b64 	%rd20, %rd263, %rd267, %p1164;
 	selp.b64 	%rd21, %rd264, %rd268, %p1165;
 $L__tmp74:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	shl.b32 	%r1507, %r1188, 2;
 	shl.b32 	%r1508, %r1185, 1;
 	or.b32 	%r1509, %r1507, %r1508;
@@ -4062,10 +4062,10 @@ $L__tmp74:
 	shfl.sync.bfly.b32 	%r1523, %r1520, 1, 31, -1;
 	mov.b64 	%rd269, {%r1522, %r1523};
 $L__tmp75:
-	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ] ]
+	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ] ]
 	xor.b64 	%rd23, %rd22, %rd269;
 $L__tmp76:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	setp.eq.b32 	%p14, %r1191, 0;
 	// begin inline asm
 	@%p14 st.shared.b64 [ %r702 + 0 ], %rd23;
@@ -4080,10 +4080,10 @@ $L__tmp76:
 	shfl.sync.bfly.b32 	%r1527, %r1524, 1, 31, -1;
 	mov.b64 	%rd270, {%r1526, %r1527};
 $L__tmp77:
-	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ] ]
+	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ] ]
 	xor.b64 	%rd25, %rd24, %rd270;
 $L__tmp78:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	// begin inline asm
 	@%p14 st.shared.b64 [ %r703 + 0 ], %rd25;
 	// end inline asm
@@ -4097,10 +4097,10 @@ $L__tmp78:
 	shfl.sync.bfly.b32 	%r1531, %r1528, 1, 31, -1;
 	mov.b64 	%rd271, {%r1530, %r1531};
 $L__tmp79:
-	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ] ]
+	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ] ]
 	xor.b64 	%rd27, %rd26, %rd271;
 $L__tmp80:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	// begin inline asm
 	@%p14 st.shared.b64 [ %r704 + 0 ], %rd27;
 	// end inline asm
@@ -4114,10 +4114,10 @@ $L__tmp80:
 	shfl.sync.bfly.b32 	%r1535, %r1532, 1, 31, -1;
 	mov.b64 	%rd272, {%r1534, %r1535};
 $L__tmp81:
-	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ] ]
+	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ] ]
 	xor.b64 	%rd29, %rd28, %rd272;
 $L__tmp82:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	// begin inline asm
 	@%p14 st.shared.b64 [ %r705 + 0 ], %rd29;
 	// end inline asm
@@ -4127,19 +4127,19 @@ $L__tmp82:
 	ld.shared.b64 	%rd275, [%r1518+32];
 	ld.shared.b64 	%rd276, [%r1518+48];
 $L__tmp83:
-	.loc	2 381 14                        // standard.py:381:14 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 381 14                        // standard.py:381:14 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	xor.b64 	%rd277, %rd273, %rd18;
 	xor.b64 	%rd278, %rd274, %rd19;
 	xor.b64 	%rd279, %rd275, %rd20;
 	xor.b64 	%rd280, %rd276, %rd21;
-	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	setp.gt.s64 	%p1166, %rd18, %rd277;
 	setp.gt.s64 	%p1167, %rd19, %rd278;
 	setp.gt.s64 	%p1168, %rd20, %rd279;
 	setp.gt.s64 	%p1169, %rd21, %rd280;
-	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	xor.b32 	%r1536, %r1188, %r1186;
-	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b32 	%r1537, 1, 0, %p1166;
 	selp.b32 	%r1538, 1, 0, %p1167;
 	selp.b32 	%r1539, 1, 0, %p1168;
@@ -4148,13 +4148,13 @@ $L__tmp83:
 	setp.eq.b32 	%p1171, %r1536, %r1538;
 	setp.eq.b32 	%p1172, %r1536, %r1539;
 	setp.eq.b32 	%p1173, %r1536, %r1540;
-	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b64 	%rd281, %rd18, %rd277, %p1170;
 	selp.b64 	%rd282, %rd19, %rd278, %p1171;
 	selp.b64 	%rd283, %rd20, %rd279, %p1172;
 	selp.b64 	%rd284, %rd21, %rd280, %p1173;
 $L__tmp84:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	mov.b64 	{_, %r1541}, %rd281;
 	cvt.u32.u64 	%r1542, %rd281;
 	shfl.sync.bfly.b32 	%r1543, %r1542, 16, 31, -1;
@@ -4176,14 +4176,14 @@ $L__tmp84:
 	shfl.sync.bfly.b32 	%r1556, %r1553, 16, 31, -1;
 	mov.b64 	%rd288, {%r1555, %r1556};
 $L__tmp85:
-	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	setp.gt.s64 	%p1174, %rd281, %rd285;
 	setp.gt.s64 	%p1175, %rd282, %rd286;
 	setp.gt.s64 	%p1176, %rd283, %rd287;
 	setp.gt.s64 	%p1177, %rd284, %rd288;
-	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	xor.b32 	%r1557, %r1188, %r1185;
-	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b32 	%r1558, 1, 0, %p1174;
 	selp.b32 	%r1559, 1, 0, %p1175;
 	selp.b32 	%r1560, 1, 0, %p1176;
@@ -4192,13 +4192,13 @@ $L__tmp85:
 	setp.eq.b32 	%p1179, %r1557, %r1559;
 	setp.eq.b32 	%p1180, %r1557, %r1560;
 	setp.eq.b32 	%p1181, %r1557, %r1561;
-	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b64 	%rd289, %rd281, %rd285, %p1178;
 	selp.b64 	%rd290, %rd282, %rd286, %p1179;
 	selp.b64 	%rd291, %rd283, %rd287, %p1180;
 	selp.b64 	%rd292, %rd284, %rd288, %p1181;
 $L__tmp86:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	mov.b64 	{_, %r1562}, %rd289;
 	cvt.u32.u64 	%r1563, %rd289;
 	shfl.sync.bfly.b32 	%r1564, %r1563, 8, 31, -1;
@@ -4220,14 +4220,14 @@ $L__tmp86:
 	shfl.sync.bfly.b32 	%r1577, %r1574, 8, 31, -1;
 	mov.b64 	%rd296, {%r1576, %r1577};
 $L__tmp87:
-	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	setp.gt.s64 	%p1182, %rd289, %rd293;
 	setp.gt.s64 	%p1183, %rd290, %rd294;
 	setp.gt.s64 	%p1184, %rd291, %rd295;
 	setp.gt.s64 	%p1185, %rd292, %rd296;
-	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	xor.b32 	%r1578, %r1188, %r1183;
-	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b32 	%r1579, 1, 0, %p1182;
 	selp.b32 	%r1580, 1, 0, %p1183;
 	selp.b32 	%r1581, 1, 0, %p1184;
@@ -4236,13 +4236,13 @@ $L__tmp87:
 	setp.eq.b32 	%p1187, %r1578, %r1580;
 	setp.eq.b32 	%p1188, %r1578, %r1581;
 	setp.eq.b32 	%p1189, %r1578, %r1582;
-	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b64 	%rd297, %rd289, %rd293, %p1186;
 	selp.b64 	%rd298, %rd290, %rd294, %p1187;
 	selp.b64 	%rd299, %rd291, %rd295, %p1188;
 	selp.b64 	%rd300, %rd292, %rd296, %p1189;
 $L__tmp88:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	mov.b64 	{_, %r1583}, %rd297;
 	cvt.u32.u64 	%r1584, %rd297;
 	shfl.sync.bfly.b32 	%r1585, %r1584, 4, 31, -1;
@@ -4264,14 +4264,14 @@ $L__tmp88:
 	shfl.sync.bfly.b32 	%r1598, %r1595, 4, 31, -1;
 	mov.b64 	%rd304, {%r1597, %r1598};
 $L__tmp89:
-	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	setp.gt.s64 	%p1190, %rd297, %rd301;
 	setp.gt.s64 	%p1191, %rd298, %rd302;
 	setp.gt.s64 	%p1192, %rd299, %rd303;
 	setp.gt.s64 	%p1193, %rd300, %rd304;
-	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	xor.b32 	%r1599, %r1188, %r1181;
-	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b32 	%r1600, 1, 0, %p1190;
 	selp.b32 	%r1601, 1, 0, %p1191;
 	selp.b32 	%r1602, 1, 0, %p1192;
@@ -4280,13 +4280,13 @@ $L__tmp89:
 	setp.eq.b32 	%p1195, %r1599, %r1601;
 	setp.eq.b32 	%p1196, %r1599, %r1602;
 	setp.eq.b32 	%p1197, %r1599, %r1603;
-	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b64 	%rd305, %rd297, %rd301, %p1194;
 	selp.b64 	%rd306, %rd298, %rd302, %p1195;
 	selp.b64 	%rd307, %rd299, %rd303, %p1196;
 	selp.b64 	%rd308, %rd300, %rd304, %p1197;
 $L__tmp90:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	mov.b64 	{_, %r1604}, %rd305;
 	cvt.u32.u64 	%r1605, %rd305;
 	shfl.sync.bfly.b32 	%r1606, %r1605, 2, 31, -1;
@@ -4308,14 +4308,14 @@ $L__tmp90:
 	shfl.sync.bfly.b32 	%r1619, %r1616, 2, 31, -1;
 	mov.b64 	%rd312, {%r1618, %r1619};
 $L__tmp91:
-	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	setp.gt.s64 	%p1198, %rd305, %rd309;
 	setp.gt.s64 	%p1199, %rd306, %rd310;
 	setp.gt.s64 	%p1200, %rd307, %rd311;
 	setp.gt.s64 	%p1201, %rd308, %rd312;
-	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	xor.b32 	%r1620, %r1188, %r1190;
-	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b32 	%r1621, 1, 0, %p1198;
 	selp.b32 	%r1622, 1, 0, %p1199;
 	selp.b32 	%r1623, 1, 0, %p1200;
@@ -4324,13 +4324,13 @@ $L__tmp91:
 	setp.eq.b32 	%p1203, %r1620, %r1622;
 	setp.eq.b32 	%p1204, %r1620, %r1623;
 	setp.eq.b32 	%p1205, %r1620, %r1624;
-	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b64 	%rd313, %rd305, %rd309, %p1202;
 	selp.b64 	%rd314, %rd306, %rd310, %p1203;
 	selp.b64 	%rd315, %rd307, %rd311, %p1204;
 	selp.b64 	%rd316, %rd308, %rd312, %p1205;
 $L__tmp92:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	mov.b64 	{_, %r1625}, %rd313;
 	cvt.u32.u64 	%r1626, %rd313;
 	shfl.sync.bfly.b32 	%r1627, %r1626, 1, 31, -1;
@@ -4352,14 +4352,14 @@ $L__tmp92:
 	shfl.sync.bfly.b32 	%r1640, %r1637, 1, 31, -1;
 	mov.b64 	%rd320, {%r1639, %r1640};
 $L__tmp93:
-	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	setp.gt.s64 	%p1206, %rd313, %rd317;
 	setp.gt.s64 	%p1207, %rd314, %rd318;
 	setp.gt.s64 	%p1208, %rd315, %rd319;
 	setp.gt.s64 	%p1209, %rd316, %rd320;
-	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	xor.b32 	%r1641, %r1188, %r1191;
-	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b32 	%r1642, 1, 0, %p1206;
 	selp.b32 	%r1643, 1, 0, %p1207;
 	selp.b32 	%r1644, 1, 0, %p1208;
@@ -4368,13 +4368,13 @@ $L__tmp93:
 	setp.eq.b32 	%p1211, %r1641, %r1643;
 	setp.eq.b32 	%p1212, %r1641, %r1644;
 	setp.eq.b32 	%p1213, %r1641, %r1645;
-	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b64 	%rd30, %rd313, %rd317, %p1210;
 	selp.b64 	%rd31, %rd314, %rd318, %p1211;
 	selp.b64 	%rd32, %rd315, %rd319, %p1212;
 	selp.b64 	%rd33, %rd316, %rd320, %p1213;
 $L__tmp94:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	bar.sync 	0;
 	shl.b32 	%r1646, %r1186, 2;
 	or.b32 	%r1647, %r1646, %r1508;
@@ -4412,10 +4412,10 @@ $L__tmp94:
 	shfl.sync.bfly.b32 	%r1659, %r1656, 1, 31, -1;
 	mov.b64 	%rd321, {%r1658, %r1659};
 $L__tmp95:
-	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ] ]
+	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ] ]
 	xor.b64 	%rd35, %rd34, %rd321;
 $L__tmp96:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	// begin inline asm
 	@%p14 st.shared.b64 [ %r702 + 0 ], %rd35;
 	// end inline asm
@@ -4428,10 +4428,10 @@ $L__tmp96:
 	shfl.sync.bfly.b32 	%r1663, %r1660, 1, 31, -1;
 	mov.b64 	%rd322, {%r1662, %r1663};
 $L__tmp97:
-	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ] ]
+	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ] ]
 	xor.b64 	%rd37, %rd36, %rd322;
 $L__tmp98:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	// begin inline asm
 	@%p14 st.shared.b64 [ %r703 + 0 ], %rd37;
 	// end inline asm
@@ -4444,10 +4444,10 @@ $L__tmp98:
 	shfl.sync.bfly.b32 	%r1667, %r1664, 1, 31, -1;
 	mov.b64 	%rd323, {%r1666, %r1667};
 $L__tmp99:
-	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ] ]
+	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ] ]
 	xor.b64 	%rd39, %rd38, %rd323;
 $L__tmp100:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	// begin inline asm
 	@%p14 st.shared.b64 [ %r704 + 0 ], %rd39;
 	// end inline asm
@@ -4460,10 +4460,10 @@ $L__tmp100:
 	shfl.sync.bfly.b32 	%r1671, %r1668, 1, 31, -1;
 	mov.b64 	%rd324, {%r1670, %r1671};
 $L__tmp101:
-	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ] ]
+	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ] ]
 	xor.b64 	%rd41, %rd40, %rd324;
 $L__tmp102:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	// begin inline asm
 	@%p14 st.shared.b64 [ %r705 + 0 ], %rd41;
 	// end inline asm
@@ -4473,17 +4473,17 @@ $L__tmp102:
 	ld.shared.b64 	%rd327, [%r1654+32];
 	ld.shared.b64 	%rd328, [%r1654+48];
 $L__tmp103:
-	.loc	2 381 14                        // standard.py:381:14 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 381 14                        // standard.py:381:14 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	xor.b64 	%rd329, %rd325, %rd30;
 	xor.b64 	%rd330, %rd326, %rd31;
 	xor.b64 	%rd331, %rd327, %rd32;
 	xor.b64 	%rd332, %rd328, %rd33;
-	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	setp.gt.s64 	%p1214, %rd31, %rd330;
 	setp.gt.s64 	%p1215, %rd33, %rd332;
-	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	xor.b32 	%r1672, %r1188, 1;
-	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b32 	%r1673, 1, 0, %p1214;
 	selp.b32 	%r1674, 1, 0, %p1215;
 	and.b32 	%r1675, %r1187, 1;
@@ -4494,13 +4494,13 @@ $L__tmp103:
 	setp.le.s64 	%p1220, %rd32, %rd331;
 	xor.pred 	%p1221, %p1220, %p1216;
 	setp.eq.b32 	%p1222, %r1672, %r1674;
-	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b64 	%rd42, %rd30, %rd329, %p1218;
 	selp.b64 	%rd43, %rd31, %rd330, %p1219;
 	selp.b64 	%rd44, %rd32, %rd331, %p1221;
 	selp.b64 	%rd45, %rd33, %rd332, %p1222;
 $L__tmp104:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	bar.sync 	0;
 	// begin inline asm
 	@%p4 st.shared.b64 [ %r698 + 0 ], %rd42;
@@ -4524,10 +4524,10 @@ $L__tmp104:
 	shfl.sync.bfly.b32 	%r1679, %r1676, 1, 31, -1;
 	mov.b64 	%rd333, {%r1678, %r1679};
 $L__tmp105:
-	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ] ]
+	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ] ]
 	xor.b64 	%rd47, %rd46, %rd333;
 $L__tmp106:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	// begin inline asm
 	@%p14 st.shared.b64 [ %r702 + 0 ], %rd47;
 	// end inline asm
@@ -4540,10 +4540,10 @@ $L__tmp106:
 	shfl.sync.bfly.b32 	%r1683, %r1680, 1, 31, -1;
 	mov.b64 	%rd334, {%r1682, %r1683};
 $L__tmp107:
-	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ] ]
+	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ] ]
 	xor.b64 	%rd49, %rd48, %rd334;
 $L__tmp108:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	// begin inline asm
 	@%p14 st.shared.b64 [ %r703 + 0 ], %rd49;
 	// end inline asm
@@ -4556,10 +4556,10 @@ $L__tmp108:
 	shfl.sync.bfly.b32 	%r1687, %r1684, 1, 31, -1;
 	mov.b64 	%rd335, {%r1686, %r1687};
 $L__tmp109:
-	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ] ]
+	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ] ]
 	xor.b64 	%rd51, %rd50, %rd335;
 $L__tmp110:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	// begin inline asm
 	@%p14 st.shared.b64 [ %r704 + 0 ], %rd51;
 	// end inline asm
@@ -4572,10 +4572,10 @@ $L__tmp110:
 	shfl.sync.bfly.b32 	%r1691, %r1688, 1, 31, -1;
 	mov.b64 	%rd336, {%r1690, %r1691};
 $L__tmp111:
-	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ] ]
+	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ] ]
 	xor.b64 	%rd53, %rd52, %rd336;
 $L__tmp112:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	// begin inline asm
 	@%p14 st.shared.b64 [ %r705 + 0 ], %rd53;
 	// end inline asm
@@ -4585,17 +4585,17 @@ $L__tmp112:
 	ld.shared.b64 	%rd339, [%r1518+32];
 	ld.shared.b64 	%rd340, [%r1518+48];
 $L__tmp113:
-	.loc	2 381 14                        // standard.py:381:14 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 381 14                        // standard.py:381:14 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	xor.b64 	%rd341, %rd337, %rd42;
 	xor.b64 	%rd342, %rd338, %rd43;
 	xor.b64 	%rd343, %rd339, %rd44;
 	xor.b64 	%rd344, %rd340, %rd45;
-	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	setp.gt.s64 	%p1223, %rd43, %rd342;
 	setp.gt.s64 	%p1224, %rd45, %rd344;
-	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	xor.b32 	%r1692, %r1186, 1;
-	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b32 	%r1693, 1, 0, %p1223;
 	selp.b32 	%r1694, 1, 0, %p1224;
 	and.b32 	%r1695, %r731, 1;
@@ -4606,13 +4606,13 @@ $L__tmp113:
 	setp.le.s64 	%p1229, %rd44, %rd343;
 	xor.pred 	%p1230, %p1229, %p1225;
 	setp.eq.b32 	%p1231, %r1692, %r1694;
-	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b64 	%rd345, %rd42, %rd341, %p1227;
 	selp.b64 	%rd346, %rd43, %rd342, %p1228;
 	selp.b64 	%rd347, %rd44, %rd343, %p1230;
 	selp.b64 	%rd348, %rd45, %rd344, %p1231;
 $L__tmp114:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	mov.b64 	{_, %r1696}, %rd345;
 	cvt.u32.u64 	%r1697, %rd345;
 	shfl.sync.bfly.b32 	%r1698, %r1697, 16, 31, -1;
@@ -4634,12 +4634,12 @@ $L__tmp114:
 	shfl.sync.bfly.b32 	%r1711, %r1708, 16, 31, -1;
 	mov.b64 	%rd352, {%r1710, %r1711};
 $L__tmp115:
-	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	setp.gt.s64 	%p1232, %rd346, %rd350;
 	setp.gt.s64 	%p1233, %rd348, %rd352;
-	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	xor.b32 	%r1712, %r1185, 1;
-	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b32 	%r1713, 1, 0, %p1232;
 	selp.b32 	%r1714, 1, 0, %p1233;
 	and.b32 	%r1715, %r1184, 1;
@@ -4650,13 +4650,13 @@ $L__tmp115:
 	setp.le.s64 	%p1238, %rd347, %rd351;
 	xor.pred 	%p1239, %p1238, %p1234;
 	setp.eq.b32 	%p1240, %r1712, %r1714;
-	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b64 	%rd353, %rd345, %rd349, %p1236;
 	selp.b64 	%rd354, %rd346, %rd350, %p1237;
 	selp.b64 	%rd355, %rd347, %rd351, %p1239;
 	selp.b64 	%rd356, %rd348, %rd352, %p1240;
 $L__tmp116:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	mov.b64 	{_, %r1716}, %rd353;
 	cvt.u32.u64 	%r1717, %rd353;
 	shfl.sync.bfly.b32 	%r1718, %r1717, 8, 31, -1;
@@ -4678,12 +4678,12 @@ $L__tmp116:
 	shfl.sync.bfly.b32 	%r1731, %r1728, 8, 31, -1;
 	mov.b64 	%rd360, {%r1730, %r1731};
 $L__tmp117:
-	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	setp.gt.s64 	%p1241, %rd354, %rd358;
 	setp.gt.s64 	%p1242, %rd356, %rd360;
-	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	xor.b32 	%r1732, %r1183, 1;
-	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b32 	%r1733, 1, 0, %p1241;
 	selp.b32 	%r1734, 1, 0, %p1242;
 	and.b32 	%r1735, %r1182, 1;
@@ -4694,13 +4694,13 @@ $L__tmp117:
 	setp.le.s64 	%p1247, %rd355, %rd359;
 	xor.pred 	%p1248, %p1247, %p1243;
 	setp.eq.b32 	%p1249, %r1732, %r1734;
-	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b64 	%rd361, %rd353, %rd357, %p1245;
 	selp.b64 	%rd362, %rd354, %rd358, %p1246;
 	selp.b64 	%rd363, %rd355, %rd359, %p1248;
 	selp.b64 	%rd364, %rd356, %rd360, %p1249;
 $L__tmp118:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	mov.b64 	{_, %r1736}, %rd361;
 	cvt.u32.u64 	%r1737, %rd361;
 	shfl.sync.bfly.b32 	%r1738, %r1737, 4, 31, -1;
@@ -4722,12 +4722,12 @@ $L__tmp118:
 	shfl.sync.bfly.b32 	%r1751, %r1748, 4, 31, -1;
 	mov.b64 	%rd368, {%r1750, %r1751};
 $L__tmp119:
-	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	setp.gt.s64 	%p1250, %rd362, %rd366;
 	setp.gt.s64 	%p1251, %rd364, %rd368;
-	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	xor.b32 	%r1752, %r1181, 1;
-	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b32 	%r1753, 1, 0, %p1250;
 	selp.b32 	%r1754, 1, 0, %p1251;
 	and.b32 	%r1755, %r1180, 1;
@@ -4738,13 +4738,13 @@ $L__tmp119:
 	setp.le.s64 	%p1256, %rd363, %rd367;
 	xor.pred 	%p1257, %p1256, %p1252;
 	setp.eq.b32 	%p1258, %r1752, %r1754;
-	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b64 	%rd369, %rd361, %rd365, %p1254;
 	selp.b64 	%rd370, %rd362, %rd366, %p1255;
 	selp.b64 	%rd371, %rd363, %rd367, %p1257;
 	selp.b64 	%rd372, %rd364, %rd368, %p1258;
 $L__tmp120:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	mov.b64 	{_, %r1756}, %rd369;
 	cvt.u32.u64 	%r1757, %rd369;
 	shfl.sync.bfly.b32 	%r1758, %r1757, 2, 31, -1;
@@ -4766,12 +4766,12 @@ $L__tmp120:
 	shfl.sync.bfly.b32 	%r1771, %r1768, 2, 31, -1;
 	mov.b64 	%rd376, {%r1770, %r1771};
 $L__tmp121:
-	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	setp.gt.s64 	%p1259, %rd370, %rd374;
 	setp.gt.s64 	%p1260, %rd372, %rd376;
-	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	xor.b32 	%r1772, %r1190, 1;
-	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b32 	%r1773, 1, 0, %p1259;
 	selp.b32 	%r1774, 1, 0, %p1260;
 	and.b32 	%r1775, %r1189, 1;
@@ -4782,13 +4782,13 @@ $L__tmp121:
 	setp.le.s64 	%p1265, %rd371, %rd375;
 	xor.pred 	%p1266, %p1265, %p1261;
 	setp.eq.b32 	%p1267, %r1772, %r1774;
-	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b64 	%rd377, %rd369, %rd373, %p1263;
 	selp.b64 	%rd378, %rd370, %rd374, %p1264;
 	selp.b64 	%rd379, %rd371, %rd375, %p1266;
 	selp.b64 	%rd380, %rd372, %rd376, %p1267;
 $L__tmp122:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	mov.b64 	{_, %r1776}, %rd377;
 	cvt.u32.u64 	%r1777, %rd377;
 	shfl.sync.bfly.b32 	%r1778, %r1777, 1, 31, -1;
@@ -4810,12 +4810,12 @@ $L__tmp122:
 	shfl.sync.bfly.b32 	%r1791, %r1788, 1, 31, -1;
 	mov.b64 	%rd384, {%r1790, %r1791};
 $L__tmp123:
-	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	setp.gt.s64 	%p1268, %rd378, %rd382;
 	setp.gt.s64 	%p1269, %rd380, %rd384;
-	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 40                        // standard.py:388:40 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	xor.b32 	%r1792, %r1191, 1;
-	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b32 	%r1793, 1, 0, %p1268;
 	selp.b32 	%r1794, 1, 0, %p1269;
 	setp.ne.b32 	%p1270, %r1191, 0;
@@ -4825,7 +4825,7 @@ $L__tmp123:
 	setp.le.s64 	%p1274, %rd379, %rd383;
 	xor.pred 	%p1275, %p1274, %p1270;
 	setp.eq.b32 	%p1276, %r1792, %r1794;
-	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b64 	%rd385, %rd377, %rd381, %p1272;
 	selp.b64 	%rd386, %rd378, %rd382, %p1273;
 	selp.b64 	%rd387, %rd379, %rd383, %p1275;
@@ -4835,7 +4835,7 @@ $L__tmp123:
 	max.s64 	%rd56, %rd387, %rd388;
 	min.s64 	%rd57, %rd388, %rd387;
 $L__tmp124:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	bar.sync 	0;
 	// begin inline asm
 	@%p4 st.shared.b64 [ %r706 + 0 ], %rd54;
@@ -4859,10 +4859,10 @@ $L__tmp124:
 	shfl.sync.bfly.b32 	%r1798, %r1795, 1, 31, -1;
 	mov.b64 	%rd389, {%r1797, %r1798};
 $L__tmp125:
-	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ] ]
+	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ] ]
 	xor.b64 	%rd59, %rd58, %rd389;
 $L__tmp126:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	// begin inline asm
 	@%p14 st.shared.b64 [ %r702 + 0 ], %rd59;
 	// end inline asm
@@ -4875,10 +4875,10 @@ $L__tmp126:
 	shfl.sync.bfly.b32 	%r1802, %r1799, 1, 31, -1;
 	mov.b64 	%rd390, {%r1801, %r1802};
 $L__tmp127:
-	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ] ]
+	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ] ]
 	xor.b64 	%rd61, %rd60, %rd390;
 $L__tmp128:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	// begin inline asm
 	@%p14 st.shared.b64 [ %r703 + 0 ], %rd61;
 	// end inline asm
@@ -4891,10 +4891,10 @@ $L__tmp128:
 	shfl.sync.bfly.b32 	%r1806, %r1803, 1, 31, -1;
 	mov.b64 	%rd391, {%r1805, %r1806};
 $L__tmp129:
-	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ] ]
+	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ] ]
 	xor.b64 	%rd63, %rd62, %rd391;
 $L__tmp130:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	// begin inline asm
 	@%p14 st.shared.b64 [ %r704 + 0 ], %rd63;
 	// end inline asm
@@ -4907,10 +4907,10 @@ $L__tmp130:
 	shfl.sync.bfly.b32 	%r1810, %r1807, 1, 31, -1;
 	mov.b64 	%rd392, {%r1809, %r1810};
 $L__tmp131:
-	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ] ]
+	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ] ]
 	xor.b64 	%rd65, %rd64, %rd392;
 $L__tmp132:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	// begin inline asm
 	@%p14 st.shared.b64 [ %r705 + 0 ], %rd65;
 	// end inline asm
@@ -4920,15 +4920,15 @@ $L__tmp132:
 	ld.shared.b64 	%rd395, [%r1654+32];
 	ld.shared.b64 	%rd396, [%r1654+48];
 $L__tmp133:
-	.loc	2 381 14                        // standard.py:381:14 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 381 14                        // standard.py:381:14 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	xor.b64 	%rd397, %rd393, %rd54;
 	xor.b64 	%rd398, %rd394, %rd55;
 	xor.b64 	%rd399, %rd395, %rd56;
 	xor.b64 	%rd400, %rd396, %rd57;
-	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	setp.gt.s64 	%p1277, %rd56, %rd399;
 	setp.gt.s64 	%p1278, %rd57, %rd400;
-	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b32 	%r1811, 1, 0, %p1277;
 	selp.b32 	%r1812, 1, 0, %p1278;
 	setp.le.s64 	%p1279, %rd54, %rd397;
@@ -4937,13 +4937,13 @@ $L__tmp133:
 	xor.pred 	%p1282, %p1281, %p1216;
 	setp.eq.b32 	%p1283, %r1672, %r1811;
 	setp.eq.b32 	%p1284, %r1672, %r1812;
-	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b64 	%rd66, %rd54, %rd397, %p1280;
 	selp.b64 	%rd67, %rd55, %rd398, %p1282;
 	selp.b64 	%rd68, %rd56, %rd399, %p1283;
 	selp.b64 	%rd69, %rd57, %rd400, %p1284;
 $L__tmp134:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	bar.sync 	0;
 	// begin inline asm
 	@%p4 st.shared.b64 [ %r698 + 0 ], %rd66;
@@ -4967,10 +4967,10 @@ $L__tmp134:
 	shfl.sync.bfly.b32 	%r1816, %r1813, 1, 31, -1;
 	mov.b64 	%rd401, {%r1815, %r1816};
 $L__tmp135:
-	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ] ]
+	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ] ]
 	xor.b64 	%rd71, %rd70, %rd401;
 $L__tmp136:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	// begin inline asm
 	@%p14 st.shared.b64 [ %r702 + 0 ], %rd71;
 	// end inline asm
@@ -4983,10 +4983,10 @@ $L__tmp136:
 	shfl.sync.bfly.b32 	%r1820, %r1817, 1, 31, -1;
 	mov.b64 	%rd402, {%r1819, %r1820};
 $L__tmp137:
-	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ] ]
+	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ] ]
 	xor.b64 	%rd73, %rd72, %rd402;
 $L__tmp138:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	// begin inline asm
 	@%p14 st.shared.b64 [ %r703 + 0 ], %rd73;
 	// end inline asm
@@ -4999,10 +4999,10 @@ $L__tmp138:
 	shfl.sync.bfly.b32 	%r1824, %r1821, 1, 31, -1;
 	mov.b64 	%rd403, {%r1823, %r1824};
 $L__tmp139:
-	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ] ]
+	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ] ]
 	xor.b64 	%rd75, %rd74, %rd403;
 $L__tmp140:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	// begin inline asm
 	@%p14 st.shared.b64 [ %r704 + 0 ], %rd75;
 	// end inline asm
@@ -5015,10 +5015,10 @@ $L__tmp140:
 	shfl.sync.bfly.b32 	%r1828, %r1825, 1, 31, -1;
 	mov.b64 	%rd404, {%r1827, %r1828};
 $L__tmp141:
-	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ] ]
+	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ] ]
 	xor.b64 	%rd77, %rd76, %rd404;
 $L__tmp142:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	// begin inline asm
 	@%p14 st.shared.b64 [ %r705 + 0 ], %rd77;
 	// end inline asm
@@ -5028,15 +5028,15 @@ $L__tmp142:
 	ld.shared.b64 	%rd407, [%r1518+32];
 	ld.shared.b64 	%rd408, [%r1518+48];
 $L__tmp143:
-	.loc	2 381 14                        // standard.py:381:14 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 381 14                        // standard.py:381:14 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	xor.b64 	%rd409, %rd405, %rd66;
 	xor.b64 	%rd410, %rd406, %rd67;
 	xor.b64 	%rd411, %rd407, %rd68;
 	xor.b64 	%rd412, %rd408, %rd69;
-	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	setp.gt.s64 	%p1285, %rd68, %rd411;
 	setp.gt.s64 	%p1286, %rd69, %rd412;
-	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b32 	%r1829, 1, 0, %p1285;
 	selp.b32 	%r1830, 1, 0, %p1286;
 	setp.le.s64 	%p1287, %rd66, %rd409;
@@ -5045,13 +5045,13 @@ $L__tmp143:
 	xor.pred 	%p1290, %p1289, %p1225;
 	setp.eq.b32 	%p1291, %r1692, %r1829;
 	setp.eq.b32 	%p1292, %r1692, %r1830;
-	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b64 	%rd413, %rd66, %rd409, %p1288;
 	selp.b64 	%rd414, %rd67, %rd410, %p1290;
 	selp.b64 	%rd415, %rd68, %rd411, %p1291;
 	selp.b64 	%rd416, %rd69, %rd412, %p1292;
 $L__tmp144:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	mov.b64 	{_, %r1831}, %rd413;
 	cvt.u32.u64 	%r1832, %rd413;
 	shfl.sync.bfly.b32 	%r1833, %r1832, 16, 31, -1;
@@ -5073,10 +5073,10 @@ $L__tmp144:
 	shfl.sync.bfly.b32 	%r1846, %r1843, 16, 31, -1;
 	mov.b64 	%rd420, {%r1845, %r1846};
 $L__tmp145:
-	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	setp.gt.s64 	%p1293, %rd415, %rd419;
 	setp.gt.s64 	%p1294, %rd416, %rd420;
-	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b32 	%r1847, 1, 0, %p1293;
 	selp.b32 	%r1848, 1, 0, %p1294;
 	setp.le.s64 	%p1295, %rd413, %rd417;
@@ -5085,13 +5085,13 @@ $L__tmp145:
 	xor.pred 	%p1298, %p1297, %p1234;
 	setp.eq.b32 	%p1299, %r1712, %r1847;
 	setp.eq.b32 	%p1300, %r1712, %r1848;
-	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b64 	%rd421, %rd413, %rd417, %p1296;
 	selp.b64 	%rd422, %rd414, %rd418, %p1298;
 	selp.b64 	%rd423, %rd415, %rd419, %p1299;
 	selp.b64 	%rd424, %rd416, %rd420, %p1300;
 $L__tmp146:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	mov.b64 	{_, %r1849}, %rd421;
 	cvt.u32.u64 	%r1850, %rd421;
 	shfl.sync.bfly.b32 	%r1851, %r1850, 8, 31, -1;
@@ -5113,10 +5113,10 @@ $L__tmp146:
 	shfl.sync.bfly.b32 	%r1864, %r1861, 8, 31, -1;
 	mov.b64 	%rd428, {%r1863, %r1864};
 $L__tmp147:
-	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	setp.gt.s64 	%p1301, %rd423, %rd427;
 	setp.gt.s64 	%p1302, %rd424, %rd428;
-	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b32 	%r1865, 1, 0, %p1301;
 	selp.b32 	%r1866, 1, 0, %p1302;
 	setp.le.s64 	%p1303, %rd421, %rd425;
@@ -5125,13 +5125,13 @@ $L__tmp147:
 	xor.pred 	%p1306, %p1305, %p1243;
 	setp.eq.b32 	%p1307, %r1732, %r1865;
 	setp.eq.b32 	%p1308, %r1732, %r1866;
-	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b64 	%rd429, %rd421, %rd425, %p1304;
 	selp.b64 	%rd430, %rd422, %rd426, %p1306;
 	selp.b64 	%rd431, %rd423, %rd427, %p1307;
 	selp.b64 	%rd432, %rd424, %rd428, %p1308;
 $L__tmp148:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	mov.b64 	{_, %r1867}, %rd429;
 	cvt.u32.u64 	%r1868, %rd429;
 	shfl.sync.bfly.b32 	%r1869, %r1868, 4, 31, -1;
@@ -5153,10 +5153,10 @@ $L__tmp148:
 	shfl.sync.bfly.b32 	%r1882, %r1879, 4, 31, -1;
 	mov.b64 	%rd436, {%r1881, %r1882};
 $L__tmp149:
-	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	setp.gt.s64 	%p1309, %rd431, %rd435;
 	setp.gt.s64 	%p1310, %rd432, %rd436;
-	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b32 	%r1883, 1, 0, %p1309;
 	selp.b32 	%r1884, 1, 0, %p1310;
 	setp.le.s64 	%p1311, %rd429, %rd433;
@@ -5165,13 +5165,13 @@ $L__tmp149:
 	xor.pred 	%p1314, %p1313, %p1252;
 	setp.eq.b32 	%p1315, %r1752, %r1883;
 	setp.eq.b32 	%p1316, %r1752, %r1884;
-	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b64 	%rd437, %rd429, %rd433, %p1312;
 	selp.b64 	%rd438, %rd430, %rd434, %p1314;
 	selp.b64 	%rd439, %rd431, %rd435, %p1315;
 	selp.b64 	%rd440, %rd432, %rd436, %p1316;
 $L__tmp150:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	mov.b64 	{_, %r1885}, %rd437;
 	cvt.u32.u64 	%r1886, %rd437;
 	shfl.sync.bfly.b32 	%r1887, %r1886, 2, 31, -1;
@@ -5193,10 +5193,10 @@ $L__tmp150:
 	shfl.sync.bfly.b32 	%r1900, %r1897, 2, 31, -1;
 	mov.b64 	%rd444, {%r1899, %r1900};
 $L__tmp151:
-	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	setp.gt.s64 	%p1317, %rd439, %rd443;
 	setp.gt.s64 	%p1318, %rd440, %rd444;
-	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b32 	%r1901, 1, 0, %p1317;
 	selp.b32 	%r1902, 1, 0, %p1318;
 	setp.le.s64 	%p1319, %rd437, %rd441;
@@ -5205,13 +5205,13 @@ $L__tmp151:
 	xor.pred 	%p1322, %p1321, %p1261;
 	setp.eq.b32 	%p1323, %r1772, %r1901;
 	setp.eq.b32 	%p1324, %r1772, %r1902;
-	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b64 	%rd445, %rd437, %rd441, %p1320;
 	selp.b64 	%rd446, %rd438, %rd442, %p1322;
 	selp.b64 	%rd447, %rd439, %rd443, %p1323;
 	selp.b64 	%rd448, %rd440, %rd444, %p1324;
 $L__tmp152:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	mov.b64 	{_, %r1903}, %rd445;
 	cvt.u32.u64 	%r1904, %rd445;
 	shfl.sync.bfly.b32 	%r1905, %r1904, 1, 31, -1;
@@ -5233,10 +5233,10 @@ $L__tmp152:
 	shfl.sync.bfly.b32 	%r1918, %r1915, 1, 31, -1;
 	mov.b64 	%rd452, {%r1917, %r1918};
 $L__tmp153:
-	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 26                        // standard.py:388:26 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	setp.gt.s64 	%p1325, %rd447, %rd451;
 	setp.gt.s64 	%p1326, %rd448, %rd452;
-	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b32 	%r1919, 1, 0, %p1325;
 	selp.b32 	%r1920, 1, 0, %p1326;
 	setp.le.s64 	%p1327, %rd445, %rd449;
@@ -5245,7 +5245,7 @@ $L__tmp153:
 	xor.pred 	%p1330, %p1329, %p1270;
 	setp.eq.b32 	%p1331, %r1792, %r1919;
 	setp.eq.b32 	%p1332, %r1792, %r1920;
-	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b64 	%rd453, %rd445, %rd449, %p1328;
 	selp.b64 	%rd454, %rd446, %rd450, %p1330;
 	selp.b64 	%rd455, %rd447, %rd451, %p1331;
@@ -5259,7 +5259,7 @@ $L__tmp153:
 	min.s64 	%rd80, %rd459, %rd460;
 	max.s64 	%rd81, %rd460, %rd459;
 $L__tmp154:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	bar.sync 	0;
 	// begin inline asm
 	@%p4 st.shared.b64 [ %r706 + 0 ], %rd78;
@@ -5283,10 +5283,10 @@ $L__tmp154:
 	shfl.sync.bfly.b32 	%r1924, %r1921, 1, 31, -1;
 	mov.b64 	%rd461, {%r1923, %r1924};
 $L__tmp155:
-	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ] ]
+	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ] ]
 	xor.b64 	%rd83, %rd82, %rd461;
 $L__tmp156:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	// begin inline asm
 	@%p14 st.shared.b64 [ %r702 + 0 ], %rd83;
 	// end inline asm
@@ -5299,10 +5299,10 @@ $L__tmp156:
 	shfl.sync.bfly.b32 	%r1928, %r1925, 1, 31, -1;
 	mov.b64 	%rd462, {%r1927, %r1928};
 $L__tmp157:
-	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ] ]
+	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ] ]
 	xor.b64 	%rd85, %rd84, %rd462;
 $L__tmp158:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	// begin inline asm
 	@%p14 st.shared.b64 [ %r703 + 0 ], %rd85;
 	// end inline asm
@@ -5315,10 +5315,10 @@ $L__tmp158:
 	shfl.sync.bfly.b32 	%r1932, %r1929, 1, 31, -1;
 	mov.b64 	%rd463, {%r1931, %r1932};
 $L__tmp159:
-	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ] ]
+	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ] ]
 	xor.b64 	%rd87, %rd86, %rd463;
 $L__tmp160:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	// begin inline asm
 	@%p14 st.shared.b64 [ %r704 + 0 ], %rd87;
 	// end inline asm
@@ -5331,10 +5331,10 @@ $L__tmp160:
 	shfl.sync.bfly.b32 	%r1936, %r1933, 1, 31, -1;
 	mov.b64 	%rd464, {%r1935, %r1936};
 $L__tmp161:
-	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ] ]
+	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ] ]
 	xor.b64 	%rd89, %rd88, %rd464;
 $L__tmp162:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	// begin inline asm
 	@%p14 st.shared.b64 [ %r705 + 0 ], %rd89;
 	// end inline asm
@@ -5344,12 +5344,12 @@ $L__tmp162:
 	ld.shared.b64 	%rd467, [%r1654+32];
 	ld.shared.b64 	%rd468, [%r1654+48];
 $L__tmp163:
-	.loc	2 381 14                        // standard.py:381:14 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 381 14                        // standard.py:381:14 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	xor.b64 	%rd469, %rd465, %rd78;
 	xor.b64 	%rd470, %rd466, %rd79;
 	xor.b64 	%rd471, %rd467, %rd80;
 	xor.b64 	%rd472, %rd468, %rd81;
-	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	setp.le.s64 	%p1333, %rd78, %rd469;
 	xor.pred 	%p1334, %p1333, %p1216;
 	setp.le.s64 	%p1335, %rd79, %rd470;
@@ -5358,13 +5358,13 @@ $L__tmp163:
 	xor.pred 	%p1338, %p1337, %p1216;
 	setp.le.s64 	%p1339, %rd81, %rd472;
 	xor.pred 	%p1340, %p1339, %p1216;
-	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b64 	%rd90, %rd78, %rd469, %p1334;
 	selp.b64 	%rd91, %rd79, %rd470, %p1336;
 	selp.b64 	%rd92, %rd80, %rd471, %p1338;
 	selp.b64 	%rd93, %rd81, %rd472, %p1340;
 $L__tmp164:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	bar.sync 	0;
 	// begin inline asm
 	@%p4 st.shared.b64 [ %r698 + 0 ], %rd90;
@@ -5388,10 +5388,10 @@ $L__tmp164:
 	shfl.sync.bfly.b32 	%r1940, %r1937, 1, 31, -1;
 	mov.b64 	%rd473, {%r1939, %r1940};
 $L__tmp165:
-	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ] ]
+	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ] ]
 	xor.b64 	%rd95, %rd94, %rd473;
 $L__tmp166:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	// begin inline asm
 	@%p14 st.shared.b64 [ %r702 + 0 ], %rd95;
 	// end inline asm
@@ -5404,10 +5404,10 @@ $L__tmp166:
 	shfl.sync.bfly.b32 	%r1944, %r1941, 1, 31, -1;
 	mov.b64 	%rd474, {%r1943, %r1944};
 $L__tmp167:
-	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ] ]
+	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ] ]
 	xor.b64 	%rd97, %rd96, %rd474;
 $L__tmp168:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	// begin inline asm
 	@%p14 st.shared.b64 [ %r703 + 0 ], %rd97;
 	// end inline asm
@@ -5420,10 +5420,10 @@ $L__tmp168:
 	shfl.sync.bfly.b32 	%r1948, %r1945, 1, 31, -1;
 	mov.b64 	%rd475, {%r1947, %r1948};
 $L__tmp169:
-	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ] ]
+	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ] ]
 	xor.b64 	%rd99, %rd98, %rd475;
 $L__tmp170:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	// begin inline asm
 	@%p14 st.shared.b64 [ %r704 + 0 ], %rd99;
 	// end inline asm
@@ -5436,10 +5436,10 @@ $L__tmp170:
 	shfl.sync.bfly.b32 	%r1952, %r1949, 1, 31, -1;
 	mov.b64 	%rd476, {%r1951, %r1952};
 $L__tmp171:
-	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ] ]
+	.loc	2 298 15                        // standard.py:298:15 @[ standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ] ]
 	xor.b64 	%rd101, %rd100, %rd476;
 $L__tmp172:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	// begin inline asm
 	@%p14 st.shared.b64 [ %r705 + 0 ], %rd101;
 	// end inline asm
@@ -5449,12 +5449,12 @@ $L__tmp172:
 	ld.shared.b64 	%rd479, [%r1518+32];
 	ld.shared.b64 	%rd480, [%r1518+48];
 $L__tmp173:
-	.loc	2 381 14                        // standard.py:381:14 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 381 14                        // standard.py:381:14 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	xor.b64 	%rd481, %rd477, %rd90;
 	xor.b64 	%rd482, %rd478, %rd91;
 	xor.b64 	%rd483, %rd479, %rd92;
 	xor.b64 	%rd484, %rd480, %rd93;
-	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	setp.le.s64 	%p1341, %rd90, %rd481;
 	xor.pred 	%p1342, %p1341, %p1225;
 	setp.le.s64 	%p1343, %rd91, %rd482;
@@ -5463,13 +5463,13 @@ $L__tmp173:
 	xor.pred 	%p1346, %p1345, %p1225;
 	setp.le.s64 	%p1347, %rd93, %rd484;
 	xor.pred 	%p1348, %p1347, %p1225;
-	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b64 	%rd485, %rd90, %rd481, %p1342;
 	selp.b64 	%rd486, %rd91, %rd482, %p1344;
 	selp.b64 	%rd487, %rd92, %rd483, %p1346;
 	selp.b64 	%rd488, %rd93, %rd484, %p1348;
 $L__tmp174:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	mov.b64 	{_, %r1953}, %rd485;
 	cvt.u32.u64 	%r1954, %rd485;
 	shfl.sync.bfly.b32 	%r1955, %r1954, 16, 31, -1;
@@ -5491,7 +5491,7 @@ $L__tmp174:
 	shfl.sync.bfly.b32 	%r1968, %r1965, 16, 31, -1;
 	mov.b64 	%rd492, {%r1967, %r1968};
 $L__tmp175:
-	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	setp.le.s64 	%p1349, %rd485, %rd489;
 	xor.pred 	%p1350, %p1349, %p1234;
 	setp.le.s64 	%p1351, %rd486, %rd490;
@@ -5500,13 +5500,13 @@ $L__tmp175:
 	xor.pred 	%p1354, %p1353, %p1234;
 	setp.le.s64 	%p1355, %rd488, %rd492;
 	xor.pred 	%p1356, %p1355, %p1234;
-	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b64 	%rd493, %rd485, %rd489, %p1350;
 	selp.b64 	%rd494, %rd486, %rd490, %p1352;
 	selp.b64 	%rd495, %rd487, %rd491, %p1354;
 	selp.b64 	%rd496, %rd488, %rd492, %p1356;
 $L__tmp176:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	mov.b64 	{_, %r1969}, %rd493;
 	cvt.u32.u64 	%r1970, %rd493;
 	shfl.sync.bfly.b32 	%r1971, %r1970, 8, 31, -1;
@@ -5528,7 +5528,7 @@ $L__tmp176:
 	shfl.sync.bfly.b32 	%r1984, %r1981, 8, 31, -1;
 	mov.b64 	%rd500, {%r1983, %r1984};
 $L__tmp177:
-	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	setp.le.s64 	%p1357, %rd493, %rd497;
 	xor.pred 	%p1358, %p1357, %p1243;
 	setp.le.s64 	%p1359, %rd494, %rd498;
@@ -5537,13 +5537,13 @@ $L__tmp177:
 	xor.pred 	%p1362, %p1361, %p1243;
 	setp.le.s64 	%p1363, %rd496, %rd500;
 	xor.pred 	%p1364, %p1363, %p1243;
-	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b64 	%rd501, %rd493, %rd497, %p1358;
 	selp.b64 	%rd502, %rd494, %rd498, %p1360;
 	selp.b64 	%rd503, %rd495, %rd499, %p1362;
 	selp.b64 	%rd504, %rd496, %rd500, %p1364;
 $L__tmp178:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	mov.b64 	{_, %r1985}, %rd501;
 	cvt.u32.u64 	%r1986, %rd501;
 	shfl.sync.bfly.b32 	%r1987, %r1986, 4, 31, -1;
@@ -5565,7 +5565,7 @@ $L__tmp178:
 	shfl.sync.bfly.b32 	%r2000, %r1997, 4, 31, -1;
 	mov.b64 	%rd508, {%r1999, %r2000};
 $L__tmp179:
-	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	setp.le.s64 	%p1365, %rd501, %rd505;
 	xor.pred 	%p1366, %p1365, %p1252;
 	setp.le.s64 	%p1367, %rd502, %rd506;
@@ -5574,13 +5574,13 @@ $L__tmp179:
 	xor.pred 	%p1370, %p1369, %p1252;
 	setp.le.s64 	%p1371, %rd504, %rd508;
 	xor.pred 	%p1372, %p1371, %p1252;
-	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b64 	%rd509, %rd501, %rd505, %p1366;
 	selp.b64 	%rd510, %rd502, %rd506, %p1368;
 	selp.b64 	%rd511, %rd503, %rd507, %p1370;
 	selp.b64 	%rd512, %rd504, %rd508, %p1372;
 $L__tmp180:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	mov.b64 	{_, %r2001}, %rd509;
 	cvt.u32.u64 	%r2002, %rd509;
 	shfl.sync.bfly.b32 	%r2003, %r2002, 2, 31, -1;
@@ -5602,7 +5602,7 @@ $L__tmp180:
 	shfl.sync.bfly.b32 	%r2016, %r2013, 2, 31, -1;
 	mov.b64 	%rd516, {%r2015, %r2016};
 $L__tmp181:
-	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	setp.le.s64 	%p1373, %rd509, %rd513;
 	xor.pred 	%p1374, %p1373, %p1261;
 	setp.le.s64 	%p1375, %rd510, %rd514;
@@ -5611,13 +5611,13 @@ $L__tmp181:
 	xor.pred 	%p1378, %p1377, %p1261;
 	setp.le.s64 	%p1379, %rd512, %rd516;
 	xor.pred 	%p1380, %p1379, %p1261;
-	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b64 	%rd517, %rd509, %rd513, %p1374;
 	selp.b64 	%rd518, %rd510, %rd514, %p1376;
 	selp.b64 	%rd519, %rd511, %rd515, %p1378;
 	selp.b64 	%rd520, %rd512, %rd516, %p1380;
 $L__tmp182:
-	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ] ]
+	.loc	2 309 36                        // standard.py:309:36 @[ standard.py:381:42 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ] ]
 	mov.b64 	{_, %r2017}, %rd517;
 	cvt.u32.u64 	%r2018, %rd517;
 	shfl.sync.bfly.b32 	%r2019, %r2018, 1, 31, -1;
@@ -5639,7 +5639,7 @@ $L__tmp182:
 	shfl.sync.bfly.b32 	%r2032, %r2029, 1, 31, -1;
 	mov.b64 	%rd524, {%r2031, %r2032};
 $L__tmp183:
-	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 33                        // standard.py:388:33 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	setp.le.s64 	%p1381, %rd517, %rd521;
 	xor.pred 	%p1382, %p1381, %p1270;
 	setp.le.s64 	%p1383, %rd518, %rd522;
@@ -5648,18 +5648,18 @@ $L__tmp183:
 	xor.pred 	%p1386, %p1385, %p1270;
 	setp.le.s64 	%p1387, %rd520, %rd524;
 	xor.pred 	%p1388, %p1387, %p1270;
-	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:107:19 ] ] ] ]
+	.loc	2 388 54                        // standard.py:388:54 @[ standard.py:410:39 @[ standard.py:450:43 @[ standard.py:465:21 @[ offload.py:109:19 ] ] ] ]
 	selp.b64 	%rd525, %rd517, %rd521, %p1382;
 	selp.b64 	%rd526, %rd518, %rd522, %p1384;
 	selp.b64 	%rd527, %rd519, %rd523, %p1386;
 	selp.b64 	%rd528, %rd520, %rd524, %p1388;
 $L__tmp184:
-	.loc	1 110 13                        // offload.py:110:13
+	.loc	1 112 13                        // offload.py:112:13
 	setp.lt.s32 	%p15, %r729, %r1179;
 	setp.lt.s32 	%p16, %r1021, %r1179;
 	setp.lt.s32 	%p17, %r1025, %r1179;
 	setp.lt.s32 	%p18, %r1029, %r1179;
-	.loc	1 111 48                        // offload.py:111:48
+	.loc	1 113 48                        // offload.py:113:48
 	cvt.u32.u64 	%r2033, %rd525;
 	and.b32 	%r723, %r2033, 511;
 	cvt.u32.u64 	%r2034, %rd526;
@@ -5668,12 +5668,12 @@ $L__tmp184:
 	and.b32 	%r725, %r2035, 511;
 	cvt.u32.u64 	%r2036, %rd528;
 	and.b32 	%r726, %r2036, 511;
-	.loc	1 114 29                        // offload.py:114:29
+	.loc	1 116 29                        // offload.py:116:29
 	add.s64 	%rd102, %rd130, %rd133;
 	add.s64 	%rd103, %rd102, 512;
 	add.s64 	%rd104, %rd102, 1024;
 	add.s64 	%rd105, %rd102, 1536;
-	.loc	1 114 16                        // offload.py:114:16
+	.loc	1 116 16                        // offload.py:116:16
 	// begin inline asm
 	mov.u32 %r710, 0x0;
 	@%p15 ld.global.b32 { %r710 }, [ %rd102 + 0 ];
@@ -5690,12 +5690,12 @@ $L__tmp184:
 	mov.u32 %r713, 0x0;
 	@%p18 ld.global.b32 { %r713 }, [ %rd105 + 0 ];
 	// end inline asm
-	.loc	1 114 52                        // offload.py:114:52
+	.loc	1 116 52                        // offload.py:116:52
 	add.s32 	%r719, %r710, %r735;
 	add.s32 	%r720, %r711, %r735;
 	add.s32 	%r721, %r712, %r735;
 	add.s32 	%r722, %r713, %r735;
-	.loc	1 115 35                        // offload.py:115:35
+	.loc	1 117 35                        // offload.py:117:35
 	and.b64 	%rd529, %rd525, 511;
 	shl.b64 	%rd530, %rd529, 2;
 	add.s64 	%rd106, %rd128, %rd530;
@@ -5708,7 +5708,7 @@ $L__tmp184:
 	and.b64 	%rd535, %rd528, 511;
 	shl.b64 	%rd536, %rd535, 2;
 	add.s64 	%rd109, %rd128, %rd536;
-	.loc	1 115 18                        // offload.py:115:18
+	.loc	1 117 18                        // offload.py:117:18
 	// begin inline asm
 	mov.u32 %r714, 0xffffffffffffffff;
 	@%p15 ld.global.b32 { %r714 }, [ %rd106 + 0 ];
@@ -5725,24 +5725,24 @@ $L__tmp184:
 	mov.u32 %r717, 0xffffffffffffffff;
 	@%p18 ld.global.b32 { %r717 }, [ %rd109 + 0 ];
 	// end inline asm
-	.loc	1 116 4                         // offload.py:116:4
+	.loc	1 118 4                         // offload.py:118:4
 	bar.sync 	0;
-	.loc	1 117 58                        // offload.py:117:58
+	.loc	1 119 58                        // offload.py:119:58
 	setp.gt.s32 	%p1389, %r714, -1;
 	setp.gt.s32 	%p1390, %r715, -1;
 	setp.gt.s32 	%p1391, %r716, -1;
 	setp.gt.s32 	%p1392, %r717, -1;
-	.loc	1 117 51                        // offload.py:117:51
+	.loc	1 119 51                        // offload.py:119:51
 	and.pred 	%p19, %p15, %p1389;
 	and.pred 	%p20, %p16, %p1390;
 	and.pred 	%p21, %p17, %p1391;
 	and.pred 	%p22, %p18, %p1392;
-	.loc	1 117 31                        // offload.py:117:31
+	.loc	1 119 31                        // offload.py:119:31
 	mad.wide.s32 	%rd110, %r714, 4, %rd127;
 	mad.wide.s32 	%rd111, %r715, 4, %rd127;
 	mad.wide.s32 	%rd112, %r716, 4, %rd127;
 	mad.wide.s32 	%rd113, %r717, 4, %rd127;
-	.loc	1 117 36                        // offload.py:117:36
+	.loc	1 119 36                        // offload.py:119:36
 	// begin inline asm
 	@%p19 st.global.b32 [ %rd110 + 0 ], { %r718 };
 	// end inline asm
@@ -5755,7 +5755,7 @@ $L__tmp184:
 	// begin inline asm
 	@%p22 st.global.b32 [ %rd113 + 0 ], { %r718 };
 	// end inline asm
-	.loc	1 118 38                        // offload.py:118:38
+	.loc	1 120 38                        // offload.py:120:38
 	// begin inline asm
 	@%p15 st.global.b32 [ %rd106 + 0 ], { %r719 };
 	// end inline asm
@@ -5768,12 +5768,12 @@ $L__tmp184:
 	// begin inline asm
 	@%p18 st.global.b32 [ %rd109 + 0 ], { %r722 };
 	// end inline asm
-	.loc	1 119 31                        // offload.py:119:31
+	.loc	1 121 31                        // offload.py:121:31
 	mad.wide.s32 	%rd114, %r719, 4, %rd127;
 	mad.wide.s32 	%rd115, %r720, 4, %rd127;
 	mad.wide.s32 	%rd116, %r721, 4, %rd127;
 	mad.wide.s32 	%rd117, %r722, 4, %rd127;
-	.loc	1 119 34                        // offload.py:119:34
+	.loc	1 121 34                        // offload.py:121:34
 	// begin inline asm
 	@%p15 st.global.b32 [ %rd114 + 0 ], { %r723 };
 	// end inline asm
@@ -5786,7 +5786,7 @@ $L__tmp184:
 	// begin inline asm
 	@%p18 st.global.b32 [ %rd117 + 0 ], { %r726 };
 	// end inline asm
-	.loc	1 120 25                        // offload.py:120:25
+	.loc	1 122 25                        // offload.py:122:25
 	shl.b64 	%rd537, %rd529, 3;
 	add.s64 	%rd118, %rd129, %rd537;
 	shl.b64 	%rd538, %rd531, 3;
@@ -5795,7 +5795,7 @@ $L__tmp184:
 	add.s64 	%rd120, %rd129, %rd539;
 	shl.b64 	%rd540, %rd535, 3;
 	add.s64 	%rd121, %rd129, %rd540;
-	.loc	1 120 33                        // offload.py:120:33
+	.loc	1 122 33                        // offload.py:122:33
 	// begin inline asm
 	@%p15 st.global.b64 [ %rd118 + 0 ], { %rd2 };
 	// end inline asm
@@ -5808,12 +5808,12 @@ $L__tmp184:
 	// begin inline asm
 	@%p18 st.global.b64 [ %rd121 + 0 ], { %rd2 };
 	// end inline asm
-	.loc	1 121 25                        // offload.py:121:25
+	.loc	1 123 25                        // offload.py:123:25
 	add.s64 	%rd122, %rd131, %rd133;
 	add.s64 	%rd123, %rd122, 512;
 	add.s64 	%rd124, %rd122, 1024;
 	add.s64 	%rd125, %rd122, 1536;
-	.loc	1 121 28                        // offload.py:121:28
+	.loc	1 123 28                        // offload.py:123:28
 	// begin inline asm
 	@%p15 st.global.b32 [ %rd122 + 0 ], { %r723 };
 	// end inline asm
@@ -5826,25 +5826,25 @@ $L__tmp184:
 	// begin inline asm
 	@%p18 st.global.b32 [ %rd125 + 0 ], { %r726 };
 	// end inline asm
-	.loc	1 122 4                         // offload.py:122:4
+	.loc	1 124 4                         // offload.py:124:4
 	bar.sync 	0;
-	.loc	1 126 18                        // offload.py:126:18
+	.loc	1 128 18                        // offload.py:128:18
 	// begin inline asm
 	mov.u32 %r727, 0xffffffffffffffff;
 	@%p2 ld.global.b32 { %r727 }, [ %rd5 + 0 ];
 	// end inline asm
-	.loc	1 127 30                        // offload.py:127:30
+	.loc	1 129 30                        // offload.py:129:30
 	// begin inline asm
 	@%p2 st.global.b32 [ %rd4 + 0 ], { %r727 };
 	// end inline asm
-	.loc	1 127 4                         // offload.py:127:4
+	.loc	1 129 4                         // offload.py:129:4
 	ret;
 $L__tmp185:
 $L__func_end0:
                                         // -- End function
 }
 	.file	1 "/home/work/Code/ext/ferrum-torrens/python/ferrum_kernel/offload.py"
-	.file	2 "/nix/store/spzdz8izj7dqi61xkgnn85cald7hl1xj-python3-3.14.7-env/lib/python3.14/site-packages/triton/language/standard.py"
+	.file	2 "/nix/store/zzzpp0izfi823v22xc1rlivfigswm5xg-python3-3.14.7-env/lib/python3.14/site-packages/triton/language/standard.py"
 	.section	.debug_abbrev
 	{
 .b8 1                                   // Abbreviation Code
@@ -6054,7 +6054,7 @@ $L__func_end0:
 .b64 $L__tmp1                           // DW_AT_low_pc
 .b64 $L__tmp18                          // DW_AT_high_pc
 .b8 1                                   // DW_AT_call_file
-.b8 82                                  // DW_AT_call_line
+.b8 84                                  // DW_AT_call_line
 .b8 25                                  // DW_AT_call_column
 .b8 5                                   // Abbrev [5] 0xa2:0x19 DW_TAG_inlined_subroutine
 .b32 92                                 // DW_AT_abstract_origin
@@ -6070,7 +6070,7 @@ $L__func_end0:
 .b64 $L__tmp19                          // DW_AT_low_pc
 .b64 $L__tmp36                          // DW_AT_high_pc
 .b8 1                                   // DW_AT_call_file
-.b8 85                                  // DW_AT_call_line
+.b8 87                                  // DW_AT_call_line
 .b8 18                                  // DW_AT_call_column
 .b8 5                                   // Abbrev [5] 0xd4:0x19 DW_TAG_inlined_subroutine
 .b32 92                                 // DW_AT_abstract_origin
@@ -6086,7 +6086,7 @@ $L__func_end0:
 .b64 $L__tmp37                          // DW_AT_low_pc
 .b64 $L__tmp42                          // DW_AT_high_pc
 .b8 1                                   // DW_AT_call_file
-.b8 86                                  // DW_AT_call_line
+.b8 88                                  // DW_AT_call_line
 .b8 25                                  // DW_AT_call_column
 .b8 5                                   // Abbrev [5] 0x106:0x19 DW_TAG_inlined_subroutine
 .b32 92                                 // DW_AT_abstract_origin
@@ -6102,7 +6102,7 @@ $L__func_end0:
 .b64 $L__tmp43                          // DW_AT_low_pc
 .b64 $L__tmp184                         // DW_AT_high_pc
 .b8 1                                   // DW_AT_call_file
-.b8 107                                 // DW_AT_call_line
+.b8 109                                 // DW_AT_call_line
 .b8 19                                  // DW_AT_call_column
 .b8 6                                   // Abbrev [6] 0x138:0x9a DW_TAG_inlined_subroutine
 .b32 92                                 // DW_AT_abstract_origin

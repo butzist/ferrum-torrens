@@ -1809,6 +1809,32 @@ settled.
       Reasoning stays out of scope (optional for opencode).
     - **Status.** Recorded as the next feature; not yet implemented.
 
+75. **The staging copy kernel is vectorized** (2026-10-16, implemented) -- the
+    fix for the decode-throughput gap the smoke found (decision 73), item 9.
+    - **Why.** Decode was 81% expert-staging copy at ~0.6 GB/s: the old
+      `_index_copy_multi_kernel` used a flat byte layout where every lane computed
+      its own row (`o // feat`, `o % feat`) off a `uint8` pointer, so Triton could
+      not prove contiguity and emitted per-lane byte gathers. That is ~50x under
+      the reference's own copy (`fast_index_copy.cuh`: 16-byte
+      `ld.global.L1::no_allocate.v4` streaming loads + `.wt` stores, ~31 GB/s).
+      The FTW reader and PCIe were both exonerated first (pinned H2D 13.4 GB/s;
+      reverting `O_DIRECT` changed nothing).
+    - **Shape.** One program per `(bank, row, segment)`: the row index is a
+      **scalar** load per program, so each segment is a contiguous `SEG_I32`
+      (4096 int32 = 16 KiB) run of one source row, which vectorizes. Grid is
+      `(NUM_BANKS, BLOCK_K, SPLITS)` = `(6, 128, 64)` -- `BLOCK_K` rows per launch
+      (the decode plan cap, and the prefill whole-layer copy is split into
+      `BLOCK_K`-row groups), `SPLITS` segments of the 1 MiB `gate_up_packed` row.
+      `NUM_BANKS`/`SEG_I32` are the constexprs; `GROUPS`/`STEPS`/`BLOCK_BYTES` are
+      gone. Loads use `.cg`, stores `.cs` (streaming). The cubins,
+      `kernel/manifest.json`, the ABI assertions and the `--interp` selftest's
+      copy cases (now including a >16 KiB row) were updated together;
+      `scripts/check-kernels.sh` passes.
+    - **Result.** tg **0.9 -> 4.7 tok/s** (5.2x); per-token 1.08 s -> 0.21 s; the
+      copy is now ~0.013 s/token (~6% of decode), i.e. at the copy-removed floor.
+      `cuda_moe_matches_reference` still passes (3.31e-3 rel). Decode is now
+      plan+GEMV bound (~0.20 s/token), the new open gap in item 9.
+
 ---
 
 ## Progress log (narrative, pre-2026-10-15 compaction)

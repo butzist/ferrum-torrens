@@ -1164,12 +1164,12 @@ mod tests {
         assert_eq!(lru.constexpr("BLOCK_K").unwrap(), 128);
         assert_eq!(lru.constexpr("BLOCK_C").unwrap(), 512);
         let copy = abi.kernel(INDEX_COPY).unwrap();
-        assert_eq!(copy.grid, [6, 128, 1]);
+        // One program per (bank, row, segment): `BLOCK_K` rows of the plan, each
+        // tiled into `COPY_SEG_I32`-word segments.
+        assert_eq!(copy.grid, [6, 128, 64]);
         assert_eq!(copy.block_threads(), 128);
         assert_eq!(copy.constexpr("NUM_BANKS").unwrap(), 6);
-        assert_eq!(copy.constexpr("GROUPS").unwrap(), 128);
-        // A `BLOCK_K`-route plan of the 1 MiB `gate_up_packed` row.
-        assert_eq!(copy.constexpr("STEPS").unwrap(), 128);
+        assert_eq!(copy.constexpr("SEG_I32").unwrap(), 4096);
     }
 
     #[test]

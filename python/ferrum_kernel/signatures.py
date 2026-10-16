@@ -13,7 +13,7 @@ baked into the cubin rather than passed at launch.
 from __future__ import annotations
 
 from .nvfp4_moe import DECODE_BLOCK_KB, DECODE_BLOCK_N
-from .offload import COPY_BLOCK_BYTES, COPY_GROUPS, USAGE_MAX, copy_steps
+from .offload import COPY_SEG_I32, USAGE_MAX, copy_splits
 
 # The serving attention geometry (Qwen3.6-35B-A3B): 16 query heads over 2 KV
 # heads at head_dim 256. All four are constexpr, so the committed cubin is
@@ -130,9 +130,7 @@ def index_copy() -> dict:
         "src_idx": "*i32",
         "num_ptr": "*i64",
         "NUM_BANKS": "constexpr",
-        "GROUPS": "constexpr",
-        "STEPS": "constexpr",
-        "BLOCK_BYTES": "constexpr",
+        "SEG_I32": "constexpr",
     }
 
 
@@ -176,12 +174,12 @@ SERVING_BLOCK_C = 512
 
 # Copy geometry. The FTW MoE offload has six banks per layer (gate_up/down x
 # packed/scale/global) and `gate_up_packed#L*` is [num_experts, 1024, 1024] =
-# 1 MiB per expert, the largest row the copy moves. `STEPS` has to cover a full
-# `BLOCK_K`-route plan of that row; it is a constexpr, so it is baked into the
-# cubin and the Rust ABI reads it.
+# 1 MiB per expert, the largest row the copy moves. `SPLITS` segments of
+# `COPY_SEG_I32` words cover one such row; it is a constexpr, so it is baked into
+# the cubin and the Rust ABI reads it.
 SERVING_NUM_BANKS = 6
 SERVING_MAX_FEAT_BYTES = 1024 * 1024
-SERVING_COPY_STEPS = copy_steps(SERVING_BLOCK_K, SERVING_MAX_FEAT_BYTES)
+SERVING_COPY_SPLITS = copy_splits(SERVING_MAX_FEAT_BYTES)
 
 
 def lru_constexprs() -> dict:
@@ -193,14 +191,10 @@ def lru_constexprs() -> dict:
     }
 
 
-def index_copy_constexprs(
-    num_banks: int = SERVING_NUM_BANKS, steps: int = SERVING_COPY_STEPS
-) -> dict:
+def index_copy_constexprs(num_banks: int = SERVING_NUM_BANKS) -> dict:
     return {
         "NUM_BANKS": num_banks,
-        "GROUPS": COPY_GROUPS,
-        "STEPS": steps,
-        "BLOCK_BYTES": COPY_BLOCK_BYTES,
+        "SEG_I32": COPY_SEG_I32,
     }
 
 

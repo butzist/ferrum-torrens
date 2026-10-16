@@ -482,10 +482,8 @@
   "staging": {
     "index_copy": {
       "constexprs": {
-        "BLOCK_BYTES": 8192,
-        "GROUPS": 128,
         "NUM_BANKS": 6,
-        "STEPS": 128
+        "SEG_I32": 4096
       },
       "declared_args": [
         "dst_ptrs",
@@ -500,7 +498,7 @@
       "grid": [
         6,
         128,
-        1
+        64
       ],
       "num_warps": 4,
       "params": [

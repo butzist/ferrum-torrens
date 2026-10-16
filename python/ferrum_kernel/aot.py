@@ -40,13 +40,15 @@ from .nvfp4_moe import (
     _silu_mul_kernel,
     _sum_reduce_kernel,
 )
-from .offload import COPY_GROUPS, _ensure_experts_kernel, _index_copy_multi_kernel
+from .offload import _ensure_experts_kernel, _index_copy_multi_kernel
 from .attention import _paged_attention_decode_kernel
 
 # The silu kernel's tile is derived from the intermediate size at launch
 # (`min(next_power_of_2(inter), 256)`), so the AOT build pins the serving value.
 SILU_BLOCK_I = 256
 from .signatures import (
+    SERVING_BLOCK_K,
+    SERVING_COPY_SPLITS,
     SERVING_DTYPE,
     SERVING_HIDDEN,
     SERVING_INTER,
@@ -108,7 +110,7 @@ KERNELS: dict[str, dict] = {
 # `grouped_moe`: it runs on its own streams around the grouped launches and has
 # its own launcher, so it lives in a separate manifest section (`staging`) with
 # a `grid` launch shape instead of the grouped `n`/`block` column tile. LRU is a
-# single program; the copy is one program per (bank, group).
+# single program; the copy is one program per (bank, row, segment).
 STAGING_KERNELS: dict[str, dict] = {
     "lru_ensure": {
         "fn": _ensure_experts_kernel,
@@ -120,7 +122,7 @@ STAGING_KERNELS: dict[str, dict] = {
         "fn": _index_copy_multi_kernel,
         "signature": index_copy(),
         "constexprs": index_copy_constexprs(),
-        "grid": [SERVING_NUM_BANKS, COPY_GROUPS, 1],
+        "grid": [SERVING_NUM_BANKS, SERVING_BLOCK_K, SERVING_COPY_SPLITS],
     },
 }
 

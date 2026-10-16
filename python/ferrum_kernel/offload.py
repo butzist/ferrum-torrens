@@ -18,9 +18,9 @@ the plan is data-dependent. These two fixed-shape kernels move it to the device:
 Both are fixed-shape. The plan count is the only thing that varies per step and
 it lives on the device (`num_ptr`), so a launch's grid and arguments are stable
 and the pair is safe to capture (DONE.md decision 40). The LRU kernel's
-`BLOCK_K`/`BLOCK_C` and the copy's `GROUPS`/`STEPS` are constexpr, so a new
-serving shape is a recompile; the `n`/`block` fields in the AOT manifest record
-the pinned values.
+`BLOCK_K`/`BLOCK_C` and the copy's `NUM_BANKS`/`SEG_I32` are constexpr, and the
+copy's grid pins the row cap and the segment count, so a new serving shape is a
+recompile; the `n`/`block` fields in the AOT manifest record the pinned values.
 """
 
 from __future__ import annotations
@@ -40,10 +40,12 @@ USAGE_MAX = (1 << 55) - 1
 # would make a free or step-touched slot sort as if it were the coldest.
 KEY_MAX = tl.constexpr(0x7FFFFFFFFFFFFFFF)
 
-# Copy geometry. `GROUPS` programs per bank, each copying `BLOCK_BYTES` at a
-# time; `STEPS` is derived at launch from the largest bank and the plan cap.
-COPY_GROUPS = 128
-COPY_BLOCK_BYTES = 8192
+# Copy geometry. One program per (bank, row, segment): `SEG_I32` int32 words of a
+# row per program. The row index is a scalar load per program, so the segment is
+# a contiguous, 16-byte-vectorizable run; the old flat-byte layout made every
+# lane compute its own row (`o // feat`) which Triton could not vectorize, so the
+# copy ran byte-at-a-time and was ~81% of decode time (TODO.md section 8).
+COPY_SEG_I32 = 4096  # 16 KiB per program
 
 
 @triton.jit
@@ -136,32 +138,28 @@ def _index_copy_multi_kernel(
     src_idx,
     num_ptr,
     NUM_BANKS: tl.constexpr,
-    GROUPS: tl.constexpr,
-    STEPS: tl.constexpr,
-    BLOCK_BYTES: tl.constexpr,
+    SEG_I32: tl.constexpr,
 ):
     bank = tl.program_id(0)
-    group = tl.program_id(1)
-    if bank < NUM_BANKS:
-        feat = tl.load(feat_bytes + bank)
-        n = tl.load(num_ptr)
-        total = n * feat
-        base_dst = tl.load(dst_ptrs + bank).to(tl.pointer_type(tl.uint8))
-        base_src = tl.load(src_ptrs + bank).to(tl.pointer_type(tl.uint8))
-        # Flat byte copy across the bank's rows. A step's worth of bytes is
-        # `GROUPS * BLOCK_BYTES`; `STEPS` covers the largest plan the launch was
-        # sized for and every lane past `total` is masked off. `tl.range` keeps
-        # it a real loop: `static_range` unrolls all STEPS and emits a cubin an
-        # order of magnitude larger.
-        for s in tl.range(0, STEPS):
-            o = (group + s * GROUPS) * BLOCK_BYTES + tl.arange(0, BLOCK_BYTES)
-            m = o < total
-            row = o // feat
-            within = o % feat
-            d = tl.load(dst_idx + row, mask=m, other=-1).to(tl.int64)
-            src_row = tl.load(src_idx + row, mask=m, other=-1).to(tl.int64)
-            v = tl.load(base_src + src_row * feat + within, mask=m, other=0)
-            tl.store(base_dst + d * feat + within, v, mask=m)
+    row = tl.program_id(1)
+    seg = tl.program_id(2)
+    # `row < num` gates the indices; the row/segment index enters only through
+    # scalar loads, so each program's access is one contiguous `SEG_I32`-word run
+    # of a single row (uniform source row) -- that is what lets Triton emit wide
+    # vector loads instead of a per-lane gather.
+    n = tl.load(num_ptr)
+    feat = tl.load(feat_bytes + bank)
+    feat_i32 = (feat // 4).to(tl.int32)
+    base_dst = tl.load(dst_ptrs + bank).to(tl.pointer_type(tl.int32))
+    base_src = tl.load(src_ptrs + bank).to(tl.pointer_type(tl.int32))
+    live = row < n
+    drow = tl.load(dst_idx + row, mask=live, other=0).to(tl.int64)
+    srow = tl.load(src_idx + row, mask=live, other=0).to(tl.int64)
+    off = seg * SEG_I32 + tl.arange(0, SEG_I32)
+    m = live & (off < feat_i32)
+    # `.cg` skips L1 for the streaming host read; `.cs` streams the store.
+    v = tl.load(base_src + srow * feat_i32 + off, mask=m, other=0, cache_modifier=".cg")
+    tl.store(base_dst + drow * feat_i32 + off, v, mask=m, cache_modifier=".cs")
 
 
 def block_c(cache_size: int) -> int:
@@ -207,10 +205,9 @@ def ensure_experts(
     )
 
 
-def copy_steps(plan_cap: int, max_feat_bytes: int, groups: int = COPY_GROUPS, block_bytes: int = COPY_BLOCK_BYTES) -> int:
-    """`STEPS` that covers a plan of `plan_cap` rows of the largest bank."""
-    per_step = groups * block_bytes
-    return max(1, -(-(plan_cap * max_feat_bytes) // per_step))
+def copy_splits(max_feat_bytes: int, seg_i32: int = COPY_SEG_I32) -> int:
+    """`SPLITS` segments that cover the largest bank's row at `seg_i32` words each."""
+    return max(1, -(-max_feat_bytes // (seg_i32 * 4)))
 
 
 def index_copy_multi(
@@ -221,14 +218,18 @@ def index_copy_multi(
     src_idx: torch.Tensor,
     num_ptr: torch.Tensor,
     plan_cap: int,
-    groups: int = COPY_GROUPS,
-    block_bytes: int = COPY_BLOCK_BYTES,
+    seg_i32: int = COPY_SEG_I32,
 ) -> None:
-    """Launch the fused multi-bank copy. Reads `num_ptr` on the device."""
+    """Launch the fused multi-bank copy. Reads `num_ptr` on the device.
+
+    Grid is `(banks, plan_cap, splits)`: `plan_cap` bounds the rows a launch
+    carries (the pinned `BLOCK_K`), `splits` covers one full row of the largest
+    bank. Both are fixed for the launch, which is what keeps it capture-safe.
+    """
     n_banks = int(dst_ptrs.numel())
     max_feat = int(feat_bytes.max().item())
-    steps = copy_steps(plan_cap, max_feat, groups, block_bytes)
-    _index_copy_multi_kernel[(n_banks, groups)](
+    splits = copy_splits(max_feat, seg_i32)
+    _index_copy_multi_kernel[(n_banks, plan_cap, splits)](
         dst_ptrs,
         src_ptrs,
         feat_bytes,
@@ -236,9 +237,7 @@ def index_copy_multi(
         src_idx,
         num_ptr,
         NUM_BANKS=n_banks,
-        GROUPS=groups,
-        STEPS=steps,
-        BLOCK_BYTES=block_bytes,
+        SEG_I32=seg_i32,
     )
 
 
