@@ -1656,8 +1656,28 @@ settled.
     - **Tests.** `DeviceCache` manager tests (committed-prefix reuse, strict-prefix
       cold, prompt-end commit reuse, page/slot conservation, shared snapshot) and
       generation wiring tests (adopt + both commits in order, per-request in a
-      batch), plus the whole existing suite unchanged. The gated oracle against
-      FreeToken's `test_hybrid_radix.py` on the real checkpoint is still to run.
+      batch), plus the whole existing suite unchanged. The gated end-to-end oracle
+      is decision 70.
+
+70. **The cross-request reuse gate reuses on the real checkpoint** (2026-10-16,
+    implemented) -- the end-to-end counterpart of FreeToken's
+    `tests/kvcache/radix/test_hybrid_radix.py`, which pins the tree's invariants
+    on a synthetic ledger. `tests/kvcache_cross_request_reuse.rs` (gated on the
+    converted checkpoint) drives the real tower through the wired path directly:
+    request A prefills its prompt, `commit(finished=false)` snapshots the
+    prompt-end GDN state and hands the tree A's pages, A `end`s; request B, whose
+    prompt is A extended by a tail, `adopt_prefix`es `ids[..len-1]`, matches the
+    deep snapshot, COW-restores the state and repoints at the tree's pages. B then
+    prefills only its tail, and the last-token logits must equal a cold re-feed of
+    the whole sequence. It asserts the reused length (7 of 10 tokens), the
+    page accounting (`available() == num_pages - prompt_len` after both `end`s,
+    since B borrowed A's pages and frees only its own tail), argmax equality, and a
+    `2.4e-6`-of-scale logit gap. Why a hand-driven gate and not `generation`: the
+    loop exposes no way to observe a request's `reused` length, and the point here
+    is the cache contract under adoption, which the sibling
+    `tests/kvcache_incremental_decode.rs` is the same shape of. Validated on the
+    libtorch CPU backend in the agent sandbox; the same body runs on the target
+    GPU via `auto_device` (a contended sandbox GPU could not fit the tower).
 
 ---
 
@@ -2120,7 +2140,8 @@ subsection names are kept verbatim.
 - [x] P0 page free-list (`free_slots` holds page bases) + per-req page table holding **token locations** + dummy row pointing at a sentinel page. (`domain/kvcache.rs`)
 - [x] P0 radix prefix tree: walk by first-page-key, `std::mismatch`-comparison align-down to page, node split, insert, LRU evict (unlocked leaf only), ref-counted handles. (`domain/kvcache.rs`, page_size=1)
 - [x] P2 hybrid_radix **domain core + device primitive** (2026-10-16, decision 68): `HybridRadixIndex` (dual `full_ref`/`mamba_ref`, tombstones, deepest-live-snapshot `match_prefix`, `evict_mamba` counts snapshots / `evict_full` counts tokens, donate-not-copy as a caller-owned slot) + `RadixNode.mamba_value/mamba_refcount` + `LinearStateSlabs::copy_slot`. 17 unit tests.
-- [x] P2 hybrid_radix **generation-loop wiring** (2026-10-16, decision 69): `DeviceCache` owns the tree; `adopt_prefix` COW-restores a matched snapshot and repoints at the tree's pages; `commit(finished=false)` snapshots the prompt end and locks, `commit(finished=true)` donates the live slot zero-copy; `reserve`/slot allocation drive `evict_full`/`evict_mamba` on pressure (pools are independent, no partitioning). `generation::open_cache` + the prefill/finish commits wire it in. Deferred: mid-prefill (`CHUNK`) snapshots, since prefill is single-shot; gated oracle against `test_hybrid_radix.py` still to run.
+- [x] P2 hybrid_radix **generation-loop wiring** (2026-10-16, decision 69): `DeviceCache` owns the tree; `adopt_prefix` COW-restores a matched snapshot and repoints at the tree's pages; `commit(finished=false)` snapshots the prompt end and locks, `commit(finished=true)` donates the live slot zero-copy; `reserve`/slot allocation drive `evict_full`/`evict_mamba` on pressure (pools are independent, no partitioning). `generation::open_cache` + the prefill/finish commits wire it in. Deferred: mid-prefill (`CHUNK`) snapshots, since prefill is single-shot.
+- [x] P2 hybrid_radix **cross-request reuse gate** (2026-10-16, decision 70): gated `tests/kvcache_cross_request_reuse.rs` drives the real checkpoint through commit-prompt-end / adopt-in-the-next-request / COW-restore and matches the adopted step to a cold re-feed (reused 7 of 10 tokens, `2.4e-6` of scale).
 - [x] P0 **KV dtype serving-safe (SERVING BLOCKER).** Done 2026-10-15. `[kv] dtype = "f32" | "bf16"` (`fp8` refused at validation until a path exists) now picks the pool element type in `registry::kv_cache`; the default is `bf16`, which halves the pool, so the 4.51 GiB resident tower and the default `num_tokens = 131072` pool (2.5 GiB) fit the 7.53 GiB device. `MhaPool::gather*` now always returns f32 (upcasting bf16 on read), which is what lets the f32 attention math and the dense padded-window fallback consume a bf16 pool; the f32-only paged kernel still serves f32 pools. Measured on the device: `a_bf16_pool_device_decode_matches_refeeding_the_whole_prefix` keeps the greedy token equal to the f32 re-fed forward at every step with a worst logit shift of ~13% of scale (bf16 K/V rounding; the checkpoint itself serves fp8 KV). Gated f32 gates are pinned `dtype = "f32"` where they assert exact numerics (decision 64).
 - [x] P0 GDN linear-state pool: free-slot bookkeeping (conv-state + recurrent fp32 rows are infra tensors); ping-pong live slots and restore land with the hybrid path.
 ### Scheduler

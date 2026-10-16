@@ -10,10 +10,11 @@ chunked LRU. The `hybrid_radix` GDN snapshot donation is **wired end to end**
 (decisions 68, 69): `HybridRadixIndex` (dual refcounts, tombstones,
 deepest-live-snapshot match, dual eviction), `LinearStateSlabs::copy_slot`, and
 the generation loop's prompt-end/finish commit boundaries with dual-eviction
-triggers. Cross-request prefix reuse is now real. Open work is the ordered
-backlog in section 8: the gated oracle against FreeToken's `test_hybrid_radix.py`,
-deferred mid-prefill snapshots, and the remaining M5 items.
-Progress history and the full decision log (numbers 1..69) live in `DONE.md`;
+triggers. Cross-request prefix reuse is now real, and the gated end-to-end oracle
+against the real checkpoint (`tests/kvcache_cross_request_reuse.rs`, decision 70)
+passes. Open work is the ordered backlog in section 8: the remaining M5 items and
+deferred mid-prefill snapshots.
+Progress history and the full decision log (numbers 1..70) live in `DONE.md`;
 read that for the "why" behind any decision number referenced in code or tests.
 
 Goal: a **minimal, fast, single-GPU** Rust serving engine for **one model** --
@@ -215,7 +216,8 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 ### KV cache + radix
 
 - [x] P2 **hybrid_radix domain core + device primitive -- DONE (2026-10-16), decision 68.** `HybridRadixIndex` in `domain/kvcache.rs` (dual `full_ref`/`mamba_ref` counts, tombstones, `full_ref >= mamba_ref`, deepest-live-snapshot `match_prefix`, `split_at` keeps the snapshot on the suffix, `evict_mamba` counts snapshots / `evict_full` counts tokens, donate-not-copy as a caller-owned-slot contract) plus `RadixNode.mamba_value/mamba_refcount` and `LinearStateSlabs::copy_slot` (COW donate/restore). 17 unit tests + a gated device test.
-- [x] **hybrid_radix wiring -- DONE (2026-10-16), decision 69.** `DeviceCache` owns the tree and drives both boundaries: `begin` allocates a live slot, `adopt_prefix` matches the prompt, COWs the snapshot into the live slot (`copy_slot`) and repoints the request at the tree's canonical KV pages; `commit(finished=false)` snapshots the prompt-end state and locks the node; `commit(finished=true)` donates the live slot zero-copy and clears the request. Pressure drives eviction: `reserve` reclaims parent pages via `evict_full`; snapshot allocation reclaims GDN slots via `evict_mamba`. The page and state pools are independent, so no partitioning is needed. The generation loop opens each request with `open_cache` (adopt over `ids[..len-1]`), commits the prompt after the prefill forward, and commits the whole sequence at finish. Domain + device + generation tests green; the gated oracle against `test_hybrid_radix.py` is the remaining gate (deferred: mid-prefill per-chunk snapshots, since prefill is single-shot today).
+- [x] **hybrid_radix wiring -- DONE (2026-10-16), decision 69.** `DeviceCache` owns the tree and drives both boundaries: `begin` allocates a live slot, `adopt_prefix` matches the prompt, COWs the snapshot into the live slot (`copy_slot`) and repoints the request at the tree's canonical KV pages; `commit(finished=false)` snapshots the prompt-end state and locks the node; `commit(finished=true)` donates the live slot zero-copy and clears the request. Pressure drives eviction: `reserve` reclaims parent pages via `evict_full`; snapshot allocation reclaims GDN slots via `evict_mamba`. The page and state pools are independent, so no partitioning is needed. The generation loop opens each request with `open_cache` (adopt over `ids[..len-1]`), commits the prompt after the prefill forward, and commits the whole sequence at finish. Domain + device + generation tests green.
+- [x] **hybrid_radix cross-request reuse gate -- DONE (2026-10-16), decision 70.** Gated `tests/kvcache_cross_request_reuse.rs` drives the real checkpoint through commit-prompt-end, cross-request `adopt_prefix`, COW state restore and repointed pages, then matches the adopted step's last-token logits to a cold re-feed (reused 7 of 10 tokens, `2.4e-6` of scale). Deferred: mid-prefill per-chunk snapshots, since prefill is single-shot today.
 
 ### Server (axum recommended)
 
@@ -255,16 +257,23 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
   layer prefill overlap (DONE, decisions 42-48, 66, 67); batch concurrency.
 - **M5**: optional `/v1/responses`, hybrid_radix GDN snapshot donation (which is
   what makes the radix prefix cache real, decision 65) -- domain core, device
-  primitive and generation-loop wiring DONE (decisions 68, 69); the gated oracle
-  and deferred mid-prefill snapshots open -- startup load tuning.
+  primitive, generation-loop wiring and the gated cross-request oracle DONE
+  (decisions 68, 69, 70); deferred mid-prefill snapshots and startup load tuning
+  open.
 
 ## 7. Decisions
 
-The full log of confirmed decisions (numbers 1..69, stable -- code, tests and
+The full log of confirmed decisions (numbers 1..70, stable -- code, tests and
 `ARCHITECTURE.md` reference them by number) lives in `DONE.md`. This section
 lists only the decisions that still bind open work; everything else there is
 history.
 
+- **70** -- the cross-request reuse gate drives the wired path on the real
+  checkpoint directly (`tests/kvcache_cross_request_reuse.rs`), because
+  `generation` exposes no way to observe a request's reused length. It is the
+  end-to-end counterpart of FreeToken's `test_hybrid_radix.py`. Validated on the
+  CPU backend in the sandbox; the same body runs on the target GPU via
+  `auto_device`.
 - **69** -- the `hybrid_radix` wiring commits at two boundaries only: prompt end
   (`finished=false`, a COW snapshot donated so decoding continues from it) and
   finish (`finished=true`, the live slot donated zero-copy). Pressure is the
@@ -315,10 +324,10 @@ performance work.
    `HybridRadixCache` truncates a match to the deepest node with a **live GDN
    state snapshot**, so without snapshot donation `cached_len = 0`. The domain
    core of the `[opt] hybrid_radix` GDN donation (donate-not-copy, dual refcounts,
-   tombstones), the device `copy_slot` primitive, and the generation-loop
-   `match_req`/`cache_req` wiring with dual-eviction triggers are all in
-   (decisions 68, 69). Remaining: the gated oracle against
-   `test_hybrid_radix.py` and the deferred mid-prefill snapshots.
+   tombstones), the device `copy_slot` primitive, the generation-loop
+   `match_req`/`cache_req` wiring with dual-eviction triggers, and the gated
+   cross-request reuse oracle are all in (decisions 68, 69, 70). Remaining: the
+   deferred mid-prefill snapshots.
 
 **Tier 3 -- large performance (the only actionable remaining tier):**
 8. Prefill MoE path (MoE offload cache) -- **DONE (2026-10-15).** Slice 1
