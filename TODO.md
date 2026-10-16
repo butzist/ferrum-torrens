@@ -483,7 +483,8 @@ performance work.
     weights and activations. Write a fused Triton decode kernel (FLA
     `fused_sigmoid_gating_recurrent` + `causal_conv1d` are the reference) and AOT
     it like the others. Do not pull in flashinfer: it is attention-only (a quarter
-    of decode), a heavy C++/Python dependency, and would not touch GDN.
+    of decode), a heavy C++/Python dependency, and would not touch GDN. **Spec:
+    `FUSED_GDN.md`** (dtypes, grid, math, ABI/AOT steps, tests).
 16. Decode "rest" ~31% -- **OPEN.** ~59 ms/token outside mixer+MoE: input/post
     norms (80/layer), embed gather, lm_head GEMV (vocab 248320 x hidden bf16),
     sampling (+ its D2H). Profile which dominates once the kernels above land.
