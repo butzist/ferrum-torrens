@@ -20,11 +20,13 @@ read ~6.6x (13.6 s -> 2.06 s) and keeping the weights out of the page cache
 RTX 5060 Laptop it first measured pp ~34 tok/s, tg ~0.9 tok/s. The staging copy
 was then found to be ~81% of decode and vectorized (decision 75): **tg is now
 4.7 tok/s** (5.2x), and decode is plan+GEMV-bound (~0.20 s/token), the open gap.
-Tool calling on `/v1/chat/completions` was brought into scope
+FreeToken on the same GPU/FTW does **22.5-30.3 tok/s** (decision 76), so the
+compute path and the GPU memory budget are both open. Tool calling on
+`/v1/chat/completions` was brought into scope
 (decision 74) so the server can drive opencode/agentic clients; it is the next
-feature. Open work: tool calling, the `[opt] /v1/responses` surface, the decode
-plan+GEMV gap, and the section 8 experiments.
-Progress history and the full decision log (numbers 1..75) live in `DONE.md`;
+feature. Open work: tool calling, the `[opt] /v1/responses` surface, server-side
+batching, the decode plan+GEMV gap, and the section 8 experiments.
+Progress history and the full decision log (numbers 1..76) live in `DONE.md`;
 read that for the "why" behind any decision number referenced in code or tests.
 
 Goal: a **minimal, fast, single-GPU** Rust serving engine for **one model** --
@@ -286,7 +288,7 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 
 ## 7. Decisions
 
-The full log of confirmed decisions (numbers 1..75, stable -- code, tests and
+The full log of confirmed decisions (numbers 1..76, stable -- code, tests and
 `ARCHITECTURE.md` reference them by number) lives in `DONE.md`. This section
 lists only the decisions that still bind open work; everything else there is
 history.
@@ -337,6 +339,10 @@ history.
   (`.cg`/`.cs`); grid `(6, 128, 64)`, constexprs `NUM_BANKS`/`SEG_I32`. Replaces
   the flat-byte gather (`GROUPS`/`STEPS`/`BLOCK_BYTES`). Decode tg 0.9 -> 4.7
   tok/s; the copy is now ~6% of decode, so decoding is plan+GEMV-bound (item 9).
+- **76** -- FreeToken `offload` on the same GPU/FTW does 22.5 tok/s at 512 slots
+  and 30.3 tok/s at auto (1900 slots) in 6.85-7.05 GiB; we do 4.7 tok/s in
+  7.9 GiB. We are 4.8-6.4x slower and fit a ~3.7x smaller cache, so both the
+  compute path and the GPU memory budget are open. Run recipe in `DONE.md`.
 - **73** -- the gated single-request throughput smoke (`tests/throughput_smoke.rs`)
   measures pp ~34 tok/s and tg ~0.9 tok/s on the RTX 5060 Laptop; the staging
   copy turned out to be ~81% of decode (decision 75), not PCIe. Floor is loose
@@ -422,6 +428,14 @@ performance work.
    occupancy and amortize the per-token weight read. VRAM is nearly full
    (**7908/8151 MiB**), so a server-side batch queue is also the cheap fix vs.
    growing the MoE cache (which is 9% of decode and has ~243 MiB of room).
+   **FreeToken head-to-head (decision 76).** Same GPU, same FTW, bs=1, bf16:
+   FreeToken `offload` does **22.5 tok/s (44.4 ms/token) at 512 slots** and
+   **30.3 tok/s (33 ms/token) at auto cache (1900 slots)**, using **6.85-7.05 GiB**
+   VRAM; we do **4.7 tok/s at 512 slots** in 7.9 GiB. So we are **4.8-6.4x
+   slower**, and FreeToken fits a ~3.7x larger cache in *less* VRAM -- our GPU
+   footprint outside the expert cache is ~2.5 GiB larger (candidates: the on-device
+   bf16 tower / lm_head / embed, GDN state slabs, graph pools). Cache size helps
+   (~35% going 512 -> 1900 at bs=1) but is secondary to the ~5x compute gap.
 10. GDN state-slot sizing -- **OPEN.** The pool is `max_running_requests (+1 for
     the captured graph's padding row)`, which leaves no room for hybrid-radix
     prefix snapshots: at `max_running_requests = 1` the second request panics with

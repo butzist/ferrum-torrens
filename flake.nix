@@ -124,6 +124,9 @@
           # A live GPU monitor (loads the host's libnvidia-ml, on LD_LIBRARY_PATH
           # via /run/opengl-driver/lib).
           pkgs.nvtopPackages.nvidia
+          # `ninja`: FreeToken's flashinfer JIT-compiles its attention module on
+          # first serve, and its own build tool is `ninja`.
+          pkgs.ninja
         ];
 
         cudaDevicePaths = with combinators; [

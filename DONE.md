@@ -1835,6 +1835,42 @@ settled.
       `cuda_moe_matches_reference` still passes (3.31e-3 rel). Decode is now
       plan+GEMV bound (~0.20 s/token), the new open gap in item 9.
 
+76. **FreeToken decode head-to-head** (2026-10-16, benchmark) -- what the
+    reference achieves on this GPU, to size our gap (item 9).
+    - **Numbers** (same RTX 5060 Laptop, same FTW checkpoint, bs=1, bf16,
+      `ft serve --moe-backend offload` via `benchmarks/bench_decode_moe.py`):
+
+      | engine | expert cache | decode | ms/token | VRAM |
+      |---|---|---|---|---|
+      | FreeToken offload | 512 | 22.5 tok/s | 44.4 | 7.05 GiB |
+      | FreeToken offload | 1900 (auto) | 30.3 tok/s | 33.0 | 6.85 GiB |
+      | FerrumTorrens | 512 | 4.7 tok/s | 213 | 7.9 GiB |
+
+      So FreeToken is **4.8-6.4x faster** and fits a **~3.7x larger** expert cache
+      in *less* VRAM; our non-cache GPU footprint is ~2.5 GiB larger. Cache size
+      matters (~35% from 512 -> 1900) but is secondary to the ~5x compute gap,
+      which matches the profile (mixer-bound, latency-bound at bs=1).
+    - **How to run** (jail cannot: the venv interpreter and the HF checkpoint are
+      not bound). In a devshell, with our FTW in `$FLAKE_ROOT`, after repointing
+      the venv at the env's python (`ln -sf $(which python3.12)
+      FreeToken/.venv/bin/python`) and `uv pip install --python
+      FreeToken/.venv/bin/python ninja`:
+      ```
+      C=<cudatoolkit>
+      env -u PYTHONPATH -u LIBTORCH -u LIBTORCH_LIB -u LIBTORCH_INCLUDE \
+        PATH="<venv>/bin:$PATH" CPATH="$C/include" CPLUS_INCLUDE_PATH="$C/include" \
+        LIBRARY_PATH="$C/lib:$C/lib/stubs:/run/opengl-driver/lib" \
+        LD_LIBRARY_PATH="$C/lib:/run/opengl-driver/lib" \
+        CUDA_VISIBLE_DEVICES=0 FREETOKEN_ALLOW_CUDA_MISMATCH=1 \
+        FreeToken/.venv/bin/python FreeToken/benchmarks/bench_decode_moe.py \
+          --model .model-cache/Qwen3.6-35B-A3B-NVFP4.ftw --backend offload \
+          --cache 512 --aime <local.jsonl> --decode 256
+      ```
+      `FREETOKEN_ALLOW_CUDA_MISMATCH=1` because nix nvcc is 12.9 while the venv
+      torch is cu13; `CPATH`/`LIBRARY_PATH` because the merged toolkit is `lib/`,
+      not CUDA's `lib64/` (flashinfer and FreeToken's kernel JIT both need it).
+      `pkgs.ninja` was added to the flake for the flashinfer JIT.
+
 ---
 
 ## Progress log (narrative, pre-2026-10-15 compaction)
