@@ -300,12 +300,17 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
   load tuning DONE (decision 72); throughput smoke DONE (decision 73);
   `[opt] /v1/responses` remains, plus the section 8 experiments.
 - **M6 (CURRENT): agentic serving.** Tool calling on `/v1/chat/completions` so
-  opencode/agentic clients can drive the model (decision 74); the staging copy is
-  vectorized (decision 75) and the remaining decode gap is plan+GEMV-bound.
+  opencode/agentic clients can drive the model (decision 74). The decode gap is
+  pursued by vendoring FreeToken's own Triton kernels (decision 82): bf16 paged
+  attention (decision 83) and the W8A16 FP8 projections (decision 84) landed,
+  taking tg 8.2 -> 10.9 tok/s and VRAM 7.9 -> 4.83 GiB; the remaining slices are
+  bf16 mixer activations + fused conv (item 19) and the prefill chunk kernels
+  (item 20), with cache growth (item 21) and server-side batching (item 11) as
+  the other levers.
 
 ## 7. Decisions
 
-The full log of confirmed decisions (numbers 1..76, stable -- code, tests and
+The full log of confirmed decisions (numbers 1..84, stable -- code, tests and
 `ARCHITECTURE.md` reference them by number) lives in `DONE.md`. This section
 lists only the decisions that still bind open work; everything else there is
 history.
@@ -532,14 +537,13 @@ performance work.
     tool-call token, so a multi-turn loop (tool call -> result -> continue) reuses
     the pre-call prefix instead of re-prefilling. Add the analogous snapshot point
     when the tool-call feature lands; it is the agentic-session cache.
-14. bf16 paged attention -- **OPEN, the top remaining lever (decision 81).** The
-    committed `paged_attention` cubin is wired only for `KvDType::F32`; the
-    default bf16 KV falls back to a libtorch `gather_rows` +
-    `attention_cached_pos` masked softmax. The re-profile puts the whole
-    full-attention block at **~30-35 ms/token (~29%)** at bs=1, the single
-    largest block. Add the bf16 variant (q f32 activation, bf16 K/V pool, f32
-    out) so the fast path is the default; the f32 pool + our kernel is already
-    ~11% faster end to end.
+14. bf16 paged attention -- **DONE (decision 83, decision 82 slice 1).** A second
+    AOT signature `paged_attention_bf16` on the same `_paged_attention_decode_kernel`
+    (q/out f32, K/V bf16) plus `PagedAttention::decode(..., kv_bf16)` and a
+    `full_attention_cached` dispatch on `pool.dtype()`. The default bf16 KV no longer
+    takes the libtorch gather + masked-softmax fallback. tg 8.2 -> 10.3, VRAM
+    7.1 -> 6.05 GiB (the fallback's padded-window materialization is gone from the
+    graph pool). f32 pool + f32 kernel is unchanged.
 15. Fused GDN decode kernel -- **DONE (decision 77).** One `gdn_decode` Triton
     kernel per layer replaces the ~15-op GDN recurrence (gating + q/k L2-norm +
     delta-rule update + state), AOT'd and wired into the device decode path; the
@@ -563,9 +567,9 @@ performance work.
 18. Dense NVFP4 lm_head GEMV -- **DONE (decision 79).** `_nvfp4_dense_gemv_kernel`
     + `DenseGemv` launcher + `Head` storage: the packed checkpoint head stays
     resident and is streamed once per token. Correct (CUDA cross-check argmax
-    11751, 0.21% shift); VRAM -0.81 GiB; throughput neutral. The reusable pattern
-    for E1; the freed VRAM is blocked from the expert cache by the load-time peak
-    (item 12).
+    11751, 0.21% shift); VRAM -0.81 GiB; throughput neutral (the 4-bit LUT unpack
+    is arithmetic-bound, unlike W8A16). The reusable pattern for item 17; its freed
+    VRAM feeds item 21.
 19. bf16 mixer activations + fused conv -- **OPEN (decision 82, slice 3).** Run the
     mixer in bf16 (rms_norm/conv/attention outputs) to match FreeToken and let
     their kernels drop in; vendor `causal_conv1d_decode` (fused conv+silu, in-place
@@ -573,6 +577,50 @@ performance work.
 20. Prefill chunk kernels -- **OPEN (decision 82, slice 4).** Vendor FLA
     `chunk_gated_delta_rule` + `causal_conv1d_varlen`; our prefill is still
     libtorch op soup with no FLA chunk kernel.
+21. Expert cache growth (E4) -- **OPEN, now unblocked on VRAM but blocked in code.**
+    The FP8 slice (item 17) freed ~1.2 GiB, so the cache could grow past 512 slots
+    into FreeToken's ~1900-slot regime (it measured ~35% from cache size at bs=1,
+    decision 76). Blocked because device staging bakes `BLOCK_C 512` and refuses
+    more (`cuda_moe.rs:438`, decision 84). Fix: raise the staging `lru_ensure`
+    constexpr and re-check. MoE is only ~17% of decode here, so expect a few ms,
+    not FreeToken's share.
+
+### Decode speed plan (decision 82): status and next steps
+
+Measured on the RTX 5060 Laptop, bs=1, bf16 KV, `tests/throughput_smoke.rs`
+(the config's own numbers; `tg` varies ~5% run to run):
+
+| stage | tg (tok/s) | VRAM (GiB) | commit |
+|---|---|---|---|
+| after bf16 GEMM in `linear` (decision 78) | 8.2-8.8 | 7.9 | `8eeee85` |
+| + packed NVFP4 lm_head (decision 79) | 8.2 | 7.1 | `8eeee85` |
+| + bf16 paged attention (83, slice 1) | 10.3 | 6.05 | `61021e8` |
+| + vendored W8A16 FP8 projections (84, slice 2) | 10.9 | 4.83 | `fea0281` |
+
+FreeToken `offload` on the same GPU/FTW does **22.5 tok/s** (512 slots) / **30.3**
+(1900 slots), so the gap is now **~2.1-2.8x** (was ~3.7x). The plan and its
+FreeToken facts live in `FUSED_GDN.md` "Plan"; slices 1-2 are landed. Ordered
+next steps:
+
+1. **E4 / item 21 -- raise the staging `BLOCK_C`.** Turns the VRAM the FP8 slice
+   freed into expert-cache slots. Small and self-contained (one constexpr +
+   `check-kernels.sh` + the offload ABI tests), measured with the smoke.
+2. **Slice 3 (item 19) -- bf16 mixer activations + `causal_conv1d_decode`.** The
+   tower-wide numerics change (rms_norm/conv/attention outputs to bf16) that lets
+   FreeToken's kernels drop in with signature-only edits; re-run every gate (the
+   decision 80 bounds already anticipate bf16).
+3. **Slice 4 (item 20) -- prefill chunk kernels** (`chunk_gated_delta_rule`,
+   `causal_conv1d_varlen`). This is the **pp** lever, not tg.
+4. **Item 11 -- server-side batching.** Not a kernel, but the largest *serving*
+   lever: at bs>1 the per-token weight read amortizes and `max_running_requests`
+   engages. It pairs with the per-batch-size decode graphs already built.
+
+Caveat: FreeToken's last ~35% at bs=1 came from **cache size** (22.5 -> 30.3),
+i.e. item 21, not a kernel. Our step is also spread across attention and norms
+rather than projection-dominated, so slices 3-4 win less than their FreeToken
+share. If **tg parity at bs=1** is the goal, item 21 + slice 3 are the path; if
+**serving throughput** is the goal, item 11 dominates and should be measured
+before more kernel work.
 
 ### Experiments to try (not on the critical path)
 

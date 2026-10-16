@@ -384,9 +384,10 @@ of decision 80 already anticipate it).
 
 ### Ordered slices
 
-1. **E3: bf16 paged attention** (this change; half-wired). q/output stay f32
-   (the mixer activation), K/V read bf16 from the pool. One extra signature +
-   cubin, dispatch on `pool.dtype()`.
+1. **E3: bf16 paged attention. DONE (decision 83).** q/output stay f32 (the mixer
+   activation), K/V read bf16 from the pool. One extra signature + cubin
+   (`paged_attention_bf16`), dispatch on `pool.dtype()`. tg 8.2 -> 10.3, VRAM
+   7.1 -> 6.05 GiB.
 2. **E1: vendor `fp8_pertensor_linear` (W8A16). DONE (decision 84).** Keep the FP8
    projections resident, dequant e4m3->f32 in-register, f32 accumulate. Their
    docstring records this exact path (bf16-widened weights through cuBLAS) as
@@ -402,3 +403,46 @@ of decision 80 already anticipate it).
    conv+silu (in-place slot state).
 4. **Prefill chunk kernels** (`chunk_gated_delta_rule`, `causal_conv1d_varlen`):
    our prefill is still op soup and has no FLA chunk kernel at all.
+
+## Next steps (ordered, 2026-10-16)
+
+Standing measurement (RTX 5060 Laptop, bs=1, bf16 KV, `tests/throughput_smoke.rs`):
+
+| stage | tg (tok/s) | VRAM (GiB) | commit |
+|---|---|---|---|
+| after bf16 GEMM `linear` (decision 78) | 8.2-8.8 | 7.9 | `8eeee85` |
+| + packed NVFP4 lm_head (79) | 8.2 | 7.1 | `8eeee85` |
+| + bf16 paged attention (83, slice 1) | 10.3 | 6.05 | `61021e8` |
+| + vendored W8A16 FP8 projections (84, slice 2) | 10.9 | 4.83 | `fea0281` |
+
+FreeToken is 22.5 tok/s (512 slots) / 30.3 (1900 slots); the gap is now ~2.1-2.8x.
+Slices 1-2 are done. The ordered remainder, with what each step actually is:
+
+1. **E4 (item 21): raise the staging `BLOCK_C`.** The FP8 slice freed ~1.2 GiB, but
+   `enable_device_staging` refuses a cache larger than the baked `BLOCK_C 512`
+   (`cuda_moe.rs:438`). Bump the `lru_ensure` constexpr, re-run
+   `scripts/check-kernels.sh` and the offload ABI/plan tests, then sweep slots in
+   the smoke. FreeToken got ~35% from 512 -> 1900 at bs=1; our MoE is only ~17% of
+   decode, so expect a few ms -- but the VRAM is already paid for.
+2. **Slice 3 (item 19): bf16 mixer activations + `causal_conv1d_decode`.** Move the
+   mixer activation stream (rms_norm/conv/attention outputs) from f32 to bf16 so
+   FreeToken's kernels take signature-only edits, and vendor their fused conv+silu
+   (`_causal_conv1d_decode` + in-place `[slots, dim, K-1]` state) to replace
+   `conv1d_silu_step_batch`. This is the tower-wide numerics change: re-measure
+   every logit gate (the decision 80 bounds already allow for bf16), and the
+   `--interp` selftest must be added for the conv kernel.
+3. **Slice 4 (item 20): prefill chunk kernels** (`chunk_gated_delta_rule`,
+   `causal_conv1d_varlen`). This is the **pp** lever (our prefill is still libtorch
+   op soup), not tg.
+4. **Item 11: server-side batching.** Not kernel work, but the largest *serving*
+   lever -- the generation loop currently runs one `run_batch` per request, so
+   decode never batches and `max_running_requests` is dead. At bs>1 the per-token
+   weight read amortizes; measure it before investing further in single-stream
+   kernels, and note it reuses the per-batch-size graphs already built.
+
+Expectation setting: the E2 caution (decision 79, the NVFP4 lm_head was neutral
+because its 4-bit LUT unpack is arithmetic-bound) did **not** repeat for W8A16 --
+a per-byte e4m3 convert is cheap, so its bandwidth win landed (+6% and -1.22 GiB).
+But our step is spread across attention and norms, so slices 3-4 win less than
+their FreeToken share; batching (item 11) and cache growth (item 21) may dominate
+the remaining serving gap.
