@@ -1764,6 +1764,51 @@ settled.
       checkpoint end to end through the new reader (CPU + libtorch, ~25 s, I/O
       now ~2 s of it).
 
+73. **Single-request throughput smoke** (2026-10-16, implemented) -- the P1
+    Hygiene item, and the first end-to-end performance number for the serving
+    path on the target GPU.
+    - **Shape.** `tests/throughput_smoke.rs` (gated, `--features cuda`) loads the
+      real checkpoint on CUDA with the serving config (bf16 KV, `kernel.triton`,
+      whole-layer prefill overlap, captured decode) and prints llama.cpp-style
+      pp/tg: pp = prompt tokens / time-to-first-token, tg = decoded tokens /
+      span between the first and last token. A warmup run captures the decode
+      graph and fills the expert slot cache before the measured run.
+    - **Measured (RTX 5060 Laptop, 8 GB).** pp = 517 prompt tokens / 15.0 s =
+      **34.4 tok/s**; tg = 127 decoded / 137.1 s = **0.9 tok/s**. The paper
+      target is 77-83 tok/s on an RTX 5090.
+    - **Decode is a gap, and it is not bandwidth.** A pinned host->device copy of
+      512 MiB measures **13.4 GB/s**, and the expert banks are pinned
+      host-resident (`FtwPinnedBanks`), so a decode miss is an H2D copy, not a
+      disk read: ~540 MiB of routed experts per token at 13 GB/s is ~0.04 s, i.e.
+      ~25 tok/s, ~28x the measured 0.9. Decode is limited by the per-token expert
+      staging path (serial per-expert copies / LRU misses), not by PCIe. The
+      scratch bandwidth probe was temporary and is removed.
+    - **The floor is loose on purpose.** The smoke asserts only that the kernel
+      ran (`expert_steps > 0`) and that pp/tg are not catastrophic (>1 / >0.2
+      tok/s), because the item is "a target, not a benchmark suite". The real
+      investigation (why decode is ~28x off the bandwidth ceiling) is a backlog
+      item.
+    - **Sizing finding.** With `max_running_requests = 1` the smoke panics with
+      "state slots exhausted": the GDN state-slot pool is `max_running_requests
+      (+1 for graph padding)`, leaving no room for hybrid-radix prefix snapshots
+      after one request finishes. A config/design edge, recorded as a backlog
+      item; the smoke runs at the serving-default concurrency (4).
+
+74. **Tool calling is in scope** (2026-10-16, decision) -- a deliberate scope
+    expansion, so the server can drive agentic clients (opencode, Codex-style)
+    that speak the OpenAI wire. Not part of the original MVP: `TODO.md` section 2
+    listed "reasoning parsers, tool-call streaming parsers" as out of scope, and
+    the domain `ChatMessage` is `{role, content}` with `render_chat` passing
+    `tools: null`.
+    - **What it is.** Function/tool calling on `POST /v1/chat/completions`:
+      accept `tools` (+ `tool_choice`), render them through the checkpoint's own
+      chat template (which already supports `tools`/`tool_call`/`tool_response`),
+      stream back `tool_calls` deltas, and accept `role: "tool"` result messages.
+    - **What it is not.** No new endpoint: opencode talks chat-completions, not
+      `/v1/responses` (that is Codex). No Anthropic `/v1/messages` (decision 38).
+      Reasoning stays out of scope (optional for opencode).
+    - **Status.** Recorded as the next feature; not yet implemented.
+
 ---
 
 ## Progress log (narrative, pre-2026-10-15 compaction)

@@ -16,9 +16,14 @@ prefix reuse is now real, the gated end-to-end oracle against the real checkpoin
 no sample), so mid-prompt prefixes are reusable too (decision 71). The FTW reader
 is now `pread` with `O_DIRECT` (buffered fallback), cutting the cold dense-load
 read ~6.6x (13.6 s -> 2.06 s) and keeping the weights out of the page cache
-(decision 72). Open work is the remaining M5 items: the `[opt] /v1/responses`
-surface, the throughput smoke, and the section 8 experiments.
-Progress history and the full decision log (numbers 1..72) live in `DONE.md`;
+(decision 72). The single-request throughput smoke landed (decision 73): on the
+RTX 5060 Laptop it measures pp ~34 tok/s, tg ~0.9 tok/s -- well under the paper
+target and ~28x under the measured 13.4 GB/s H2D ceiling, so **decode throughput
+is an open gap**. Tool calling on `/v1/chat/completions` was brought into scope
+(decision 74) so the server can drive opencode/agentic clients; it is the next
+feature. Open work: tool calling, the `[opt] /v1/responses` surface, the decode
+throughput gap, and the section 8 experiments.
+Progress history and the full decision log (numbers 1..74) live in `DONE.md`;
 read that for the "why" behind any decision number referenced in code or tests.
 
 Goal: a **minimal, fast, single-GPU** Rust serving engine for **one model** --
@@ -65,8 +70,11 @@ with `--text-model-only`). Known-good bf16/Fp8 siblings: `Qwen/Qwen3.6-35B-A3B`,
 - Prefill: chunked (default budget 8192), strict prefill-priority scheduling.
 - Decode: batched, CUDA-graph captured per batch size up to `max_running_req`, one model step per token.
 - Sampling: temperature / top_k / top_p / greedy (argmax) only. EOS + stop-strings + max-tokens.
-- OpenAI-compatible HTTP API (the whole MVP surface; Anthropic is out, decision 37).
-- Reuse FreeToken's one-time `ft checkpoint` conversion to FTW (+ aligned 4096 shards), then read it with mmap. Do **not** write our own converter in v0.
+- OpenAI-compatible HTTP API (the whole MVP surface; Anthropic is out, decision 38).
+- Function/tool calling on `/v1/chat/completions` (request `tools`, streamed
+  `tool_calls`, `role: "tool"` results) so agentic clients (opencode) can drive
+  the model (decision 74).
+- Reuse FreeToken's one-time `ft checkpoint` conversion to FTW (+ aligned 4096 shards), then read it with `O_DIRECT` pread. Do **not** write our own converter in v0.
 
 ### Out of scope (explicitly deferred, will not be implemented in MVP)
 
@@ -77,7 +85,7 @@ with `--text-model-only`). Known-good bf16/Fp8 siblings: `Qwen/Qwen3.6-35B-A3B`,
 - Multimodal (`mm/`), mRoPE, image/media handling.
 - Tensor parallelism / distributed / PyNCCL / ZMQ IPC.
 - DSV4 / SWA / DSA / MLA / QSA / BSA attention families (full-attention GQA only).
-- Reasoning parsers, tool-call streaming parsers (buffered tool JSON optional later).
+- Reasoning parsers (reasoning is optional for opencode; tool calling is in scope, decision 74).
 - Daemon, proxy, shell/TUI, `ft ctl`, accounting, log ring.
 - `/v1/responses` API (optional, in decisions).
 
@@ -230,12 +238,13 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 
 ### Server (axum recommended)
 
-- [ ] [opt] `/v1/responses` (needed only for Codex).
-- Anthropic `/v1/messages` is out of the MVP (decision 37).
+- [ ] P0 **tool calling on `/v1/chat/completions` -- decision 74, next feature.** Accept `tools`/`tool_choice`, render through the checkpoint's chat template, stream `tool_calls` deltas, accept `role: "tool"` results. Required for opencode/agentic clients.
+- [ ] [opt] `/v1/responses` (needed only for Codex; opencode talks chat-completions, decision 74).
+- Anthropic `/v1/messages` is out of the MVP (decision 38).
 
 ### Hygiene
 
-- [ ] P1 smoke: llama.cpp-style single-request throughput; token/s vs paper (77-83 tok/s on RTX 5090) as a target, not a benchmark suite.
+- [x] P1 **single-request throughput smoke -- DONE (2026-10-16), decision 73.** Gated `tests/throughput_smoke.rs` prints llama.cpp-style pp/tg with the serving config. Measured on the RTX 5060 Laptop: pp ~34.4 tok/s, tg ~0.9 tok/s -- well under the paper target and ~28x under the measured 13.4 GB/s H2D ceiling, so decode throughput is an open gap (section 8 backlog).
 
 ## 6. Milestones
 
@@ -268,12 +277,15 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
   what makes the radix prefix cache real, decision 65) -- domain core, device
   primitive, generation-loop wiring, chunked prefill with mid-prefill snapshots,
   and the gated cross-request oracle DONE (decisions 68, 69, 70, 71); startup
-  load tuning DONE (decision 72); `[opt] /v1/responses` and the throughput smoke
-  remain, plus the section 8 experiments.
+  load tuning DONE (decision 72); throughput smoke DONE (decision 73);
+  `[opt] /v1/responses` remains, plus the section 8 experiments.
+- **M6 (CURRENT): agentic serving.** Tool calling on `/v1/chat/completions` so
+  opencode/agentic clients can drive the model (decision 74); the decode
+  throughput gap (decision 73) is the performance counterpart.
 
 ## 7. Decisions
 
-The full log of confirmed decisions (numbers 1..71, stable -- code, tests and
+The full log of confirmed decisions (numbers 1..74, stable -- code, tests and
 `ARCHITECTURE.md` reference them by number) lives in `DONE.md`. This section
 lists only the decisions that still bind open work; everything else there is
 history.
@@ -312,6 +324,18 @@ history.
   no alignment guarantee; `memmap2` is dropped. `madvise(Sequential)` made mmap
   worse (~47 s), so it is not a fix. Zero-copy mmap and an O_DIRECT-dense /
   mmap-expert hybrid are recorded as experiments in section 8.
+- **74** -- function/tool calling is in scope on `/v1/chat/completions` (accept
+  `tools`/`tool_choice`, render through the checkpoint's chat template, stream
+  `tool_calls`, accept `role: "tool"`), so agentic clients (opencode) can drive
+  the model. It is not a new endpoint (`/v1/responses` is for Codex, not
+  opencode) and not Anthropic (decision 38); reasoning stays out of scope. Next
+  feature; see `DONE.md`.
+- **73** -- the gated single-request throughput smoke (`tests/throughput_smoke.rs`)
+  measures pp ~34 tok/s and tg ~0.9 tok/s on the RTX 5060 Laptop. Decode is
+  ~28x under the measured 13.4 GB/s H2D ceiling and the expert banks are pinned
+  host-resident, so the bottleneck is the per-token expert staging path, not
+  PCIe; the decode gap is a section 8 backlog item. Floor is loose (a printer,
+  not a gate).
 - **68** -- the `hybrid_radix` domain core (`HybridRadixIndex`, dual refcounts,
   tombstones, deepest-live-snapshot match, dual eviction) and
   `LinearStateSlabs::copy_slot` landed first; the generation-loop wiring landed
@@ -365,6 +389,21 @@ performance work.
    whole-layer streaming with a double-buffered copy/compute overlap at
    `cache_size_slots >= 2*num_experts`, gated by
    `a_whole_layer_prefill_overlap_matches_the_host_plan`.
+
+**Tier 4 -- open gaps found by the 2026-10-16 throughput smoke:**
+9. Decode throughput -- **OPEN, the current performance blocker.** tg is ~0.9
+   tok/s vs pp ~34 tok/s, ~28x under the measured 13.4 GB/s pinned H2D ceiling,
+   and the expert banks are pinned host-resident, so the cost is the per-token
+   expert staging (serial per-expert copies / LRU misses), not PCIe (decision 73).
+   Investigate: is the device-staged miss path serial and latency-bound, what is
+   the slot-cache hit rate at `cache_size_slots = 512` (~2 layers) with ~320
+   experts/token over 40 layers, and whether the copy kernel or a batch/fused
+   staging (the deferred `moe_prefill_hit_d2d`-style path) closes it.
+10. GDN state-slot sizing -- **OPEN.** The pool is `max_running_requests (+1 for
+    the captured graph's padding row)`, which leaves no room for hybrid-radix
+    prefix snapshots: at `max_running_requests = 1` the second request panics with
+    "state slots exhausted" (decision 73). Either size the pool with headroom for
+    cached prefixes or make snapshots reclaimable under that pressure.
 
 ### Experiments to try (not on the critical path)
 
