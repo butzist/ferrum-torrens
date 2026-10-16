@@ -415,12 +415,21 @@ performance work.
    floor. So B (overlap decode copy/compute) is now moot.
    **Profiled (2026-10-16, ablate-and-diff, since `nsys`'s report importer is
    broken in-jail and `ncu` lacks counter permission).** At bs=1 a 100-token
-   decode is ~200 ms/token, split: **mixer (attention+GDN) ~114 ms (59%)**, MoE
-   (plan+copy+gemm) ~17 ms (9%), the rest (norms, embed, lm_head, sampling) ~63 ms
-   (32%). NVML samples the GPU **100% busy (mean and max)**: no idle/launch
-   bubbles, so it is not overhead-bound. But NVML only means "a kernel was
-   resident"; the achieved rate is ~4 GB of weight traffic/token in 200 ms = ~8%
-   of the ~250 GB/s HBM peak, i.e. latency-bound at one row, not throughput-bound.
+   decode is ~200 ms/token, split: **GDN ~68 ms (35%), attention ~49 ms (25%),
+   MoE ~17 ms (9%), the rest (norms, embed, lm_head, sampling) ~59 ms (31%)** --
+   so the mixer is GDN-heavy, not attention-heavy. NVML samples the GPU **100%
+   busy (mean and max)**: no idle/launch bubbles, so it is not overhead-bound.
+   But NVML only means "a kernel was resident"; the achieved rate is ~4 GB of
+   weight traffic/token in 200 ms = ~8% of the ~250 GB/s HBM peak, i.e.
+   latency-bound at one row, not throughput-bound. The mixer is **libtorch op
+   soup** (our GDN is ~15 ops/layer including per-step `f32_` casts of weights,
+   `gdn_core_batch`), where FreeToken uses fused kernels (FLA
+   `fused_sigmoid_gating_recurrent` + `causal_conv1d`). We use **no flashinfer**;
+   our own `paged_attention` cubin is used only for **f32** KV, so the default
+   **bf16** KV takes a libtorch dense-gather + masked-softmax fallback
+   (`attention_cached_pos`) -- f32 KV (our kernel) is ~11% faster end to end.
+   No speculative/multi-token decode exists in FreeToken for this model (MTP
+   dropped), so the gap is kernel quality, not decode strategy.
    **Root lever: the serving path never batches.** `generate`/`generate_streaming`
    both call `run_batch(engine, vec![request])` (generation.rs:114/127), one HTTP
    request per loop, so `max_running_requests` and the per-batch-size decode
@@ -464,6 +473,20 @@ performance work.
     tool-call token, so a multi-turn loop (tool call -> result -> continue) reuses
     the pre-call prefix instead of re-prefilling. Add the analogous snapshot point
     when the tool-call feature lands; it is the agentic-session cache.
+14. bf16 paged attention -- **OPEN.** The committed `paged_attention` cubin is
+    wired only for `KvDType::F32`; the default bf16 KV falls back to a libtorch
+    `gather_rows` + `attention_cached_pos` masked softmax (~20 ms/token, 10%).
+    Add the bf16 variant so the fast path is the default. Attention is ~25% of
+    decode, so this plus freeing the fallback is worth it.
+15. Fused GDN decode kernel -- **OPEN, the biggest single win (GDN ~35%).**
+    `gdn_core_batch` is ~15 libtorch ops/layer, including per-step `f32_` casts of
+    weights and activations. Write a fused Triton decode kernel (FLA
+    `fused_sigmoid_gating_recurrent` + `causal_conv1d` are the reference) and AOT
+    it like the others. Do not pull in flashinfer: it is attention-only (a quarter
+    of decode), a heavy C++/Python dependency, and would not touch GDN.
+16. Decode "rest" ~31% -- **OPEN.** ~59 ms/token outside mixer+MoE: input/post
+    norms (80/layer), embed gather, lm_head GEMV (vocab 248320 x hidden bf16),
+    sampling (+ its D2H). Profile which dominates once the kernels above land.
 
 ### Experiments to try (not on the critical path)
 
