@@ -105,6 +105,14 @@ Instructions for AI coding agents working in this repository.
   `rustfmt`, lint with `clippy`.
 - No comments unless they explain a non-obvious "why". Configuration gets no
   comments. ASCII only (no em-dash, no arrows).
+- **Do not transliterate the Python reference.** `FreeToken/` is a porting
+  guide, not a line-by-line spec. Reach for the Rust-native shape of each idea:
+  ownership instead of manual refcounts where it fits, `Rc`/`Arc` for genuinely
+  shared state, `Cow` for copy-on-write, RAII (`Drop`, guard types) instead of
+  paired acquire/release calls, iterators/slices and the type system instead of
+  runtime checks. Match the reference's *semantics* (numerics, cache invariants,
+  eviction rules), not its call structure. Note each deliberate divergence and
+  its reason in `DONE.md` when it changes behaviour.
 - Keep everything GPU-only single-process in-process. This repo has no JS
   runtime (node/bun/deno were intentionally removed from the flake).
 - Rust is the only language at runtime. Python is used for the one-time HF -> FTW
