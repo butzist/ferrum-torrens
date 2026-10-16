@@ -253,7 +253,7 @@ A tree of prefixes sharing KV pages across requests:
   caller-owned slot id (donate-not-copy). The device primitive
   `LinearStateSlabs::copy_slot` does the COW donate/restore.
 - The wiring is implemented (decision 69). `DeviceCache` owns the tree and drives
-  two commit boundaries: at **prompt end** `commit(finished=false)` COWs the
+  the commit boundaries: at **prompt end** `commit(finished=false)` COWs the
   running GDN state into a tree-owned slot and locks the node; at **finish**
   `commit(finished=true)` inserts the full sequence and donates the request's
   final live slot zero-copy. `adopt_prefix` matches the prompt minus its last
@@ -261,11 +261,12 @@ A tree of prefixes sharing KV pages across requests:
   request's live slot and re-points the request at the tree's canonical KV pages.
   Pressure runs the evictions: `reserve` reclaims pages via `evict_full`, slot
   allocation reclaims GDN slots via `evict_mamba` (the two pools are independent,
-  so no partitioning). Prefill is single-shot, so mid-prefill (x64 chunk)
-  snapshots are deferred; only prompt-boundary and completed-sequence prefixes
-  are reusable for now. A snapshot carries both the recurrent state and the
-  causal-conv tail (`conv_state`), which is why the boundary is page-aligned: the
-  conv tail must line up with the tokens the KV pages hold.
+  so no partitioning). Prefill is chunked (decision 71): every non-final chunk
+  `commit(finished=false)`s its boundary too, so a prefix that ends mid-prompt is
+  reusable, not just prompt-end and completed-sequence prefixes. A snapshot
+  carries both the recurrent state and the causal-conv tail (`conv_state`), which
+  is why the boundary is page-aligned: the conv tail must line up with the tokens
+  the KV pages hold.
 
 ## 4. Expert memory hierarchy (the `offload` strategy)
 
@@ -363,8 +364,11 @@ compute on the same host memory.
   step). Known behaviour to preserve: a long chunked prefill blocks decode.
 - Prefill admission checks page tables, prefix match, KV reservation
   (`div_ceil` alignment), then locks; chunked prompts reuse their table/state slots
-  across chunks; intermediate (non-final) chunks are not committed to the radix
-  tree.
+  across chunks. Our implementation commits a `finished=false` snapshot at every
+  chunk boundary (decision 71); a continuation chunk samples nothing and is
+  re-queued. FreeToken differs: it skips `ChunkedReq` (no intermediate commit) and
+  snapshots on a fixed x64 mamba-track grid within one whole-prompt prefill, so our
+  reuse points are budget-dependent rather than on a x64 grid.
 - Decode batch is sorted by request `uid` for determinism.
 - Stop priority: EOS / stop-string wins over max-tokens; token budgets clamp
   `max_device_len`.
@@ -398,7 +402,8 @@ while not done:
 
     for req in batch: req.complete_one()  # advance lengths AFTER the step
     stop: eos / stop_str / max_device_len -> finish, else keep decoding
-    prefill done   -> cache_req (commit KV prefix + prompt-end GDN snapshot)
+    prefill chunk done -> cache_req (commit KV prefix + boundary GDN snapshot,
+                          finished=false); a non-final chunk re-queues, no sample
     request done   -> free pages, table slot, GDN slots (hybrid: donate the final
                       GDN slot to the tree first, idempotent)
     detokenize next_tokens -> SSE delta to client

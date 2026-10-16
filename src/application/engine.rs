@@ -433,28 +433,48 @@ impl Engine {
         row: CachedStep<'_>,
         rng: &mut Rng,
     ) -> Result<(u64, u32), EngineError> {
+        let logits = self.extend_cached(row.uid, row.ids, row.start, row.cache)?;
+        Ok((row.uid, sample(&logits, row.params, rng)))
+    }
+
+    /// Advance one prefill chunk without sampling: a non-final chunk has no
+    /// meaningful last-token logits, and sampling it would consume RNG draws
+    /// that make a chunked run diverge from an unchunked one. The model still
+    /// computes the answer row (its forward is fixed-shape), which is discarded.
+    pub fn run_prefill_cached(&self, row: CachedStep<'_>) -> Result<(), EngineError> {
+        self.extend_cached(row.uid, row.ids, row.start, row.cache)?;
+        Ok(())
+    }
+
+    fn extend_cached(
+        &self,
+        uid: u64,
+        ids: &[u32],
+        start: usize,
+        cache: &mut SequenceCache,
+    ) -> Result<Vec<f32>, EngineError> {
         let kv = self.cache.as_ref().ok_or(EngineError::NoKvCache)?.clone();
-        if row.ids.is_empty() {
-            return Err(EngineError::EmptyStep { uid: row.uid });
+        if ids.is_empty() {
+            return Err(EngineError::EmptyStep { uid });
         }
-        if row.start != row.cache.cached() {
+        if start != cache.cached() {
             return Err(EngineError::CacheOutOfStep {
-                uid: row.uid,
-                start: row.start,
-                cached: row.cache.cached(),
+                uid,
+                start,
+                cached: cache.cached(),
             });
         }
-        kv.reserve(row.cache, row.ids.len())
+        kv.reserve(cache, ids.len())
             .map_err(|e| EngineError::KvCache(e.to_string()))?;
-        let n = row.ids.len();
+        let n = ids.len();
         let input = crate::domain::model::ForwardInput {
-            input_ids: row.ids.to_vec(),
-            positions: (row.start..row.start + n).map(|p| p as u32).collect(),
+            input_ids: ids.to_vec(),
+            positions: (start..start + n).map(|p| p as u32).collect(),
             answers: vec![n - 1],
         };
         let logits = self
             .model
-            .forward_cached(&input, row.cache)
+            .forward_cached(&input, cache)
             .map_err(|e| EngineError::KvCache(e.to_string()))?;
         let vocab = self.model.params().vocab_size;
         if logits.len() != vocab {
@@ -463,7 +483,7 @@ impl Engine {
                 want: vocab,
             });
         }
-        Ok((row.uid, sample(&logits, row.params, rng)))
+        Ok(logits)
     }
 
     pub fn run_forward(

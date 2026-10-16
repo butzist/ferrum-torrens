@@ -27,6 +27,11 @@ pub struct Req {
     pub prompt_len: usize,
     pub prefilled: usize,
     pub generated: usize,
+    /// Prompt tokens this request's next forward feeds, assigned by
+    /// `schedule_next_batch`. Equal to `prefill_remaining` for the last chunk;
+    /// smaller when the prompt is chunked to the prefill budget, which is a
+    /// continuation chunk that samples nothing and stays queued.
+    pub extend_len: usize,
     pub table_idx: i32,
     pub phase: Phase,
     pub sampling: SamplingParams,
@@ -41,6 +46,7 @@ impl Req {
             prompt_len,
             prefilled: 0,
             generated: 0,
+            extend_len: 0,
             table_idx: -1,
             phase: Phase::Prefill,
             sampling,
@@ -54,6 +60,12 @@ impl Req {
 
     pub fn is_prefilling(&self) -> bool {
         self.phase == Phase::Prefill && self.prefill_remaining() > 0
+    }
+
+    /// True when this prefill chunk does not complete the prompt, i.e. the
+    /// request must stay queued and its forward must not be sampled.
+    pub fn is_chunk(&self) -> bool {
+        self.phase == Phase::Prefill && self.extend_len < self.prefill_remaining()
     }
 
     pub fn remaining_output(&self) -> u32 {
@@ -129,9 +141,11 @@ pub struct Batch {
 }
 
 /// Strict prefill-priority batching. Pending requests are admitted in uid order
-/// while they fit `max_prefill_tokens`; a request larger than the whole budget
-/// is admitted alone as a chunk. Decode requests are admitted together, sorted
-/// by uid, capped by `max_running_requests`.
+/// and split across `max_prefill_tokens`: each admitted request is assigned the
+/// `extend_len` its forward feeds, so a prompt longer than the budget is
+/// processed in chunks across steps (a continuation chunk completes with
+/// `is_chunk() == true` and is re-queued by the caller). Decode requests are
+/// admitted together, sorted by uid, capped by `max_running_requests`.
 pub fn schedule_next_batch(
     pending: &mut Vec<Req>,
     decoding: &mut Vec<Req>,
@@ -143,7 +157,7 @@ pub fn schedule_next_batch(
     if !pending.is_empty() {
         let mut used = 0usize;
         let mut take = 0usize;
-        for r in pending.iter() {
+        for r in pending.iter_mut() {
             if take >= budget.max_running_requests {
                 break;
             }
@@ -151,6 +165,7 @@ pub fn schedule_next_batch(
             if cost == 0 && used > 0 {
                 break;
             }
+            r.extend_len = cost;
             used += cost;
             take += 1;
             if used >= budget.max_prefill_tokens {
@@ -212,6 +227,28 @@ mod tests {
         let b = schedule_next_batch(&mut pending, &mut Vec::new(), &BUDGET);
         assert_eq!(b.reqs.len(), 2, "20 + clipped 12 fits the 32-token budget");
         assert_eq!(pending.len(), 1, "the third prompt waits for the next step");
+        assert_eq!(b.reqs[0].extend_len, 20, "the first prompt fits whole");
+        assert_eq!(
+            b.reqs[1].extend_len, 12,
+            "the second is chunked to the budget leftover"
+        );
+        assert!(
+            !b.reqs[0].is_chunk() && b.reqs[1].is_chunk(),
+            "only the clipped request is a continuation chunk"
+        );
+    }
+
+    #[test]
+    fn a_long_prompt_is_chunked_across_steps() {
+        let mut pending = vec![req(1, 100, 8)];
+        let b = schedule_next_batch(&mut pending, &mut Vec::new(), &BUDGET);
+        assert_eq!(b.reqs[0].extend_len, 32, "one budget-sized chunk this step");
+        assert!(b.reqs[0].is_chunk(), "100 > 32, so the prompt keeps going");
+
+        let mut r = b.reqs[0].clone();
+        r.advance_prefill(r.extend_len);
+        assert!(r.is_prefilling());
+        assert_eq!(r.prefill_remaining(), 68);
     }
 
     #[test]
@@ -220,6 +257,31 @@ mod tests {
         let b = schedule_next_batch(&mut pending, &mut Vec::new(), &BUDGET);
         assert_eq!(b.reqs.len(), 1);
         assert!(pending.is_empty());
+        assert_eq!(b.reqs[0].extend_len, 32, "clipped to the whole budget");
+    }
+
+    #[test]
+    fn a_continuation_completes_on_a_later_step() {
+        let mut pending = vec![req(1, 50, 8)];
+        let first = schedule_next_batch(&mut pending, &mut Vec::new(), &BUDGET);
+        let mut r = first.reqs[0].clone();
+        assert!(r.is_chunk());
+        r.advance_prefill(r.extend_len);
+        pending.push(r);
+
+        let second = schedule_next_batch(&mut pending, &mut Vec::new(), &BUDGET);
+        assert!(pending.is_empty());
+        assert_eq!(
+            second.reqs[0].extend_len, 18,
+            "the remainder fits this time"
+        );
+        assert!(
+            !second.reqs[0].is_chunk(),
+            "the last chunk completes the prompt"
+        );
+        let mut r = second.reqs[0].clone();
+        r.advance_prefill(r.extend_len);
+        assert_eq!(r.phase, Phase::Decode);
     }
 
     #[test]

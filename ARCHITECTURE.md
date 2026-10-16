@@ -536,8 +536,8 @@ sequenceDiagram
   M->>P: store(layer, tail, k, v) for full-attention layers
   M->>P: gather(layer, cache.filled())
   M->>S: state_slot read/write for GDN layers
-  G->>KV: commit(ids, finished=false) at prompt end -> snapshot + lock
-  Note over G: next step: ids = ids[start..], start = cache.cached()
+  G->>KV: commit(ids[..end], finished=false) at each prefill chunk boundary -> snapshot + lock
+  Note over G: a non-final chunk is re-queued; the final one samples
   G->>KV: commit(ids, finished=true) at finish -> donate live slot
   G->>KV: end(cache)
 ```
@@ -547,20 +547,21 @@ unit-tested in the domain (decisions 68, 69), and `DeviceCache` drives both
 commit boundaries. `adopt_prefix` matches the prompt (without its last token),
 copy-on-write restores the matched GDN snapshot into the request's live slot
 (`LinearStateSlabs::copy_slot`) and repoints the request at the tree's canonical
-KV pages. `commit(finished=false)` at prompt end snapshots the running state into
-a tree-owned slot and locks the node; `commit(finished=true)` at finish donates
-the request's final live slot zero-copy and clears the request. Pressure drives
-eviction: `reserve` reclaims pages via `evict_full`; snapshot allocation reclaims
-slots via `evict_mamba`. The two pools are independent, so no partitioning is
-needed. For this 30-GDN/10-attention tower a match is only reusable up to the
-deepest node with a live GDN state snapshot, which is why the snapshot donation
-(not the KV tree alone) is the point (decision 65). Prefill is single-shot, so
-mid-prefill (`CHUNK`-boundary) snapshots are deferred: only prompt-boundary and
-completed-sequence prefixes are reusable for now. KV is f32 or bf16: `[kv]
-dtype` picks it and the default is bf16 (half the bytes; the lever when VRAM
-binds), while `fp8` -- the checkpoint's declared `kv_cache_quant_algo` -- is still
-`[TODO]`. Gathers always return f32, so the attention math is dtype-agnostic and
-the f32-only paged decode kernel is skipped for a bf16 pool.
+KV pages. `commit(finished=false)` snapshots the running state into a tree-owned
+slot and locks the node -- at prompt end and, since decision 71, at every prefill
+chunk boundary, so a prefix that ends mid-prompt is reusable too;
+`commit(finished=true)` at finish donates the request's final live slot zero-copy
+and clears the request. Repeated non-finished commits advance the reused span
+without freeing a page (the tree adopts the pages the request already holds).
+Pressure drives eviction: `reserve` reclaims pages via `evict_full`; snapshot
+allocation reclaims slots via `evict_mamba`. The two pools are independent, so no
+partitioning is needed. For this 30-GDN/10-attention tower a match is only
+reusable up to the deepest node with a live GDN state snapshot, which is why the
+snapshot donation (not the KV tree alone) is the point (decision 65). KV is f32
+or bf16: `[kv] dtype` picks it and the default is bf16 (half the bytes; the lever
+when VRAM binds), while `fp8` -- the checkpoint's declared `kv_cache_quant_algo`
+-- is still `[TODO]`. Gathers always return f32, so the attention math is
+dtype-agnostic and the f32-only paged decode kernel is skipped for a bf16 pool.
 
 ### 3.7 Scheduler and sampling `[core]`
 
@@ -575,7 +576,10 @@ flowchart LR
 ```
 
 **Dynamic.** Strict prefill-priority: a step is either prefill or decode, never
-both. Decode rows are sorted by `uid` for determinism. Stop priority is
+both. Pending requests are admitted in `uid` order and split across
+`max_prefill_tokens`; a prompt longer than the budget is fed in chunks across
+steps, and a continuation chunk (`is_chunk()`) is re-queued rather than sampled.
+Decode rows are sorted by `uid` for determinism. Stop priority is
 EOS/stop-string over max-tokens.
 
 ### 3.8 HTTP serving and generation `[core]`
@@ -598,8 +602,8 @@ sequenceDiagram
   H->>T: encode prompt (or render chat template then encode)
   H->>G: spawn_blocking(run_batch)
   loop until stop
-    G->>E: prefill: run_forward_cached / decode: replay captured graphs (or run_forward_cached)
-    E-->>G: sampled token
+    G->>E: prefill: run_prefill_cached (non-final chunk) / run_forward_cached (final) / decode: replay captured graphs (or run_forward_cached)
+    E-->>G: sampled token (final prefill chunk and decode only)
     G->>T: decode token
     G->>Sink: token(piece) -> SSE frame
   end

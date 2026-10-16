@@ -1679,6 +1679,57 @@ settled.
     libtorch CPU backend in the agent sandbox; the same body runs on the target
     GPU via `auto_device` (a contended sandbox GPU could not fit the tower).
 
+71. **Chunked prefill commits a snapshot at every chunk boundary** (2026-10-16,
+    implemented) -- the deferred half of item 7, and what makes mid-prompt
+    prefixes reusable at all.
+    - **The scheduler already chunked; the loop did not follow.** `Budget` and
+      `schedule_next_batch` assigned each admitted request an `extend_len`
+      (`Req.extend_len`, `Req::is_chunk()`), but the generation loop kept feeding
+      the whole prompt in one forward. Now a non-final chunk runs
+      `Engine::run_prefill_cached` (a forward with no sampling), commits its
+      boundary with `commit(cache, ids[..end], false)`, advances the request, and
+      is re-queued into `pending` ahead of fresh work; only the final chunk is
+      sampled and moves to decode.
+    - **No RNG draw for a continuation.** A non-final chunk has no meaningful
+      last-token logits, and consuming a draw for it would make a chunked run
+      diverge from a whole-prompt run under temperature > 0. `run_prefill_cached`
+      runs the same fixed-shape forward (the model still computes the answer row)
+      and throws the result away.
+    - **Adoption realignment.** `SequenceCache::adopt_prefix` sets `len` to the
+      matched length, so `open_cache` realigns `Req.prefilled` to
+      `cache.cached()` at admit time and the chunk budget counts only the tail.
+      Without it the scheduler would re-count already-reused tokens.
+    - **A shadowing bug the tests caught.** The loop destructured the session's
+      `req` over the scheduled `req`, so `extend_len` read the session's stale 0.
+      The scheduled value is captured before the destructure.
+    - **Repeated non-finished commits are safe.** A mid-prompt
+      `commit(finished=false)` allocates a second live slot, `copy_slot`s the
+      running state into it, and repoints the request at the tree's canonical
+      pages; the following chunk's commit finds `prefix_len == old_reused`, so it
+      adopts exactly the pages the request already holds and frees nothing while
+      `reused` advances chunk by chunk. This lifts decision 69's deferral:
+      mid-prompt boundaries now carry a live snapshot, so a later request whose
+      prompt ends on a chunk boundary resumes there.
+    - **Unchanged.** The no-cache reference path (decision 12) stays single-shot:
+      a re-feeding forward must see the whole prefix anyway. Decode still feeds
+      one token per step.
+    - **Deliberate divergence from FreeToken.** The reference never commits an
+      intermediate scheduling chunk (`scheduler.py` skips `ChunkedReq` with "don't
+      cache intermediate chunks") and instead snapshots on a fixed x64 mamba-track
+      grid within one whole-prompt prefill (`cache.py` `mamba_last_track_seqlen`).
+      We commit at the scheduler chunk boundary, where the whole-chunk GDN
+      forward's state is known, and COW-copy it. The invariant is the same (a
+      snapshot is point-attached at a node END boundary); only the *placement* of
+      reuse points differs -- ours are budget-dependent rather than on a x64 grid,
+      so finer mid-prompt reuse needs the fast chunked GDN kernels (ALGORITHM.md
+      section 2.3.1), still deferred.
+    - **Tests.** Scheduler: `a_long_prompt_is_chunked_across_steps`,
+      `a_continuation_completes_on_a_later_step`. Generation:
+      `a_long_prompt_is_fed_to_the_cache_in_budget_sized_chunks`,
+      `the_chunked_path_samples_like_the_whole_prompt_path` (temperature 0.8,
+      seed parity), `a_non_final_chunk_never_emits_a_token`. Cache:
+      `a_chunk_boundary_commit_is_reusable_mid_prompt`.
+
 ---
 
 ## Progress log (narrative, pre-2026-10-15 compaction)
@@ -2140,8 +2191,9 @@ subsection names are kept verbatim.
 - [x] P0 page free-list (`free_slots` holds page bases) + per-req page table holding **token locations** + dummy row pointing at a sentinel page. (`domain/kvcache.rs`)
 - [x] P0 radix prefix tree: walk by first-page-key, `std::mismatch`-comparison align-down to page, node split, insert, LRU evict (unlocked leaf only), ref-counted handles. (`domain/kvcache.rs`, page_size=1)
 - [x] P2 hybrid_radix **domain core + device primitive** (2026-10-16, decision 68): `HybridRadixIndex` (dual `full_ref`/`mamba_ref`, tombstones, deepest-live-snapshot `match_prefix`, `evict_mamba` counts snapshots / `evict_full` counts tokens, donate-not-copy as a caller-owned slot) + `RadixNode.mamba_value/mamba_refcount` + `LinearStateSlabs::copy_slot`. 17 unit tests.
-- [x] P2 hybrid_radix **generation-loop wiring** (2026-10-16, decision 69): `DeviceCache` owns the tree; `adopt_prefix` COW-restores a matched snapshot and repoints at the tree's pages; `commit(finished=false)` snapshots the prompt end and locks, `commit(finished=true)` donates the live slot zero-copy; `reserve`/slot allocation drive `evict_full`/`evict_mamba` on pressure (pools are independent, no partitioning). `generation::open_cache` + the prefill/finish commits wire it in. Deferred: mid-prefill (`CHUNK`) snapshots, since prefill is single-shot.
+- [x] P2 hybrid_radix **generation-loop wiring** (2026-10-16, decision 69): `DeviceCache` owns the tree; `adopt_prefix` COW-restores a matched snapshot and repoints at the tree's pages; `commit(finished=false)` snapshots the prompt end and locks, `commit(finished=true)` donates the live slot zero-copy; `reserve`/slot allocation drive `evict_full`/`evict_mamba` on pressure (pools are independent, no partitioning). `generation::open_cache` + the prefill/finish commits wire it in. Mid-prefill snapshots landed with decision 71.
 - [x] P2 hybrid_radix **cross-request reuse gate** (2026-10-16, decision 70): gated `tests/kvcache_cross_request_reuse.rs` drives the real checkpoint through commit-prompt-end / adopt-in-the-next-request / COW-restore and matches the adopted step to a cold re-feed (reused 7 of 10 tokens, `2.4e-6` of scale).
+- [x] P2 hybrid_radix **chunked prefill + mid-prefill snapshots** (2026-10-16, decision 71): the generation loop now feeds the prompt in `max_prefill_length` chunks; a non-final chunk runs `Engine::run_prefill_cached` (no sample, no RNG draw), commits `commit(finished=false)` at its boundary, and re-queues; only the final chunk samples. `open_cache` realigns `Req.prefilled` to `cache.cached()` after adoption. Repeated non-finished commits advance `reused` without freeing a page, so mid-prompt boundaries are reusable.
 - [x] P0 **KV dtype serving-safe (SERVING BLOCKER).** Done 2026-10-15. `[kv] dtype = "f32" | "bf16"` (`fp8` refused at validation until a path exists) now picks the pool element type in `registry::kv_cache`; the default is `bf16`, which halves the pool, so the 4.51 GiB resident tower and the default `num_tokens = 131072` pool (2.5 GiB) fit the 7.53 GiB device. `MhaPool::gather*` now always returns f32 (upcasting bf16 on read), which is what lets the f32 attention math and the dense padded-window fallback consume a bf16 pool; the f32-only paged kernel still serves f32 pools. Measured on the device: `a_bf16_pool_device_decode_matches_refeeding_the_whole_prefix` keeps the greedy token equal to the f32 re-fed forward at every step with a worst logit shift of ~13% of scale (bf16 K/V rounding; the checkpoint itself serves fp8 KV). Gated f32 gates are pinned `dtype = "f32"` where they assert exact numerics (decision 64).
 - [x] P0 GDN linear-state pool: free-slot bookkeeping (conv-state + recurrent fp32 rows are infra tensors); ping-pong live slots and restore land with the hybrid path.
 ### Scheduler

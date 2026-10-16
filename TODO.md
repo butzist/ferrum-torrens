@@ -9,12 +9,13 @@ overlap (item 8 slice 2, decision 67); below `2*num_experts` slots it keeps the
 chunked LRU. The `hybrid_radix` GDN snapshot donation is **wired end to end**
 (decisions 68, 69): `HybridRadixIndex` (dual refcounts, tombstones,
 deepest-live-snapshot match, dual eviction), `LinearStateSlabs::copy_slot`, and
-the generation loop's prompt-end/finish commit boundaries with dual-eviction
-triggers. Cross-request prefix reuse is now real, and the gated end-to-end oracle
-against the real checkpoint (`tests/kvcache_cross_request_reuse.rs`, decision 70)
-passes. Open work is the ordered backlog in section 8: the remaining M5 items and
-deferred mid-prefill snapshots.
-Progress history and the full decision log (numbers 1..70) live in `DONE.md`;
+the generation loop's commit boundaries with dual-eviction triggers. Cross-request
+prefix reuse is now real, the gated end-to-end oracle against the real checkpoint
+(`tests/kvcache_cross_request_reuse.rs`, decision 70) passes, and prefill is now
+**chunked**: a non-final chunk snapshots its boundary (`commit(finished=false)`,
+no sample), so mid-prompt prefixes are reusable too (decision 71). Open work is
+the remaining M5 items in the section 8 backlog.
+Progress history and the full decision log (numbers 1..71) live in `DONE.md`;
 read that for the "why" behind any decision number referenced in code or tests.
 
 Goal: a **minimal, fast, single-GPU** Rust serving engine for **one model** --
@@ -217,7 +218,8 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 
 - [x] P2 **hybrid_radix domain core + device primitive -- DONE (2026-10-16), decision 68.** `HybridRadixIndex` in `domain/kvcache.rs` (dual `full_ref`/`mamba_ref` counts, tombstones, `full_ref >= mamba_ref`, deepest-live-snapshot `match_prefix`, `split_at` keeps the snapshot on the suffix, `evict_mamba` counts snapshots / `evict_full` counts tokens, donate-not-copy as a caller-owned-slot contract) plus `RadixNode.mamba_value/mamba_refcount` and `LinearStateSlabs::copy_slot` (COW donate/restore). 17 unit tests + a gated device test.
 - [x] **hybrid_radix wiring -- DONE (2026-10-16), decision 69.** `DeviceCache` owns the tree and drives both boundaries: `begin` allocates a live slot, `adopt_prefix` matches the prompt, COWs the snapshot into the live slot (`copy_slot`) and repoints the request at the tree's canonical KV pages; `commit(finished=false)` snapshots the prompt-end state and locks the node; `commit(finished=true)` donates the live slot zero-copy and clears the request. Pressure drives eviction: `reserve` reclaims parent pages via `evict_full`; snapshot allocation reclaims GDN slots via `evict_mamba`. The page and state pools are independent, so no partitioning is needed. The generation loop opens each request with `open_cache` (adopt over `ids[..len-1]`), commits the prompt after the prefill forward, and commits the whole sequence at finish. Domain + device + generation tests green.
-- [x] **hybrid_radix cross-request reuse gate -- DONE (2026-10-16), decision 70.** Gated `tests/kvcache_cross_request_reuse.rs` drives the real checkpoint through commit-prompt-end, cross-request `adopt_prefix`, COW state restore and repointed pages, then matches the adopted step's last-token logits to a cold re-feed (reused 7 of 10 tokens, `2.4e-6` of scale). Deferred: mid-prefill per-chunk snapshots, since prefill is single-shot today.
+- [x] **hybrid_radix cross-request reuse gate -- DONE (2026-10-16), decision 70.** Gated `tests/kvcache_cross_request_reuse.rs` drives the real checkpoint through commit-prompt-end, cross-request `adopt_prefix`, COW state restore and repointed pages, then matches the adopted step's last-token logits to a cold re-feed (reused 7 of 10 tokens, `2.4e-6` of scale).
+- [x] **chunked prefill + mid-prefill snapshots -- DONE (2026-10-16), decision 71.** The generation loop feeds the prompt in `max_prefill_length` chunks: a non-final chunk runs `Engine::run_prefill_cached` (no sample, no RNG draw), `commit(finished=false)` snapshots the boundary, and the request re-queues; only the final chunk samples. `open_cache` realigns `Req.prefilled` to `cache.cached()` after adoption. Mid-prompt prefixes are now reusable.
 
 ### Server (axum recommended)
 
@@ -257,13 +259,13 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
   layer prefill overlap (DONE, decisions 42-48, 66, 67); batch concurrency.
 - **M5**: optional `/v1/responses`, hybrid_radix GDN snapshot donation (which is
   what makes the radix prefix cache real, decision 65) -- domain core, device
-  primitive, generation-loop wiring and the gated cross-request oracle DONE
-  (decisions 68, 69, 70); deferred mid-prefill snapshots and startup load tuning
-  open.
+  primitive, generation-loop wiring, chunked prefill with mid-prefill snapshots,
+  and the gated cross-request oracle DONE (decisions 68, 69, 70, 71); startup
+  load tuning open.
 
 ## 7. Decisions
 
-The full log of confirmed decisions (numbers 1..70, stable -- code, tests and
+The full log of confirmed decisions (numbers 1..71, stable -- code, tests and
 `ARCHITECTURE.md` reference them by number) lives in `DONE.md`. This section
 lists only the decisions that still bind open work; everything else there is
 history.
@@ -279,9 +281,18 @@ history.
   finish (`finished=true`, the live slot donated zero-copy). Pressure is the
   eviction trigger: `reserve` reclaims pages via `evict_full`; snapshot
   allocation reclaims GDN slots via `evict_mamba`. The page and state pools are
-  independent, so no partitioning is needed. Prefill is single-shot, so
-  mid-prefill (`CHUNK`-boundary) snapshots are deferred; only prompt-boundary and
-  completed-sequence prefixes are reusable for now.
+  independent, so no partitioning is needed. The two-boundary rule is extended by
+  decision 71, which adds a `finished=false` commit at every prefill chunk
+  boundary (still no mid-decode commit).
+- **71** -- prefill is chunked and snapshots each chunk boundary. The generation
+  loop feeds the prompt in `max_prefill_length` chunks: a non-final chunk runs
+  `Engine::run_prefill_cached` (no sample, no RNG draw, so a chunked run matches a
+  whole-prompt run under sampling), `commit(finished=false)` snapshots the
+  boundary, and the request re-queues ahead of fresh work; only the final chunk is
+  sampled. `open_cache` realigns `Req.prefilled` to `cache.cached()` after
+  adoption. Repeated non-finished commits advance `reused` without freeing a page,
+  so mid-prompt prefixes are reusable. The no-cache reference path stays
+  single-shot (it must re-feed the whole prefix anyway).
 - **68** -- the `hybrid_radix` domain core (`HybridRadixIndex`, dual refcounts,
   tombstones, deepest-live-snapshot match, dual eviction) and
   `LinearStateSlabs::copy_slot` landed first; the generation-loop wiring landed
@@ -325,9 +336,9 @@ performance work.
    state snapshot**, so without snapshot donation `cached_len = 0`. The domain
    core of the `[opt] hybrid_radix` GDN donation (donate-not-copy, dual refcounts,
    tombstones), the device `copy_slot` primitive, the generation-loop
-   `match_req`/`cache_req` wiring with dual-eviction triggers, and the gated
-   cross-request reuse oracle are all in (decisions 68, 69, 70). Remaining: the
-   deferred mid-prefill snapshots.
+   `match_req`/`cache_req` wiring with dual-eviction triggers, chunked prefill with
+   mid-prefill snapshots, and the gated cross-request reuse oracle are all in
+   (decisions 68, 69, 70, 71).
 
 **Tier 3 -- large performance (the only actionable remaining tier):**
 8. Prefill MoE path (MoE offload cache) -- **DONE (2026-10-15).** Slice 1

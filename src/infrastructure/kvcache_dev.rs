@@ -1138,6 +1138,57 @@ mod tests {
         cache.end(&mut b);
     }
 
+    /// A chunked prefill commits at every chunk boundary with `finished=false`.
+    /// Each commit must advance the reused span by the new chunk without freeing
+    /// a page (the request shares the pages the tree adopted), and leave the
+    /// boundary resumable for a later mid-prompt request.
+    #[test]
+    fn a_chunk_boundary_commit_is_reusable_mid_prompt() {
+        let cache = DeviceCache::new(&params(), 64, 8, KvDType::F32, auto_device());
+        let total_pages = cache.num_pages();
+        let mut a = cache.begin();
+        cache.reserve(&mut a, 2).unwrap();
+        let first_pages = a.filled().to_vec();
+        stamp(cache.state(), a.state_slot(), 4.0);
+
+        cache.commit(&mut a, &[1, 2], false);
+        assert_eq!(a.reused(), 2, "the first boundary is tree-owned");
+        cache.reserve(&mut a, 2).unwrap();
+        cache.commit(&mut a, &[1, 2, 3, 4], false);
+        assert_eq!(a.reused(), 4, "the second advances the reused span");
+        cache.reserve(&mut a, 2).unwrap();
+        cache.commit(&mut a, &[1, 2, 3, 4, 5, 6], false);
+        assert_eq!(a.reused(), 6);
+        assert_eq!(
+            &a.filled()[..2],
+            &first_pages[..],
+            "the leading pages stay the ones the tree adopted"
+        );
+
+        // A follower whose prompt ends on the first chunk boundary resumes
+        // there -- the mid-prompt snapshot a chunk boundary buys.
+        let mut b = cache.begin();
+        assert_eq!(
+            cache.adopt_prefix(&mut b, &[1, 2, 9]),
+            2,
+            "the first chunk boundary is reusable mid-prompt"
+        );
+        assert!(
+            stamp_of(&cache, b.state_slot()).iter().all(|v| *v == 4.0),
+            "b resumes from the chunk-boundary GDN snapshot"
+        );
+        cache.end(&mut b);
+
+        cache.reserve(&mut a, 1).unwrap();
+        cache.commit(&mut a, &[1, 2, 3, 4, 5, 6, 7], true);
+        cache.end(&mut a);
+        assert_eq!(
+            cache.available(),
+            total_pages - 7,
+            "the tree owns one page per committed token"
+        );
+    }
+
     #[test]
     fn pages_and_slots_are_conserved_across_reuse() {
         let cache = DeviceCache::new(&params(), 32, 4, KvDType::F32, auto_device());

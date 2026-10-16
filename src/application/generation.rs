@@ -191,9 +191,13 @@ fn run_batch(
         };
         debug_assert!(!batch.reqs.is_empty());
 
+        // Prefill requests the scheduler chunked: they advance their cache this
+        // step but complete later, so they are not sampled and go back to pending.
+        let mut continuations: Vec<Req> = Vec::new();
         let sampled = if engine.cache().is_some() {
             // One page table per request, and every step advances it by the
-            // tokens it has not seen: the prompt first, then one token each.
+            // tokens it has not seen: the prompt in budget-sized chunks, then one
+            // token each.
             let kv = engine.cache().expect("checked above").clone();
             if phase == Phase::Decode && engine.captured().is_some() {
                 // The engine owns a captured decode service, so a whole decode
@@ -202,9 +206,10 @@ fn run_batch(
                 captured_decode_step(engine, &kv, &mut sessions, &batch.reqs, &mut rng)?
             } else {
                 let mut out = Vec::with_capacity(batch.reqs.len());
-                for req in &batch.reqs {
+                for scheduled in &batch.reqs {
+                    let extend_len = scheduled.extend_len;
                     let s = sessions
-                        .get_mut(&req.uid)
+                        .get_mut(&scheduled.uid)
                         .expect("scheduled row has a session");
                     let Session {
                         ids,
@@ -213,14 +218,35 @@ fn run_batch(
                         req,
                     } = s;
                     if slot.is_none() {
-                        *slot = Some(open_cache(&kv, ids));
+                        let opened = open_cache(&kv, ids);
+                        // A matched prefix already covers tokens the scheduler
+                        // counted as pending; realign so chunking resumes past it.
+                        req.prefilled = req.prefilled.max(opened.cached());
+                        *slot = Some(opened);
                     }
                     let cache = slot.as_mut().expect("opened above");
                     let start = cache.cached();
+                    let chunk = extend_len.min(ids.len() - start).max(1);
+                    let end = start + chunk;
+                    if phase == Phase::Prefill && end < ids.len() {
+                        // A non-final chunk: advance the cache and snapshot the
+                        // boundary, but keep the request queued for the rest.
+                        engine.run_prefill_cached(CachedStep {
+                            uid: req.uid,
+                            ids: &ids[start..end],
+                            start,
+                            cache,
+                            params: &req.sampling,
+                        })?;
+                        kv.commit(cache, &ids[..end], false);
+                        req.advance_prefill(chunk);
+                        continuations.push(req.clone());
+                        continue;
+                    }
                     let step = engine.run_forward_cached(
                         CachedStep {
                             uid: req.uid,
-                            ids: &ids[start..],
+                            ids: &ids[start..end],
                             start,
                             cache,
                             params: &req.sampling,
@@ -258,8 +284,8 @@ fn run_batch(
             s.ids.push(token);
             s.generated.push(token);
             if phase == Phase::Prefill {
-                // The reference path sees the whole prompt at once.
-                s.req.advance_prefill(s.req.prompt_len);
+                // The final prefill chunk saw the whole remaining prompt at once.
+                s.req.advance_prefill(s.req.prefill_remaining());
             }
             let stop = match check_stop(&s.req, token, engine.eos_ids()) {
                 Some(reason) => Some(reason),
@@ -283,6 +309,8 @@ fn run_batch(
                 decoding.push(s.req.clone());
             }
         }
+        // Chunked prefills continue on a later step, still ahead of fresh work.
+        pending.extend(continuations);
     }
 
     finished.sort_unstable();
@@ -592,6 +620,75 @@ mod tests {
             vec![(2, false), (3, false), (4, true), (5, true)],
             "each request commits its prompt, then its finished sequence"
         );
+    }
+
+    fn chunk_limits() -> crate::application::engine::EngineLimits {
+        crate::application::engine::EngineLimits {
+            max_prefill_length: 2,
+            ..limits()
+        }
+    }
+
+    /// A prompt longer than the prefill budget is fed to the cache in chunks: a
+    /// non-final chunk advances the cache and snapshots its boundary but samples
+    /// nothing and stays queued, so only the final chunk produces a token.
+    #[test]
+    fn a_long_prompt_is_fed_to_the_cache_in_budget_sized_chunks() {
+        let (e, rec, cache) = test_cached_engine(chunk_limits());
+        let g = generate(&e, req(&e, 1, "abcdef", params(2)), 0).unwrap();
+        let feeds: Vec<Vec<u32>> = rec
+            .cached_calls()
+            .into_iter()
+            .map(|c| c.input_ids)
+            .collect();
+        assert_eq!(
+            feeds,
+            vec![vec![97, 98], vec![99, 100], vec![101, 102], vec![103]],
+            "three 2-token prefill chunks, then the token the last one sampled"
+        );
+        assert_eq!(
+            rec.cached_calls()[2].positions,
+            vec![4, 5],
+            "each chunk feeds at the length the cache already holds"
+        );
+        assert_eq!(
+            cache.commits(),
+            vec![(2, false), (4, false), (6, false), (8, true)],
+            "a snapshot per chunk boundary, then the finished sequence"
+        );
+        assert_eq!(
+            g.tokens,
+            vec![103, 104],
+            "a full generated run still follows"
+        );
+    }
+
+    /// Chunking must not shift the sampler: a non-final chunk consumes no RNG
+    /// draw, so a chunked run and a whole-prompt run of the same seed agree.
+    #[test]
+    fn the_chunked_path_samples_like_the_whole_prompt_path() {
+        let (whole, _rec, _cache) = test_cached_engine(limits());
+        let (chunked, _rec2, _cache2) = test_cached_engine(chunk_limits());
+        let mut p = params(6);
+        p.temperature = 0.8;
+        let a = generate(&whole, req(&whole, 1, "abcdef", p.clone()), 7).unwrap();
+        let b = generate(&chunked, req(&chunked, 1, "abcdef", p), 7).unwrap();
+        assert_eq!(
+            a.tokens, b.tokens,
+            "splitting the prefill leaves the RNG stream untouched"
+        );
+        assert_eq!(a.finish_reason, b.finish_reason);
+    }
+
+    /// A continuation chunk samples nothing even when the sampler is not greedy,
+    /// so a chunked prefill of a single request yields exactly one token.
+    #[test]
+    fn a_non_final_chunk_never_emits_a_token() {
+        let (e, _rec, _cache) = test_cached_engine(chunk_limits());
+        let mut p = params(1);
+        p.temperature = 1.0;
+        let g = generate(&e, req(&e, 1, "abcdef", p), 0).unwrap();
+        assert_eq!(g.tokens.len(), 1, "only the final chunk is sampled");
     }
 
     #[test]
