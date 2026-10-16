@@ -547,7 +547,10 @@ fn attention_ptx(name: &str) -> &'static str {
 /// The fused GDN decode kernel the linear-attention mixer launches.
 pub const GDN_DECODE: &str = "gdn_decode";
 
-const LINEAR_NAMES: [&str; 1] = [GDN_DECODE];
+/// The dense NVFP4 GEMV the lm_head runs (TODO.md section 8 item 18).
+pub const NVFP4_DENSE_GEMV: &str = "nvfp4_dense_gemv";
+
+const LINEAR_NAMES: [&str; 2] = [GDN_DECODE, NVFP4_DENSE_GEMV];
 
 #[derive(Debug, Deserialize)]
 struct LinearEntry {
@@ -671,6 +674,7 @@ impl LinearAbi {
 pub fn linear_cubin(name: &str) -> Result<&'static [u8], MoEError> {
     Ok(match name {
         GDN_DECODE => include_bytes!("../../kernel/gdn_decode.cubin"),
+        NVFP4_DENSE_GEMV => include_bytes!("../../kernel/nvfp4_dense_gemv.cubin"),
         other => return Err(MoEError::Bad(format!("no committed cubin for {other}"))),
     })
 }
@@ -680,6 +684,7 @@ pub fn linear_cubin(name: &str) -> Result<&'static [u8], MoEError> {
 fn linear_ptx(name: &str) -> &'static str {
     match name {
         GDN_DECODE => include_str!("../../kernel/gdn_decode.ptx"),
+        NVFP4_DENSE_GEMV => include_str!("../../kernel/nvfp4_dense_gemv.ptx"),
         other => panic!("no committed ptx for {other}"),
     }
 }
@@ -1140,6 +1145,64 @@ pub fn gdn_grid(rows: usize, kernel: &LinearKernel) -> Result<(u32, u32, u32), M
     let v_heads = kernel.constexpr("NUM_V_HEADS")?;
     let tiles = v.div_ceil(bv) as u32;
     Ok((1, tiles, (rows as u64 * v_heads) as u32))
+}
+
+/// Device addresses and shapes for one dense NVFP4 GEMV launch. `a` is
+/// `[M, K]` bf16 activations, `packed`/`scale`/`global` are the NVFP4 weight
+/// banks (`[N, K // 2]` u8, `[N, K // 16]` e4m3 bytes, `[N]` f16 bytes), `c` is
+/// the `[M, N]` fp32 output and `lut` the 16-entry e2m1 table.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DenseGemvArgs {
+    pub a: u64,
+    pub packed: u64,
+    pub scale: u64,
+    pub global: u64,
+    pub c: u64,
+    pub lut: u64,
+    pub m: u32,
+    pub n: u32,
+    pub stride_am: u32,
+    pub stride_ak: u32,
+    pub stride_pn: u32,
+    pub stride_pkb: u32,
+    pub stride_sn: u32,
+    pub stride_sblk: u32,
+    pub stride_cm: u32,
+    pub stride_cn: u32,
+}
+
+/// The dense NVFP4 GEMV launch argument pack, in the cubin's declared order.
+pub fn nvfp4_dense_gemv_args(abi: &LinearAbi, a: &DenseGemvArgs) -> Result<ArgPack, MoEError> {
+    let kernel = abi.kernel(NVFP4_DENSE_GEMV)?;
+    let mut p = ArgPack::for_linear(kernel);
+    p.ptr(a.a)?;
+    p.ptr(a.packed)?;
+    p.ptr(a.scale)?;
+    p.ptr(a.global)?;
+    p.ptr(a.c)?;
+    p.ptr(a.lut)?;
+    p.u32(a.m)?;
+    p.u32(a.n)?;
+    p.u32(a.stride_am)?;
+    p.u32(a.stride_ak)?;
+    p.u32(a.stride_pn)?;
+    p.u32(a.stride_pkb)?;
+    p.u32(a.stride_sn)?;
+    p.u32(a.stride_sblk)?;
+    p.u32(a.stride_cm)?;
+    p.u32(a.stride_cn)?;
+    Ok(p)
+}
+
+/// The dense NVFP4 GEMV grid: one program per `(row, N block)`. The block is a
+/// constexpr baked into the cubin, so the y extent comes from the manifest.
+pub fn nvfp4_dense_gemv_grid(
+    m: usize,
+    n: usize,
+    kernel: &LinearKernel,
+) -> Result<(u32, u32, u32), MoEError> {
+    let block_n = kernel.constexpr("BLOCK_N")?;
+    Ok((m as u32, n.div_ceil(block_n as usize) as u32, 1))
 }
 
 /// The launch grid for a kernel: one program per row (a route, or a token for
@@ -1619,5 +1682,56 @@ mod tests {
         v["linear"].as_object_mut().unwrap().remove(GDN_DECODE);
         let err = LinearAbi::parse(&v.to_string()).unwrap_err().to_string();
         assert!(err.contains("missing linear kernel gdn_decode"), "{err}");
+    }
+
+    #[test]
+    fn the_dense_gemv_manifest_records_the_tile() {
+        let abi = LinearAbi::committed().unwrap();
+        let kernel = abi.kernel(NVFP4_DENSE_GEMV).unwrap();
+        // One hidden size in a serving checkpoint, so K // 2 = 1024.
+        assert_eq!(kernel.constexpr("K_BYTES").unwrap(), 1024);
+        assert_eq!(kernel.constexpr("BLOCK_N").unwrap(), 128);
+        assert_eq!(kernel.num_warps, 4);
+    }
+
+    #[test]
+    fn the_dense_gemv_argument_builder_matches_its_kernel_signature() {
+        let abi = LinearAbi::committed().unwrap();
+        let args = DenseGemvArgs {
+            a: 0x1000,
+            packed: 0x2000,
+            scale: 0x3000,
+            global: 0x4000,
+            c: 0x5000,
+            lut: 0x6000,
+            m: 1,
+            n: 248320,
+            stride_am: 2048,
+            stride_ak: 1,
+            stride_pn: 1024,
+            stride_pkb: 1,
+            stride_sn: 128,
+            stride_sblk: 1,
+            stride_cm: 248320,
+            stride_cn: 1,
+        };
+        let pack = nvfp4_dense_gemv_args(&abi, &args).unwrap();
+        let kernel = abi.kernel(NVFP4_DENSE_GEMV).unwrap();
+        let params = pack.kernel_params().unwrap();
+        assert_eq!(params.len(), kernel.args.len() + kernel.scratch_params);
+        for slot in &pack.slots()[kernel.args.len()..] {
+            assert_eq!(*slot, 0, "scratch slot is not null");
+        }
+    }
+
+    #[test]
+    fn the_dense_gemv_grid_tiles_the_vocab() {
+        let abi = LinearAbi::committed().unwrap();
+        let kernel = abi.kernel(NVFP4_DENSE_GEMV).unwrap();
+        // 248320 vocab / 128 tile = 1940 blocks in y, one program per row in x.
+        assert_eq!(
+            nvfp4_dense_gemv_grid(1, 248320, kernel).unwrap(),
+            (1, 1940, 1)
+        );
     }
 }

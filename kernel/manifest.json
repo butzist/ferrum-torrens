@@ -556,6 +556,111 @@
       "profile_scratch_size": 0,
       "scratch_params": 2,
       "shared": 512
+    },
+    "nvfp4_dense_gemv": {
+      "constexprs": {
+        "BLOCK_KB": 64,
+        "BLOCK_N": 128,
+        "K_BYTES": 1024
+      },
+      "declared_args": [
+        "a_ptr",
+        "packed_ptr",
+        "scale_ptr",
+        "global_ptr",
+        "c_ptr",
+        "lut_ptr",
+        "M",
+        "N",
+        "stride_am",
+        "stride_ak",
+        "stride_pn",
+        "stride_pkb",
+        "stride_sn",
+        "stride_sblk",
+        "stride_cm",
+        "stride_cn"
+      ],
+      "entry": "_nvfp4_dense_gemv_kernel",
+      "global_scratch_size": 0,
+      "num_warps": 4,
+      "params": [
+        {
+          "index": 0,
+          "kind": "ptr"
+        },
+        {
+          "index": 1,
+          "kind": "ptr"
+        },
+        {
+          "index": 2,
+          "kind": "ptr"
+        },
+        {
+          "index": 3,
+          "kind": "ptr"
+        },
+        {
+          "index": 4,
+          "kind": "ptr"
+        },
+        {
+          "index": 5,
+          "kind": "ptr"
+        },
+        {
+          "index": 6,
+          "kind": "u32"
+        },
+        {
+          "index": 7,
+          "kind": "u32"
+        },
+        {
+          "index": 8,
+          "kind": "u32"
+        },
+        {
+          "index": 9,
+          "kind": "u32"
+        },
+        {
+          "index": 10,
+          "kind": "u32"
+        },
+        {
+          "index": 11,
+          "kind": "u32"
+        },
+        {
+          "index": 12,
+          "kind": "u32"
+        },
+        {
+          "index": 13,
+          "kind": "u32"
+        },
+        {
+          "index": 14,
+          "kind": "u32"
+        },
+        {
+          "index": 15,
+          "kind": "u32"
+        },
+        {
+          "index": 16,
+          "kind": "ptr"
+        },
+        {
+          "index": 17,
+          "kind": "ptr"
+        }
+      ],
+      "profile_scratch_size": 0,
+      "scratch_params": 2,
+      "shared": 0
     }
   },
   "shapes": {

@@ -35,6 +35,7 @@ from triton.backends.nvidia.compiler import CUDAOptions
 from triton.compiler import ASTSource, compile as triton_compile
 
 from .gdn import _gdn_decode_kernel
+from .linear import DENSE_WARPS, _nvfp4_dense_gemv_kernel
 from .nvfp4_moe import (
     DECODE_BLOCK_N,
     _nvfp4_gemv_kernel,
@@ -64,6 +65,8 @@ from .signatures import (
     index_copy_constexprs,
     lru_constexprs,
     lru_ensure,
+    nvfp4_dense_gemv,
+    nvfp4_dense_gemv_constexprs,
     paged_attention,
     paged_attention_constexprs,
     reduce,
@@ -153,6 +156,12 @@ LINEAR_KERNELS: dict[str, dict] = {
         "signature": gdn_decode(),
         "constexprs": gdn_decode_constexprs(),
         "num_warps": 4,
+    },
+    "nvfp4_dense_gemv": {
+        "fn": _nvfp4_dense_gemv_kernel,
+        "signature": nvfp4_dense_gemv(),
+        "constexprs": nvfp4_dense_gemv_constexprs(),
+        "num_warps": DENSE_WARPS,
     },
 }
 

@@ -90,6 +90,7 @@ pub fn build(
                 )?;
                 let attention = attention_port(&params, device, stream)?;
                 let gdn = gdn_port(&params, device, stream)?;
+                let head_gemv = head_port(device, stream)?;
                 let cache = Arc::new(kv_cache(config, &params, device, capture));
                 let model = crate::models::qwen3_6::forward_torch::TorchQwen3_6::load(
                     params,
@@ -99,6 +100,7 @@ pub fn build(
                     moe,
                     attention,
                     gdn,
+                    head_gemv,
                     cache.clone(),
                 )
                 .map_err(|e| RegistryError::Build(e.to_string()))?;
@@ -381,6 +383,24 @@ fn gdn_port(
         Device::Cuda(_) => Ok(Some(Arc::new(
             GdnDecode::new(device, params, stream)
                 .map_err(|e| RegistryError::Build(e.to_string()))?,
+        ))),
+        _ => Ok(None),
+    }
+}
+
+/// The dense NVFP4 GEMV launcher the lm_head runs, when the engine runs on a
+/// CUDA device. It keeps the checkpoint's packed lm_head and streams it once per
+/// token instead of widening it to bf16 (TODO.md item 18); a CPU device gets
+/// `None` and keeps the widened-bf16 head, the same shape as `gdn_port`.
+#[cfg(feature = "cuda")]
+fn head_port(
+    device: Device,
+    stream: crate::infrastructure::cuda_driver::CUstream,
+) -> Result<Option<Arc<crate::infrastructure::cuda_linear::DenseGemv>>, RegistryError> {
+    use crate::infrastructure::cuda_linear::DenseGemv;
+    match device {
+        Device::Cuda(_) => Ok(Some(Arc::new(
+            DenseGemv::new(device, stream).map_err(|e| RegistryError::Build(e.to_string()))?,
         ))),
         _ => Ok(None),
     }

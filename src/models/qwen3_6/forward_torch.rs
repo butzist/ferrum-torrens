@@ -28,6 +28,7 @@ use crate::domain::model::{ForwardInput, LayerType, Model, ModelParams};
 use crate::domain::weights::{DType, TensorDesc, TensorKind, WeightsReader};
 use crate::infrastructure::cuda_attention::PagedAttention;
 use crate::infrastructure::cuda_gdn::GdnDecode;
+use crate::infrastructure::cuda_linear::DenseGemv;
 use crate::infrastructure::decode_buffers::DecodeBuffers;
 use crate::infrastructure::ftw::FtwIndex;
 use crate::infrastructure::kvcache_dev::{DeviceCache, KvDType, LinearStateSlabs, MhaPool};
@@ -305,6 +306,59 @@ impl<'a> Loader<'a> {
             rows: d.rows,
         })
     }
+
+    /// A whole tensor's raw bytes as a uint8 device tensor of `shape`. The dense
+    /// loader walks in windows to bound host memory; the lm_head banks are small
+    /// enough (the largest is 254 MiB) to read once, and they stay packed on the
+    /// device so every decode step reads the checkpoint's own NVFP4 bytes.
+    fn bytes_device(&self, name: &str, shape: &[i64], device: Device) -> Result<SharedTensor> {
+        let raw = self.raw(name)?;
+        let numel: i64 = shape.iter().product();
+        if numel as usize != raw.len() {
+            return Err(TorchError::Bad(
+                "shape",
+                format!("{name} is {} bytes for {numel} elements", raw.len()),
+            ));
+        }
+        Ok(up(Tensor::from_slice(&raw)
+            .view(shape)
+            .to_device(device.to_tch())))
+    }
+
+    /// The lm_head, kept NVFP4 on a CUDA device (the dense GEMV reads the packed
+    /// bytes) and widened to bf16 otherwise. The head is applied to a single row
+    /// (a prefill answers only its last token), so the packed form is always
+    /// streamed the optimal once-per-step way.
+    fn head(&self, name: &str, device: Device) -> Result<Head> {
+        let d = self.dense_desc(name)?;
+        if matches!(device, Device::Cuda(_)) && d.kind == DenseKind::Nvfp4 {
+            let rows = d.rows as i64;
+            let packed = self.bytes_device(&d.name, &[rows, (d.cols / 2) as i64], device)?;
+            let scale = self.bytes_device(
+                &format!("{}_scale", d.name),
+                &[rows, (d.cols / 16) as i64],
+                device,
+            )?;
+            // The global is f16 per row, so its byte bank is twice as long.
+            let global = self.bytes_device(&format!("{}_global", d.name), &[rows * 2], device)?;
+            return Ok(Head {
+                rows: d.rows,
+                weight: HeadWeight::Nvfp4 {
+                    packed,
+                    scale,
+                    global,
+                },
+            });
+        }
+        let dense = self.dense(name, device)?;
+        Ok(Head {
+            rows: dense.rows,
+            weight: HeadWeight::Bf16 {
+                w: dense.w,
+                row_scale: dense.row_scale,
+            },
+        })
+    }
 }
 
 fn shape2(name: &str, t: &TensorDesc) -> Result<(usize, usize)> {
@@ -352,11 +406,24 @@ fn rms_norm(x: &Tensor, w: &Tensor, eps: f32) -> Tensor {
 /// `w` is `[out, in]` as the checkpoint stores it, so the transpose is a view and
 /// BLAS takes it as a transposed operand rather than copying.
 fn linear(x: &Tensor, w: &Tensor, row_scale: Option<&Tensor>) -> Tensor {
-    let y = f32_(x).matmul(&f32_(w).transpose(0, 1));
+    // The weight is already bf16 and stays bf16: cuBLAS accumulates a bf16
+    // matmul in f32, so only the small activation is cast and only the small
+    // output is upcast. Upcasting `w` here instead re-uploads every projection
+    // (up to the 2 GB `lm_head`) to f32 on every step, which was the decode
+    // bottleneck (decision 78).
+    let y = f32_(&x.to_kind(Kind::BFloat16).matmul(&w.transpose(0, 1)));
     match row_scale {
         Some(s) => y * s,
         None => y,
     }
+}
+
+/// A profiling aid: `FT_ABLATE=mixer,attn,gdn,moe,head` short-circuits that
+/// block's work so an ablate-and-diff run can attribute decode time (nsys' report
+/// importer is broken in the sandbox and `ncu` lacks counter permission). Off
+/// unless the variable is set, so a normal forward is untouched.
+fn ablated(what: &str) -> bool {
+    std::env::var("FT_ABLATE").is_ok_and(|v| v.split(',').any(|p| p == what))
 }
 
 /// Same trace lines as `forward::trace_vec`, off unless `FT_TRACE=1`.
@@ -911,6 +978,26 @@ struct FullAttention {
     k_norm: SharedTensor,
 }
 
+/// The lm_head's resident weight. On a CUDA device the checkpoint's NVFP4 bytes
+/// stay packed and the dense GEMV kernel reads them (TODO.md item 18); anywhere
+/// else (the CPU oracle) it is widened to bf16 like every other projection.
+struct Head {
+    rows: usize,
+    weight: HeadWeight,
+}
+
+enum HeadWeight {
+    Bf16 {
+        w: SharedTensor,
+        row_scale: Option<SharedTensor>,
+    },
+    Nvfp4 {
+        packed: SharedTensor,
+        scale: SharedTensor,
+        global: SharedTensor,
+    },
+}
+
 struct GatedDeltaNet {
     qkvz: Dense,
     o: Dense,
@@ -946,7 +1033,7 @@ pub struct TorchQwen3_6 {
     embed: Dense,
     final_norm: SharedTensor,
     layers: Vec<TorchLayer>,
-    lm_head: Dense,
+    lm_head: Head,
     index: std::sync::Arc<FtwIndex>,
     reader: std::sync::Arc<dyn WeightsReader>,
     /// The engine's MoE port when the kernel is configured: the slot cache,
@@ -964,6 +1051,9 @@ pub struct TorchQwen3_6 {
     /// recurrent update into one kernel per layer through this; `None` keeps the
     /// op-by-op libtorch path, which is what a CPU device (decision 21) runs.
     gdn: Option<std::sync::Arc<GdnDecode>>,
+    /// The dense NVFP4 GEMV launcher the lm_head runs, when this device can run
+    /// it (TODO.md item 18). `None` keeps the widened-bf16 head path.
+    head_gemv: Option<std::sync::Arc<DenseGemv>>,
     /// The KV cache this forward reads and writes, when the engine gave it one.
     /// The engine keeps a clone of the same allocation to hand out page tables.
     cache: Option<std::sync::Arc<DeviceCache>>,
@@ -998,6 +1088,7 @@ impl TorchQwen3_6 {
         moe: Option<std::sync::Arc<dyn MoEExecutor>>,
         attention: Option<std::sync::Arc<PagedAttention>>,
         gdn: Option<std::sync::Arc<GdnDecode>>,
+        head_gemv: Option<std::sync::Arc<DenseGemv>>,
         cache: std::sync::Arc<DeviceCache>,
     ) -> Result<Self> {
         let ld = Loader {
@@ -1112,7 +1203,7 @@ impl TorchQwen3_6 {
             });
         }
 
-        let lm_head = ld.dense("lm_head.weight", device)?;
+        let lm_head = ld.head("lm_head.weight", device)?;
         let (rope_cos, rope_sin) = precompute_rope_cache(
             params.max_position_embeddings.max(4096),
             params.rotary_dim,
@@ -1131,6 +1222,7 @@ impl TorchQwen3_6 {
             moe,
             attention,
             gdn,
+            head_gemv,
             cache: Some(cache),
             rope_cos: up(rope_cos),
             rope_sin: up(rope_sin),
@@ -1743,26 +1835,46 @@ impl TorchQwen3_6 {
     fn lm_head_logits(&self, x: &Tensor) -> Vec<f32> {
         let head = &self.lm_head;
         let out = Tensor::zeros([1, head.rows as i64], (Kind::Float, self.device.to_tch()));
-        lm_head_logits_into(head, x, &out);
+        lm_head_logits_into(head, self.head_gemv.as_deref(), x, &out);
         to_f32_vec(&out)
     }
 }
 
 /// `lm_head(x)` written into `out` (`[rows, vocab]`, f32) instead of returned as
 /// a host vector. Every row is one token's logits, so a decode step writes the
-/// whole batch and a prefill writes its single last-token row. Widening
-/// `LM_HEAD_BLOCK` rows at a time bounds the f32 scratch, and writing straight
-/// into the caller's device buffer is what makes the tail of a decode step free
-/// of a host round-trip (decision 49).
-fn lm_head_logits_into(head: &Dense, x: &Tensor, out: &Tensor) {
+/// whole batch and a prefill writes its single last-token row.
+///
+/// When the head is resident NVFP4 and the dense GEMV launcher is present (a
+/// CUDA device), one kernel streams the packed weight and writes every row; the
+/// old path widened `LM_HEAD_BLOCK` rows at a time to bound f32 scratch, which
+/// the packed form does not need.
+fn lm_head_logits_into(head: &Head, gemv: Option<&DenseGemv>, x: &Tensor, out: &Tensor) {
     let rows = x.size()[0];
     debug_assert_eq!(out.size(), vec![rows, head.rows as i64]);
+    if let (
+        HeadWeight::Nvfp4 {
+            packed,
+            scale,
+            global,
+        },
+        Some(gemv),
+    ) = (&head.weight, gemv)
+    {
+        let a = x.to_kind(Kind::BFloat16);
+        // SAFETY: the head banks and `out` are live device allocations on the
+        // launcher's context; the launcher checks the shapes before launching.
+        unsafe { gemv.gemv(&a, packed, scale, global, out) }.expect("dense NVFP4 gemv launch");
+        return;
+    }
+    let HeadWeight::Bf16 { w, row_scale } = &head.weight else {
+        unreachable!("an NVFP4 head needs the dense gemv launcher");
+    };
     let mut r0 = 0usize;
     while r0 < head.rows {
         let n = LM_HEAD_BLOCK.min(head.rows - r0);
-        let block = head.w.narrow(0, r0 as i64, n as i64);
-        let y = f32_(x).matmul(&f32_(&block).transpose(0, 1));
-        let y = match head.row_scale.as_deref() {
+        let block = w.narrow(0, r0 as i64, n as i64);
+        let y = f32_(&x.to_kind(Kind::BFloat16).matmul(&block.transpose(0, 1)));
+        let y = match row_scale.as_deref() {
             Some(s) => y * s.narrow(0, r0 as i64, n as i64),
             None => y,
         };
@@ -1821,15 +1933,26 @@ impl TorchQwen3_6 {
                 Some(r) => &x + &r,
             };
             let h1 = rms_norm(&xsum, &layer.input_norm, p.rms_norm_eps);
-            let mixer_out = match &layer.mixer {
-                Mixer::Full(fa) => {
-                    self.full_attention_cached(li, fa, &h1, positions, access, slab.mha())?
+            let mixer_out = if ablated("mixer") {
+                Tensor::zeros_like(&h1)
+            } else {
+                match &layer.mixer {
+                    Mixer::Full(fa) if !ablated("attn") => {
+                        self.full_attention_cached(li, fa, &h1, positions, access, slab.mha())?
+                    }
+                    Mixer::Linear(gdn) if !ablated("gdn") => {
+                        self.gdn_cached(li, gdn, &h1, access, slab.state())
+                    }
+                    _ => Tensor::zeros_like(&h1),
                 }
-                Mixer::Linear(gdn) => self.gdn_cached(li, gdn, &h1, access, slab.state()),
             };
             let sum2 = &mixer_out + &xsum;
             let h2 = rms_norm(&sum2, &layer.post_norm, p.rms_norm_eps);
-            x = self.moe(li, &h2)?;
+            x = if ablated("moe") {
+                h2.shallow_clone()
+            } else {
+                self.moe(li, &h2)?
+            };
             residual = Some(sum2);
         }
 
@@ -1849,7 +1972,9 @@ impl TorchQwen3_6 {
             CacheAccess::Device { .. } => rms_norm(&stream, &self.final_norm, p.rms_norm_eps),
         };
         let logits = out.reshape([normed.size()[0], self.lm_head.rows as i64]);
-        lm_head_logits_into(&self.lm_head, &normed, &logits);
+        if !ablated("head") {
+            lm_head_logits_into(&self.lm_head, self.head_gemv.as_deref(), &normed, &logits);
+        }
         Ok(())
     }
 }

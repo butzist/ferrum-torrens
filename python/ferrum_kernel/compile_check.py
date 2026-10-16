@@ -35,12 +35,15 @@ from .nvfp4_moe import (
 from .offload import _ensure_experts_kernel, _index_copy_multi_kernel
 from .attention import _paged_attention_decode_kernel
 from .gdn import _gdn_decode_kernel
+from .linear import _nvfp4_dense_gemv_kernel
 from .signatures import gdn_decode as _gdn_decode_sig
 from .signatures import gdn_decode_constexprs
 from .signatures import gemv as _gemv_sig
 from .signatures import index_copy as _index_copy_sig
 from .signatures import index_copy_constexprs, lru_constexprs
 from .signatures import lru_ensure as _lru_sig
+from .signatures import nvfp4_dense_gemv as _nvfp4_dense_gemv_sig
+from .signatures import nvfp4_dense_gemv_constexprs
 from .signatures import paged_attention as _paged_attention_sig
 from .signatures import paged_attention_constexprs
 from .signatures import reduce as _reduce_sig
@@ -130,6 +133,17 @@ def main() -> int:
     except Exception as e:  # noqa: BLE001
         failures += 1
         print(f"gdn_decode FAILED: {type(e).__name__}: {str(e)[:200]}")
+    # The dense NVFP4 GEMV the lm_head runs (TODO.md section 8 item 18).
+    try:
+        check(
+            "nvfp4_dense_gemv",
+            _nvfp4_dense_gemv_kernel,
+            _nvfp4_dense_gemv_sig(),
+            nvfp4_dense_gemv_constexprs(),
+        )
+    except Exception as e:  # noqa: BLE001
+        failures += 1
+        print(f"nvfp4_dense_gemv FAILED: {type(e).__name__}: {str(e)[:200]}")
     print("FAIL" if failures else "PASS")
     return 1 if failures else 0
 

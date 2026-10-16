@@ -11,6 +11,8 @@ pub mod cuda_gdn;
 #[cfg(feature = "cuda")]
 pub mod cuda_graph;
 #[cfg(feature = "cuda")]
+pub mod cuda_linear;
+#[cfg(feature = "cuda")]
 pub mod cuda_moe;
 #[cfg(feature = "cuda")]
 pub mod decode_buffers;

@@ -34,6 +34,7 @@ use ferrum_torrens::infrastructure::cuda_attention::PagedAttention;
 use ferrum_torrens::infrastructure::cuda_driver::{CAPTURE_MODE_GLOBAL, Driver};
 use ferrum_torrens::infrastructure::cuda_gdn::GdnDecode;
 use ferrum_torrens::infrastructure::cuda_graph::{self, GraphPool};
+use ferrum_torrens::infrastructure::cuda_linear::DenseGemv;
 use ferrum_torrens::infrastructure::cuda_moe::CudaMoE;
 use ferrum_torrens::infrastructure::decode_buffers::{DecodeBuffers, DecodeRow};
 use ferrum_torrens::infrastructure::decode_graph::DecodeGraph;
@@ -127,6 +128,8 @@ fn build(num_pages: usize, num_slots: usize) -> Built {
         PagedAttention::new(device, &params, stream).expect("the paged attention launcher"),
     );
     let gdn = Arc::new(GdnDecode::new(device, &params, stream).expect("the fused gdn launcher"));
+    let head_gemv =
+        Arc::new(DenseGemv::new(device, stream).expect("the dense nvfp4 head launcher"));
     let model = TorchQwen3_6::load(
         params,
         device,
@@ -135,6 +138,7 @@ fn build(num_pages: usize, num_slots: usize) -> Built {
         Some(port),
         Some(attention),
         Some(gdn),
+        Some(head_gemv),
         cache.clone(),
     )
     .unwrap();

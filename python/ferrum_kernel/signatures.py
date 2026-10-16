@@ -13,6 +13,7 @@ baked into the cubin rather than passed at launch.
 from __future__ import annotations
 
 from .gdn import GDN_BV
+from .linear import DENSE_BLOCK_KB, DENSE_BLOCK_N
 from .nvfp4_moe import DECODE_BLOCK_KB, DECODE_BLOCK_N
 from .offload import COPY_SEG_I32, USAGE_MAX, copy_splits
 
@@ -282,4 +283,44 @@ def gdn_decode_constexprs(
         "V": v,
         "BK": 1 << (k - 1).bit_length(),
         "BV": bv,
+    }
+
+
+def nvfp4_dense_gemv() -> dict:
+    """The dense NVFP4 GEMV the lm_head runs (TODO.md section 8 item 18).
+
+    `a` is bf16 activations `[M, K]`, the weight is NVFP4 (packed u8, e4m3
+    block scales, f16 row global) and `c` is fp32 `[M, N]`. The scale pointer is
+    declared `*fp8e4nv` but carries a uint8 tensor: libtorch cannot build an
+    fp8 view from a host slice through tch, so the kernel reinterprets the
+    address, the same contract the MoE scale banks use.
+    """
+    return {
+        "a_ptr": f"*{SERVING_DTYPE}",
+        "packed_ptr": "*u8",
+        "scale_ptr": "*fp8e4nv",
+        "global_ptr": "*fp16",
+        "c_ptr": "*fp32",
+        "lut_ptr": "*fp32",
+        "M": "i32",
+        "N": "i32",
+        "stride_am": "i32",
+        "stride_ak": "i32",
+        "stride_pn": "i32",
+        "stride_pkb": "i32",
+        "stride_sn": "i32",
+        "stride_sblk": "i32",
+        "stride_cm": "i32",
+        "stride_cn": "i32",
+        "K_BYTES": "constexpr",
+        "BLOCK_N": "constexpr",
+        "BLOCK_KB": "constexpr",
+    }
+
+
+def nvfp4_dense_gemv_constexprs(k: int = SERVING_HIDDEN) -> dict:
+    return {
+        "K_BYTES": k // 2,
+        "BLOCK_N": DENSE_BLOCK_N,
+        "BLOCK_KB": DENSE_BLOCK_KB,
     }

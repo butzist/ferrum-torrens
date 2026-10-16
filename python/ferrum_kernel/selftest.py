@@ -21,6 +21,7 @@ import torch
 
 from . import attention as attn
 from . import gdn as gdn_mod
+from . import linear as linear_mod
 from . import offload as off
 from .nvfp4_moe import _check_constexprs, grouped_moe, require_native_e4m3
 
@@ -349,6 +350,39 @@ def check_gdn(device: torch.device, tol: float, full: bool) -> int:
     return failures
 
 
+def random_dense_case(device: str, m: int = 2, n: int = 128, k: int = 256, seed: int = 0):
+    """A dense NVFP4 GEMV case: `[n, k//2]` packed nibbles, `[n, k//16]` e4m3
+    block scales, `[n]` f16 globals, and a bf16 activation row."""
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    dev = torch.device(device)
+    packed = torch.randint(0, 256, (n, k // 2), generator=g, dtype=torch.uint8).to(dev)
+    block = torch.rand((n, k // 16), generator=g) * 2.0 + 0.25
+    scale = block.to(torch.float8_e4m3fn).to(dev)
+    glob = (torch.rand((n,), generator=g) * 1.5 + 0.5).to(torch.float16).to(dev)
+    a = (torch.rand((m, k), generator=g) * 2.0 - 1.0).to(dev).to(torch.bfloat16)
+    return a, packed, scale, glob
+
+
+def check_nvfp4_dense(device: torch.device, tol: float) -> int:
+    """Dense NVFP4 GEMV (the lm_head tail): kernel against the torch oracle."""
+    failures = 0
+    cases = [("small", {"m": 2, "n": 128, "k": 256}), ("serving-k", {"m": 1, "n": 96, "k": 2048})]
+    for label, shape in cases:
+        for seed in range(2):
+            a, packed, scale, glob = random_dense_case(str(device), seed=seed, **shape)
+            want = linear_mod.nvfp4_dense_gemv_reference(a, packed, scale, glob)
+            got = torch.empty((shape["m"], shape["n"]), dtype=torch.float32, device=device)
+            linear_mod.nvfp4_dense_gemv(a, packed, scale, glob, got)
+            rel = (
+                (got - want).abs().max() / want.abs().max().clamp(min=1e-6)
+            ).item()
+            print(f"dense-gemv {label} seed {seed}: rel {rel:.3e}")
+            if rel > tol:
+                failures += 1
+                print(f"dense-gemv {label} seed {seed}: FAIL", file=sys.stderr)
+    return failures
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--device", default="cpu")
@@ -420,6 +454,10 @@ def main(argv: list[str] | None = None) -> int:
         torch.device(args.device), args.tol, full=args.device != "cpu"
     )
     if gdn_failures:
+        print("FAIL", file=sys.stderr)
+        return 1
+    dense_failures = check_nvfp4_dense(torch.device(args.device), args.tol)
+    if dense_failures:
         print("FAIL", file=sys.stderr)
         return 1
     print("PASS")

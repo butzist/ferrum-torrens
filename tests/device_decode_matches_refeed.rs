@@ -21,6 +21,7 @@ use ferrum_torrens::domain::kvcache::{CachedModel, KvCache, SequenceCache};
 use ferrum_torrens::domain::model::{ForwardInput, Model};
 use ferrum_torrens::infrastructure::cuda_attention::PagedAttention;
 use ferrum_torrens::infrastructure::cuda_gdn::GdnDecode;
+use ferrum_torrens::infrastructure::cuda_linear::DenseGemv;
 use ferrum_torrens::infrastructure::decode_buffers::{DecodeBuffers, DecodeRow};
 use ferrum_torrens::infrastructure::ftw::{FtwIndex, FtwReader};
 use ferrum_torrens::infrastructure::kvcache_dev::{DeviceCache, KvDType};
@@ -79,6 +80,12 @@ fn model_with_dtype(
         )),
         _ => None,
     };
+    let head_gemv = match device {
+        Device::Cuda(_) => Some(Arc::new(
+            DenseGemv::new(device, std::ptr::null_mut()).unwrap(),
+        )),
+        _ => None,
+    };
     let m = TorchQwen3_6::load(
         params,
         device,
@@ -87,6 +94,7 @@ fn model_with_dtype(
         None,
         attention,
         gdn,
+        head_gemv,
         cache.clone(),
     )
     .unwrap();
@@ -153,9 +161,12 @@ fn assert_close(dev: &[f32], whole: &[f32], at: usize) {
         .fold(0.0f32, f32::max)
         / scale;
     // The device step gathers a fixed-length window rather than exactly
-    // `filled()`, so libtorch sums the same masked terms in another order.
+    // `filled()`, and the dense projections now run bf16 tensor-core GEMMs
+    // (decision 78), whose tiling moves with the batch shape; the argmax above
+    // is the exact check and this bound is the bf16 headroom (measured ~1e-1 for
+    // a 7-row prefix, stable across runs).
     assert!(
-        diff < 1e-3,
+        diff < 0.2,
         "device step drifted from the re-fed forward at {at}: {diff:.3e} of scale"
     );
     eprintln!(
@@ -359,7 +370,7 @@ fn a_batched_decode_step_matches_n_single_row_steps() {
             .fold(0.0f32, f32::max)
             / scale;
         assert!(
-            diff < 1e-3,
+            diff < 0.2,
             "batched row {i} drifted from its single-row step: {diff:.3e} of scale"
         );
         eprintln!(

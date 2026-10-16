@@ -204,12 +204,13 @@ fn config() -> Config {
         "true"
     };
     let kv = std::env::var("FERRUM_SMOKE_KV").unwrap_or_else(|_| "bf16".into());
+    let slots = std::env::var("FERRUM_SMOKE_CACHE").unwrap_or_else(|_| "512".into());
     format!(
         "[model]\npath = \"{FTW_DIR}\"\ndevice = \"cuda\"\nmax_seq_len = 4096\n\
          max_output_tokens = {}\nmax_prefill_length = 1024\n\
          max_running_requests = 4\ncuda_graph = {graph}\n\n\
          [kv]\nnum_tokens = 4096\ndtype = \"{kv}\"\n\n\
-         [moe]\ncache_size_slots = 512\nprefill_overlap = true\n\n\
+         [moe]\ncache_size_slots = {slots}\nprefill_overlap = true\n\n\
          [kernel]\ntriton = true\n",
         decode_tokens()
     )
@@ -220,6 +221,9 @@ fn config() -> Config {
 fn greedy(max_tokens: u32) -> SamplingParams {
     SamplingParams {
         temperature: 0.0,
+        // A throughput smoke measures a fixed number of decode steps: the
+        // synthetic prompt must not stop on an EOS the model happens to emit.
+        ignore_eos: true,
         max_tokens,
         ..SamplingParams::default()
     }

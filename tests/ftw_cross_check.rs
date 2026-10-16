@@ -5,7 +5,9 @@
 // (needs .model-cache/Qwen3.6-35B-A3B-NVFP4.ftw). `FT_TRACE=1` makes both
 // implementations print the same per-layer l2/amax lines, so a divergence can
 // be pinned to the first layer and stage that disagrees. Both must land on the
-// oracle token 11751 with logits within 5% of each other.
+// oracle token 11751 with logits within 8% of each other: the libtorch path runs
+// bf16 tensor-core GEMMs (decision 78) while the scalar reference accumulates in
+// f32, so the argmax is the real check and the 8% is its bf16 headroom.
 //
 // Caveat (decision 13): the scalar reference is a consistency check, not an
 // absolute ground truth. It was wrong against FreeToken before the libtorch port
@@ -89,10 +91,16 @@ fn scalar_and_libtorch_paths_agree_on_the_oracle_prompt() {
     let scalar = build_scalar(&cfg, ix.clone(), rd.clone()).unwrap();
     eprintln!("--- scalar ---");
     let a = scalar.forward(&inp);
-    let torch = build(&cfg, ix, rd, Device::Cpu, &server_config())
-        .unwrap()
-        .model;
-    eprintln!("--- libtorch ---");
+    // The libtorch path runs on the CPU by default. `FT_CROSS_DEVICE=cuda` moves
+    // it to the GPU, where the lm_head is the packed-NVFP4 kernel (TODO.md item
+    // 18) rather than a widened bf16 matmul, so this becomes the end-to-end
+    // oracle for that kernel too.
+    let device = match std::env::var("FT_CROSS_DEVICE").as_deref() {
+        Ok("cuda") => Device::Cuda(0),
+        _ => Device::Cpu,
+    };
+    let torch = build(&cfg, ix, rd, device, &server_config()).unwrap().model;
+    eprintln!("--- libtorch ({device:?}) ---");
     let b = torch.forward(&inp);
 
     for (name, l) in [("scalar", &a), ("torch", &b)] {
@@ -120,7 +128,7 @@ fn scalar_and_libtorch_paths_agree_on_the_oracle_prompt() {
         "the two paths must pick the same token"
     );
     assert!(
-        worst < 0.05,
-        "the two paths must agree within 5% of the logit scale"
+        worst < 0.08,
+        "the two paths must agree within 8% of the logit scale"
     );
 }
