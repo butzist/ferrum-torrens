@@ -1616,10 +1616,48 @@ settled.
       cascade, snapshot-count-not-tokens, slot conservation across waves,
       `evict_full` leaf + ancestor, lock pins snapshot + KV path) plus the
       gated `kvcache_dev` copy test.
-    - **Still open (the wiring, `[TODO]`).** `match_req`/`cache_req` in the
-      generation loop, the snapshot restore at prefill, the dual-eviction
-      triggers, and the pool/page partitioning. Until then the server keeps
-      cold per-request GDN states and does no cross-request reuse.
+    - **Wiring.** Landed as decision 69; the domain core and device primitive
+      are consumed by `DeviceCache` and the generation loop.
+
+69. **The hybrid-radix wiring commits at two boundaries and evicts on pressure**
+    (2026-10-16, implemented) -- item 7, the generation half of `hybrid_radix`.
+    - **Two commit boundaries, no more.** A request commits (a) at **prompt
+      end**, when the whole prompt is cached: `commit(finished=false)` allocates a
+      second live slot, `copy_slot`s the running GDN state into it, inserts the
+      prompt as a tree node owning that snapshot, frees/repoints any pages the
+      boundary already owned, and locks the node so it survives while decoding.
+      And (b) at **finish**: `commit(finished=true)` inserts the full sequence
+      (prompt + generated), donates the now-final **live** slot to the new node
+      **zero-copy** (the request is ending, so there is nothing to preserve), and
+      clears the request. There are deliberately **no mid-decode** commits: every
+      decode step appends its own page, and finish donates the state once.
+    - **Adopt is a COW restore.** `begin` allocates a live slot; `adopt_prefix`
+      matches the prompt without its last token (the forward must recompute that
+      token for its logits), and on a live-snapshot match it locks the node,
+      `copy_slot`s the tree's snapshot into the live slot, repoints the request at
+      the tree's canonical KV pages, and leaves the snapshot intact (so a second
+      concurrent request can reuse it too).
+    - **Pressure is the eviction trigger.** `reserve` reclaims request-unused
+      pages through `evict_full` (counts tokens) when the page pool is short;
+      allocating a live or snapshot slot reclaims GDN slots through `evict_mamba`
+      (counts snapshots) when the state pool is short. The two pools are
+      independent by construction, so no partitioning is needed -- the earlier
+      plan's "partition the pools" step was unnecessary once eviction runs on
+      demand.
+    - **Where it is wired.** `generation::open_cache` opens each request (adopt
+      over `ids[..len-1]`); the prefill forward is followed by
+      `commit(cache, ids, false)`; the finish loop runs `commit(cache, &s.ids,
+      true)` before `end`. The captured decode path shares the same `open_cache`.
+    - **Deferred.** FreeToken snapshots mid-prompt at fixed `CHUNK` boundaries
+      (per-64-token) so a prefix that ends mid-chunk is reusable. Our prefill is
+      single-shot, so only prompt-boundary and completed-sequence prefixes are
+      reusable today. Exact-same-prompt reuse is therefore still zero (the match
+      is `ids[:-1]`); prefix-extension and multi-turn reuse are not.
+    - **Tests.** `DeviceCache` manager tests (committed-prefix reuse, strict-prefix
+      cold, prompt-end commit reuse, page/slot conservation, shared snapshot) and
+      generation wiring tests (adopt + both commits in order, per-request in a
+      batch), plus the whole existing suite unchanged. The gated oracle against
+      FreeToken's `test_hybrid_radix.py` on the real checkpoint is still to run.
 
 ---
 
@@ -2081,7 +2119,8 @@ subsection names are kept verbatim.
 - [x] P0 the engine decodes off the page table: one `SequenceCache` per request, opened on its first step and released when it finishes; a forward without a cache keeps re-feeding and must produce the same tokens (`application/generation.rs`).
 - [x] P0 page free-list (`free_slots` holds page bases) + per-req page table holding **token locations** + dummy row pointing at a sentinel page. (`domain/kvcache.rs`)
 - [x] P0 radix prefix tree: walk by first-page-key, `std::mismatch`-comparison align-down to page, node split, insert, LRU evict (unlocked leaf only), ref-counted handles. (`domain/kvcache.rs`, page_size=1)
-- [x] P2 hybrid_radix **domain core + device primitive** (2026-10-16, decision 68): `HybridRadixIndex` (dual `full_ref`/`mamba_ref`, tombstones, deepest-live-snapshot `match_prefix`, `evict_mamba` counts snapshots / `evict_full` counts tokens, donate-not-copy as a caller-owned slot) + `RadixNode.mamba_value/mamba_refcount` + `LinearStateSlabs::copy_slot`. 17 unit tests. The generation-loop wiring (`match_req`/`cache_req`, restore, dual eviction, pool partitioning) is still open.
+- [x] P2 hybrid_radix **domain core + device primitive** (2026-10-16, decision 68): `HybridRadixIndex` (dual `full_ref`/`mamba_ref`, tombstones, deepest-live-snapshot `match_prefix`, `evict_mamba` counts snapshots / `evict_full` counts tokens, donate-not-copy as a caller-owned slot) + `RadixNode.mamba_value/mamba_refcount` + `LinearStateSlabs::copy_slot`. 17 unit tests.
+- [x] P2 hybrid_radix **generation-loop wiring** (2026-10-16, decision 69): `DeviceCache` owns the tree; `adopt_prefix` COW-restores a matched snapshot and repoints at the tree's pages; `commit(finished=false)` snapshots the prompt end and locks, `commit(finished=true)` donates the live slot zero-copy; `reserve`/slot allocation drive `evict_full`/`evict_mamba` on pressure (pools are independent, no partitioning). `generation::open_cache` + the prefill/finish commits wire it in. Deferred: mid-prefill (`CHUNK`) snapshots, since prefill is single-shot; gated oracle against `test_hybrid_radix.py` still to run.
 - [x] P0 **KV dtype serving-safe (SERVING BLOCKER).** Done 2026-10-15. `[kv] dtype = "f32" | "bf16"` (`fp8` refused at validation until a path exists) now picks the pool element type in `registry::kv_cache`; the default is `bf16`, which halves the pool, so the 4.51 GiB resident tower and the default `num_tokens = 131072` pool (2.5 GiB) fit the 7.53 GiB device. `MhaPool::gather*` now always returns f32 (upcasting bf16 on read), which is what lets the f32 attention math and the dense padded-window fallback consume a bf16 pool; the f32-only paged kernel still serves f32 pools. Measured on the device: `a_bf16_pool_device_decode_matches_refeeding_the_whole_prefix` keeps the greedy token equal to the f32 re-fed forward at every step with a worst logit shift of ~13% of scale (bf16 K/V rounding; the checkpoint itself serves fp8 KV). Gated f32 gates are pinned `dtype = "f32"` where they assert exact numerics (decision 64).
 - [x] P0 GDN linear-state pool: free-slot bookkeeping (conv-state + recurrent fp32 rows are infra tensors); ping-pong live slots and restore land with the hybrid path.
 ### Scheduler

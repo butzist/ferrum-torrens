@@ -17,7 +17,9 @@ use std::sync::Mutex;
 
 use tch::{Kind, Tensor};
 
-use crate::domain::kvcache::{KvCache, KvcacheError, LinearStatePool, PagePool, SequenceCache};
+use crate::domain::kvcache::{
+    EvictResult, HybridRadixIndex, KvCache, KvcacheError, LinearStatePool, PagePool, SequenceCache,
+};
 use crate::domain::model::{LayerType, ModelParams};
 use crate::infrastructure::torch::Device;
 
@@ -394,9 +396,15 @@ impl LinearStateSlabs {
 /// The free lists are behind mutexes and the tensors behind shared borrows, so
 /// the engine can hold one `DeviceCache` for every session while each session's
 /// forward borrows the slabs for the duration of its step.
+///
+/// It also owns the hybrid prefix tree (`HybridRadixIndex`): the pure radix
+/// bookkeeping that lets a request reuse another's KV pages and GDN state. The
+/// tree stores page and slot ids only; this adapter is what moves the actual
+/// device bytes (`copy_slot`) and drives the two pools.
 pub struct DeviceCache {
     pages: Mutex<PagePool>,
     slots: Mutex<LinearStatePool>,
+    tree: Mutex<HybridRadixIndex>,
     slabs: SharedSlabs,
 }
 
@@ -422,6 +430,7 @@ impl DeviceCache {
         Self {
             pages: Mutex::new(PagePool::new(PAGE_SIZE as usize, num_pages)),
             slots: Mutex::new(LinearStatePool::new(num_slots)),
+            tree: Mutex::new(HybridRadixIndex::new(PAGE_SIZE as usize)),
             slabs: SharedSlabs {
                 mha: MhaPool::new(params, num_pages, dtype, device),
                 state: LinearStateSlabs::new(params, num_slots, device),
@@ -441,32 +450,88 @@ impl DeviceCache {
     pub fn bytes(&self) -> usize {
         self.slabs.mha.bytes() + self.slabs.state.bytes()
     }
+
+    /// Return an eviction's spoils to the two pools: KV locations to the page
+    /// pool, GDN state slots to the slot pool.
+    fn free_evicted(&self, ev: EvictResult) {
+        if !ev.kv.is_empty() {
+            self.pages.lock().expect("kvcache lock").free_pages(ev.kv);
+        }
+        if !ev.mamba_slots.is_empty() {
+            let mut slots = self.slots.lock().expect("kvcache lock");
+            for slot in ev.mamba_slots {
+                slots.release(slot);
+            }
+        }
+    }
+
+    /// Allocate a GDN state slot, evicting unlocked tree snapshots (LRU) until
+    /// one is free. Panics only if the pool is sized below the live
+    /// concurrency, which is a config error.
+    fn alloc_slot(&self) -> u32 {
+        loop {
+            let free = { self.slots.lock().expect("kvcache lock").allocate() };
+            if let Some(slot) = free {
+                return slot;
+            }
+            let ev = self.tree.lock().expect("kvcache lock").evict_mamba(1);
+            if ev.mamba_slots.is_empty() && ev.kv.is_empty() {
+                panic!("state slots exhausted: size the cache for the request concurrency");
+            }
+            self.free_evicted(ev);
+        }
+    }
+
+    /// Reserve `n` pages for `cache`, evicting the tree's unlocked KV leaves when
+    /// the page pool runs short. Eviction also returns each evicted leaf's
+    /// snapshot slot.
+    fn reserve_pages(&self, cache: &mut SequenceCache, n: usize) -> Result<(), KvcacheError> {
+        {
+            let mut pages = self.pages.lock().expect("kvcache lock");
+            if cache.grow(n, &mut pages).is_ok() {
+                return Ok(());
+            }
+        }
+        loop {
+            let have = self.pages.lock().expect("kvcache lock").available();
+            if have >= n {
+                break;
+            }
+            let ev = self.tree.lock().expect("kvcache lock").evict_full(n - have);
+            if ev.kv.is_empty() && ev.mamba_slots.is_empty() {
+                break;
+            }
+            self.free_evicted(ev);
+        }
+        cache.grow(n, &mut self.pages.lock().expect("kvcache lock"))
+    }
 }
 
 impl KvCache for DeviceCache {
     fn begin(&self) -> SequenceCache {
-        let slot = self
-            .slots
-            .lock()
-            .expect("kvcache lock")
-            .allocate()
-            .expect("state slots exhausted: size the cache for the request concurrency");
+        let slot = self.alloc_slot();
         // A recycled slot still holds the last request's GDN state; zero it, or
-        // the new request's first chunk would continue someone else's.
+        // the new request's first chunk would continue someone else's. A reused
+        // prefix overwrites it with the restored snapshot in `adopt_prefix`.
         self.slabs.state.reset_slot(slot);
         SequenceCache::new(slot)
     }
 
     fn reserve(&self, cache: &mut SequenceCache, n: usize) -> Result<(), KvcacheError> {
-        cache.grow(n, &mut self.pages.lock().expect("kvcache lock"))
+        self.reserve_pages(cache, n)
     }
 
     fn end(&self, cache: &mut SequenceCache) {
         cache.release(&mut self.pages.lock().expect("kvcache lock"));
-        self.slots
-            .lock()
-            .expect("kvcache lock")
-            .release(cache.state_slot());
+        if let Some(node) = cache.take_lock() {
+            self.tree.lock().expect("kvcache lock").dec_lock(node);
+        }
+        if !cache.donated() {
+            self.slots
+                .lock()
+                .expect("kvcache lock")
+                .release(cache.state_slot());
+        }
     }
 
     fn available(&self) -> usize {
@@ -475,6 +540,91 @@ impl KvCache for DeviceCache {
 
     fn num_pages(&self) -> usize {
         self.pages.lock().expect("kvcache lock").total_pages()
+    }
+
+    fn adopt_prefix(&self, cache: &mut SequenceCache, ids: &[u32]) -> usize {
+        if ids.is_empty() {
+            return 0;
+        }
+        let (node, snapshot, canonical) = {
+            let mut tree = self.tree.lock().expect("kvcache lock");
+            let m = tree.match_prefix(ids);
+            match m.mamba_value {
+                Some(snapshot) if m.cached_len > 0 => {
+                    tree.inc_lock(m.node);
+                    (m.node, snapshot, m.kv_indices)
+                }
+                _ => return 0,
+            }
+        };
+        // Copy-on-write the snapshot into this request's live slot: the tree
+        // keeps its copy, the request resumes the GDN recurrence from here.
+        self.slabs.state.copy_slot(snapshot, cache.state_slot());
+        cache.adopt_prefix(&canonical);
+        cache.set_lock(Some(node));
+        canonical.len()
+    }
+
+    fn commit(&self, cache: &mut SequenceCache, ids: &[u32], finished: bool) {
+        let cached_len = cache.cached();
+        if cached_len == 0 || ids.len() < cached_len {
+            if let Some(node) = cache.take_lock() {
+                self.tree.lock().expect("kvcache lock").dec_lock(node);
+            }
+            return;
+        }
+        let old_reused = cache.reused();
+        let keys = &ids[..cached_len];
+        // The donated slot: the live one for a finished request (zero-copy, the
+        // request is done), else a COW copy so the live slot keeps decoding.
+        let donated_slot = if finished {
+            cache.state_slot()
+        } else {
+            let slot = self.alloc_slot();
+            self.slabs.state.copy_slot(cache.state_slot(), slot);
+            slot
+        };
+        let (prefix_len, mamba_exist, node, canonical) = {
+            let mut tree = self.tree.lock().expect("kvcache lock");
+            let ins = tree.insert(keys, cache.filled(), donated_slot);
+            let m = tree.match_prefix(keys);
+            (ins.prefix_len, ins.mamba_exist, m.node, m.kv_indices)
+        };
+        if mamba_exist {
+            // The boundary already owns a snapshot (dedup): drop the donated
+            // copy, or, when finished, let `end` return the live slot.
+            if !finished {
+                self.slots
+                    .lock()
+                    .expect("kvcache lock")
+                    .release(donated_slot);
+            }
+        } else if finished {
+            // The tree owns the live slot; `end` must not return it.
+            cache.set_donated(true);
+        }
+        // The request's own locations in [old_reused, prefix_len) already exist
+        // in the tree. Free them; if the request keeps decoding, re-point the
+        // row at the tree's canonical pages first (attention still reads it).
+        if prefix_len > old_reused {
+            let dup = cache.filled()[old_reused..prefix_len].to_vec();
+            if !finished {
+                cache.repoint(old_reused, prefix_len, &canonical);
+            }
+            self.pages.lock().expect("kvcache lock").free_pages(dup);
+        }
+        if let Some(old) = cache.take_lock() {
+            self.tree.lock().expect("kvcache lock").dec_lock(old);
+        }
+        if finished {
+            cache.clear();
+        } else {
+            self.tree.lock().expect("kvcache lock").inc_lock(node);
+            cache.set_lock(Some(node));
+            // The insert adopted the whole committed span, so the tree now owns
+            // every leading location, not just the pre-existing prefix.
+            cache.set_reused(cached_len);
+        }
     }
 }
 
@@ -889,6 +1039,182 @@ mod tests {
                 .iter()
                 .all(|v| *v == 0.0),
             "the device accessor never aliases another slot"
+        );
+    }
+
+    /// Mark a slot's first linear layer so a restore can be told apart from a
+    /// zeroed fresh slot.
+    fn stamp(s: &LinearStateSlabs, slot: u32, value: f32) {
+        let n = s.recurrent_size().iter().product::<i64>() as usize;
+        s.set_recurrent_state(
+            slot,
+            1,
+            f32_tensor(&vec![value; n], &s.recurrent_size()[..], auto_device()),
+        );
+    }
+
+    fn stamp_of(cache: &DeviceCache, slot: u32) -> Vec<f32> {
+        to_f32_vec(&cache.state().recurrent_state(slot, 1))
+    }
+
+    #[test]
+    fn a_committed_prefix_is_reused_by_the_next_request() {
+        let cache = DeviceCache::new(&params(), 32, 4, KvDType::F32, auto_device());
+        let mut a = cache.begin();
+        assert_eq!(
+            cache.adopt_prefix(&mut a, &[1, 2, 3]),
+            0,
+            "the empty tree is cold"
+        );
+        cache.reserve(&mut a, 4).unwrap();
+        let a_pages = a.filled().to_vec();
+        stamp(cache.state(), a.state_slot(), 5.0);
+        cache.commit(&mut a, &[1, 2, 3, 4], true);
+        cache.end(&mut a);
+
+        let mut b = cache.begin();
+        assert_eq!(
+            cache.adopt_prefix(&mut b, &[1, 2, 3, 4]),
+            4,
+            "the whole committed prefix matches"
+        );
+        assert_eq!(
+            b.filled(),
+            &a_pages[..],
+            "b reads the tree's canonical pages, not its own"
+        );
+        assert!(
+            stamp_of(&cache, b.state_slot()).iter().all(|v| *v == 5.0),
+            "b resumes from a's donated GDN state"
+        );
+        cache.end(&mut b);
+    }
+
+    #[test]
+    fn a_prefix_shorter_than_a_snapshot_boundary_reuses_nothing() {
+        let cache = DeviceCache::new(&params(), 32, 4, KvDType::F32, auto_device());
+        let mut a = cache.begin();
+        cache.reserve(&mut a, 4).unwrap();
+        stamp(cache.state(), a.state_slot(), 7.0);
+        cache.commit(&mut a, &[1, 2, 3, 4], true);
+        cache.end(&mut a);
+
+        let mut b = cache.begin();
+        assert_eq!(
+            cache.adopt_prefix(&mut b, &[1, 2, 3]),
+            0,
+            "a strict prefix of a snapshot node has no resumable state"
+        );
+        assert!(
+            stamp_of(&cache, b.state_slot()).iter().all(|v| *v == 0.0),
+            "a cold start keeps the zeroed slot"
+        );
+        cache.end(&mut b);
+    }
+
+    #[test]
+    fn a_prompt_end_commit_lets_a_follower_reuse_the_prompt() {
+        let cache = DeviceCache::new(&params(), 64, 4, KvDType::F32, auto_device());
+        let mut a = cache.begin();
+        cache.reserve(&mut a, 4).unwrap();
+        stamp(cache.state(), a.state_slot(), 3.0);
+        cache.commit(&mut a, &[1, 2, 3, 4], false);
+        assert_eq!(a.cached(), 4, "a keeps decoding over its own pages");
+        assert_eq!(a.reused(), 4, "the tree now owns a's prompt");
+        cache.reserve(&mut a, 1).unwrap();
+        cache.commit(&mut a, &[1, 2, 3, 4, 5], true);
+        cache.end(&mut a);
+
+        let mut b = cache.begin();
+        assert_eq!(
+            cache.adopt_prefix(&mut b, &[1, 2, 3, 4]),
+            4,
+            "the prompt boundary is reusable"
+        );
+        assert!(
+            stamp_of(&cache, b.state_slot()).iter().all(|v| *v == 3.0),
+            "b resumes from the prompt-end snapshot"
+        );
+        cache.end(&mut b);
+    }
+
+    #[test]
+    fn pages_and_slots_are_conserved_across_reuse() {
+        let cache = DeviceCache::new(&params(), 32, 4, KvDType::F32, auto_device());
+        let total_pages = cache.num_pages();
+        let mut a = cache.begin();
+        cache.reserve(&mut a, 6).unwrap();
+        stamp(cache.state(), a.state_slot(), 1.0);
+        cache.commit(&mut a, &[1, 2, 3, 4, 5, 6], true);
+        cache.end(&mut a);
+
+        // A second request reuses the prefix, adds a tail, and commits it.
+        let mut b = cache.begin();
+        assert_eq!(cache.adopt_prefix(&mut b, &[1, 2, 3, 4, 5, 6]), 6);
+        cache.reserve(&mut b, 2).unwrap();
+        cache.commit(&mut b, &[1, 2, 3, 4, 5, 6, 7, 8], true);
+        cache.end(&mut b);
+
+        // The tree owns eight pages and one snapshot; everything else is free.
+        assert_eq!(cache.available(), total_pages - 8);
+    }
+
+    #[test]
+    fn adopting_the_same_prefix_twice_shares_one_tree_snapshot() {
+        let cache = DeviceCache::new(&params(), 32, 4, KvDType::F32, auto_device());
+        let mut a = cache.begin();
+        cache.reserve(&mut a, 4).unwrap();
+        stamp(cache.state(), a.state_slot(), 9.0);
+        cache.commit(&mut a, &[1, 2, 3, 4], true);
+        cache.end(&mut a);
+
+        let mut b = cache.begin();
+        assert_eq!(cache.adopt_prefix(&mut b, &[1, 2, 3, 4]), 4);
+        let mut c = cache.begin();
+        assert_eq!(
+            cache.adopt_prefix(&mut c, &[1, 2, 3, 4]),
+            4,
+            "two live requests share the same snapshot"
+        );
+        assert_ne!(
+            b.state_slot(),
+            c.state_slot(),
+            "each restores into its own slot"
+        );
+        assert!(stamp_of(&cache, b.state_slot()).iter().all(|v| *v == 9.0));
+        assert!(stamp_of(&cache, c.state_slot()).iter().all(|v| *v == 9.0));
+        cache.end(&mut b);
+        cache.end(&mut c);
+    }
+
+    #[test]
+    fn a_prompt_end_snapshot_shares_pages_with_the_still_decoding_request() {
+        let cache = DeviceCache::new(&params(), 32, 4, KvDType::F32, auto_device());
+        let mut a = cache.begin();
+        cache.reserve(&mut a, 4).unwrap();
+        stamp(cache.state(), a.state_slot(), 2.0);
+        cache.commit(&mut a, &[1, 2, 3, 4], false);
+        let a_pages = a.filled().to_vec();
+
+        // A second request adopts the same prefix while a is still decoding.
+        let mut b = cache.begin();
+        assert_eq!(cache.adopt_prefix(&mut b, &[1, 2, 3, 4]), 4);
+        assert_eq!(b.filled(), &a_pages[..], "both point at the tree's pages");
+
+        // a keeps decoding and finishes over a longer chain.
+        cache.reserve(&mut a, 1).unwrap();
+        cache.commit(&mut a, &[1, 2, 3, 4, 5], true);
+        cache.end(&mut a);
+
+        // b finishes over a different tail without losing its adopted pages.
+        cache.reserve(&mut b, 1).unwrap();
+        cache.commit(&mut b, &[1, 2, 3, 4, 6], true);
+        cache.end(&mut b);
+
+        assert_eq!(
+            cache.available(),
+            32 - 6,
+            "the shared prefix and both tails are the tree's six pages"
         );
     }
 }

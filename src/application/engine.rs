@@ -626,6 +626,8 @@ pub(crate) mod fake {
     pub struct FakeCache {
         pages: Mutex<crate::domain::kvcache::PagePool>,
         slots: Mutex<crate::domain::kvcache::LinearStatePool>,
+        adopts: Mutex<Vec<usize>>,
+        commits: Mutex<Vec<(usize, bool)>>,
     }
 
     impl FakeCache {
@@ -635,11 +637,23 @@ pub(crate) mod fake {
             Self {
                 pages: Mutex::new(crate::domain::kvcache::PagePool::new(1, Self::PAGES)),
                 slots: Mutex::new(crate::domain::kvcache::LinearStatePool::new(4)),
+                adopts: Mutex::new(Vec::new()),
+                commits: Mutex::new(Vec::new()),
             }
         }
 
         pub fn pages_left(&self) -> usize {
             self.pages.lock().unwrap().available()
+        }
+
+        /// The match length of every `adopt_prefix` call, in order.
+        pub fn adopts(&self) -> Vec<usize> {
+            self.adopts.lock().unwrap().clone()
+        }
+
+        /// The `(sequence length, finished)` of every `commit` call, in order.
+        pub fn commits(&self) -> Vec<(usize, bool)> {
+            self.commits.lock().unwrap().clone()
         }
     }
 
@@ -668,6 +682,24 @@ pub(crate) mod fake {
 
         fn num_pages(&self) -> usize {
             Self::PAGES
+        }
+
+        fn adopt_prefix(
+            &self,
+            _cache: &mut crate::domain::kvcache::SequenceCache,
+            ids: &[u32],
+        ) -> usize {
+            self.adopts.lock().unwrap().push(ids.len());
+            0
+        }
+
+        fn commit(
+            &self,
+            _cache: &mut crate::domain::kvcache::SequenceCache,
+            ids: &[u32],
+            finished: bool,
+        ) {
+            self.commits.lock().unwrap().push((ids.len(), finished));
         }
     }
 

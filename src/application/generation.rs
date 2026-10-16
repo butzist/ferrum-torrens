@@ -139,6 +139,18 @@ pub fn generate_batch(
     run_batch(engine, requests, seed, None)
 }
 
+/// Open a session's cache and, if a hybrid prefix tree has a resumable match,
+/// adopt it: reuse the matched KV pages and restore the GDN snapshot. The match
+/// is against the prompt without its last token, because the forward must still
+/// recompute that token for its logits.
+fn open_cache(kv: &Arc<dyn KvCache>, ids: &[u32]) -> SequenceCache {
+    let mut cache = kv.begin();
+    if ids.len() > 1 {
+        kv.adopt_prefix(&mut cache, &ids[..ids.len() - 1]);
+    }
+    cache
+}
+
 /// The one generation loop: forward + sample per step, stop rules around it, and
 /// every finished session turned back into a `Generation`. `sink` is what makes
 /// a run a stream; `None` is a plain run to completion.
@@ -200,7 +212,10 @@ fn run_batch(
                         cache: slot,
                         req,
                     } = s;
-                    let cache = slot.get_or_insert_with(|| kv.begin());
+                    if slot.is_none() {
+                        *slot = Some(open_cache(&kv, ids));
+                    }
+                    let cache = slot.as_mut().expect("opened above");
                     let start = cache.cached();
                     let step = engine.run_forward_cached(
                         CachedStep {
@@ -212,6 +227,12 @@ fn run_batch(
                         },
                         &mut rng,
                     )?;
+                    if phase == Phase::Prefill {
+                        // The whole prompt is now cached: commit its prefix and a
+                        // prompt-end GDN snapshot, so a later request that extends
+                        // this prompt can resume from here.
+                        kv.commit(cache, ids.as_slice(), false);
+                    }
                     out.push(step);
                 }
                 out
@@ -269,6 +290,9 @@ fn run_batch(
     for uid in finished {
         let mut s = sessions.remove(&uid).expect("finished session");
         if let (Some(kv), Some(mut cache)) = (engine.cache(), s.cache.take()) {
+            // Donate the finished request's full sequence (prompt + generated)
+            // and its final GDN state to the prefix tree before releasing it.
+            kv.commit(&mut cache, &s.ids, true);
             kv.end(&mut cache);
         }
         let text = finish_text(engine, &s)?;
@@ -304,7 +328,10 @@ fn captured_decode_step(
         let Session {
             ids, cache: slot, ..
         } = s;
-        let cache = slot.get_or_insert_with(|| kv.begin());
+        if slot.is_none() {
+            *slot = Some(open_cache(kv, ids));
+        }
+        let cache = slot.as_mut().expect("opened above");
         let start = cache.cached();
         if ids.len() != start + 1 {
             return Err(EngineError::DecodeStepNotOne {
@@ -532,6 +559,39 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].tokens, vec![99, 100], "uid 1 walks the counter");
         assert_eq!(out[1].tokens, vec![123, 124], "uid 2 walks its own counter");
+    }
+
+    #[test]
+    fn a_cached_run_commits_the_prompt_and_the_finish_to_the_tree() {
+        let (e, _rec, cache) = test_cached_engine(limits());
+        generate(&e, req(&e, 1, "abcd", params(2)), 0).unwrap();
+        assert_eq!(
+            cache.adopts(),
+            vec![3],
+            "the prompt without its last token is looked up in the tree"
+        );
+        assert_eq!(
+            cache.commits(),
+            vec![(4, false), (6, true)],
+            "the full prompt is committed at prompt end, the whole sequence at finish"
+        );
+    }
+
+    #[test]
+    fn every_request_in_a_cached_batch_opens_and_commits_its_own_prefix() {
+        let (e, _rec, cache) = test_cached_engine(limits());
+        let batch = vec![req(&e, 1, "ab", params(2)), req(&e, 2, "xyz", params(2))];
+        generate_batch(&e, batch, 0).unwrap();
+        assert_eq!(
+            cache.adopts(),
+            vec![1, 2],
+            "one lookup per request, over the prompt minus its last token"
+        );
+        assert_eq!(
+            cache.commits(),
+            vec![(2, false), (3, false), (4, true), (5, true)],
+            "each request commits its prompt, then its finished sequence"
+        );
     }
 
     #[test]

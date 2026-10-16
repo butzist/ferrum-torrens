@@ -251,10 +251,21 @@ A tree of prefixes sharing KV pages across requests:
   `full_ref >= mamba_ref`; `evict_mamba` counts snapshots (tombstone an internal
   node, free a leaf's KV too) and `evict_full` counts tokens; donation is a
   caller-owned slot id (donate-not-copy). The device primitive
-  `LinearStateSlabs::copy_slot` does the COW donate/restore. The generation-loop
-  wiring (`match_req`/`cache_req`, restore, dual-eviction triggers, pool
-  partitioning) is still `[TODO]`; until then the server keeps cold per-request
-  states.
+  `LinearStateSlabs::copy_slot` does the COW donate/restore.
+- The wiring is implemented (decision 69). `DeviceCache` owns the tree and drives
+  two commit boundaries: at **prompt end** `commit(finished=false)` COWs the
+  running GDN state into a tree-owned slot and locks the node; at **finish**
+  `commit(finished=true)` inserts the full sequence and donates the request's
+  final live slot zero-copy. `adopt_prefix` matches the prompt minus its last
+  token, and on a live-snapshot match copy-restores the snapshot into the
+  request's live slot and re-points the request at the tree's canonical KV pages.
+  Pressure runs the evictions: `reserve` reclaims pages via `evict_full`, slot
+  allocation reclaims GDN slots via `evict_mamba` (the two pools are independent,
+  so no partitioning). Prefill is single-shot, so mid-prefill (x64 chunk)
+  snapshots are deferred; only prompt-boundary and completed-sequence prefixes
+  are reusable for now. A snapshot carries both the recurrent state and the
+  causal-conv tail (`conv_state`), which is why the boundary is page-aligned: the
+  conv tail must line up with the tokens the KV pages hold.
 
 ## 4. Expert memory hierarchy (the `offload` strategy)
 
@@ -387,7 +398,8 @@ while not done:
 
     for req in batch: req.complete_one()  # advance lengths AFTER the step
     stop: eos / stop_str / max_device_len -> finish, else keep decoding
-    prefill done   -> cache_req (commit KV prefix into radix tree)
-    request done   -> free pages, table slot, GDN slots (idempotent)
+    prefill done   -> cache_req (commit KV prefix + prompt-end GDN snapshot)
+    request done   -> free pages, table slot, GDN slots (hybrid: donate the final
+                      GDN slot to the tree first, idempotent)
     detokenize next_tokens -> SSE delta to client
 ```

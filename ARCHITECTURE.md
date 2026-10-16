@@ -485,7 +485,7 @@ indices) is retained across transitions; the driver exposes it through owned
 `OwnedStream`/`OwnedEvent` handles that destroy themselves on drop. The blocks
 are the cache's own slots, so this adds no expert VRAM.
 
-### 3.6 KV cache, radix, and GDN state `[core]` (radix wired into serving `[partial]`)
+### 3.6 KV cache, radix, and GDN state `[core]`
 
 **Static.** The domain owns the bookkeeping (pages, page table, radix tree,
 state-slot pool, `SequenceCache`); the adapter owns the device slabs.
@@ -509,13 +509,15 @@ flowchart LR
   DC --> Slabs
   DC --> Pool
   DC --> SP
+  DC --> Hybrid
   Pool --> PT --> SC
   Radix --> Pool
   Hybrid --> SP
 ```
 
 `HybridRadixIndex` shares the page pool (its `full_ref` counts KV pages) and the
-state-slot pool (its `mamba_ref` counts GDN snapshots).
+state-slot pool (its `mamba_ref` counts GDN snapshots). `DeviceCache` owns the
+tree and drives both commit boundaries and both eviction triggers.
 
 **Dynamic -- prefill growth and decode step.** Pages are handed out by the
 engine, the model stores K/V at those locations, and the next step reads them
@@ -528,30 +530,37 @@ sequenceDiagram
   participant M as torch forward
   participant P as MhaPool
   participant S as LinearStateSlabs
-  G->>KV: begin() -> SequenceCache (private state slot)
+  G->>KV: begin() -> SequenceCache (live state slot)
+  G->>KV: adopt_prefix(ids[:-1]) -> copy_slot(snapshot, live) + reuse canonical pages
   G->>KV: reserve(cache, n) -> cache.tail()
   M->>P: store(layer, tail, k, v) for full-attention layers
   M->>P: gather(layer, cache.filled())
   M->>S: state_slot read/write for GDN layers
+  G->>KV: commit(ids, finished=false) at prompt end -> snapshot + lock
   Note over G: next step: ids = ids[start..], start = cache.cached()
-  G->>KV: end(cache) when the request finishes
+  G->>KV: commit(ids, finished=true) at finish -> donate live slot
+  G->>KV: end(cache)
 ```
 
-`[TODO]`/`[partial]`: the plain radix tree and the hybrid tree's domain core are
-implemented and unit-tested in the domain (decision 68), and the engine decodes
-off per-request page tables, but the server does not commit prefixes into either
-tree. That is deliberate, not just unfinished: for this 30-GDN/10-attention tower
-a match is only reusable up to the deepest node with a live GDN state snapshot,
-so KV-only reuse is zero value (decision 65). The `hybrid_radix` domain core
-(`HybridRadixIndex`: dual `full_ref`/`mamba_ref` counts, tombstones, deepest-
-live-snapshot `match_prefix`, dual eviction) and the device `copy_slot`
-primitive are DONE; the `[TODO]` that makes radix real is wiring
-`match_req`/`cache_req` + the snapshot restore, dual-eviction triggers and pool
-partitioning into the generation loop. The MVP keeps cold per-request GDN states. KV is f32 or bf16: `[kv] dtype` picks it and the default is bf16 (half
-the bytes; the lever when VRAM binds), while `fp8` -- the checkpoint's declared
-`kv_cache_quant_algo` -- is still `[TODO]`. Gathers always return f32, so the
-attention math is dtype-agnostic and the f32-only paged decode kernel is skipped
-for a bf16 pool.
+`[core]`: the plain radix tree and the hybrid tree are implemented and
+unit-tested in the domain (decisions 68, 69), and `DeviceCache` drives both
+commit boundaries. `adopt_prefix` matches the prompt (without its last token),
+copy-on-write restores the matched GDN snapshot into the request's live slot
+(`LinearStateSlabs::copy_slot`) and repoints the request at the tree's canonical
+KV pages. `commit(finished=false)` at prompt end snapshots the running state into
+a tree-owned slot and locks the node; `commit(finished=true)` at finish donates
+the request's final live slot zero-copy and clears the request. Pressure drives
+eviction: `reserve` reclaims pages via `evict_full`; snapshot allocation reclaims
+slots via `evict_mamba`. The two pools are independent, so no partitioning is
+needed. For this 30-GDN/10-attention tower a match is only reusable up to the
+deepest node with a live GDN state snapshot, which is why the snapshot donation
+(not the KV tree alone) is the point (decision 65). Prefill is single-shot, so
+mid-prefill (`CHUNK`-boundary) snapshots are deferred: only prompt-boundary and
+completed-sequence prefixes are reusable for now. KV is f32 or bf16: `[kv]
+dtype` picks it and the default is bf16 (half the bytes; the lever when VRAM
+binds), while `fp8` -- the checkpoint's declared `kv_cache_quant_algo` -- is still
+`[TODO]`. Gathers always return f32, so the attention math is dtype-agnostic and
+the f32-only paged decode kernel is skipped for a bf16 pool.
 
 ### 3.7 Scheduler and sampling `[core]`
 

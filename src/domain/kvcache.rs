@@ -857,6 +857,16 @@ pub struct SequenceCache {
     /// How many of `pages` have actually been written this request.
     len: usize,
     state_slot: u32,
+    /// How many leading tokens are tree-owned (locked, reused from a hybrid
+    /// prefix). `pages[..reused]` are the tree's canonical locations and must
+    /// not be freed by this request; only `pages[reused..len]` are its own.
+    reused: usize,
+    /// The hybrid tree node this request holds locked, if any. Released on
+    /// commit or `end`.
+    lock: Option<usize>,
+    /// The live GDN slot was donated to the tree on commit; `end` must not
+    /// return it to the slot pool.
+    donated: bool,
 }
 
 impl SequenceCache {
@@ -865,6 +875,9 @@ impl SequenceCache {
             pages: Vec::new(),
             len: 0,
             state_slot,
+            reused: 0,
+            lock: None,
+            donated: false,
         }
     }
 
@@ -877,6 +890,68 @@ impl SequenceCache {
         self.state_slot
     }
 
+    /// Tokens of `filled()` reused from a hybrid prefix (tree-owned, locked).
+    pub fn reused(&self) -> usize {
+        self.reused
+    }
+
+    pub fn set_reused(&mut self, n: usize) {
+        debug_assert!(n <= self.len);
+        self.reused = n;
+    }
+
+    pub fn lock(&self) -> Option<usize> {
+        self.lock
+    }
+
+    pub fn set_lock(&mut self, node: Option<usize>) {
+        self.lock = node;
+    }
+
+    pub fn take_lock(&mut self) -> Option<usize> {
+        self.lock.take()
+    }
+
+    pub fn donated(&self) -> bool {
+        self.donated
+    }
+
+    pub fn set_donated(&mut self, donated: bool) {
+        self.donated = donated;
+    }
+
+    /// The request's own locations, `filled()[reused..]`: what a commit may free
+    /// or hand to the tree.
+    pub fn own(&self) -> &[u32] {
+        &self.pages[self.reused..self.len]
+    }
+
+    /// Point `pages[from..to]` at the tree's canonical locations. A commit that
+    /// found `[reused, prefix_len)` already in the tree returns the request's own
+    /// (now duplicate) locations to the pool; the request keeps reading this row
+    /// while it decodes, so it must be re-pointed at the canonical ones first.
+    pub fn repoint(&mut self, from: usize, to: usize, canonical: &[u32]) {
+        debug_assert!(from <= to && to <= self.len && to <= canonical.len());
+        self.pages[from..to].copy_from_slice(&canonical[from..to]);
+    }
+
+    /// Adopt `pages` as the leading, tree-owned (reused) locations: a matched
+    /// prefix at admission.
+    pub fn adopt_prefix(&mut self, pages: &[u32]) {
+        debug_assert!(self.pages.is_empty() && self.len == 0);
+        self.pages.extend_from_slice(pages);
+        self.len = pages.len();
+        self.reused = pages.len();
+    }
+
+    /// Drop every page reference (a finished commit has handed all of them to
+    /// the tree or freed the duplicates), so `end` frees nothing.
+    pub fn clear(&mut self) {
+        self.pages.clear();
+        self.len = 0;
+        self.reused = 0;
+    }
+
     /// Reserve room for `n` more tokens, drawing pages from the pool. The
     /// caller owns the pool and grows the cache before the forward, because the
     /// forward only writes into the locations it is handed.
@@ -887,19 +962,23 @@ impl SequenceCache {
         Ok(())
     }
 
-    /// Give `n` of this request's pages back, keeping the earlier ones. Used
-    /// when a prefix is rolled back to a shorter cached length.
+    /// Give `n` of this request's own pages back, keeping the earlier ones. Used
+    /// when a prefix is rolled back to a shorter cached length. Never crosses the
+    /// tree-owned `reused` boundary.
     pub fn truncate(&mut self, n: usize, pool: &mut PagePool) {
-        debug_assert!(n <= self.len);
+        debug_assert!(n <= self.len - self.reused);
         let keep = self.len - n;
         let tail = self.pages.split_off(keep);
         pool.free_pages(tail);
         self.len = keep;
     }
 
-    /// Hand every page back, e.g. when the request finishes.
+    /// Hand the request's own pages back; the tree-owned leading pages are not
+    /// this request's to free. Used by `end` for a request that did not commit.
     pub fn release(&mut self, pool: &mut PagePool) {
-        self.truncate(self.len, pool);
+        let own = self.pages.split_off(self.reused);
+        pool.free_pages(own);
+        self.len = self.reused;
     }
 
     /// Every filled location, in token order: what attention gathers over.
@@ -936,6 +1015,28 @@ pub trait KvCache: Send + Sync {
 
     /// Total pages, i.e. the token budget across every live request.
     fn num_pages(&self) -> usize;
+
+    /// A hybrid (GDN) cache: try to reuse a cached prefix of `ids`, which is the
+    /// prompt without its last token (the forward must still recompute that token
+    /// for its logits). On a hit, restore the matched GDN snapshot into `cache`'s
+    /// live slot (copy-on-write), point the cache's leading pages at the tree's
+    /// canonical KV, lock the matched node, and return the reused length. Zero is
+    /// a cold start and leaves `cache` untouched. A cache without GDN snapshots
+    /// never reuses, which is the default.
+    fn adopt_prefix(&self, cache: &mut SequenceCache, ids: &[u32]) -> usize {
+        let _ = (cache, ids);
+        0
+    }
+
+    /// A hybrid (GDN) cache: commit `ids` (the tokens whose KV and state `cache`
+    /// holds) into the prefix tree, donating the request's GDN state. `finished`
+    /// distinguishes the mid-request prompt-end commit (the request keeps
+    /// decoding, so duplicate pages are re-pointed at the tree's canonical ones)
+    /// from the finish commit (the request is done, duplicates are just freed).
+    /// A cache without a prefix tree does nothing, which is the default.
+    fn commit(&self, cache: &mut SequenceCache, ids: &[u32], finished: bool) {
+        let _ = (cache, ids, finished);
+    }
 }
 
 /// A forward that reads and writes a `SequenceCache` instead of re-running the
@@ -1182,6 +1283,86 @@ mod tests {
         c.release(&mut pool);
         assert_eq!(c.cached(), 0);
         assert_eq!(pool.available(), 4, "release gives every page back");
+    }
+
+    #[test]
+    fn adopting_a_prefix_makes_it_tree_owned_and_pool_free() {
+        let mut pool = PagePool::new(1, 8);
+        let mut c = SequenceCache::new(0);
+        c.adopt_prefix(&[3, 4, 5]);
+        assert_eq!(c.cached(), 3);
+        assert_eq!(c.reused(), 3);
+        assert_eq!(c.filled(), &[3, 4, 5]);
+        assert!(
+            c.own().is_empty(),
+            "an adopted prefix is not the request's own"
+        );
+        assert_eq!(
+            pool.available(),
+            8,
+            "adopted pages are not drawn from the pool"
+        );
+        c.grow(2, &mut pool).unwrap();
+        assert_eq!(c.cached(), 5);
+        assert_eq!(c.own().len(), 2, "own pages are the tail past the match");
+        assert_eq!(c.own(), &c.filled()[3..], "own is filled past reused");
+        assert_eq!(pool.available(), 6);
+
+        c.release(&mut pool);
+        assert_eq!(c.cached(), 3, "release keeps the tree-owned prefix");
+        assert_eq!(
+            pool.available(),
+            8,
+            "only the request's own pages come back"
+        );
+    }
+
+    #[test]
+    fn repointing_swaps_own_pages_for_the_canonical_ones() {
+        let mut pool = PagePool::new(1, 8);
+        let mut c = SequenceCache::new(0);
+        c.adopt_prefix(&[3, 4]);
+        c.grow(2, &mut pool).unwrap();
+        let own = c.own().to_vec();
+        c.repoint(2, 4, &[3, 4, 9, 9]);
+        assert_eq!(c.filled(), &[3, 4, 9, 9]);
+        assert_ne!(
+            c.own(),
+            &own[..],
+            "the duplicate span now names canonical pages"
+        );
+    }
+
+    #[test]
+    fn clear_drops_every_reference_so_end_frees_nothing() {
+        let mut pool = PagePool::new(1, 8);
+        let mut c = SequenceCache::new(0);
+        c.adopt_prefix(&[3, 4]);
+        c.grow(2, &mut pool).unwrap();
+        let free_before = pool.available();
+        c.clear();
+        assert_eq!(c.cached(), 0);
+        assert_eq!(c.reused(), 0);
+        assert_eq!(c.own().len(), 0);
+        c.release(&mut pool);
+        assert_eq!(
+            pool.available(),
+            free_before,
+            "a committed cache owns no pages, so end frees nothing"
+        );
+    }
+
+    #[test]
+    fn the_lock_and_donation_flags_track_the_request() {
+        let mut c = SequenceCache::new(7);
+        assert_eq!(c.lock(), None);
+        assert!(!c.donated());
+        c.set_lock(Some(42));
+        c.set_donated(true);
+        assert_eq!(c.lock(), Some(42));
+        assert!(c.donated());
+        assert_eq!(c.take_lock(), Some(42));
+        assert_eq!(c.lock(), None, "take_lock clears it");
     }
 
     /// Build a two-node tree: X=[1,2] with snapshot `mx`, its child Y=[3,4] with
