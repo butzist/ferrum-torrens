@@ -496,6 +496,7 @@ flowchart LR
     Pool["PagePool\nfree-list of page bases"]
     PT["ReqPageTable\ntoken -> location"]
     Radix["RadixIndex\nprefix tree, refcount, LRU evict"]
+    Hybrid["HybridRadixIndex\n+ GDN snapshot\n(dual refcount, tombstone)"]
     SP["LinearStatePool\nGDN slot free-list"]
     SC["SequenceCache\npages + state_slot"]
   end
@@ -510,7 +511,11 @@ flowchart LR
   DC --> SP
   Pool --> PT --> SC
   Radix --> Pool
+  Hybrid --> SP
 ```
+
+`HybridRadixIndex` shares the page pool (its `full_ref` counts KV pages) and the
+state-slot pool (its `mamba_ref` counts GDN snapshots).
 
 **Dynamic -- prefill growth and decode step.** Pages are handed out by the
 engine, the model stores K/V at those locations, and the next step reads them
@@ -532,14 +537,17 @@ sequenceDiagram
   G->>KV: end(cache) when the request finishes
 ```
 
-`[TODO]`/`[partial]`: the radix tree is implemented and unit-tested in the
-domain, and the engine decodes off per-request page tables, but the server does
-not commit prefixes into it. That is deliberate, not just unfinished: for this
-30-GDN/10-attention tower a match is only reusable up to the deepest node with a
-live GDN state snapshot, so KV-only reuse is zero value (decision 65). The
-`[TODO]` that makes radix real is `hybrid_radix` GDN-state donation
-(donate-not-copy, dual refcounts, restore on match); the MVP keeps cold
-per-request GDN states. KV is f32 or bf16: `[kv] dtype` picks it and the default is bf16 (half
+`[TODO]`/`[partial]`: the plain radix tree and the hybrid tree's domain core are
+implemented and unit-tested in the domain (decision 68), and the engine decodes
+off per-request page tables, but the server does not commit prefixes into either
+tree. That is deliberate, not just unfinished: for this 30-GDN/10-attention tower
+a match is only reusable up to the deepest node with a live GDN state snapshot,
+so KV-only reuse is zero value (decision 65). The `hybrid_radix` domain core
+(`HybridRadixIndex`: dual `full_ref`/`mamba_ref` counts, tombstones, deepest-
+live-snapshot `match_prefix`, dual eviction) and the device `copy_slot`
+primitive are DONE; the `[TODO]` that makes radix real is wiring
+`match_req`/`cache_req` + the snapshot restore, dual-eviction triggers and pool
+partitioning into the generation loop. The MVP keeps cold per-request GDN states. KV is f32 or bf16: `[kv] dtype` picks it and the default is bf16 (half
 the bytes; the lever when VRAM binds), while `fp8` -- the checkpoint's declared
 `kv_cache_quant_algo` -- is still `[TODO]`. Gathers always return f32, so the
 attention math is dtype-agnostic and the f32-only paged decode kernel is skipped

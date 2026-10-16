@@ -19,7 +19,8 @@ pub use expert_kernel::{
     MoEExecutor, MoEGroup, MoETensor, Part, Slab,
 };
 pub use kvcache::{
-    KvcacheError, LinearStatePool, PagePool, RadixIndex, ReqPageTable, SENTINEL_PAGE,
+    EvictResult, HybridInsert, HybridMatch, HybridRadixIndex, KvcacheError, LinearStatePool,
+    PagePool, RadixIndex, ReqPageTable, SENTINEL_PAGE,
 };
 pub use model::{ForwardInput, LayerType, Model, ModelParams};
 pub use numerics::{FP4_E2M1_LUT, bf16_to_f32, e4m3fn_to_f32, f16_to_f32, fp4_nibble};

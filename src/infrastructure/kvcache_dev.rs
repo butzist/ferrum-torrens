@@ -356,6 +356,33 @@ impl LinearStateSlabs {
         }
     }
 
+    /// Copy a whole slot's conv + recurrent state (all linear layers) from `src`
+    /// to `dst`. The hybrid-radix currency: a donation snapshots a live slot into
+    /// a tree-owned slot, and a restore copies a snapshot back into a fresh live
+    /// slot (copy-on-write, so the donated snapshot stays intact).
+    pub fn copy_slot(&self, src: u32, dst: u32) {
+        debug_assert_ne!(src, dst, "copy_slot is not a reset");
+        for layer in 0..self.dense_of.len() {
+            if self.dense_of[layer].is_some() {
+                self.conv
+                    .select(0, self.slab(layer))
+                    .select(0, dst as i64)
+                    .shallow_clone()
+                    .copy_(&self.conv.select(0, self.slab(layer)).select(0, src as i64));
+                self.recurrent
+                    .select(0, self.slab(layer))
+                    .select(0, dst as i64)
+                    .shallow_clone()
+                    .copy_(
+                        &self
+                            .recurrent
+                            .select(0, self.slab(layer))
+                            .select(0, src as i64),
+                    );
+            }
+        }
+    }
+
     fn slab(&self, layer: usize) -> i64 {
         self.dense_of[layer].expect("layer has no linear state") as i64
     }
@@ -737,6 +764,59 @@ mod tests {
                 .iter()
                 .all(|v| *v == 0.0),
             "a recycled slot must not leak the previous request's state"
+        );
+    }
+
+    #[test]
+    fn a_linear_state_slot_copies_conv_and_recurrent_to_another() {
+        let s = LinearStateSlabs::new(&params(), 2, auto_device());
+        let cv = s.conv_size();
+        let rv = s.recurrent_size();
+        // Both linear layers carry distinct state on slot 0.
+        for layer in [1usize, 2] {
+            s.set_conv_state(
+                0,
+                layer,
+                f32_tensor(
+                    &data((cv[0] * cv[1]) as usize, 81 + layer as u32),
+                    &cv[..],
+                    auto_device(),
+                ),
+            );
+            s.set_recurrent_state(
+                0,
+                layer,
+                f32_tensor(
+                    &data((rv[0] * rv[1] * rv[2]) as usize, 91 + layer as u32),
+                    &rv[..],
+                    auto_device(),
+                ),
+            );
+        }
+        s.copy_slot(0, 1);
+        for layer in [1usize, 2] {
+            assert_eq!(
+                to_f32_vec(&s.conv_state(1, layer)),
+                to_f32_vec(&s.conv_state(0, layer)),
+                "the copy matches the source conv"
+            );
+            assert_eq!(
+                to_f32_vec(&s.recurrent_state(1, layer)),
+                to_f32_vec(&s.recurrent_state(0, layer)),
+                "the copy matches the source recurrent"
+            );
+        }
+        // Copy-on-write: writing the live slot afterwards leaves the snapshot.
+        let before = to_f32_vec(&s.recurrent_state(1, 1));
+        s.set_recurrent_state(
+            0,
+            1,
+            f32_tensor(&vec![7.0f32; before.len()], &rv[..], auto_device()),
+        );
+        assert_eq!(
+            to_f32_vec(&s.recurrent_state(1, 1)),
+            before,
+            "a snapshot slot is not aliased by a later live write"
         );
     }
 

@@ -125,6 +125,10 @@ struct RadixNode {
     children: BTreeMap<u32, NodeId>,
     refcount: u32,
     timestamp: u64,
+    /// The GDN-state snapshot this node donates, if any. Only `HybridRadixIndex`
+    /// sets it; the plain `RadixIndex` leaves it `None`.
+    mamba_value: Option<u32>,
+    mamba_refcount: u32,
 }
 
 /// Radix prefix cache holding token keys and the KV pages that back each span.
@@ -153,6 +157,8 @@ impl RadixIndex {
             children: BTreeMap::new(),
             refcount: 1,
             timestamp: 0,
+            mamba_value: None,
+            mamba_refcount: 0,
         }];
         Self {
             page_size,
@@ -256,6 +262,8 @@ impl RadixIndex {
             children: BTreeMap::new(),
             refcount: 0,
             timestamp: self.clock,
+            mamba_value: None,
+            mamba_refcount: 0,
         });
         self.nodes.len() - 1
     }
@@ -341,6 +349,8 @@ impl RadixIndex {
             children: BTreeMap::new(),
             refcount: self.nodes[node].refcount,
             timestamp: self.clock,
+            mamba_value: None,
+            mamba_refcount: 0,
         });
         let prefix = self.nodes.len() - 1;
         // The suffix is keyed by its own new first token; the parent keeps
@@ -361,6 +371,443 @@ fn first_key(node: &RadixNode) -> u32 {
 
 fn new_len(node: &RadixNode) -> usize {
     node.pages.len()
+}
+
+/// Hybrid radix index: the prefix tree plus a second currency, an optional
+/// GDN-state snapshot (a `LinearStatePool` slot id) donated at a node's END
+/// boundary. Mirrors FreeToken's `HybridRadixCache` (decision 68).
+///
+/// A snapshot is point-attached, not a window: a strict prefix of a
+/// snapshot-bearing node is not resumable, so a continuation can only resume the
+/// GDN recurrence from a checkpointed boundary. `match_prefix` therefore
+/// truncates the reusable length to the deepest node on the matched path that
+/// still owns a LIVE snapshot, and `split_at` leaves the snapshot on the suffix
+/// half. `evict_mamba` reclaims snapshot slots (tombstoning an internal node in
+/// place, keeping its KV); `evict_full` reclaims KV leaves and cascades through
+/// the KV-only tombstone leaves an unlink exposes. `inc_lock` pins a snapshot
+/// AND the whole root..node KV path (`full_ref >= mamba_ref`).
+pub struct HybridRadixIndex {
+    page_size: usize,
+    nodes: Vec<RadixNode>,
+    root: NodeId,
+    clock: u64,
+    full_evictable: usize,
+    full_protected: usize,
+    mamba_evictable: usize,
+    mamba_protected: usize,
+}
+
+/// The result of a hybrid prefix match: the reusable KV locations, truncated to
+/// the deepest live snapshot, and the snapshot to restore (`None` = cold).
+pub struct HybridMatch {
+    pub node: NodeId,
+    pub kv_indices: Vec<u32>,
+    pub cached_len: usize,
+    pub mamba_value: Option<u32>,
+}
+
+/// The result of a hybrid insert: how much of the key was already cached, and
+/// whether the boundary already owns a snapshot (the caller must free its
+/// donated slot; the tree keeps the existing one).
+pub struct HybridInsert {
+    pub prefix_len: usize,
+    pub mamba_exist: bool,
+}
+
+/// What a hybrid eviction freed: KV locations and GDN-state slots.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct EvictResult {
+    pub kv: Vec<u32>,
+    pub mamba_slots: Vec<u32>,
+}
+
+impl HybridRadixIndex {
+    pub fn new(page_size: usize) -> Self {
+        debug_assert_eq!(page_size, 1, "only page_size == 1 is implemented");
+        let nodes = vec![RadixNode {
+            token_key: Vec::new(),
+            pages: Vec::new(),
+            parent: None,
+            children: BTreeMap::new(),
+            refcount: 1,
+            timestamp: 0,
+            mamba_value: None,
+            mamba_refcount: 0,
+        }];
+        Self {
+            page_size,
+            nodes,
+            root: 0,
+            clock: 0,
+            full_evictable: 0,
+            full_protected: 0,
+            mamba_evictable: 0,
+            mamba_protected: 0,
+        }
+    }
+
+    /// KV tokens reclaimable by `evict_full`.
+    pub fn full_evictable(&self) -> usize {
+        self.full_evictable
+    }
+
+    pub fn full_protected(&self) -> usize {
+        self.full_protected
+    }
+
+    /// Live, unlocked snapshot slots reclaimable by `evict_mamba`.
+    pub fn mamba_evictable(&self) -> usize {
+        self.mamba_evictable
+    }
+
+    pub fn mamba_protected(&self) -> usize {
+        self.mamba_protected
+    }
+
+    /// Every live snapshot in the tree, locked or not.
+    pub fn live_snapshots(&self) -> usize {
+        self.mamba_evictable + self.mamba_protected
+    }
+
+    /// Insert the committed KV prefix and donate `mamba_value` at the
+    /// page-aligned end boundary. Returns how much was already cached and whether
+    /// the boundary already owns a live snapshot, in which case the caller must
+    /// free its donated slot (dedup).
+    pub fn insert(&mut self, token_key: &[u32], pages: &[u32], mamba_value: u32) -> HybridInsert {
+        debug_assert_eq!(token_key.len(), pages.len());
+        let insert_len = token_key.len() / self.page_size * self.page_size;
+        let (mut node, prefix_len) = self.tree_walk(&token_key[..insert_len]);
+        if prefix_len != insert_len {
+            let new = self.new_leaf(
+                &token_key[prefix_len..insert_len],
+                &pages[prefix_len..insert_len],
+            );
+            self.full_evictable += new_len(&self.nodes[new]);
+            self.reparent(node, new);
+            node = new;
+        }
+        if node == self.root || self.nodes[node].mamba_value.is_some() {
+            return HybridInsert {
+                prefix_len,
+                mamba_exist: true,
+            };
+        }
+        self.nodes[node].mamba_value = Some(mamba_value);
+        if self.nodes[node].mamba_refcount == 0 {
+            self.mamba_evictable += 1;
+        }
+        HybridInsert {
+            prefix_len,
+            mamba_exist: false,
+        }
+    }
+
+    /// Match the token prefix and truncate the reusable length to the deepest
+    /// node on the path that still owns a live snapshot.
+    pub fn match_prefix(&mut self, token_key: &[u32]) -> HybridMatch {
+        let (node, _) = self.tree_walk(token_key);
+        let mut cur = node;
+        let mut end_len = self.path_len(node);
+        while cur != self.root {
+            if self.nodes[cur].mamba_value.is_some() {
+                return HybridMatch {
+                    node: cur,
+                    kv_indices: self.collect_kv(cur),
+                    cached_len: end_len,
+                    mamba_value: self.nodes[cur].mamba_value,
+                };
+            }
+            end_len -= new_len(&self.nodes[cur]);
+            cur = self.nodes[cur].parent.expect("non-root has a parent");
+        }
+        HybridMatch {
+            node: self.root,
+            kv_indices: Vec::new(),
+            cached_len: 0,
+            mamba_value: None,
+        }
+    }
+
+    /// Protect a matched node's snapshot and its whole KV path up to the root.
+    pub fn inc_lock(&mut self, node: NodeId) {
+        if self.nodes[node].mamba_value.is_some() {
+            if self.nodes[node].mamba_refcount == 0 {
+                self.mamba_evictable -= 1;
+                self.mamba_protected += 1;
+            }
+            self.nodes[node].mamba_refcount += 1;
+        }
+        let mut cur = node;
+        while cur != self.root {
+            let len = new_len(&self.nodes[cur]);
+            if self.nodes[cur].refcount == 0 {
+                self.full_evictable -= len;
+                self.full_protected += len;
+            }
+            self.nodes[cur].refcount += 1;
+            cur = self.nodes[cur].parent.expect("non-root has a parent");
+        }
+    }
+
+    pub fn dec_lock(&mut self, node: NodeId) {
+        if self.nodes[node].mamba_value.is_some() && self.nodes[node].mamba_refcount > 0 {
+            self.nodes[node].mamba_refcount -= 1;
+            if self.nodes[node].mamba_refcount == 0 {
+                self.mamba_evictable += 1;
+                self.mamba_protected -= 1;
+            }
+        }
+        let mut cur = node;
+        while cur != self.root {
+            let len = new_len(&self.nodes[cur]);
+            debug_assert!(self.nodes[cur].refcount > 0);
+            self.nodes[cur].refcount -= 1;
+            if self.nodes[cur].refcount == 0 {
+                self.full_evictable += len;
+                self.full_protected -= len;
+            }
+            cur = self.nodes[cur].parent.expect("non-root has a parent");
+        }
+    }
+
+    /// Evict `num_tokens` of KV by LRU over unlocked leaves, freeing each
+    /// evicted node's snapshot and cascading through the KV-only tombstone leaves
+    /// the unlinks expose. Counts tokens, so it may overshoot to a whole leaf.
+    pub fn evict_full(&mut self, num_tokens: usize) -> EvictResult {
+        let mut out = EvictResult::default();
+        let mut freed = 0usize;
+        while freed < num_tokens {
+            let Some(node) = self.oldest_unlocked_leaf() else {
+                break;
+            };
+            let len = new_len(&self.nodes[node]);
+            freed += len;
+            out.kv.extend_from_slice(&self.nodes[node].pages);
+            self.full_evictable -= len;
+            self.free_node_mamba(node, &mut out.mamba_slots);
+            let parent = self.unlink(node);
+            let (_, casc) = self.cascade_tombstone_leaves(parent, &mut out.kv);
+            freed += casc;
+        }
+        out
+    }
+
+    /// Evict `num` GDN-state snapshots by LRU over unlocked snapshot-bearing
+    /// nodes, internal nodes included. An internal node is tombstoned in place
+    /// (slot freed, KV kept); a leaf node frees both and unlinks, cascading
+    /// through the KV-only tombstone leaves it exposes. Counts snapshots, not
+    /// tokens.
+    pub fn evict_mamba(&mut self, num: usize) -> EvictResult {
+        let mut out = EvictResult::default();
+        let mut freed = 0usize;
+        while freed < num {
+            let Some(node) = self.oldest_unlocked_snapshot() else {
+                break;
+            };
+            let is_leaf = self.nodes[node].children.is_empty();
+            if is_leaf && self.nodes[node].refcount == 0 {
+                let len = new_len(&self.nodes[node]);
+                out.kv.extend_from_slice(&self.nodes[node].pages);
+                self.full_evictable -= len;
+                self.free_node_mamba(node, &mut out.mamba_slots);
+                freed += 1;
+                let parent = self.unlink(node);
+                self.cascade_tombstone_leaves(parent, &mut out.kv);
+            } else {
+                self.free_node_mamba(node, &mut out.mamba_slots);
+                freed += 1;
+            }
+        }
+        out
+    }
+
+    /// Structural invariant: every snapshot-bearing node holds a slot id and
+    /// non-negative ref counts. KV/slot conservation is the caller's ledger.
+    pub fn check_integrity(&self) {
+        debug_assert!(
+            self.nodes[self.root].mamba_value.is_none(),
+            "the root holds no snapshot"
+        );
+        for node in &self.nodes {
+            if node.mamba_value.is_none() {
+                debug_assert_eq!(node.mamba_refcount, 0, "a free node has no mamba lock");
+            }
+        }
+    }
+
+    fn free_node_mamba(&mut self, node: NodeId, out: &mut Vec<u32>) {
+        if let Some(slot) = self.nodes[node].mamba_value {
+            out.push(slot);
+            self.nodes[node].mamba_value = None;
+            if self.nodes[node].mamba_refcount == 0 {
+                self.mamba_evictable -= 1;
+            }
+        }
+    }
+
+    fn unlink(&mut self, node: NodeId) -> NodeId {
+        let parent = self.nodes[node].parent.expect("leaf is never the root");
+        let key = first_key(&self.nodes[node]);
+        self.nodes[parent].children.remove(&key);
+        parent
+    }
+
+    /// After a leaf is unlinked, eagerly reclaim the KV-only tombstone leaves it
+    /// exposes upward, keeping the "a leaf always carries a live snapshot"
+    /// invariant. Returns the highest surviving ancestor and the tokens freed.
+    fn cascade_tombstone_leaves(
+        &mut self,
+        mut parent: NodeId,
+        kv: &mut Vec<u32>,
+    ) -> (NodeId, usize) {
+        let mut freed = 0usize;
+        while parent != self.root
+            && self.nodes[parent].mamba_value.is_none()
+            && self.nodes[parent].children.is_empty()
+            && self.nodes[parent].refcount == 0
+        {
+            let len = new_len(&self.nodes[parent]);
+            kv.extend_from_slice(&self.nodes[parent].pages);
+            self.full_evictable -= len;
+            freed += len;
+            parent = self.unlink(parent);
+        }
+        (parent, freed)
+    }
+
+    fn oldest_unlocked_leaf(&self) -> Option<NodeId> {
+        self.nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| {
+                !n.token_key.is_empty()
+                    && n.children.is_empty()
+                    && n.refcount == 0
+                    && n.parent.is_some()
+            })
+            .min_by_key(|(_, n)| n.timestamp)
+            .map(|(id, _)| id)
+    }
+
+    fn oldest_unlocked_snapshot(&self) -> Option<NodeId> {
+        self.nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.mamba_value.is_some() && n.mamba_refcount == 0)
+            .min_by_key(|(_, n)| n.timestamp)
+            .map(|(id, _)| id)
+    }
+
+    fn path_len(&self, node: NodeId) -> usize {
+        let mut total = 0usize;
+        let mut cur = node;
+        while cur != self.root {
+            total += new_len(&self.nodes[cur]);
+            cur = self.nodes[cur].parent.expect("non-root has a parent");
+        }
+        total
+    }
+
+    fn collect_kv(&self, node: NodeId) -> Vec<u32> {
+        let mut parts: Vec<&[u32]> = Vec::new();
+        let mut cur = node;
+        while cur != self.root {
+            parts.push(&self.nodes[cur].pages);
+            cur = self.nodes[cur].parent.expect("non-root has a parent");
+        }
+        parts.reverse();
+        parts.into_iter().flatten().copied().collect()
+    }
+
+    fn reparent(&mut self, parent: NodeId, child: NodeId) {
+        let key = first_key(&self.nodes[child]);
+        debug_assert!(!self.nodes[parent].children.contains_key(&key));
+        self.nodes[child].parent = Some(parent);
+        self.nodes[parent].children.insert(key, child);
+    }
+
+    fn new_leaf(&mut self, token_key: &[u32], pages: &[u32]) -> NodeId {
+        debug_assert!(!token_key.is_empty());
+        debug_assert_eq!(token_key.len(), pages.len());
+        assert!(
+            token_key.len().is_multiple_of(self.page_size),
+            "insert_len is page-aligned"
+        );
+        self.clock += 1;
+        self.nodes.push(RadixNode {
+            token_key: token_key.to_vec(),
+            pages: pages.to_vec(),
+            parent: None,
+            children: BTreeMap::new(),
+            refcount: 0,
+            timestamp: self.clock,
+            mamba_value: None,
+            mamba_refcount: 0,
+        });
+        self.nodes.len() - 1
+    }
+
+    fn tree_walk(&mut self, token_key: &[u32]) -> (NodeId, usize) {
+        self.clock += 1;
+        let clock = self.clock;
+        let mut prefix_len = 0usize;
+        let mut node = self.root;
+        while prefix_len < token_key.len() {
+            let first = token_key[prefix_len];
+            let Some(&child) = self.nodes[node].children.get(&first) else {
+                return (node, prefix_len);
+            };
+            node = child;
+            let matched = self.match_len(node, &token_key[prefix_len..]);
+            let matched = matched / self.page_size * self.page_size;
+            prefix_len += matched;
+            if matched != self.nodes[node].token_key.len() {
+                let split = self.split_at(node, matched);
+                self.nodes[split].timestamp = clock;
+                return (split, prefix_len);
+            }
+            self.nodes[node].timestamp = clock;
+        }
+        (node, prefix_len)
+    }
+
+    fn match_len(&self, node: NodeId, token_key: &[u32]) -> usize {
+        let key = &self.nodes[node].token_key;
+        key.iter()
+            .zip(token_key)
+            .take_while(|(a, b)| a == b)
+            .count()
+    }
+
+    /// Split `node` at `pos` (page boundary). The new prefix node gets no
+    /// snapshot: a snapshot is attached to an end boundary, so only the suffix
+    /// (whose boundary is unchanged) keeps it.
+    fn split_at(&mut self, node: NodeId, pos: usize) -> NodeId {
+        debug_assert!(pos > 0 && pos < self.nodes[node].token_key.len());
+        self.clock += 1;
+        let parent = self.nodes[node].parent.expect("root is never split");
+        let prefix_pages = self.nodes[node].pages[..pos].to_vec();
+        let prefix_key = self.nodes[node].token_key[..pos].to_vec();
+        self.nodes[node].token_key.drain(..pos);
+        self.nodes[node].pages.drain(..pos);
+        self.nodes.push(RadixNode {
+            token_key: prefix_key,
+            pages: prefix_pages,
+            parent: Some(parent),
+            children: BTreeMap::new(),
+            refcount: self.nodes[node].refcount,
+            timestamp: self.clock,
+            mamba_value: None,
+            mamba_refcount: 0,
+        });
+        let prefix = self.nodes.len() - 1;
+        let suffix_key = first_key(&self.nodes[node]);
+        self.nodes[prefix].children.insert(suffix_key, node);
+        self.nodes[node].parent = Some(prefix);
+        let prefix_key = first_key(&self.nodes[prefix]);
+        self.nodes[parent].children.insert(prefix_key, prefix);
+        prefix
+    }
 }
 
 /// GDN linear-state pool bookkeeping: free-slot list of recurrent + conv state
@@ -735,5 +1182,256 @@ mod tests {
         c.release(&mut pool);
         assert_eq!(c.cached(), 0);
         assert_eq!(pool.available(), 4, "release gives every page back");
+    }
+
+    /// Build a two-node tree: X=[1,2] with snapshot `mx`, its child Y=[3,4] with
+    /// snapshot `my`. Returns (index, mx, my). Adapted from the reference
+    /// `two_node_tree`, at page_size 1.
+    fn hybrid_two_node_tree() -> (HybridRadixIndex, u32, u32) {
+        let mut h = HybridRadixIndex::new(1);
+        h.insert(&[1, 2], &[10, 11], 100);
+        h.insert(&[1, 2, 3, 4], &[10, 11, 12, 13], 200);
+        (h, 100, 200)
+    }
+
+    #[test]
+    fn hybrid_insert_attaches_snapshot_and_match_restores_it() {
+        let mut h = HybridRadixIndex::new(1);
+        let ins = h.insert(&[1, 2], &[10, 11], 100);
+        assert_eq!(ins.prefix_len, 0, "nothing cached yet");
+        assert!(!ins.mamba_exist);
+        h.check_integrity();
+
+        let m = h.match_prefix(&[1, 2]);
+        assert_eq!(m.cached_len, 2);
+        assert_eq!(m.kv_indices, vec![10, 11]);
+        assert_eq!(m.mamba_value, Some(100));
+        assert_eq!(h.live_snapshots(), 1);
+    }
+
+    #[test]
+    fn hybrid_deepest_snapshot_wins_and_unmatched_suffix_is_dropped() {
+        let (mut h, mx, my) = hybrid_two_node_tree();
+        assert_ne!(mx, my);
+
+        let m = h.match_prefix(&[1, 2, 3, 4]);
+        assert_eq!((m.cached_len, m.mamba_value), (4, Some(my)));
+        // a query running past the end of the tree still resumes from the
+        // deepest snapshot
+        let m = h.match_prefix(&[1, 2, 3, 4, 5]);
+        assert_eq!((m.cached_len, m.mamba_value), (4, Some(my)));
+        h.check_integrity();
+    }
+
+    #[test]
+    fn hybrid_split_leaves_the_snapshot_on_the_suffix_half() {
+        let (mut h, mx, my) = hybrid_two_node_tree();
+
+        // Diverges inside Y=[3,4] -> Y splits into [3] + [4]; the prefix half
+        // owns no snapshot, so the match truncates back to X's snapshot.
+        let m = h.match_prefix(&[1, 2, 3, 5]);
+        assert_eq!((m.cached_len, m.mamba_value), (2, Some(mx)));
+        h.check_integrity();
+
+        // The suffix half kept my, so the deep hit survives.
+        let m = h.match_prefix(&[1, 2, 3, 4]);
+        assert_eq!((m.cached_len, m.mamba_value), (4, Some(my)));
+        assert_eq!(h.live_snapshots(), 2);
+        assert_eq!(h.full_evictable(), 4, "a split moves no KV");
+    }
+
+    #[test]
+    fn hybrid_prefix_of_a_snapshot_node_is_not_reusable() {
+        let mut h = HybridRadixIndex::new(1);
+        h.insert(&[1, 2, 3, 4], &[10, 11, 12, 13], 100);
+        h.check_integrity();
+
+        // The snapshot is point-attached at the node's end boundary: matching an
+        // interior boundary yields nothing at all, not a shortened hit.
+        let m = h.match_prefix(&[1, 2]);
+        assert_eq!((m.cached_len, m.mamba_value), (0, None));
+        assert!(m.kv_indices.is_empty());
+
+        let m = h.match_prefix(&[1, 2, 3, 4]);
+        assert_eq!((m.cached_len, m.mamba_value), (4, Some(100)));
+        assert_eq!(m.kv_indices, vec![10, 11, 12, 13]);
+        assert_eq!(h.full_evictable(), 4);
+    }
+
+    #[test]
+    fn hybrid_insert_dedups_and_the_caller_frees_the_donated_slot() {
+        let mut h = HybridRadixIndex::new(1);
+        h.insert(&[1, 2], &[10, 11], 100);
+        let ins = h.insert(&[1, 2], &[20, 21], 200);
+        assert_eq!(ins.prefix_len, 2);
+        assert!(ins.mamba_exist, "the boundary already owns a snapshot");
+        assert_eq!(h.live_snapshots(), 1, "still exactly one snapshot");
+
+        let m = h.match_prefix(&[1, 2]);
+        assert_eq!(m.mamba_value, Some(100), "the original snapshot is kept");
+        assert_eq!(m.kv_indices, vec![10, 11], "the KV stays canonical");
+    }
+
+    #[test]
+    fn hybrid_insert_stores_whole_boundaries_only() {
+        let mut h = HybridRadixIndex::new(1);
+        let ins = h.insert(&[], &[], 100);
+        assert_eq!((ins.prefix_len, ins.mamba_exist), (0, true));
+        assert_eq!(h.full_evictable(), 0);
+        assert_eq!(h.live_snapshots(), 0, "the root cannot hold a snapshot");
+
+        let ins = h.insert(&[1, 2], &[10, 11], 100);
+        assert_eq!((ins.prefix_len, ins.mamba_exist), (0, false));
+        assert_eq!(h.full_evictable(), 2);
+        let m = h.match_prefix(&[1, 2]);
+        assert_eq!((m.cached_len, m.mamba_value), (2, Some(100)));
+    }
+
+    #[test]
+    fn hybrid_evict_mamba_tombstones_an_internal_node_and_keeps_its_kv() {
+        let (mut h, mx, my) = hybrid_two_node_tree();
+
+        let e = h.evict_mamba(1);
+        assert_eq!(e.mamba_slots, vec![mx]);
+        assert!(e.kv.is_empty(), "no KV was reclaimed");
+        assert_eq!(h.full_evictable(), 4);
+        assert_eq!(h.live_snapshots(), 1);
+
+        let m = h.match_prefix(&[1, 2]);
+        assert_eq!(
+            (m.cached_len, m.mamba_value),
+            (0, None),
+            "tombstoned boundary"
+        );
+        let m = h.match_prefix(&[1, 2, 3, 4]);
+        assert_eq!((m.cached_len, m.mamba_value), (4, Some(my)));
+    }
+
+    #[test]
+    fn hybrid_insert_refills_a_tombstoned_node() {
+        let (mut h, _, _) = hybrid_two_node_tree();
+        h.evict_mamba(1);
+        h.check_integrity();
+
+        let ins = h.insert(&[1, 2], &[20, 21], 300);
+        assert_eq!((ins.prefix_len, ins.mamba_exist), (2, false), "attaches");
+        h.check_integrity();
+
+        let m = h.match_prefix(&[1, 2]);
+        assert_eq!((m.cached_len, m.mamba_value), (2, Some(300)));
+        assert_eq!(m.kv_indices, vec![10, 11], "KV stays canonical");
+        assert_eq!(h.live_snapshots(), 2);
+    }
+
+    #[test]
+    fn hybrid_evict_mamba_on_a_leaf_frees_kv_and_cascades_through_tombstones() {
+        let (mut h, _, _) = hybrid_two_node_tree();
+        h.evict_mamba(1); // X -> KV-only tombstone
+        let e = h.evict_mamba(1); // Y is now the only snapshot node, and a leaf
+        assert_eq!(e.mamba_slots, vec![200]);
+        assert_eq!(e.kv, vec![12, 13, 10, 11], "Y then the exposed X");
+
+        assert_eq!(h.full_evictable(), 0);
+        assert_eq!(h.live_snapshots(), 0);
+        assert_eq!(h.match_prefix(&[1, 2, 3, 4]).cached_len, 0);
+    }
+
+    #[test]
+    fn hybrid_evict_mamba_counts_snapshots_not_tokens() {
+        let mut h = HybridRadixIndex::new(1);
+        h.insert(&[1], &[10], 100);
+        h.insert(&[1, 2], &[10, 11], 200);
+        h.insert(&[1, 2, 3], &[10, 11, 12], 300);
+        h.check_integrity();
+        assert_eq!(h.live_snapshots(), 3);
+        assert_eq!(h.full_evictable(), 3);
+
+        let e = h.evict_mamba(2);
+        assert_eq!(e.mamba_slots.len(), 2, "exactly two snapshots");
+        assert!(e.kv.is_empty(), "no KV touched");
+        assert_eq!(h.full_evictable(), 3);
+        assert_eq!(h.live_snapshots(), 1);
+    }
+
+    #[test]
+    fn hybrid_snapshot_slots_are_conserved_across_eviction_waves() {
+        let n: u32 = 8;
+        let mut h = HybridRadixIndex::new(1);
+        let mut handed: Vec<u32> = Vec::new();
+        for k in 1..=n {
+            let key: Vec<u32> = (1..=k).collect();
+            let pages: Vec<u32> = (0..k).map(|i| 1000 + i).collect();
+            let slot = 100 + k;
+            h.insert(&key, &pages, slot);
+            handed.push(slot);
+        }
+        h.check_integrity();
+        assert_eq!(h.live_snapshots() as u32, n);
+        assert_eq!(h.full_evictable() as u32, n);
+
+        let mut freed: Vec<u32> = Vec::new();
+        for _ in 0..16 {
+            if h.live_snapshots() == 0 {
+                break;
+            }
+            freed.extend(h.evict_mamba(3).mamba_slots);
+        }
+        assert_eq!(h.live_snapshots(), 0, "evict_mamba converges");
+        freed.sort_unstable();
+        handed.sort_unstable();
+        assert_eq!(freed, handed, "every donated slot comes back exactly once");
+        assert_eq!(h.full_evictable(), 0);
+        assert_eq!(h.match_prefix(&(1..=n).collect::<Vec<_>>()).cached_len, 0);
+    }
+
+    #[test]
+    fn hybrid_evict_full_takes_the_leaf_snapshot_and_leaves_the_ancestor_usable() {
+        let (mut h, mx, my) = hybrid_two_node_tree();
+
+        let e = h.evict_full(2); // the only unlocked leaf is Y
+        assert_eq!(e.mamba_slots, vec![my]);
+        assert!(e.kv.contains(&12) && e.kv.contains(&13));
+        assert!(!e.mamba_slots.contains(&mx), "X was not reclaimed");
+        assert_eq!(h.full_evictable(), 2);
+        assert_eq!(h.live_snapshots(), 1);
+        h.check_integrity();
+
+        let m = h.match_prefix(&[1, 2, 3, 4]);
+        assert_eq!((m.cached_len, m.mamba_value), (2, Some(mx)));
+    }
+
+    #[test]
+    fn hybrid_evict_full_cascades_through_an_exposed_tombstone_leaf() {
+        let (mut h, _, _) = hybrid_two_node_tree();
+        h.evict_mamba(1); // X -> tombstone
+        h.evict_full(2); // evicting Y exposes X and reclaims it too
+
+        assert_eq!(h.full_evictable(), 0);
+        assert_eq!(h.live_snapshots(), 0);
+        assert_eq!(h.match_prefix(&[1, 2, 3, 4]).cached_len, 0);
+    }
+
+    #[test]
+    fn hybrid_lock_pins_the_snapshot_and_the_whole_kv_path() {
+        let (mut h, mx, _my) = hybrid_two_node_tree();
+        let held = h.match_prefix(&[1, 2, 3, 4]).node;
+        h.inc_lock(held);
+        h.check_integrity();
+
+        // Y is locked, X is internal -> nothing is evictable.
+        let e = h.evict_full(4);
+        assert_eq!(e, EvictResult::default());
+        assert_eq!(h.full_evictable(), 0, "all 4 pages are protected now");
+
+        // X's snapshot is unprotected -> tombstoned in place.
+        assert_eq!(h.evict_mamba(1).mamba_slots, vec![mx]);
+        // Y's snapshot is pinned by the lock.
+        assert!(h.evict_mamba(1).mamba_slots.is_empty());
+        h.check_integrity();
+
+        h.dec_lock(held);
+        assert_eq!(h.full_evictable(), 4);
+        let e = h.evict_full(2); // Y is evictable again; X cascades behind it
+        assert!(!e.mamba_slots.is_empty());
     }
 }

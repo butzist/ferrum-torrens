@@ -242,8 +242,19 @@ A tree of prefixes sharing KV pages across requests:
 - `hybrid_radix` (paper's "semantic anchor"/sglang MambaRadixCache inspiration)
   additionally **donates** a GDN recurrent-state snapshot at page-aligned chunk
   boundaries (x64) into radix nodes, with a second refcount + separate eviction
-  (internal-node tombstones free the slot but keep KV). MVP can defer donation and
-  just keep cold per-request states.
+  (internal-node tombstones free the slot but keep KV). The domain core is
+  implemented (`domain/kvcache.rs::HybridRadixIndex`, decision 68): a snapshot is
+  point-attached at a node's END boundary, so a strict prefix of a snapshot node
+  is not reusable and `match_prefix` truncates to the deepest node on the matched
+  path with a live snapshot; `split_at` keeps the snapshot on the suffix; the two
+  refcounts are `full_ref` (KV pages) and `mamba_ref` (the slot), with
+  `full_ref >= mamba_ref`; `evict_mamba` counts snapshots (tombstone an internal
+  node, free a leaf's KV too) and `evict_full` counts tokens; donation is a
+  caller-owned slot id (donate-not-copy). The device primitive
+  `LinearStateSlabs::copy_slot` does the COW donate/restore. The generation-loop
+  wiring (`match_req`/`cache_req`, restore, dual-eviction triggers, pool
+  partitioning) is still `[TODO]`; until then the server keeps cold per-request
+  states.
 
 ## 4. Expert memory hierarchy (the `offload` strategy)
 

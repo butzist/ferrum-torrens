@@ -6,11 +6,13 @@ infrastructure is landed and gated on the real checkpoint: driver-API kernels
 decode graphs, and bf16 KV by default so a default config fits the 8 GiB target.
 Prefill MoE now streams whole layers with the double-buffered copy/compute
 overlap (item 8 slice 2, decision 67); below `2*num_experts` slots it keeps the
-chunked LRU. Open work is the ordered backlog in section 8: the `hybrid_radix`
-GDN snapshot donation that item 7 (radix wiring) is blocked on, and the remaining
-M5 items. Progress history and the full decision log (numbers 1..67) live in
-`DONE.md`; read that for the "why" behind any decision number referenced in code
-or tests.
+chunked LRU. The `hybrid_radix` GDN snapshot donation's **domain core and device
+primitive landed** (decision 68): `HybridRadixIndex` (dual refcounts, tombstones,
+deepest-live-snapshot match, dual eviction) plus `LinearStateSlabs::copy_slot`.
+Open work is the ordered backlog in section 8: wiring `match_req`/`cache_req` and
+the snapshot restore into the generation loop, and the remaining M5 items.
+Progress history and the full decision log (numbers 1..68) live in `DONE.md`;
+read that for the "why" behind any decision number referenced in code or tests.
 
 Goal: a **minimal, fast, single-GPU** Rust serving engine for **one model** --
 `Qwen3.6-35B-A3B-NVFP4` (MoE + hybrid GatedDeltaNet/attention) -- using FreeToken's
@@ -210,8 +212,9 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 
 ### KV cache + radix
 
-- [ ] **BLOCKED on the GDN snapshot donation below.** prefill flow: `match_req` -> lock -> allocate_paged -> compute/store kv -> `cache_req` commit. Audited 2026-10-15: for this 30-GDN/10-attention tower, KV-only reuse is **zero value** and must not be wired alone. FreeToken's `HybridRadixCache.match_prefix` walks to the deepest node that owns a **live GDN state snapshot** and truncates `cached_len` to it; with no snapshot anywhere it returns `cached_len = 0, mamba_value = None` (cold), i.e. no reuse. A request cannot resume attention K/V without the matching GDN recurrence, so committing KV pages alone would either reuse nothing or (if forced) compute the GDN state from zero and produce wrong output. Wiring `match_req`/`cache_req` is therefore part of the hybrid feature, not a standalone item.
-- [ ] [opt] hybrid_radix full feature (the real radix enabler): donate the GDN state slot at a page/chunk-aligned boundary node, dual (full+mamba) ref-counts and dual eviction (tombstones), then wire `match_req`/`cache_req` and the snapshot restore into the generation loop. FreeToken mirrors `MambaRadixCache` (donate-not-copy, `full_ref >= mamba_ref`, deepest-live-snapshot truncation). P2/large; without it the MVP correctly does no cross-request reuse.
+- [x] P2 **hybrid_radix domain core + device primitive -- DONE (2026-10-16), decision 68.** `HybridRadixIndex` in `domain/kvcache.rs` (dual `full_ref`/`mamba_ref` counts, tombstones, `full_ref >= mamba_ref`, deepest-live-snapshot `match_prefix`, `split_at` keeps the snapshot on the suffix, `evict_mamba` counts snapshots / `evict_full` counts tokens, donate-not-copy as a caller-owned-slot contract) plus `RadixNode.mamba_value/mamba_refcount` and `LinearStateSlabs::copy_slot` (COW donate/restore). 17 unit tests + a gated device test.
+- [ ] **BLOCKED on the wiring below.** prefill flow: `match_req` -> lock -> allocate_paged -> compute/store kv -> `cache_req` commit. Audited 2026-10-15: for this 30-GDN/10-attention tower, KV-only reuse is **zero value** and must not be wired alone. FreeToken's `HybridRadixCache.match_prefix` walks to the deepest node that owns a **live GDN state snapshot** and truncates `cached_len` to it; with no snapshot anywhere it returns `cached_len = 0, mamba_value = None` (cold), i.e. no reuse. A request cannot resume attention K/V without the matching GDN recurrence, so committing KV pages alone would either reuse nothing or (if forced) compute the GDN state from zero and produce wrong output. Wiring `match_req`/`cache_req` is therefore part of the hybrid feature, not a standalone item.
+- [ ] [opt] **hybrid_radix wiring -- the remaining half of item 7.** With the domain core (decision 68) in hand: (a) on prefill, `match_prefix` the prompt and, when a live snapshot matches, COW it into a fresh live slot (`copy_slot`) and reuse the tree's KV pages up to `cached_len`; (b) at a commit boundary, adopt the request's pages into the tree and donate the final slot; (c) drive dual eviction (`evict_full` when pages run out, `evict_mamba` when states run out) and size/partition the page and state pools. Gate on the real checkpoint against FreeToken's `test_hybrid_radix.py`. P2/large; without it the MVP correctly does no cross-request reuse.
 
 ### Server (axum recommended)
 
@@ -250,15 +253,21 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 - **M4 offload**: LRU slot cache + fused copy + chunked staged prefill + whole
   layer prefill overlap (DONE, decisions 42-48, 66, 67); batch concurrency.
 - **M5**: optional `/v1/responses`, hybrid_radix GDN snapshot donation (which is
-  what makes the radix prefix cache real, decision 65), startup load tuning.
+  what makes the radix prefix cache real, decision 65) -- domain core + device
+  primitive DONE (decision 68), wiring open -- startup load tuning.
 
 ## 7. Decisions
 
-The full log of confirmed decisions (numbers 1..67, stable -- code, tests and
+The full log of confirmed decisions (numbers 1..68, stable -- code, tests and
 `ARCHITECTURE.md` reference them by number) lives in `DONE.md`. This section
 lists only the decisions that still bind open work; everything else there is
 history.
 
+- **68** -- the `hybrid_radix` domain core and its device primitive land before
+  the wiring. `HybridRadixIndex` (dual refcounts, tombstones, deepest-live-
+  snapshot match, dual eviction) and `LinearStateSlabs::copy_slot` are in; the
+  generation-loop `match_req`/`cache_req` + restore, dual-eviction triggers and
+  pool partitioning remain (see the KV cache + radix backlog item).
 - **65** -- the radix prefix cache needs `hybrid_radix` GDN snapshot donation.
   KV-only reuse is zero for a 30-GDN/10-attention tower, so radix wiring is
   blocked until M5.
@@ -292,12 +301,14 @@ performance work.
 6. KV dtype serving-safe (KV cache + radix) -- **DONE (2026-10-15)**. `[kv] dtype`
    with a bf16 default; measured ~13% logit shift at stable greedy argmax
    (decision 64).
-7. Radix prefix cache in the generation loop -- **BLOCKED, re-ranked (2026-10-15)**.
+7. Radix prefix cache in the generation loop -- **IN PROGRESS (2026-10-16)**.
    KV-only reuse is zero value for a 30-GDN/10-attention tower: FreeToken's
    `HybridRadixCache` truncates a match to the deepest node with a **live GDN
-   state snapshot**, so without snapshot donation `cached_len = 0`. The real item
-   is the `[opt] hybrid_radix` GDN donation (donate-not-copy, dual refcounts,
-   tombstones), which is large/P2; `match_req`/`cache_req` wiring rides with it.
+   state snapshot**, so without snapshot donation `cached_len = 0`. The domain
+   core of the `[opt] hybrid_radix` GDN donation (donate-not-copy, dual refcounts,
+   tombstones) and the device `copy_slot` primitive are **DONE (decision 68)**;
+   the `match_req`/`cache_req` wiring, dual-eviction triggers and pool
+   partitioning remain.
 
 **Tier 3 -- large performance (the only actionable remaining tier):**
 8. Prefill MoE path (MoE offload cache) -- **DONE (2026-10-15).** Slice 1

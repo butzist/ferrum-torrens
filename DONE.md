@@ -1579,6 +1579,48 @@ settled.
       slot-space partition, and verifying it needs a race detector this repo has
       no harness for.
 
+68. **The hybrid-radix domain core lands before its wiring** (2026-10-16,
+    implemented) -- item 7, the domain half of `hybrid_radix`.
+    - **Why split.** The real radix enabler is GDN snapshot donation (decision
+      65), but the whole feature is large: the tree's dual bookkeeping is pure
+      domain logic and testable without libtorch, while the generation-loop
+      wiring needs the real checkpoint. So the domain core and the device
+      primitive land first, wired later.
+    - **What landed (domain).** `HybridRadixIndex` in `domain/kvcache.rs`,
+      beside the plain `RadixIndex`, with `RadixNode` extended by
+      `mamba_value: Option<u32>` + `mamba_refcount: u32`. It mirrors FreeToken's
+      `HybridRadixCache`:
+      - a snapshot is **point-attached** at a node's END boundary, so a strict
+        prefix of a snapshot node is **not** reusable and `match` truncates to
+        the deepest node on the matched path whose snapshot is live;
+      - `split_at` leaves the snapshot on the suffix half (the new prefix node
+        starts with no snapshot);
+      - **dual refcounts**: `full_ref` (KV pages) and `mamba_ref` (the slot);
+        `inc_lock` pins the snapshot and the whole root..node KV path, with the
+        invariant `full_ref >= mamba_ref`; a request must lock a real
+        (non-tombstone) snapshot or the whole path is released again;
+      - **dual eviction**: `evict_mamba` counts **snapshots** and tombstones an
+        internal node in place (drops the slot, keeps KV) but frees a leaf's KV
+        too, cascading through wrapper tombstone leaves; `evict_full` counts
+        **tokens**, frees each evicted leaf's snapshot, and also cascades;
+      - **donate-not-copy** is a domain contract, not a copy: `insert` takes a
+        caller-owned slot id and reports `slot_reused` so the caller frees the
+        donated slot when the boundary already had one.
+    - **What landed (device).** `LinearStateSlabs::copy_slot(src, dst)` copies a
+      whole slot's conv + recurrent state across every linear layer: a donation
+      snapshots the live slot into a tree-owned slot, and a restore copies the
+      snapshot into a fresh live slot (copy-on-write, so the snapshot survives).
+    - **Tests.** 17 hybrid unit tests in `domain/kvcache.rs` (insert/match/
+      restore, deepest-snapshot truncation, prefix-not-reusable, split, dedup,
+      whole-boundary-only, tombstone internal, refill tombstone, leaf-frees-KV +
+      cascade, snapshot-count-not-tokens, slot conservation across waves,
+      `evict_full` leaf + ancestor, lock pins snapshot + KV path) plus the
+      gated `kvcache_dev` copy test.
+    - **Still open (the wiring, `[TODO]`).** `match_req`/`cache_req` in the
+      generation loop, the snapshot restore at prefill, the dual-eviction
+      triggers, and the pool/page partitioning. Until then the server keeps
+      cold per-request GDN states and does no cross-request reuse.
+
 ---
 
 ## Progress log (narrative, pre-2026-10-15 compaction)
@@ -2039,6 +2081,7 @@ subsection names are kept verbatim.
 - [x] P0 the engine decodes off the page table: one `SequenceCache` per request, opened on its first step and released when it finishes; a forward without a cache keeps re-feeding and must produce the same tokens (`application/generation.rs`).
 - [x] P0 page free-list (`free_slots` holds page bases) + per-req page table holding **token locations** + dummy row pointing at a sentinel page. (`domain/kvcache.rs`)
 - [x] P0 radix prefix tree: walk by first-page-key, `std::mismatch`-comparison align-down to page, node split, insert, LRU evict (unlocked leaf only), ref-counted handles. (`domain/kvcache.rs`, page_size=1)
+- [x] P2 hybrid_radix **domain core + device primitive** (2026-10-16, decision 68): `HybridRadixIndex` (dual `full_ref`/`mamba_ref`, tombstones, deepest-live-snapshot `match_prefix`, `evict_mamba` counts snapshots / `evict_full` counts tokens, donate-not-copy as a caller-owned slot) + `RadixNode.mamba_value/mamba_refcount` + `LinearStateSlabs::copy_slot`. 17 unit tests. The generation-loop wiring (`match_req`/`cache_req`, restore, dual eviction, pool partitioning) is still open.
 - [x] P0 **KV dtype serving-safe (SERVING BLOCKER).** Done 2026-10-15. `[kv] dtype = "f32" | "bf16"` (`fp8` refused at validation until a path exists) now picks the pool element type in `registry::kv_cache`; the default is `bf16`, which halves the pool, so the 4.51 GiB resident tower and the default `num_tokens = 131072` pool (2.5 GiB) fit the 7.53 GiB device. `MhaPool::gather*` now always returns f32 (upcasting bf16 on read), which is what lets the f32 attention math and the dense padded-window fallback consume a bf16 pool; the f32-only paged kernel still serves f32 pools. Measured on the device: `a_bf16_pool_device_decode_matches_refeeding_the_whole_prefix` keeps the greedy token equal to the f32 re-fed forward at every step with a worst logit shift of ~13% of scale (bf16 K/V rounding; the checkpoint itself serves fp8 KV). Gated f32 gates are pinned `dtype = "f32"` where they assert exact numerics (decision 64).
 - [x] P0 GDN linear-state pool: free-slot bookkeeping (conv-state + recurrent fp32 rows are infra tensors); ping-pong live slots and restore land with the hybrid path.
 ### Scheduler
