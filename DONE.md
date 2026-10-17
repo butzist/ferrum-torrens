@@ -2114,6 +2114,39 @@ settled.
       share (decision 81). The default config stays at 512; larger caches are
       opt-in, and this is the ceiling item 12's budget planner would spend.
 
+86. **Fused GDN causal conv + silu** (2026-10-17, implemented) -- FUSED_GDN slice
+    3 (the conv half), TODO item 19.
+    - **Why.** The decode path built the GDN conv from libtorch ops per layer:
+      `f32_`, `cat` with the `[rows, conv_dim, K-1]` state, a `w.repeat([rows, 1,
+      1])` materializing `[rows * conv_dim, 1, K]`, a grouped `conv1d`, `silu`,
+      and the state narrow. FreeToken delegates this to sgl_kernel's
+      `causal_conv1d_update` / its own Triton fallback; this vendors the shape.
+    - **What was built.** `python/ferrum_kernel/conv.py` `_conv_decode_kernel`:
+      one program per `(row, feature block)`, a `[BLOCK_N, TAPS]` window tile
+      (`TAPS = next_power_of_2(K)` so the new token has a lane), the depthwise dot
+      with the `[conv_dim, K]` filter, `silu`, and the in-place window shift. f32
+      in/out (the forward's conv is f32; only the recurrence state precision is
+      load-bearing), with `x`'s row stride a runtime arg because the forward hands
+      a strided narrow of the qkvz projection. AOT'd into the `linear` section;
+      `LinearAbi` gains `conv_decode` + args/grid, `GdnDecode` gains `conv_decode`,
+      and `gdn_core_batch_fused` launches it in place of `conv1d_silu_step_batch`.
+      The checkpoint's `[conv_dim, 1, K]` filter is reshaped to `[conv_dim, K]`.
+      The recurrence still reads q/k/v as narrows of the kernel's contiguous
+      `[rows, conv_dim]` output, so no extra copy.
+    - **Correctness.** `--interp` ~1e-7 (output and shifted state, B>1 and a
+      strided `x`); `scripts/check-kernels.sh` green; `device_decode_matches_refeed`
+      passes 3/3 (f32, bf16 pool, batched rows), argmax exact, `max|dlogit|/scale`
+      3.6e-3..9.4e-2 (the decision 80 bound).
+    - **Result: throughput neutral.** The GDN mixer is ~10 ms/token before and
+      after (ablate-and-diff), so tg is flat at ~11.3 tok/s at 1536 slots, exactly
+      as decision 77 predicted (the conv was never the bottleneck). Kept because
+      it drops the `w.repeat` allocation and the grouped-conv op soup (fewer graph
+      nodes) and is the ABI/AOT pattern the slice-4 prefill conv reuses. The other
+      half of slice 3 (bf16 mixer activations) stays open; it is a tower-wide
+      numerics change whose value is bounded by the ~10 ms GDN / ~30 ms "rest"
+      shares (decision 81), which is why item 11 (batching) is the larger serving
+      lever.
+
 ---
 
 ## Progress log (narrative, pre-2026-10-15 compaction)

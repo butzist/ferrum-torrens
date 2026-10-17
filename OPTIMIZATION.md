@@ -426,13 +426,20 @@ Slices 1-2 and E4 are done. The ordered remainder, with what each step actually 
    FreeToken's ~35%, because MoE is only ~17% of decode here. The config default
    stays 512; the ceiling is opt-in. Gated by
    `cuda_moe_matches_reference::a_cache_above_the_old_ceiling_stages_on_device`.
-2. **Slice 3 (item 19): bf16 mixer activations + `causal_conv1d_decode`.** Move the
-   mixer activation stream (rms_norm/conv/attention outputs) from f32 to bf16 so
-   FreeToken's kernels take signature-only edits, and vendor their fused conv+silu
-   (`_causal_conv1d_decode` + in-place `[slots, dim, K-1]` state) to replace
-   `conv1d_silu_step_batch`. This is the tower-wide numerics change: re-measure
-   every logit gate (the decision 80 bounds already allow for bf16), and the
-   `--interp` selftest must be added for the conv kernel.
+2. **Slice 3 (item 19): bf16 mixer activations + `causal_conv1d_decode`.**
+   **Fused conv DONE (2026-10-17), decision 86:** `python/ferrum_kernel/conv.py`
+   `conv_decode` (one `[BLOCK_N, TAPS]`-tile program per row/feature block, f32
+   in/out, in-place `[rows, conv_dim, K-1]` state, `x` row stride runtime) replaces
+   `conv1d_silu_step_batch` on the device decode path; `--interp` ~1e-7 and
+   `device_decode_matches_refeed` argmax-exact. **Throughput neutral**: the GDN
+   block is ~10 ms/token before and after, so the conv was never the cost (decision
+   77); it is kept for the dropped `w.repeat` allocation / op soup and as the ABI
+   pattern for slice 4. **OPEN: bf16 mixer activations.** Move the mixer activation
+   stream (rms_norm/conv/attention outputs) from f32 to bf16 so FreeToken's kernels
+   take signature-only edits; tower-wide numerics, so re-measure every logit gate
+   (the decision 80 bounds already allow for bf16) and give `conv_decode` a bf16
+   variant. Bounded by the ~10 ms GDN + ~30 ms "rest" shares (decision 81), so item
+   11 (batching) is the larger serving lever.
 3. **Slice 4 (item 20): prefill chunk kernels** (`chunk_gated_delta_rule`,
    `causal_conv1d_varlen`). This is the **pp** lever (our prefill is still libtorch
    op soup), not tg.

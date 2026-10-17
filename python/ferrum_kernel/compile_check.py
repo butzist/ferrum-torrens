@@ -34,6 +34,7 @@ from .nvfp4_moe import (
 )
 from .offload import _ensure_experts_kernel, _index_copy_multi_kernel
 from .attention import _paged_attention_decode_kernel
+from .conv import _conv_decode_kernel
 from .gdn import _gdn_decode_kernel
 from .fp8_linear import (
     _fp8_gemm_kernel,
@@ -41,6 +42,8 @@ from .fp8_linear import (
     _fp8_splitk_reduce_kernel,
 )
 from .linear import _nvfp4_dense_gemv_kernel
+from .signatures import conv_decode as _conv_decode_sig
+from .signatures import conv_decode_constexprs
 from .signatures import fp8_gemm as _fp8_gemm_sig
 from .signatures import fp8_gemm_constexprs
 from .signatures import fp8_gemv as _fp8_gemv_sig
@@ -154,6 +157,17 @@ def main() -> int:
     except Exception as e:  # noqa: BLE001
         failures += 1
         print(f"gdn_decode FAILED: {type(e).__name__}: {str(e)[:200]}")
+    # The fused GDN causal conv + silu (TODO.md item 19).
+    try:
+        check(
+            "conv_decode",
+            _conv_decode_kernel,
+            _conv_decode_sig(),
+            conv_decode_constexprs(),
+        )
+    except Exception as e:  # noqa: BLE001
+        failures += 1
+        print(f"conv_decode FAILED: {type(e).__name__}: {str(e)[:200]}")
     # The dense NVFP4 GEMV the lm_head runs (TODO.md section 8 item 18).
     try:
         check(

@@ -1743,14 +1743,19 @@ impl TorchQwen3_6 {
         let (conv_in, z) = two(qkvz, [conv_dim, value_dim], 1);
         let ba = f32_(x).matmul(&f32_(&gdn.ba).transpose(0, 1));
 
-        let (mixed, conv_out) = conv1d_silu_step_batch(
-            &conv_in,
-            &f32_(&gdn.conv),
-            conv_dim,
-            p.linear_conv_kernel_dim as i64,
-            conv_state,
-        );
+        // Fused conv + silu (item 19): one launch for the depthwise conv, the
+        // silu and the in-place state shift. `conv_state` is the gathered f32
+        // `[n, conv_dim, k - 1]` row block, so the kernel mutates it and the
+        // caller's `set_conv_state_rows` writes it back. The checkpoint stores
+        // the depthwise filter as `[conv_dim, 1, k]`, so drop the group axis.
+        let conv_w = f32_(&gdn.conv).reshape([conv_dim, p.linear_conv_kernel_dim as i64]);
+        let mixed = Tensor::empty([n, conv_dim], (Kind::Float, x.device()));
+        // SAFETY: `conv_in`/`conv_w`/`conv_state`/`mixed` are live device
+        // allocations and the shapes match the committed conv cubin.
+        unsafe { kernel.conv_decode(&conv_in, &conv_w, conv_state, &mixed) }
+            .expect("gdn conv kernel");
         trace_tensor("gdn.conv", layer, &mixed);
+        let conv_out = conv_state.shallow_clone();
         // q/k/v are narrows of `mixed`: strided rows, head-major within a row.
         // The kernel takes the row strides, so no contiguous copy is needed.
         let (qf, kf, vf) = three(mixed, [key_dim, key_dim, value_dim], 1);

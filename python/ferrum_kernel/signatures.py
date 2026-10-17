@@ -12,6 +12,7 @@ baked into the cubin rather than passed at launch.
 
 from __future__ import annotations
 
+from .conv import CONV_BLOCK_N
 from .gdn import GDN_BV
 from .fp8_linear import (
     GEMM_BLOCK_K as FP8_GEMM_BLOCK_K,
@@ -255,6 +256,11 @@ SERVING_GDN_K_HEADS = 16
 SERVING_GDN_V_HEADS = 32
 SERVING_GDN_K = 128
 SERVING_GDN_V = 128
+# The conv geometry: `conv_dim = 2 * key_dim + value_dim` and the checkpoint's
+# `linear_conv_kernel_dim`. Both are constexpr, so the committed conv cubin is
+# specialized like the GDN one.
+SERVING_CONV_DIM = 2 * SERVING_GDN_K_HEADS * SERVING_GDN_K + SERVING_GDN_V_HEADS * SERVING_GDN_V
+SERVING_CONV_WIDTH = 4
 
 
 def gdn_decode(dtype: str = SERVING_DTYPE) -> dict:
@@ -299,6 +305,41 @@ def gdn_decode_constexprs(
         "V": v,
         "BK": 1 << (k - 1).bit_length(),
         "BV": bv,
+    }
+
+
+def conv_decode() -> dict:
+    """The fused single-token GDN causal conv + silu (TODO.md item 19).
+
+    `x`/`w`/`state`/`out` are f32: the forward's conv runs f32 (`conv1d_silu_step_batch`
+    casts to f32), and only the recurrence's state precision is load-bearing. `x`
+    may be a strided view, so its row stride is a runtime arg.
+    """
+    return {
+        "x_ptr": "*fp32",
+        "w_ptr": "*fp32",
+        "state_ptr": "*fp32",
+        "out_ptr": "*fp32",
+        "stride_x": "i32",
+        "stride_state": "i32",
+        "stride_out": "i32",
+        "CONV_DIM": "constexpr",
+        "K": "constexpr",
+        "TAPS": "constexpr",
+        "BLOCK_N": "constexpr",
+    }
+
+
+def conv_decode_constexprs(
+    conv_dim: int = SERVING_CONV_DIM,
+    k: int = SERVING_CONV_WIDTH,
+    block_n: int = CONV_BLOCK_N,
+) -> dict:
+    return {
+        "CONV_DIM": conv_dim,
+        "K": k,
+        "TAPS": 1 << (k - 1).bit_length(),
+        "BLOCK_N": block_n,
     }
 
 

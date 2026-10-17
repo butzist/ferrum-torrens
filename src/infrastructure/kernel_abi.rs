@@ -560,8 +560,12 @@ pub const FP8_GEMV: &str = "fp8_gemv";
 pub const FP8_SPLITK_REDUCE: &str = "fp8_splitk_reduce";
 pub const FP8_GEMM: &str = "fp8_gemm";
 
-const LINEAR_NAMES: [&str; 5] = [
+/// The fused single-token GDN causal conv + silu (TODO.md item 19).
+pub const CONV_DECODE: &str = "conv_decode";
+
+const LINEAR_NAMES: [&str; 6] = [
     GDN_DECODE,
+    CONV_DECODE,
     NVFP4_DENSE_GEMV,
     FP8_GEMV,
     FP8_SPLITK_REDUCE,
@@ -690,6 +694,7 @@ impl LinearAbi {
 pub fn linear_cubin(name: &str) -> Result<&'static [u8], MoEError> {
     Ok(match name {
         GDN_DECODE => include_bytes!("../../kernel/gdn_decode.cubin"),
+        CONV_DECODE => include_bytes!("../../kernel/conv_decode.cubin"),
         NVFP4_DENSE_GEMV => include_bytes!("../../kernel/nvfp4_dense_gemv.cubin"),
         FP8_GEMV => include_bytes!("../../kernel/fp8_gemv.cubin"),
         FP8_SPLITK_REDUCE => include_bytes!("../../kernel/fp8_splitk_reduce.cubin"),
@@ -703,6 +708,7 @@ pub fn linear_cubin(name: &str) -> Result<&'static [u8], MoEError> {
 fn linear_ptx(name: &str) -> &'static str {
     match name {
         GDN_DECODE => include_str!("../../kernel/gdn_decode.ptx"),
+        CONV_DECODE => include_str!("../../kernel/conv_decode.ptx"),
         NVFP4_DENSE_GEMV => include_str!("../../kernel/nvfp4_dense_gemv.ptx"),
         FP8_GEMV => include_str!("../../kernel/fp8_gemv.ptx"),
         FP8_SPLITK_REDUCE => include_str!("../../kernel/fp8_splitk_reduce.ptx"),
@@ -1172,6 +1178,49 @@ pub fn gdn_grid(rows: usize, kernel: &LinearKernel) -> Result<(u32, u32, u32), M
     let v_heads = kernel.constexpr("NUM_V_HEADS")?;
     let tiles = v.div_ceil(bv) as u32;
     Ok((1, tiles, (rows as u64 * v_heads) as u32))
+}
+
+/// Device addresses for one fused GDN causal conv + silu launch. `x` is
+/// `[rows, conv_dim]` f32 (possibly strided), `w` `[conv_dim, K]` f32, `state`
+/// `[rows, conv_dim, K-1]` f32 (updated in place) and `out` `[rows, conv_dim]`.
+/// The three strides are the row strides: `x` is a narrow of the qkvz projection
+/// so its rows are not packed.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ConvArgs {
+    pub x: u64,
+    pub w: u64,
+    pub state: u64,
+    pub out: u64,
+    pub stride_x: u32,
+    pub stride_state: u32,
+    pub stride_out: u32,
+}
+
+/// The conv decode launch argument pack, in the cubin's declared order.
+pub fn conv_decode_args(abi: &LinearAbi, a: &ConvArgs) -> Result<ArgPack, MoEError> {
+    let kernel = abi.kernel(CONV_DECODE)?;
+    let mut p = ArgPack::for_linear(kernel);
+    p.ptr(a.x)?;
+    p.ptr(a.w)?;
+    p.ptr(a.state)?;
+    p.ptr(a.out)?;
+    p.u32(a.stride_x)?;
+    p.u32(a.stride_state)?;
+    p.u32(a.stride_out)?;
+    Ok(p)
+}
+
+/// The conv decode launch grid: one program per `(row, feature block)`. `rows`
+/// is the step's batch, so it is runtime; the feature tile is the baked
+/// constexpr.
+pub fn conv_grid(rows: usize, kernel: &LinearKernel) -> Result<(u32, u32, u32), MoEError> {
+    let conv_dim = kernel.constexpr("CONV_DIM")?;
+    let block_n = kernel.constexpr("BLOCK_N")?;
+    Ok((
+        rows as u32,
+        (conv_dim as usize).div_ceil(block_n as usize) as u32,
+        1,
+    ))
 }
 
 /// Device addresses and shapes for one dense NVFP4 GEMV launch. `a` is
@@ -1862,6 +1911,55 @@ mod tests {
         v["linear"].as_object_mut().unwrap().remove(GDN_DECODE);
         let err = LinearAbi::parse(&v.to_string()).unwrap_err().to_string();
         assert!(err.contains("missing linear kernel gdn_decode"), "{err}");
+    }
+
+    #[test]
+    fn the_conv_manifest_records_the_shape() {
+        let abi = LinearAbi::committed().unwrap();
+        let kernel = abi.kernel(CONV_DECODE).unwrap();
+        // conv_dim = 2 * 16 * 128 + 32 * 128 = 8192, the checkpoint's conv width.
+        assert_eq!(kernel.constexpr("CONV_DIM").unwrap(), 8192);
+        assert_eq!(kernel.constexpr("K").unwrap(), 4);
+        assert_eq!(kernel.constexpr("TAPS").unwrap(), 4);
+        assert_eq!(kernel.constexpr("BLOCK_N").unwrap(), 256);
+        assert_eq!(kernel.num_warps, 4);
+    }
+
+    #[test]
+    fn the_conv_argument_builder_matches_its_kernel_signature() {
+        let abi = LinearAbi::committed().unwrap();
+        let args = ConvArgs {
+            x: 0x1000,
+            w: 0x2000,
+            state: 0x3000,
+            out: 0x4000,
+            stride_x: 12288,
+            stride_state: 24576,
+            stride_out: 8192,
+        };
+        let pack = conv_decode_args(&abi, &args).unwrap();
+        let kernel = abi.kernel(CONV_DECODE).unwrap();
+        let params = pack.kernel_params().unwrap();
+        assert_eq!(params.len(), kernel.args.len() + kernel.scratch_params);
+        for slot in &pack.slots()[kernel.args.len()..] {
+            assert_eq!(*slot, 0, "scratch slot is not null");
+        }
+    }
+
+    #[test]
+    fn the_conv_grid_tiles_the_features() {
+        let abi = LinearAbi::committed().unwrap();
+        let kernel = abi.kernel(CONV_DECODE).unwrap();
+        // 8192 features / 256 tile = 32 blocks in y, one program per row in x.
+        assert_eq!(conv_grid(2, kernel).unwrap(), (2, 32, 1));
+    }
+
+    #[test]
+    fn a_manifest_missing_the_conv_kernel_is_rejected() {
+        let mut v: serde_json::Value = serde_json::from_str(MANIFEST_JSON).unwrap();
+        v["linear"].as_object_mut().unwrap().remove(CONV_DECODE);
+        let err = LinearAbi::parse(&v.to_string()).unwrap_err().to_string();
+        assert!(err.contains("missing linear kernel conv_decode"), "{err}");
     }
 
     #[test]

@@ -535,6 +535,67 @@
     }
   },
   "linear": {
+    "conv_decode": {
+      "constexprs": {
+        "BLOCK_N": 256,
+        "CONV_DIM": 8192,
+        "K": 4,
+        "TAPS": 4
+      },
+      "declared_args": [
+        "x_ptr",
+        "w_ptr",
+        "state_ptr",
+        "out_ptr",
+        "stride_x",
+        "stride_state",
+        "stride_out"
+      ],
+      "entry": "_conv_decode_kernel",
+      "global_scratch_size": 0,
+      "num_warps": 4,
+      "params": [
+        {
+          "index": 0,
+          "kind": "ptr"
+        },
+        {
+          "index": 1,
+          "kind": "ptr"
+        },
+        {
+          "index": 2,
+          "kind": "ptr"
+        },
+        {
+          "index": 3,
+          "kind": "ptr"
+        },
+        {
+          "index": 4,
+          "kind": "u32"
+        },
+        {
+          "index": 5,
+          "kind": "u32"
+        },
+        {
+          "index": 6,
+          "kind": "u32"
+        },
+        {
+          "index": 7,
+          "kind": "ptr"
+        },
+        {
+          "index": 8,
+          "kind": "ptr"
+        }
+      ],
+      "profile_scratch_size": 0,
+      "scratch_params": 2,
+      "shared": 1024
+    },
     "fp8_gemm": {
       "constexprs": {
         "BLOCK_K": 64,

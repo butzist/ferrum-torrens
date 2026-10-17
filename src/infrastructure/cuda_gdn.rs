@@ -19,7 +19,8 @@ use crate::domain::expert_kernel::MoEError;
 use crate::domain::model::ModelParams;
 use crate::infrastructure::cuda_driver::{CUstream, CudaError, Driver, GdnKernels};
 use crate::infrastructure::kernel_abi::{
-    GDN_DECODE, GdnArgs, LinearAbi, gdn_decode_args, gdn_grid,
+    CONV_DECODE, ConvArgs, GDN_DECODE, GdnArgs, LinearAbi, conv_decode_args, conv_grid,
+    gdn_decode_args, gdn_grid,
 };
 use crate::infrastructure::torch::Device;
 
@@ -45,6 +46,10 @@ pub struct GdnDecode {
     v_heads: i64,
     kd: i64,
     vdim: i64,
+    /// `2 * key_dim + value_dim`, the fused conv's feature width.
+    conv_dim: i64,
+    /// The conv kernel width (`linear_conv_kernel_dim`).
+    conv_k: i64,
     stream: CUstream,
 }
 
@@ -74,13 +79,23 @@ impl GdnDecode {
         let abi = LinearAbi::committed().map_err(bad_abi)?;
         check_geometry(params, &abi)?;
         let kernels = GdnKernels::load(Arc::new(lib), abi.clone()).map_err(driver)?;
+        let (k_heads, v_heads) = (
+            params.linear_num_key_heads as i64,
+            params.linear_num_value_heads as i64,
+        );
+        let (kd, vdim) = (
+            params.linear_key_head_dim as i64,
+            params.linear_value_head_dim as i64,
+        );
         Ok(Self {
             kernels,
             abi,
-            k_heads: params.linear_num_key_heads as i64,
-            v_heads: params.linear_num_value_heads as i64,
-            kd: params.linear_key_head_dim as i64,
-            vdim: params.linear_value_head_dim as i64,
+            k_heads,
+            v_heads,
+            kd,
+            vdim,
+            conv_dim: 2 * k_heads * kd + v_heads * vdim,
+            conv_k: params.linear_conv_kernel_dim as i64,
             stream,
         })
     }
@@ -173,6 +188,61 @@ impl GdnDecode {
         // belongs to the context made current at construction.
         unsafe { self.kernels.launch(kernel, grid, &mut params, self.stream) }.map_err(driver)
     }
+
+    /// Launch one fused conv + silu decode step for `rows` rows.
+    ///
+    /// `x` is `[rows, conv_dim]` f32, `w` `[conv_dim, K]` f32, `state`
+    /// `[rows, conv_dim, K - 1]` f32 (updated in place) and `out`
+    /// `[rows, conv_dim]` f32. Only `x`'s row stride need be real: the forward
+    /// hands a strided narrow of the qkvz projection.
+    ///
+    /// # Safety
+    /// Every tensor must be a live device allocation in this launcher's context,
+    /// and `state`/`out` large enough for their shapes.
+    pub unsafe fn conv_decode(
+        &self,
+        x: &Tensor,
+        w: &Tensor,
+        state: &Tensor,
+        out: &Tensor,
+    ) -> Result<(), MoEError> {
+        let kernel = self.abi.kernel(CONV_DECODE).map_err(bad_abi)?;
+        let bad = |what: &str| {
+            MoEError::Bad(format!(
+                "the conv kernel was built for {what}, not the shapes handed in"
+            ))
+        };
+        let x_size = x.size();
+        if x_size.len() != 2 || x_size[1] != self.conv_dim {
+            return Err(bad("x = [rows, conv_dim]"));
+        }
+        let rows = x_size[0];
+        if w.size() != [self.conv_dim, self.conv_k] {
+            return Err(bad("w = [conv_dim, K]"));
+        }
+        if state.size() != [rows, self.conv_dim, self.conv_k - 1] {
+            return Err(bad("state = [rows, conv_dim, K - 1]"));
+        }
+        if out.size() != x_size {
+            return Err(bad("out = x"));
+        }
+        let args = ConvArgs {
+            x: x.data_ptr() as u64,
+            w: w.data_ptr() as u64,
+            state: state.data_ptr() as u64,
+            out: out.data_ptr() as u64,
+            stride_x: x.stride()[0] as u32,
+            stride_state: state.stride()[0] as u32,
+            stride_out: out.stride()[0] as u32,
+        };
+        let pack = conv_decode_args(&self.abi, &args).map_err(bad_abi)?;
+        let mut params = pack.kernel_params().map_err(bad_abi)?;
+        let grid = conv_grid(rows as usize, kernel).map_err(bad_abi)?;
+        // SAFETY: the caller guarantees every tensor is live in this context;
+        // `params` was built from this kernel's manifest entry, and `self.stream`
+        // belongs to the context made current at construction.
+        unsafe { self.kernels.launch(kernel, grid, &mut params, self.stream) }.map_err(driver)
+    }
 }
 
 /// The cubin bakes the GDN geometry, so a checkpoint whose head shape differs
@@ -192,6 +262,21 @@ fn check_geometry(params: &ModelParams, abi: &LinearAbi) -> Result<(), MoEError>
         if built != value {
             return Err(MoEError::Bad(format!(
                 "the gdn kernel was built with {name} = {built}, but the model has {value}"
+            )));
+        }
+    }
+    let conv = abi.kernel(CONV_DECODE).map_err(bad_abi)?;
+    let cc = |name: &str| conv.constexpr(name).map_err(bad_abi);
+    let conv_dim = 2 * params.linear_num_key_heads as u64 * params.linear_key_head_dim as u64
+        + params.linear_num_value_heads as u64 * params.linear_value_head_dim as u64;
+    for (name, value) in [
+        ("CONV_DIM", conv_dim),
+        ("K", params.linear_conv_kernel_dim as u64),
+    ] {
+        let built = cc(name)?;
+        if built != value {
+            return Err(MoEError::Bad(format!(
+                "the conv kernel was built with {name} = {built}, but the model has {value}"
             )));
         }
     }

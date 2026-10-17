@@ -208,9 +208,10 @@ flowchart LR
   launch contracts, one section each: `kernels` (the four grouped-MoE passes),
   `staging` (`lru_ensure`, `index_copy`), `attention` (`paged_attention` f32 and
   `paged_attention_bf16`, the pool-dtype variants) and
-  `linear` (`gdn_decode`, the fused GDN decode, `nvfp4_dense_gemv`, the lm_head
-  tail, and `fp8_gemv`/`fp8_splitk_reduce`/`fp8_gemm`, the vendored W8A16 FP8
-  projections). The devshell aliases
+  `linear` (`gdn_decode`, the fused GDN decode, `conv_decode`, the fused GDN
+  causal conv + silu, `nvfp4_dense_gemv`, the lm_head tail, and
+  `fp8_gemv`/`fp8_splitk_reduce`/`fp8_gemm`, the vendored W8A16 FP8 projections).
+  The devshell aliases
   `kernel-aot`, `kernel-selftest` (CPU interpreter gate) and
   `kernel-compile-check` are the kernel inner loop.
 - **The devshell exports the roots** `LIBTORCH`, `LIBTORCH_INCLUDE`,

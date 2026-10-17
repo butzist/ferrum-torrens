@@ -20,6 +20,7 @@ import sys
 import torch
 
 from . import attention as attn
+from . import conv as conv_mod
 from . import fp8_linear as fp8_mod
 from . import gdn as gdn_mod
 from . import linear as linear_mod
@@ -356,6 +357,59 @@ def check_gdn(device: torch.device, tol: float, full: bool) -> int:
     return failures
 
 
+def random_conv_case(device: str, rows: int, conv_dim: int, k: int, seed: int):
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    dev = torch.device(device)
+    x = (torch.randn((rows, conv_dim), generator=g, dtype=torch.float32) * 0.5).to(dev)
+    w = (torch.randn((conv_dim, k), generator=g, dtype=torch.float32) * 0.5).to(dev)
+    state = (torch.randn((rows, conv_dim, k - 1), generator=g, dtype=torch.float32) * 0.5).to(dev)
+    return x, w, state
+
+
+def check_conv(device: torch.device, tol: float, full: bool) -> int:
+    """Fused GDN conv + silu (TODO.md item 19): the kernel against the torch
+    reference, both the output and the in-place shifted state. `full` adds the
+    serving conv width; a strided `x` case pins the row-stride argument the
+    forward's qkvz slice needs."""
+    cases = [("small", {"rows": 2, "conv_dim": 32, "k": 4})]
+    if full:
+        cases.append(("qwen-shape", {"rows": 2, "conv_dim": 8192, "k": 4}))
+    failures = 0
+    for label, shape in cases:
+        for seed in range(2):
+            x, w, state = random_conv_case(str(device), seed=seed, **shape)
+            want_out, want_state = conv_mod.conv_decode_reference(x, w, state)
+            rows, conv_dim = x.shape
+            got_out = torch.empty((rows, conv_dim), dtype=torch.float32, device=device)
+            state_in = state.clone()
+            conv_mod.conv_decode(x, w, state_in, got_out)
+            rel_out = (got_out - want_out).abs().max() / want_out.abs().max().clamp(min=1e-6)
+            rel_state = (state_in - want_state).abs().max() / want_state.abs().max().clamp(min=1e-6)
+            print(
+                f"conv {label} seed {seed}: out rel {rel_out:.3e}, "
+                f"state rel {rel_state:.3e}"
+            )
+            if rel_out.item() > tol or rel_state.item() > tol:
+                failures += 1
+                print(f"conv {label} seed {seed}: FAIL", file=sys.stderr)
+    # Strided x: a padded row buffer sliced to `conv_dim`, the layout the forward
+    # hands the kernel (a narrow of the qkvz projection), so `stride_x` is real.
+    x, w, state = random_conv_case(str(device), seed=7, rows=2, conv_dim=64, k=4)
+    want_out, want_state = conv_mod.conv_decode_reference(x, w, state)
+    padded = torch.cat([x, torch.zeros((2, 8), dtype=torch.float32, device=device)], dim=1)
+    xs = padded[:, :64]
+    assert xs.stride(0) == 72, "the strided case must not be contiguous"
+    got_out = torch.empty((2, 64), dtype=torch.float32, device=device)
+    state_in = state.clone()
+    conv_mod.conv_decode(xs, w, state_in, got_out)
+    rel = ((got_out - want_out).abs().max() / want_out.abs().max().clamp(min=1e-6)).item()
+    print(f"conv strided: out rel {rel:.3e}")
+    if rel > tol:
+        failures += 1
+        print("conv strided: FAIL", file=sys.stderr)
+    return failures
+
+
 def random_dense_case(device: str, m: int = 2, n: int = 128, k: int = 256, seed: int = 0):
     """A dense NVFP4 GEMV case: `[n, k//2]` packed nibbles, `[n, k//16]` e4m3
     block scales, `[n]` f16 globals, and a bf16 activation row."""
@@ -496,6 +550,12 @@ def main(argv: list[str] | None = None) -> int:
         torch.device(args.device), args.tol, full=args.device != "cpu"
     )
     if gdn_failures:
+        print("FAIL", file=sys.stderr)
+        return 1
+    conv_failures = check_conv(
+        torch.device(args.device), args.tol, full=args.device != "cpu"
+    )
+    if conv_failures:
         print("FAIL", file=sys.stderr)
         return 1
     dense_failures = check_nvfp4_dense(torch.device(args.device), args.tol)

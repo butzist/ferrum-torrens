@@ -43,9 +43,12 @@ The decode gap is now pursued by **vendoring FreeToken's own Triton kernels**
 NVFP4 lm_head (decision 79) take decode **tg 8.2 -> 10.9 tok/s** and VRAM
 **7.9 -> 4.83 GiB**. E4 (item 21, decision 85) raised the staging ceiling so the
 cache can grow to 2048 slots: tg 10.6 -> 11.5 at 1536 slots (plateau), VRAM up to
-7.4 GiB. Next: bf16 mixer activations + a fused conv (slice 3), then the prefill
-chunk kernels (slice 4); libtorch stays the generic/CPU fallback.
-Progress history and the full decision log (numbers 1..85) live in `DONE.md`;
+7.4 GiB. Slice 3's fused conv landed (item 19, decision 86): `conv_decode`
+replaces the grouped-conv op soup on the device path, correct and throughput
+neutral. Remaining: bf16 mixer activations (slice 3), the prefill chunk kernels
+(slice 4), and item 11 (server-side batching) as the largest serving lever;
+libtorch stays the generic/CPU fallback.
+Progress history and the full decision log (numbers 1..86) live in `DONE.md`;
 read that for the "why" behind any decision number referenced in code or tests.
 
 Goal: a **minimal, fast, single-GPU** Rust serving engine for **one model** --
@@ -317,6 +320,15 @@ The full log of confirmed decisions (numbers 1..84, stable -- code, tests and
 lists only the decisions that still bind open work; everything else there is
 history.
 
+- **86** -- the GDN decode conv is the vendored fused `conv_decode` kernel
+  (fused depthwise causal conv + silu, in-place `[rows, conv_dim, K-1]` f32
+  state), replacing `conv1d_silu_step_batch` on the device path (FUSED_GDN slice
+  3, the conv half). It reads the checkpoint's `[conv_dim, 1, K]` filter as
+  `[conv_dim, K]`, takes `x`'s row stride so the qkvz narrow goes straight in,
+  and outputs a contiguous `[rows, conv_dim]` buffer the recurrence reads. The
+  `conv_decode` cubin is a `linear`-section contract. Throughput neutral (the
+  conv is not the cost); it binds the remaining slice-3 work (bf16 mixer
+  activations), which would need a bf16 variant.
 - **85** -- the staging `lru_ensure` cache ceiling is 2048 slots
   (`SERVING_BLOCK_C`, `SLOT_BITS` 11). It is the largest power of two that still
   fits the 8 GiB target at the current non-slot footprint, and it unblocks growing
@@ -578,10 +590,15 @@ performance work.
     11751, 0.21% shift); VRAM -0.81 GiB; throughput neutral (the 4-bit LUT unpack
     is arithmetic-bound, unlike W8A16). The reusable pattern for item 17; its freed
     VRAM feeds item 21.
-19. bf16 mixer activations + fused conv -- **OPEN (decision 82, slice 3).** Run the
-    mixer in bf16 (rms_norm/conv/attention outputs) to match FreeToken and let
-    their kernels drop in; vendor `causal_conv1d_decode` (fused conv+silu, in-place
-    slot state) to replace `conv1d_silu_step_batch`. Tower-wide numerics change.
+19. bf16 mixer activations + fused conv -- **PARTIAL (decision 82, slice 3).**
+    **Fused conv DONE (2026-10-17), decision 86:** `conv_decode` (fused depthwise
+    causal conv + silu, in-place `[rows, conv_dim, K-1]` state) replaces
+    `conv1d_silu_step_batch` on the device decode path; correct at ~1e-7 (interp)
+    and argmax-exact in `device_decode_matches_refeed`, throughput neutral (the
+    conv was never the cost, decision 77) but removes the `w.repeat` allocation
+    and the grouped-conv op soup. **OPEN:** move the mixer activation stream
+    (rms_norm/conv/attention outputs) from f32 to bf16 to match FreeToken; a
+    tower-wide numerics change that needs every logit gate re-measured.
 20. Prefill chunk kernels -- **OPEN (decision 82, slice 4).** Vendor FLA
     `chunk_gated_delta_rule` + `causal_conv1d_varlen`; our prefill is still
     libtorch op soup with no FLA chunk kernel.
