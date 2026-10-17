@@ -1061,8 +1061,8 @@ impl CudaMoE {
         // A prefill-shaped step (`>` one `lru_ensure` launch of routes) with the
         // overlap harness takes the whole-layer path: one streamed copy of the
         // layer and one GEMV pass, no per-chunk `lru_ensure`. Anything smaller
-        // stays on the flat LRU, and a step that returns to decode clears the
-        // borrowed slots the prefill left behind.
+        // stays on the flat LRU. Entering the prefill frees only the buffer
+        // slots; the rest of the decode LRU survives (TODO.md item 24).
         if self.is_prefill_step(tokens * top_k)? {
             if self.residency != Residency::Prefill {
                 self.enter_prefill()?;
@@ -1107,10 +1107,13 @@ impl CudaMoE {
     }
 
     /// Enter the whole-layer prefill: fence the copy stream behind the compute
-    /// stream (a preceding decode may still be reading the borrowed slots), clear
-    /// the now-stale LRU tables and reset the half bookkeeping.
+    /// stream (a preceding decode may still be reading the borrowed slots), free
+    /// only the `2 * num_experts` buffer slots, and reset the half bookkeeping.
+    ///
+    /// Only the buffer range is touched; the decode LRU in the rest of the cache
+    /// is retained across the prefill (TODO.md item 24, optimization.md R7.2).
     fn enter_prefill(&mut self) -> Result<(), MoEError> {
-        self.reset_staging()?;
+        self.clear_buffer_slots()?;
         let copy_stream = {
             let pf = self
                 .prefill
@@ -1131,11 +1134,34 @@ impl CudaMoE {
         Ok(())
     }
 
-    /// Leave the whole-layer prefill: clear the borrowed-slot LRU state so the
-    /// next decode step starts cold rather than trusting a stale table.
+    /// Leave the whole-layer prefill. The buffer slots were freed on entry and
+    /// the LRU tables never referenced them during the prefill, so the next
+    /// decode step picks them up as free slots; the retained LRU is intact.
     fn leave_prefill(&mut self) -> Result<(), MoEError> {
-        self.reset_staging()?;
         self.residency = Residency::Decode;
+        Ok(())
+    }
+
+    /// Free the `2 * num_experts` slots the whole-layer double buffer owns:
+    /// evict whatever decode experts were placed there from the reverse map and
+    /// mark the range empty, leaving every other slot's LRU state untouched.
+    fn clear_buffer_slots(&mut self) -> Result<(), MoEError> {
+        let Some(st) = self.device_staging.as_mut() else {
+            return Ok(());
+        };
+        let buffer = 2 * st.experts;
+        let dev = self.device.to_tch();
+        // The flat ids the buffer currently holds (decode may have placed experts
+        // in these slots). Read them before the table is overwritten.
+        let old = st.id_of_slot.narrow(0, 0, buffer as i64);
+        let valid = old.ge(0);
+        let idx = old.masked_select(&valid).to_kind(tch::Kind::Int64);
+        if idx.numel() > 0 {
+            let neg = Tensor::from_slice(&vec![-1i32; idx.numel()]).to(dev);
+            let _ = st.slot_for_id.index_put_(&[Some(&idx)], &neg, false);
+        }
+        let _ = st.id_of_slot.narrow(0, 0, buffer as i64).fill_(-1);
+        let _ = st.usage.narrow(0, 0, buffer as i64).fill_(0i64);
         Ok(())
     }
 

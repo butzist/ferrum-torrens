@@ -2349,6 +2349,36 @@ settled.
     `tests/dispatcher_batching.rs` is the gate. The per-request path is
     byte-identical for a lone request (same seed derivation).
 
+93. **Shared expert stays packed NVFP4** (2026-10-17, implemented) -- TODO.md
+    item 23, `optimization.md` R7.1. The checkpoint stores
+    `mlp.shared_expert.{gate_up,down}_proj` NVFP4; `Loader::dense` widened both to
+    bf16 and the decode step read 240 MiB/token. `Dense` now carries
+    `Nvfp4Dense { packed, scale, global, gemv }` (K-major banks built by
+    `head_nvfp4_kmajor`) alongside the bf16 weight, and `Dense::apply` runs the
+    dense NVFP4 GEMV for `m <= NVFP4_GEMV_MAX_ROWS` (8, decode and small batched
+    decode), bf16 (cuBLAS) above (prefill). `shared` 3.12 -> 2.26 ms/token.
+    Enabling this found that the dense GEMV cubin baked `K_WORDS` as a constexpr
+    (the head's K=2048), so the shared `down` (K=512) overran it; `K_WORDS` is
+    now a runtime arg (`DenseGemvArgs::k_words`, dropped from
+    `nvfp4_dense_gemv_constexprs`) so one cubin serves any K. The device oracle
+    gate still reaches token 11751; the device-decode gate's argmax stays exact
+    with max|dlogit|/scale 0.16 (the decode/prefill representation difference,
+    within the 0.2 bound).
+
+94. **Prefill retains the decode expert cache** (2026-10-17, implemented) --
+    TODO.md item 24, `optimization.md` R7.2. The whole-layer prefill harness
+    borrowed the cache's first `2 * num_experts` slots for its double buffer, and
+    `enter_prefill`/`leave_prefill` both called `reset_staging()`, so every
+    prefill wiped the *entire* decode LRU. `enter_prefill` now frees only the
+    buffer range (`clear_buffer_slots`: scatter `-1` for the ids the buffer held,
+    zero their usage) and `leave_prefill` is a residency flip; `[2*E, slots)`
+    keeps its experts across the prefill. The `Residency::{Decode, Prefill}` enum
+    is the state the operator asked for. Remaining: pick the coldest/MFU experts
+    for the buffer instead of the fixed low range (the `dst_idx` copy plan is
+    static), a two-request miss-count acceptance test, and a KV-vs-expert
+    eviction policy (not needed yet: the buffer is already reserved and the
+    resident tower is never evicted).
+
 ---
 
 ## Progress log (narrative, pre-2026-10-15 compaction)

@@ -63,10 +63,13 @@ resolves ~1900 slots on the 8 GiB target and gives **tg 18.7 tok/s**. **R6 is
 partial:** the paged attention kernel now runs 8 warps (`attn` 4.7 -> 4.37); the
 other R6 items have hard blockers (see `optimization.md`). **R5 landed
 (decision 92):** one dispatcher worker batches queued requests into a single
-`run_batch`; K=4 aggregate decode **16.6 -> 26.2 tok/s (1.58x)**. Remaining
-levers: the PCIe copy (miss-bound) and the spread compute (GDN/attn/shared/LRU);
-the R6 slices. Instruments: `FT_PROFILE=1` and `scripts/freetoken_probe/`.
-Progress history and the full decision log (numbers 1..92) live in `DONE.md`;
+`run_batch`; K=4 aggregate decode **16.6 -> 26.2 tok/s (1.58x)**. **Shared expert
+stays NVFP4** (decision 93, `shared` 3.12 -> 2.26) and **a prefill no longer
+wipes the decode expert cache** (decision 94: only the `2*E` buffer slots are
+freed). Remaining levers: the PCIe copy (miss-bound) and the spread compute
+(GDN/attn/shared/LRU); the R6 slices. Instruments: `FT_PROFILE=1` and
+`scripts/freetoken_probe/`.
+Progress history and the full decision log (numbers 1..94) live in `DONE.md`;
 read that for the "why" behind any decision number referenced in code or tests.
 
 Goal: a **minimal, fast, single-GPU** Rust serving engine for **one model** --
@@ -336,11 +339,21 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 
 ## 7. Decisions
 
-The full log of confirmed decisions (numbers 1..92, stable -- code, tests and
+The full log of confirmed decisions (numbers 1..94, stable -- code, tests and
 `ARCHITECTURE.md` reference them by number) lives in `DONE.md`. This section
 lists only the decisions that still bind open work; everything else there is
 history.
 
+- **94** -- the whole-layer prefill frees only its `2 * num_experts` double-buffer
+  slots (`CudaMoE::clear_buffer_slots`) and leaves `[2*E, slots)` retained; no
+  code may call `reset_staging()` around a prefill or between requests. The
+  buffer range is fixed at `[0, 2*E)`; choosing the coldest/MFU slots for it is
+  the next slice (the copy plan is static today). KV/state pools are per-request
+  and are freed at `commit`/`end`, never with the expert cache.
+- **93** -- the shared expert stays NVFP4 in VRAM: `Dense::apply` runs the dense
+  NVFP4 GEMV for `m <= 8` and bf16 above. The dense GEMV takes `K_WORDS` at
+  runtime so one cubin serves the head and the shared `down`; do not make it a
+  constexpr again.
 - **92** -- all serving forwards run on one `application::dispatcher::Dispatcher`
   worker (decision 92), which batches whatever is queued up to
   `model.max_running_requests`. New server work must submit a `Job` rather than
@@ -695,14 +708,17 @@ performance work.
      banks and run the dense NVFP4 GEMV for decode (like the lm_head), bf16 for
      prefill (M>1). Saves ~2 ms/token and ~180 MiB. Design in `optimization.md`
      R7.
-24. Prefill/cache residency -- **OPEN (operator request, 2026-10-17).** Audit and
-     redesign how the MoE slot cache, the prefill double buffer and the KV/state
-     pools share VRAM: retain the decode cache across a prefill and between
-     requests instead of evicting it; give the slot cache an explicit state enum
-     (`Experts` vs `DoubleBuffered { retained }`) so a whole-layer prefill only
-     takes `2 * num_experts` slots and keeps LRU/MFU experts in the retained
-     area; and let a prefill under pressure evict KV/dense before the expert
-     cache. Full idea list and evaluation in `optimization.md` R7.
+24. Prefill/cache residency -- **PARTIAL (2026-10-17, decision 94).** Audit
+     found the whole-layer prefill called `reset_staging()` on enter *and* leave,
+     wiping the entire decode LRU around every prefill. It now frees only the
+     `2 * num_experts` buffer slots (`CudaMoE::clear_buffer_slots`) and leaves
+     `[2*E, slots)` retained; entering/leaving no longer resets. The cache state
+     is the existing `Residency::{Decode, Prefill}` plus the fixed buffer range.
+     Still open: choosing the coldest/MFU experts for the buffer (`dst_idx` is a
+     static plan today), a two-request acceptance test that counts misses
+     before/after a prefill, and the KV-vs-expert eviction policy under pressure
+     (prefill needs only the 512 buffer slots, and the resident tower is never
+     evicted, so no KV eviction is wired yet). Details in `optimization.md` R7.2.
 
 ### Decode speed plan (decision 82): status and next steps
 

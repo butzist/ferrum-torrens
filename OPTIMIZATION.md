@@ -791,3 +791,39 @@ Acceptance: a gated test that runs a decode, then a prefill, then another decode
 on the same engine and shows the second decode's `moe_copy` miss count is close
 to the first (the cache was retained), plus the prefill using only
 `2 * num_experts` slots. Re-measure tg after the change.
+
+### R7.2 audit result (2026-10-17, decision 94)
+
+Answered, with the code path:
+
+1. **Prefill used to evict the whole expert cache.** `CudaMoE::enter_prefill`
+   called `reset_staging()` and `leave_prefill` called it again, so every
+   prefill wiped `slot_for_id`, `id_of_slot`, `usage` and `step` for *all*
+   slots. Fixed: `enter_prefill` now calls `clear_buffer_slots`, which frees only
+   the `2 * num_experts` slots the double buffer owns (scatter `-1` for the ids
+   they held, zero `usage`), and `leave_prefill` no longer resets. The region
+   `[2*E, slots)` keeps its decode experts across the prefill.
+2. **Between requests the expert cache is not reset.** The adapter is built once
+   in `registry::build`; the only whole-cache reset was the prefill path above
+   (now removed). A finished request donates its *KV pages* and GDN state slot
+   (`KvCache::commit/end`), which is per-request and correct.
+3. **KV/state invalidation points:** `DeviceCache::end`/`commit` free the
+   request's pages/state slot; `alloc_slot` evicts unlocked radix snapshots under
+   pressure. None touches the expert slot cache.
+4. **Input-batch space:** a whole-layer prefill needs `2 * num_experts` slots
+   (two halves of one layer, 512 at 256 experts), not `layers * experts`. The
+   harness already sizes it that way (`groups = experts / BLOCK_K`, two buffers).
+5. **State:** `Residency::{Decode, Prefill}` (the enum the operator asked for)
+   gates the path. The buffer range is fixed at `[0, 2*E)`; decode may use the
+   whole cache in `Decode` and only `[2*E, slots)` is guaranteed retained. Next
+   refinement: choose the buffer's slots as the coldest/MFU set instead of the
+   low fixed range (the `dst_idx` copy plan is static today).
+6. **KV/dense eviction under prefill pressure:** not needed yet. The prefill
+   only borrows the 512 buffer slots (already reserved out of the auto budget),
+   and the resident dense tower is never evicted. If a future prefill needs more
+   scratch, the trade order is: request KV pages (re-prefill) first, then the
+   expert LRU (PCIe re-fetch), never the resident dense tower.
+7. **Retention policy:** the LRU already keeps the most recent experts in
+   `[2*E, slots)`; the buffer reclaims whatever sat in `[0, 2*E)` (the fixed
+   low range). Using the coldest slots for the buffer would protect the MFU set
+   explicitly; left as the next slice with the two-request miss-count gate.
