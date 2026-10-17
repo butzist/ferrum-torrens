@@ -61,10 +61,12 @@ during this layer's compute -- there is nothing to prefetch. **R4 landed
 the expert cache from the free VRAM after the tower and KV pool are resident; it
 resolves ~1900 slots on the 8 GiB target and gives **tg 18.7 tok/s**. **R6 is
 partial:** the paged attention kernel now runs 8 warps (`attn` 4.7 -> 4.37); the
-other R6 items have hard blockers (see `optimization.md`). Remaining levers: the
-PCIe copy (miss-bound) and the spread compute (GDN/attn/shared/LRU), plus
-batching (R5). Instruments: `FT_PROFILE=1` and `scripts/freetoken_probe/`.
-Progress history and the full decision log (numbers 1..88) live in `DONE.md`;
+other R6 items have hard blockers (see `optimization.md`). **R5 landed
+(decision 92):** one dispatcher worker batches queued requests into a single
+`run_batch`; K=4 aggregate decode **16.6 -> 26.2 tok/s (1.58x)**. Remaining
+levers: the PCIe copy (miss-bound) and the spread compute (GDN/attn/shared/LRU);
+the R6 slices. Instruments: `FT_PROFILE=1` and `scripts/freetoken_probe/`.
+Progress history and the full decision log (numbers 1..92) live in `DONE.md`;
 read that for the "why" behind any decision number referenced in code or tests.
 
 Goal: a **minimal, fast, single-GPU** Rust serving engine for **one model** --
@@ -334,11 +336,17 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 
 ## 7. Decisions
 
-The full log of confirmed decisions (numbers 1..91, stable -- code, tests and
+The full log of confirmed decisions (numbers 1..92, stable -- code, tests and
 `ARCHITECTURE.md` reference them by number) lives in `DONE.md`. This section
 lists only the decisions that still bind open work; everything else there is
 history.
 
+- **92** -- all serving forwards run on one `application::dispatcher::Dispatcher`
+  worker (decision 92), which batches whatever is queued up to
+  `model.max_running_requests`. New server work must submit a `Job` rather than
+  call `generation::generate` from a handler: the one CUDA stream, MoE slot cache
+  and prefix tree are single-instance. A request carries its own `seed` for
+  reproducibility. This binds the HTTP layer and `Engine`'s batched path.
 - **90** -- `[moe] cache_size_slots` is an integer or `"auto"`, **default auto**
   (decision 90). `registry::resolve_cache_slots` sizes the expert cache from the
   free device memory after the tower and KV pool are resident, minus a 1 GiB
@@ -599,12 +607,13 @@ performance work.
     snapshot per running request, plus a slot of progress headroom. Sizing at
     exactly `max_running_requests` panicked on the first prompt-end snapshot
     (`one_token_through_the_kernel_matches_the_oracle` was red); it now passes.
-11. Server-side batching -- **OPEN (new, from the decode profile).** The server
-    runs one `run_batch` per request (batch size always 1), so the GPU is latched
-    at low occupancy and `max_running_requests` is dead in the serving path. Add a
-    central dispatcher that admits concurrent requests into one `generate_batch`
-    so decode batches, then re-measure. This is the main utilization lever before
-    any kernel rewrite.
+11. Server-side batching -- **DONE (2026-10-17), decision 92.** A single
+    `application::dispatcher::Dispatcher` worker owns every forward: handlers
+    tokenize and submit jobs, the worker coalesces the queue into one
+    `run_batch` (per-uid sinks for streams, per-request seeds for
+    reproducibility). It also fixes a latent race -- two handlers previously
+    drove the one CUDA stream/prefix tree at once. K=4 aggregate decode
+    **16.6 -> 26.2 tok/s (1.58x)**; the per-request path is unchanged.
 12. VRAM budget planner -- **DONE (2026-10-17), decision 90 (R4).**
     `[moe] cache_size_slots` accepts an integer or `"auto"` (default `Auto`).
     `registry::resolve_cache_slots` reads free device memory after the tower and
@@ -712,10 +721,10 @@ next steps:
    ~1900 slots on the 8 GiB target, captured tg **16.7 -> 18.7 tok/s**.
 4. **Slice 4 (item 20) -- prefill chunk kernels** (`chunk_gated_delta_rule`,
    `causal_conv1d_varlen`). This is the **pp** lever, not tg.
-5. **R5 / item 11 -- server-side batching.** The largest *serving* lever once
-   the per-step cost is sane: at bs>1 the per-token weight read amortizes and
-   `max_running_requests` engages. It pairs with the per-batch-size decode graphs
-   already built.
+5. **R5 / item 11 -- DONE (decision 92).** A single dispatcher worker batches
+   queued requests into one `run_batch` (and one captured decode step); K=4
+   aggregate decode **16.6 -> 26.2 tok/s (1.58x)**. It also serializes all model
+   work, closing a latent concurrent-forward race.
 6. **R6 -- PARTIAL (decision 90).** Paged attention now runs 8 warps (`attn`
    4.7 -> 4.37). The rest is blocked: `moe_lru` top-k needs `tl.topk` (the
    interpreter gate cannot run it); GDN/attn projections need the W8A8

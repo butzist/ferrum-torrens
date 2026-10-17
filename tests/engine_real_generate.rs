@@ -71,9 +71,9 @@ fn one_token_prediction_matches_the_oracle() {
     let ids = engine.encode(PROMPT).unwrap();
     eprintln!("prompt {PROMPT:?} -> {} tokens", ids.len());
 
-    let request = make_request(&engine, 1, ids, greedy(1)).unwrap();
+    let request = make_request(&engine, 1, ids, greedy(1), 0).unwrap();
     let start = Instant::now();
-    let g = generation::generate(&engine, request, 0).unwrap();
+    let g = generation::generate(&engine, request).unwrap();
     eprintln!("1 token in {:.1}s", start.elapsed().as_secs_f64());
     eprintln!("generated ids {:?}", g.tokens);
     eprintln!("text {:?}", g.text);
@@ -112,8 +112,8 @@ fn a_chat_request_answers_from_the_rendered_template() {
         "the template must render the transformers prompt, got {prompt:?}"
     );
 
-    let request = make_request(&engine, 1, ids, greedy(1)).unwrap();
-    let g = generation::generate(&engine, request, 0).unwrap();
+    let request = make_request(&engine, 1, ids, greedy(1), 0).unwrap();
+    let g = generation::generate(&engine, request).unwrap();
     assert_eq!(
         g.tokens[0], CHAT_PIN_FIRST_TOKEN,
         "the templated conversation must answer the pinned token, got {:?}",
@@ -154,9 +154,9 @@ fn one_token_through_the_kernel_matches_the_oracle() {
     );
     assert_eq!(engine.expert_steps(), 0, "nothing has run yet");
 
-    let request = make_request(&engine, 1, ids, greedy(1)).unwrap();
+    let request = make_request(&engine, 1, ids, greedy(1), 0).unwrap();
     let start = Instant::now();
-    let g = generation::generate(&engine, request, 0).unwrap();
+    let g = generation::generate(&engine, request).unwrap();
     eprintln!("1 token in {:.1}s", start.elapsed().as_secs_f64());
     eprintln!("text {:?}", g.text);
 
@@ -199,9 +199,9 @@ fn a_captured_engine_decodes_on_its_graphs() {
     );
 
     let ids = engine.encode(PROMPT).unwrap();
-    let request = make_request(&engine, 1, ids, greedy(1)).unwrap();
+    let request = make_request(&engine, 1, ids, greedy(1), 0).unwrap();
     let start = Instant::now();
-    let g = generation::generate(&engine, request, 0).unwrap();
+    let g = generation::generate(&engine, request).unwrap();
     eprintln!("1 token in {:.1}s", start.elapsed().as_secs_f64());
     assert_eq!(g.tokens.len(), 1);
     assert_eq!(

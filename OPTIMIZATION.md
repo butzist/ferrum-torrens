@@ -551,15 +551,16 @@ Ours: 94-98 ms (tg 10.6-10.8) at 512. Every number below is the stage profile
 
 ### Status (applied 2026-10-17)
 
-R1, R2 and R4 landed; R3 is **withdrawn** (its premise was wrong, see below);
-R6 is partial (one win, the rest blocked). Measured on the RTX 5060 Laptop,
-bs=1, bf16 KV, graph-captured smoke:
+R1, R2, R4 and R5 landed; R3 is **withdrawn** (its premise was wrong, see
+below); R6 is partial (one win, the rest blocked). Measured on the RTX 5060
+Laptop, bs=1, bf16 KV, graph-captured smoke:
 
 | | before | after R1+R2 | after R4+R6 |
 |---|---|---|---|
 | tg @512 slots | 10.6 tok/s | 16.7 | **16.8** |
 | tg @1536 slots | 11.5 tok/s | 18.1 | **18.3** |
 | tg @auto (~1900) | -- | -- | **18.7** |
+| aggregate @K=4 (R5) | -- | -- | **26.2** |
 | `moe_gemm` (uncaptured) | 29.0 ms | 4.2 | 4.2 |
 | `head` (uncaptured) | 12.6 ms | 1.06 | 1.03 |
 | `attn` (uncaptured) | 4.4 ms | -- | **4.37** |
@@ -644,12 +645,17 @@ captured tg to 18.7 tok/s. On a broad routing distribution it buys little (the
 miss rate stays 74-84% even at 2048); on skewed/agentic routing it is the lever
 FreeToken relies on.
 
-### R5 -- Server-side batching (item 11)
+### R5 -- Server-side batching (item 11) -- DONE
 
-The per-token weight read amortizes at bs>1 and `max_running_requests` engages
-the per-batch-size graphs already built. This is the serving-throughput
-multiplier on top of parity; measure bs={1,2,4} before investing further in
-single-stream kernels.
+A single `application::dispatcher::Dispatcher` worker owns every forward:
+handlers tokenize and submit jobs, the worker coalesces the queue (2 ms window,
+up to `max_running_requests`) into one `run_batch`, and answers each job over its
+oneshot. Requests carry their own seed (per-request RNG) and streams route
+per-token callbacks by uid, so a batch can mix streaming and non-streaming
+without coupling tokens. This also serializes all model work, closing a latent
+race where two handlers drove the one CUDA stream / MoE slot cache / prefix tree
+at once. Measured (RTX 5060, captured, K=4): serial 16.6 -> batched **26.2 tok/s
+(1.58x)**, `tests/dispatcher_batching.rs`.
 
 ### R6 -- Secondary polish (optional, post-parity) -- PARTIAL
 

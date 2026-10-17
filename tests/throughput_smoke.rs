@@ -262,14 +262,14 @@ struct Timing {
 
 fn time_request(engine: &Engine, ids: Vec<u32>, max_tokens: u32) -> Timing {
     let prompt_tokens = ids.len();
-    let request = make_request(engine, 1, ids, greedy(max_tokens)).unwrap();
+    let request = make_request(engine, 1, ids, greedy(max_tokens), 0).unwrap();
     let mut stamps: Vec<std::time::Duration> = Vec::with_capacity(max_tokens as usize);
     let start = Instant::now();
     let mut sink = |_t: &str, _id: u32, _i: usize| -> Result<bool, EngineError> {
         stamps.push(start.elapsed());
         Ok(true)
     };
-    let g = generation::generate_streaming(engine, request, 0, &mut sink).unwrap();
+    let g = generation::generate_streaming(engine, request, &mut sink).unwrap();
     assert_eq!(
         g.finish_reason,
         FinishReason::Length,

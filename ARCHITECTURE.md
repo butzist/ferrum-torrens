@@ -140,7 +140,7 @@ stays pure: `Tensor` and CUDA handles never cross it (section 4).
 
 | Block | Runs on | Where |
 |---|---|---|
-| HTTP + SSE, scheduling, stop rules, streaming | Host | `infrastructure/http.rs`, `domain/scheduler.rs`, `application/generation.rs` |
+| HTTP + SSE, batching dispatcher, scheduling, stop rules, streaming | Host | `infrastructure/http.rs`, `application/dispatcher.rs`, `domain/scheduler.rs`, `application/generation.rs` |
 | Tokenize / detokenize, chat template | Host | `infrastructure/tokenizers_hf.rs`, via `Engine::encode/decode` |
 | Sampling (temperature/top-k/top-p/penalties) | Host | `domain/sampling.rs`, over f32 logits copied D2H |
 | Generation loop + KV page-table bookkeeping (`SequenceCache`) | Host | `domain/kvcache.rs`, `application/engine.rs` |
@@ -622,33 +622,45 @@ EOS/stop-string over max-tokens.
 
 **Static.** `infrastructure/http.rs` (axum) exposes `/v1/completions`,
 `/v1/chat/completions`, `/v1/models`, `/health`; `application/generation.rs`
-owns the loop; `tokenizers_hf.rs` encodes/decodes and renders the chat template.
+owns the loop; `application/dispatcher.rs` owns the single model worker;
+`tokenizers_hf.rs` encodes/decodes and renders the chat template.
 
-**Dynamic -- a streaming request.**
+**Dynamic -- a streaming request.** Handlers never call the model directly: they
+tokenize, submit a `Job` to the `Dispatcher`, and await its reply. The dispatcher
+worker coalesces the queued jobs into one `run_batch` (one captured decode step
+for every live row), which is both the batching lever (item 11) and what keeps
+the single CUDA stream / MoE slot cache / prefix tree free of concurrent
+access.
 
 ```mermaid
 sequenceDiagram
   participant C as client
   participant H as http handler
   participant T as HfTokenizer
+  participant D as Dispatcher worker
   participant G as generation::run_batch
   participant E as Engine
-  participant Sink as SSE TokenSink
+  participant Sink as SSE sink (per uid)
   C->>H: POST /v1/{chat,}completions (stream)
   H->>T: encode prompt (or render chat template then encode)
-  H->>G: spawn_blocking(run_batch)
+  H->>D: submit Job{request, sink, reply}
+  D->>G: drain queue (<= max_running) -> run_batch
   loop until stop
     G->>E: prefill: run_prefill_cached (non-final chunk) / run_forward_cached (final) / decode: replay captured graphs (or run_forward_cached)
-    E-->>G: sampled token (final prefill chunk and decode only)
+    E-->>G: sampled token per live row (final prefill chunk and decode only)
     G->>T: decode token
-    G->>Sink: token(piece) -> SSE frame
+    G->>Sink: token(uid, piece) -> SSE frame
   end
-  G-->>H: Generation (finish_reason)
+  G-->>D: Vec<Generation>
+  D-->>H: reply (per Job)
   H-->>C: final frame + usage, then [DONE]
 ```
 
-The whole forward runs inside `tokio::task::spawn_blocking`, so the async
-runtime is never blocked by GPU work. A client hang-up aborts the run.
+The dispatcher worker is a dedicated OS thread (the forward is blocking
+GPU/CPU work, never on the tokio runtime). A stream's frames ride a bounded
+channel and a per-request sink returns `false` when it is full, which aborts
+only that request instead of stalling the batch. `Request` carries its own seed,
+so co-batching never changes a lone request's tokens.
 
 ### 3.9 CUDA-graph decode capture `[core]`
 

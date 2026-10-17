@@ -20,8 +20,9 @@ use futures_core::Stream;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
+use crate::application::dispatcher::{Dispatcher, Job};
 use crate::application::engine::{Engine, EngineError};
-use crate::application::generation::{self, make_request};
+use crate::application::generation::{self, Request, make_request};
 use crate::domain::ChatMessage;
 use crate::domain::sampling::SamplingParams;
 use crate::domain::scheduler::FinishReason;
@@ -42,14 +43,19 @@ pub struct AppState {
     pub engine: Arc<Engine>,
     pub served_model_name: String,
     next_uid: AtomicU64,
+    /// The single worker every forward runs on; handlers submit jobs and await
+    /// their replies. See `application::dispatcher` (TODO.md item 11).
+    dispatcher: Dispatcher,
 }
 
 impl AppState {
     pub fn new(engine: Arc<Engine>, served_model_name: String) -> Self {
+        let dispatcher = Dispatcher::new(Arc::clone(&engine));
         Self {
             engine,
             served_model_name,
             next_uid: AtomicU64::new(1),
+            dispatcher,
         }
     }
 
@@ -449,38 +455,28 @@ async fn completions(
     let engine = Arc::clone(&state.engine);
     let params = req.sampling_params();
     let seed = req.seed.unwrap_or(uid);
+    let stream = req.stream.unwrap_or(false);
     let prompt = req.prompt;
 
-    if req.stream.unwrap_or(false) {
+    // Tokenize off the runtime, then hand the request to the dispatcher, which
+    // owns the single model worker and batches whatever is queued behind it.
+    let ids = {
         let tokenizer = Arc::clone(&engine);
-        let encoded = tokio::task::spawn_blocking(move || tokenizer.encode(&prompt))
+        match tokio::task::spawn_blocking(move || tokenizer.encode(&prompt))
             .await
-            .expect("encoding task is not cancellable");
-        let ids = match encoded {
+            .expect("encoding task is not cancellable")
+        {
             Ok(ids) => ids,
             Err(e) => return Err(ApiError::from(e)),
-        };
-        let request = make_request(&engine, uid, ids, params)?;
-        return Ok(stream_body(&state, &engine, request, seed, Wire::Text));
-    }
-
-    // The forward pass is CPU-bound and long-running; never on the runtime.
-    let outcome = tokio::task::spawn_blocking(move || {
-        let ids = engine.encode(&prompt)?;
-        let request = make_request(&engine, uid, ids, params)?;
-        generation::generate(&engine, request, seed)
-    })
-    .await;
-
-    let generated = match outcome {
-        Ok(Ok(g)) => g,
-        Ok(Err(e)) => return Err(e.into()),
-        Err(join) => {
-            return Err(ApiError::unprocessable(format!(
-                "generation task failed: {join}"
-            )));
         }
     };
+    let request = make_request(&engine, uid, ids, params, seed)?;
+
+    if stream {
+        return Ok(stream_body(&state, request, Wire::Text));
+    }
+
+    let generated = dispatch(&state, request, None).await?;
     let usage = usage_of(&generated);
     Ok(Json(CompletionResponse {
         id: format!("cmpl-{}", generated.uid),
@@ -496,6 +492,35 @@ async fn completions(
         usage: Some(usage),
     })
     .into_response())
+}
+
+/// Submit one request to the engine worker and await its `Generation`. The
+/// worker batches whatever it queued behind it (TODO.md item 11); a per-token
+/// `sink` rides along when the caller wants a stream.
+async fn dispatch(
+    state: &Arc<AppState>,
+    request: Request,
+    sink: Option<crate::application::dispatcher::Sink>,
+) -> Result<generation::Generation, ApiError> {
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    if state
+        .dispatcher
+        .submit(Job {
+            request,
+            sink,
+            reply,
+        })
+        .is_err()
+    {
+        return Err(ApiError::unprocessable("the engine worker is not running"));
+    }
+    match rx.await {
+        Ok(Ok(g)) => Ok(g),
+        Ok(Err(msg)) => Err(ApiError::unprocessable(format!("generation failed: {msg}"))),
+        Err(_) => Err(ApiError::unprocessable(
+            "the engine worker dropped the request",
+        )),
+    }
 }
 
 fn usage_of(g: &generation::Generation) -> Usage {
@@ -543,106 +568,80 @@ impl Wire {
 /// through a bounded channel: a slow client holds the run back instead of
 /// buffering it, and a client that hangs up closes the channel, which stops the
 /// run.
-fn stream_body(
-    state: &Arc<AppState>,
-    engine: &Arc<Engine>,
-    request: generation::Request,
-    seed: u64,
+/// Builds the SSE frames a stream sends. Owns its ids so the per-token sink can
+/// be a `'static + Send` closure the engine worker calls.
+#[derive(Clone)]
+struct Frames {
     wire: Wire,
-) -> Response {
-    let (tx, rx) = mpsc::channel::<String>(8);
-    let id = wire.id(request.uid);
-    let created = unix_now();
-    let model = state.served_model_name.clone();
-    let engine = Arc::clone(engine);
-    let sink_tx = tx.clone();
-    tokio::task::spawn_blocking(move || {
-        let send = |frame: String| sink_tx.blocking_send(frame).is_ok();
-        let push = |text: &str, finish: Option<&'static str>, usage: Option<Usage>| {
-            let payload = match wire {
-                Wire::Text => serde_json::to_string(&CompletionResponse {
-                    id: id.clone(),
-                    object: "text_completion",
-                    created,
-                    model: model.clone(),
-                    choices: vec![CompletionChoice {
-                        text: text.to_string(),
-                        index: 0,
-                        logprobs: None,
-                        finish_reason: finish,
-                    }],
-                    usage,
-                }),
-                Wire::Chat => serde_json::to_string(&ChatChunk {
-                    id: id.clone(),
-                    object: "chat.completion.chunk",
-                    created,
-                    model: model.clone(),
-                    choices: vec![ChatChunkChoice {
-                        index: 0,
-                        delta: ChatDelta {
-                            role: (finish.is_none() && text.is_empty()).then_some("assistant"),
-                            content: text.to_string(),
-                        },
-                        finish_reason: finish,
-                    }],
-                    usage,
-                }),
-            };
-            send(sse_data(&payload.expect("chunk serializes")))
+    id: String,
+    created: u64,
+    model: String,
+}
+
+impl Frames {
+    fn chunk(&self, text: &str, finish: Option<&'static str>, usage: Option<Usage>) -> String {
+        let payload = match self.wire {
+            Wire::Text => serde_json::to_string(&CompletionResponse {
+                id: self.id.clone(),
+                object: "text_completion",
+                created: self.created,
+                model: self.model.clone(),
+                choices: vec![CompletionChoice {
+                    text: text.to_string(),
+                    index: 0,
+                    logprobs: None,
+                    finish_reason: finish,
+                }],
+                usage,
+            }),
+            Wire::Chat => serde_json::to_string(&ChatChunk {
+                id: self.id.clone(),
+                object: "chat.completion.chunk",
+                created: self.created,
+                model: self.model.clone(),
+                choices: vec![ChatChunkChoice {
+                    index: 0,
+                    delta: ChatDelta {
+                        role: (finish.is_none() && text.is_empty()).then_some("assistant"),
+                        content: text.to_string(),
+                    },
+                    finish_reason: finish,
+                }],
+                usage,
+            }),
         };
+        sse_data(&payload.expect("chunk serializes"))
+    }
 
-        if let Wire::Chat = wire {
-            // The opening frame names the role before any content arrives.
-            send(sse_data(
-                &serde_json::to_string(&ChatChunk {
-                    id: id.clone(),
-                    object: "chat.completion.chunk",
-                    created,
-                    model: model.clone(),
-                    choices: vec![ChatChunkChoice {
-                        index: 0,
-                        delta: ChatDelta {
-                            role: Some("assistant"),
-                            content: String::new(),
-                        },
-                        finish_reason: None,
-                    }],
-                    usage: None,
-                })
-                .expect("chunk serializes"),
-            ));
-        }
+    /// The opening chat frame: names the role before any content arrives.
+    fn role(&self) -> String {
+        let payload = serde_json::to_string(&ChatChunk {
+            id: self.id.clone(),
+            object: "chat.completion.chunk",
+            created: self.created,
+            model: self.model.clone(),
+            choices: vec![ChatChunkChoice {
+                index: 0,
+                delta: ChatDelta {
+                    role: Some("assistant"),
+                    content: String::new(),
+                },
+                finish_reason: None,
+            }],
+            usage: None,
+        });
+        sse_data(&payload.expect("chunk serializes"))
+    }
 
-        match generation::generate_streaming(
-            &engine,
-            request,
-            seed,
-            &mut |text: &str, _id: u32, _index: usize| {
-                Ok::<bool, EngineError>(push(text, None, None))
-            },
-        ) {
-            Ok(g) => {
-                if g.finish_reason != FinishReason::Abort {
-                    let usage = usage_of(&g);
-                    let reason = finish_reason_str(g.finish_reason);
-                    push("", Some(reason), Some(usage));
-                    send(sse_data("[DONE]"));
-                }
-            }
-            Err(e) => {
-                let _ = send(sse_data(
-                    &serde_json::to_string(&serde_json::json!({
-                        "error": { "message": e.to_string(), "type": "engine_error" }
-                    }))
-                    .expect("error frame serializes"),
-                ));
-                send(sse_data("[DONE]"));
-            }
-        }
-        drop(tx);
-    });
+    fn error(&self, message: &str) -> String {
+        let payload = serde_json::json!({
+            "error": { "message": message, "type": "engine_error" }
+        });
+        sse_data(&payload.to_string())
+    }
+}
 
+fn sse_response(rx: mpsc::Receiver<String>) -> Response {
     let body = Body::from_stream(SseBody { rx });
     Response::builder()
         .status(StatusCode::OK)
@@ -650,6 +649,79 @@ fn stream_body(
         .header(header::CACHE_CONTROL, "no-cache")
         .body(body)
         .expect("a static response builder succeeds")
+}
+
+/// `stream: true`: one `data: {...}` frame per token as it is sampled, a frame
+/// carrying the finish reason plus the usage, then `data: [DONE]`.
+///
+/// The prompt is tokenized and clamped before the stream starts, so a bad
+/// request is still an ordinary JSON error with its status code. Everything
+/// after that has already sent headers, so a failure mid-run rides on the stream
+/// as an `error` frame. The tokens come back through the dispatcher's per-request
+/// sink: frames go over a bounded channel, so a slow client drops its own stream
+/// (a full buffer aborts the sink) instead of stalling the batch it rides in.
+fn stream_body(state: &Arc<AppState>, request: generation::Request, wire: Wire) -> Response {
+    let (tx, rx) = mpsc::channel::<String>(32);
+    let frames = Frames {
+        wire,
+        id: wire.id(request.uid),
+        created: unix_now(),
+        model: state.served_model_name.clone(),
+    };
+    if let Wire::Chat = wire {
+        let _ = tx.try_send(frames.role());
+    }
+
+    let sink_tx = tx.clone();
+    let sink_frames = frames.clone();
+    let sink: crate::application::dispatcher::Sink = Box::new(move |_uid, text, _id, _index| {
+        sink_tx
+            .try_send(sink_frames.chunk(text, None, None))
+            .is_ok()
+    });
+
+    let (reply, rx_reply) = tokio::sync::oneshot::channel();
+    if state
+        .dispatcher
+        .submit(Job {
+            request,
+            sink: Some(sink),
+            reply,
+        })
+        .is_err()
+    {
+        let _ = tx.try_send(frames.error("the engine worker is not running"));
+        let _ = tx.try_send(sse_data("[DONE]"));
+        drop(tx);
+        return sse_response(rx);
+    }
+
+    let final_tx = tx.clone();
+    let final_frames = frames.clone();
+    tokio::spawn(async move {
+        match rx_reply.await {
+            Ok(Ok(g)) => {
+                if g.finish_reason != FinishReason::Abort {
+                    let usage = usage_of(&g);
+                    let reason = finish_reason_str(g.finish_reason);
+                    let _ = final_tx.try_send(final_frames.chunk("", Some(reason), Some(usage)));
+                    let _ = final_tx.try_send(sse_data("[DONE]"));
+                }
+            }
+            Ok(Err(msg)) => {
+                let _ = final_tx.try_send(final_frames.error(&msg));
+                let _ = final_tx.try_send(sse_data("[DONE]"));
+            }
+            Err(_) => {
+                let _ =
+                    final_tx.try_send(final_frames.error("the engine worker dropped the request"));
+                let _ = final_tx.try_send(sse_data("[DONE]"));
+            }
+        }
+        drop(final_tx);
+    });
+    drop(tx);
+    sse_response(rx)
 }
 
 async fn chat_completions(
@@ -690,7 +762,7 @@ async fn chat_completions(
         tokio::task::spawn_blocking(move || -> Result<generation::Request, EngineError> {
             let prompt = worker.render_chat(&messages)?;
             let ids = worker.encode(&prompt)?;
-            make_request(&worker, uid, ids, params)
+            make_request(&worker, uid, ids, params, seed)
         })
         .await
         .expect("preparation task is not cancellable");
@@ -700,20 +772,10 @@ async fn chat_completions(
     };
 
     if streaming {
-        return Ok(stream_body(&state, &engine, request, seed, Wire::Chat));
+        return Ok(stream_body(&state, request, Wire::Chat));
     }
 
-    let outcome =
-        tokio::task::spawn_blocking(move || generation::generate(&engine, request, seed)).await;
-    let generated = match outcome {
-        Ok(Ok(g)) => g,
-        Ok(Err(e)) => return Err(ApiError::from(e)),
-        Err(join) => {
-            return Err(ApiError::unprocessable(format!(
-                "generation task failed: {join}"
-            )));
-        }
-    };
+    let generated = dispatch(&state, request, None).await?;
     let usage = usage_of(&generated);
     Ok(Json(ChatCompletionResponse {
         id: format!("chatcmpl-{}", generated.uid),

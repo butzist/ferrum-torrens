@@ -2330,6 +2330,25 @@ settled.
     before but bootstraps fine). The prefix-reuse gate
     (`extending_a_committed_prompt_adopts_and_matches_a_cold_refeed`) stays green.
 
+92. **Server-side batching** (2026-10-17, implemented) -- TODO.md item 11,
+    `optimization.md` R5. The engine already batched (`generate_batch` and one
+    captured decode step for every live row), but the HTTP handlers called
+    `generate` once per request, so decode was batch 1 and, worse, two concurrent
+    handlers drove the single CUDA stream, MoE slot cache and prefix tree at
+    once. `application::dispatcher::Dispatcher` owns one worker thread that
+    drains queued jobs, waits a 2 ms window so a burst coalesces (up to
+    `max_running_requests`), runs them as one `run_batch`, and answers each over
+    its own oneshot. `ApplicationState` holds the dispatcher; both completion
+    handlers and `stream_body` submit jobs. Supporting changes: `Request` carries
+    its own `seed` and each `Session` its own `Rng`, so co-batching never changes
+    a request's tokens (the old single batch RNG coupled them); a new `SinkSet`
+    routes per-token stream callbacks by uid, so a batch can mix streaming and
+    non-streaming; stream frames ride a bounded channel and a full buffer aborts
+    only that request instead of stalling the batch. Measured (RTX 5060, captured,
+    bs=1 id, K=4): serial 16.6 -> batched **26.2 tok/s (1.58x)**;
+    `tests/dispatcher_batching.rs` is the gate. The per-request path is
+    byte-identical for a lone request (same seed derivation).
+
 ---
 
 ## Progress log (narrative, pre-2026-10-15 compaction)

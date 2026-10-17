@@ -40,15 +40,17 @@ pub struct Generation {
 }
 
 /// A request as handed to the engine: ids already tokenized, params not yet
-/// clamped.
+/// clamped, and the sampler seed (each request carries its own, so batching a
+/// request with others never changes the tokens it draws).
 pub struct Request {
     pub uid: u64,
     pub prompt_ids: Vec<u32>,
     pub params: SamplingParams,
+    pub seed: u64,
 }
 
 /// Engine-side per-request state the domain `Req` cannot hold (it stays pure):
-/// the full id sequence and the tokens generated so far.
+/// the full id sequence, the tokens generated so far, and this request's sampler.
 struct Session {
     req: Req,
     ids: Vec<u32>,
@@ -56,6 +58,7 @@ struct Session {
     /// This request's page table, opened on its first step. `None` until then,
     /// and for a model with no cache at all.
     cache: Option<SequenceCache>,
+    rng: Rng,
 }
 
 /// Build a request, clamping `max_tokens` by the engine's output limit and by
@@ -65,6 +68,7 @@ pub fn make_request(
     uid: u64,
     prompt_ids: Vec<u32>,
     params: SamplingParams,
+    seed: u64,
 ) -> Result<Request, EngineError> {
     let limits = engine.limits();
     if prompt_ids.is_empty() {
@@ -86,6 +90,7 @@ pub fn make_request(
         uid,
         prompt_ids,
         params,
+        seed,
     })
 }
 
@@ -110,9 +115,26 @@ where
     }
 }
 
+/// A per-request sink set for a batched run: `run_batch` looks up a scheduled
+/// row's `uid` and calls its sink, so one batch can stream several requests at
+/// once. A non-streaming batch passes `None`.
+pub trait SinkSet {
+    fn token(&mut self, uid: u64, text: &str, id: u32, index: usize) -> Result<bool, EngineError>;
+}
+
+/// Adapt a single-request `TokenSink` (which only ever sees its own uid) to a
+/// `SinkSet`, so `generate_streaming` shares the batched loop.
+struct OneSink<'a>(&'a mut dyn TokenSink);
+
+impl SinkSet for OneSink<'_> {
+    fn token(&mut self, _uid: u64, text: &str, id: u32, index: usize) -> Result<bool, EngineError> {
+        self.0.token(text, id, index)
+    }
+}
+
 /// Run one request to completion.
-pub fn generate(engine: &Engine, request: Request, seed: u64) -> Result<Generation, EngineError> {
-    let mut out = generate_batch(engine, vec![request], seed)?;
+pub fn generate(engine: &Engine, request: Request) -> Result<Generation, EngineError> {
+    let mut out = run_batch(engine, vec![request], None)?;
     out.pop().ok_or(EngineError::EmptyPrompt)
 }
 
@@ -121,22 +143,31 @@ pub fn generate(engine: &Engine, request: Request, seed: u64) -> Result<Generati
 pub fn generate_streaming(
     engine: &Engine,
     request: Request,
-    seed: u64,
     sink: &mut dyn TokenSink,
 ) -> Result<Generation, EngineError> {
-    let mut out = run_batch(engine, vec![request], seed, Some(sink))?;
+    let mut set = OneSink(sink);
+    let mut out = run_batch(engine, vec![request], Some(&mut set))?;
     out.pop().ok_or(EngineError::EmptyPrompt)
 }
 
 /// Run several requests through the scheduler until all of them finish. The
-/// server is the caller that decides to submit more than one at a time; M1 keeps
-/// the whole batch in one call.
+/// server's dispatcher is the caller that admits more than one at a time; each
+/// request carries its own seed, so co-batching does not couple their tokens.
 pub fn generate_batch(
     engine: &Engine,
     requests: Vec<Request>,
-    seed: u64,
 ) -> Result<Vec<Generation>, EngineError> {
-    run_batch(engine, requests, seed, None)
+    run_batch(engine, requests, None)
+}
+
+/// `generate_batch` with a per-uid `SinkSet`, so a batch can mix streaming and
+/// non-streaming requests. The dispatcher is the caller.
+pub fn generate_batch_with_sinks(
+    engine: &Engine,
+    requests: Vec<Request>,
+    sinks: Option<&mut dyn SinkSet>,
+) -> Result<Vec<Generation>, EngineError> {
+    run_batch(engine, requests, sinks)
 }
 
 /// Open a session's cache and, if a hybrid prefix tree has a resumable match,
@@ -157,26 +188,35 @@ fn open_cache(kv: &Arc<dyn KvCache>, ids: &[u32]) -> SequenceCache {
 fn run_batch(
     engine: &Engine,
     requests: Vec<Request>,
-    seed: u64,
-    mut sink: Option<&mut dyn TokenSink>,
+    mut sinks: Option<&mut dyn SinkSet>,
 ) -> Result<Vec<Generation>, EngineError> {
     let limits = engine.limits();
     let budget = Budget {
         max_prefill_tokens: limits.max_prefill_length,
         max_running_requests: limits.max_running_requests,
     };
-    let mut rng = Rng::new(seed);
+    // The scalar (no-cache) run samples a whole batch off one sampler; the cached
+    // runs sample per request, so each request's tokens are independent of what
+    // it was batched with.
+    let mut batch_rng = Rng::new(requests.first().map(|r| r.seed).unwrap_or(0));
     let mut sessions: HashMap<u64, Session> = HashMap::new();
     let mut pending: Vec<Req> = Vec::new();
     for r in requests {
-        let req = Req::new(r.uid, r.prompt_ids.len(), r.params);
+        let Request {
+            uid,
+            prompt_ids,
+            params,
+            seed,
+        } = r;
+        let req = Req::new(uid, prompt_ids.len(), params);
         sessions.insert(
-            r.uid,
+            uid,
             Session {
                 req: req.clone(),
-                ids: r.prompt_ids,
+                ids: prompt_ids,
                 generated: Vec::new(),
                 cache: None,
+                rng: Rng::new(seed),
             },
         );
         pending.push(req);
@@ -203,7 +243,7 @@ fn run_batch(
                 // The engine owns a captured decode service, so a whole decode
                 // step replays on one graph instead of one cached forward per
                 // request. Prefill stays on the per-request path (see below).
-                captured_decode_step(engine, &kv, &mut sessions, &batch.reqs, &mut rng)?
+                captured_decode_step(engine, &kv, &mut sessions, &batch.reqs)?
             } else {
                 let mut out = Vec::with_capacity(batch.reqs.len());
                 for scheduled in &batch.reqs {
@@ -216,6 +256,7 @@ fn run_batch(
                         generated: _,
                         cache: slot,
                         req,
+                        rng,
                     } = s;
                     if slot.is_none() {
                         let opened = open_cache(&kv, ids);
@@ -251,7 +292,7 @@ fn run_batch(
                             cache,
                             params: &req.sampling,
                         },
-                        &mut rng,
+                        rng,
                     )?;
                     if phase == Phase::Prefill {
                         // The whole prompt is now cached: commit its prefix and a
@@ -276,7 +317,7 @@ fn run_batch(
                     }
                 })
                 .collect();
-            engine.run_forward(&rows, &mut rng)?
+            engine.run_forward(&rows, &mut batch_rng)?
         };
 
         for (uid, token) in sampled {
@@ -295,11 +336,11 @@ fn run_batch(
                 Some(reason) => s.req.finish(reason),
                 None => s.req.complete_one(),
             }
-            if let Some(sink) = sink.as_deref_mut() {
+            if let Some(set) = sinks.as_deref_mut() {
                 let piece = engine.decode(std::slice::from_ref(&token))?;
                 // The token that ends the run is still streamed; only the reason a
                 // sink stops it never overwrites a real one.
-                if !sink.token(&piece, token, s.generated.len() - 1)? && !s.req.finished() {
+                if !set.token(uid, &piece, token, s.generated.len() - 1)? && !s.req.finished() {
                     s.req.finish(FinishReason::Abort);
                 }
             }
@@ -345,7 +386,6 @@ fn captured_decode_step(
     kv: &Arc<dyn KvCache>,
     sessions: &mut HashMap<u64, Session>,
     reqs: &[Req],
-    rng: &mut Rng,
 ) -> Result<Vec<(u64, u32)>, EngineError> {
     let mut rows = Vec::with_capacity(reqs.len());
     let mut windows: Vec<Vec<u32>> = Vec::with_capacity(reqs.len());
@@ -390,7 +430,13 @@ fn captured_decode_step(
     Ok(reqs
         .iter()
         .enumerate()
-        .map(|(i, req)| (req.uid, sample(&logits[i], &req.sampling, rng)))
+        .map(|(i, req)| {
+            let s = sessions
+                .get_mut(&req.uid)
+                .expect("sampled row has a session");
+            let token = sample(&logits[i], &req.sampling, &mut s.rng);
+            (req.uid, token)
+        })
         .collect())
 }
 
@@ -421,7 +467,7 @@ mod tests {
 
     fn req(e: &Engine, uid: u64, prompt: &str, params: SamplingParams) -> Request {
         let ids = e.encode(prompt).unwrap();
-        make_request(e, uid, ids, params).unwrap()
+        make_request(e, uid, ids, params, 0).unwrap()
     }
 
     fn params(max_tokens: u32) -> SamplingParams {
@@ -434,7 +480,7 @@ mod tests {
     #[test]
     fn greedy_run_walks_the_fake_counter_and_stops_at_length() {
         let (e, rec) = test_engine(limits());
-        let g = generate(&e, req(&e, 1, "ab", params(3)), 0).unwrap();
+        let g = generate(&e, req(&e, 1, "ab", params(3))).unwrap();
         assert_eq!(g.finish_reason, FinishReason::Length);
         assert_eq!(g.prompt_tokens, 2);
         assert_eq!(g.tokens, vec![99, 100, 101], "argmax is last_id + 1");
@@ -449,7 +495,7 @@ mod tests {
     #[test]
     fn every_step_refeeds_the_whole_sequence_with_restarting_positions() {
         let (e, rec) = test_engine(limits());
-        generate(&e, req(&e, 1, "ab", params(2)), 0).unwrap();
+        generate(&e, req(&e, 1, "ab", params(2))).unwrap();
         let calls = rec.calls();
         assert_eq!(calls[0].input_ids, vec![97, 98], "prefill sees the prompt");
         assert_eq!(
@@ -464,7 +510,7 @@ mod tests {
     #[test]
     fn decode_feeds_only_the_new_token_when_the_model_has_a_cache() {
         let (e, rec, _cache) = test_cached_engine(limits());
-        let g = generate(&e, req(&e, 1, "ab", params(3)), 0).unwrap();
+        let g = generate(&e, req(&e, 1, "ab", params(3))).unwrap();
         assert_eq!(
             g.tokens,
             vec![99, 100, 101],
@@ -503,7 +549,7 @@ mod tests {
     fn a_captured_engine_decodes_batched_on_the_graphs() {
         let (e, rec, _cache, captured) = test_captured_engine(limits());
         let batch = vec![req(&e, 1, "ab", params(2)), req(&e, 2, "xyz", params(2))];
-        let out = generate_batch(&e, batch, 0).unwrap();
+        let out = generate_batch(&e, batch).unwrap();
         assert_eq!(out[0].tokens, vec![99, 100], "uid 1 walks the counter");
         assert_eq!(out[1].tokens, vec![123, 124], "uid 2 walks its own");
 
@@ -529,7 +575,6 @@ mod tests {
                 req(&captured, 1, "ab", params(3)),
                 req(&captured, 2, "xyz", params(3)),
             ],
-            0,
         )
         .unwrap();
         let b = generate_batch(
@@ -538,7 +583,6 @@ mod tests {
                 req(&plain, 1, "ab", params(3)),
                 req(&plain, 2, "xyz", params(3)),
             ],
-            0,
         )
         .unwrap();
         assert_eq!(a, b);
@@ -547,7 +591,7 @@ mod tests {
     #[test]
     fn a_captured_engine_without_a_service_still_uses_the_cached_path() {
         let (e, rec, _cache) = test_cached_engine(limits());
-        let g = generate(&e, req(&e, 1, "ab", params(2)), 0).unwrap();
+        let g = generate(&e, req(&e, 1, "ab", params(2))).unwrap();
         assert_eq!(g.tokens, vec![99, 100]);
         assert_eq!(rec.cached_calls().len(), 2, "prefill plus one decode");
     }
@@ -560,7 +604,7 @@ mod tests {
     fn the_engine_reports_the_kernel_steps_its_forward_ran() {
         let (e, _rec, _cache) = test_cached_engine(limits());
         assert_eq!(e.expert_steps(), 0, "no port has been reached yet");
-        let g = generate(&e, req(&e, 1, "ab", params(2)), 0).unwrap();
+        let g = generate(&e, req(&e, 1, "ab", params(2))).unwrap();
         assert_eq!(g.tokens.len(), 2);
         assert_eq!(e.expert_steps(), 2, "prefill plus one decode step");
     }
@@ -569,7 +613,7 @@ mod tests {
     fn a_finished_request_returns_its_cache_pages() {
         let (e, rec, cache) = test_cached_engine(limits());
         let pages = cache.pages_left();
-        let g = generate(&e, req(&e, 1, "abcd", params(2)), 0).unwrap();
+        let g = generate(&e, req(&e, 1, "abcd", params(2))).unwrap();
         assert_eq!(g.tokens.len(), 2);
         assert_eq!(rec.cached_calls().len(), 2, "prefill plus one decode step");
         assert_eq!(
@@ -583,7 +627,7 @@ mod tests {
     fn a_cached_batch_keeps_every_request_on_its_own_pages() {
         let (e, _rec, _cache) = test_cached_engine(limits());
         let batch = vec![req(&e, 1, "ab", params(2)), req(&e, 2, "xyz", params(2))];
-        let out = generate_batch(&e, batch, 0).unwrap();
+        let out = generate_batch(&e, batch).unwrap();
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].tokens, vec![99, 100], "uid 1 walks the counter");
         assert_eq!(out[1].tokens, vec![123, 124], "uid 2 walks its own counter");
@@ -592,7 +636,7 @@ mod tests {
     #[test]
     fn a_cached_run_commits_the_prompt_and_the_finish_to_the_tree() {
         let (e, _rec, cache) = test_cached_engine(limits());
-        generate(&e, req(&e, 1, "abcd", params(2)), 0).unwrap();
+        generate(&e, req(&e, 1, "abcd", params(2))).unwrap();
         assert_eq!(
             cache.adopts(),
             vec![3],
@@ -609,7 +653,7 @@ mod tests {
     fn every_request_in_a_cached_batch_opens_and_commits_its_own_prefix() {
         let (e, _rec, cache) = test_cached_engine(limits());
         let batch = vec![req(&e, 1, "ab", params(2)), req(&e, 2, "xyz", params(2))];
-        generate_batch(&e, batch, 0).unwrap();
+        generate_batch(&e, batch).unwrap();
         assert_eq!(
             cache.adopts(),
             vec![1, 2],
@@ -635,7 +679,7 @@ mod tests {
     #[test]
     fn a_long_prompt_is_fed_to_the_cache_in_budget_sized_chunks() {
         let (e, rec, cache) = test_cached_engine(chunk_limits());
-        let g = generate(&e, req(&e, 1, "abcdef", params(2)), 0).unwrap();
+        let g = generate(&e, req(&e, 1, "abcdef", params(2))).unwrap();
         let feeds: Vec<Vec<u32>> = rec
             .cached_calls()
             .into_iter()
@@ -671,8 +715,12 @@ mod tests {
         let (chunked, _rec2, _cache2) = test_cached_engine(chunk_limits());
         let mut p = params(6);
         p.temperature = 0.8;
-        let a = generate(&whole, req(&whole, 1, "abcdef", p.clone()), 7).unwrap();
-        let b = generate(&chunked, req(&chunked, 1, "abcdef", p), 7).unwrap();
+        let mut ra = req(&whole, 1, "abcdef", p.clone());
+        ra.seed = 7;
+        let a = generate(&whole, ra).unwrap();
+        let mut rb = req(&chunked, 1, "abcdef", p);
+        rb.seed = 7;
+        let b = generate(&chunked, rb).unwrap();
         assert_eq!(
             a.tokens, b.tokens,
             "splitting the prefill leaves the RNG stream untouched"
@@ -687,7 +735,7 @@ mod tests {
         let (e, _rec, _cache) = test_cached_engine(chunk_limits());
         let mut p = params(1);
         p.temperature = 1.0;
-        let g = generate(&e, req(&e, 1, "abcdef", p), 0).unwrap();
+        let g = generate(&e, req(&e, 1, "abcdef", p)).unwrap();
         assert_eq!(g.tokens.len(), 1, "only the final chunk is sampled");
     }
 
@@ -699,7 +747,7 @@ mod tests {
             seen.push(text.to_string());
             Ok(true)
         };
-        let g = generate_streaming(&e, req(&e, 1, "ab", params(3)), 0, &mut collect).unwrap();
+        let g = generate_streaming(&e, req(&e, 1, "ab", params(3)), &mut collect).unwrap();
         assert_eq!(seen, vec!["c", "d", "e"], "one piece per token");
         assert_eq!(g.tokens, vec![99, 100, 101], "same run as generate");
         assert_eq!(g.text, "cde");
@@ -714,7 +762,7 @@ mod tests {
             calls += 1;
             Ok(false)
         };
-        let g = generate_streaming(&e, req(&e, 1, "ab", params(4)), 0, &mut sink).unwrap();
+        let g = generate_streaming(&e, req(&e, 1, "ab", params(4)), &mut sink).unwrap();
         assert_eq!(calls, 1);
         assert_eq!(g.tokens, vec![99], "the token the sink saw is kept");
         assert_eq!(g.finish_reason, FinishReason::Abort);
@@ -730,7 +778,7 @@ mod tests {
             calls += 1;
             Ok(index == 0)
         };
-        let g = generate_streaming(&e, req(&e, 1, "abcd", params(5)), 0, &mut sink).unwrap();
+        let g = generate_streaming(&e, req(&e, 1, "abcd", params(5)), &mut sink).unwrap();
         assert_eq!(
             calls, 2,
             "prefill token streamed, then 1st decode token streamed before abort"
@@ -756,8 +804,8 @@ mod tests {
     #[test]
     fn eos_stops_generation() {
         let (e, _) = test_engine(limits());
-        let r = make_request(&e, 1, vec![299], params(5)).unwrap();
-        let g = generate(&e, r, 0).unwrap();
+        let r = make_request(&e, 1, vec![299], params(5), 0).unwrap();
+        let g = generate(&e, r).unwrap();
         assert_eq!(g.finish_reason, FinishReason::Stop);
         assert_eq!(g.tokens, vec![300], "300 is the fake eos");
     }
@@ -767,8 +815,8 @@ mod tests {
         let (e, _) = test_engine(limits());
         let mut p = params(3);
         p.ignore_eos = true;
-        let r = make_request(&e, 1, vec![299], p).unwrap();
-        let g = generate(&e, r, 0).unwrap();
+        let r = make_request(&e, 1, vec![299], p, 0).unwrap();
+        let g = generate(&e, r).unwrap();
         assert_eq!(g.finish_reason, FinishReason::Length);
         assert_eq!(g.tokens, vec![300, 301, 302], "eos is sampled but ignored");
     }
@@ -776,8 +824,8 @@ mod tests {
     #[test]
     fn eos_wins_over_an_exhausted_length_budget() {
         let (e, _) = test_engine(limits());
-        let r = make_request(&e, 1, vec![299], params(1)).unwrap();
-        let g = generate(&e, r, 0).unwrap();
+        let r = make_request(&e, 1, vec![299], params(1), 0).unwrap();
+        let g = generate(&e, r).unwrap();
         assert_eq!(
             g.finish_reason,
             FinishReason::Stop,
@@ -790,7 +838,7 @@ mod tests {
         let (e, _) = test_engine(limits());
         let mut p = params(10);
         p.stop_strs = vec!["cd".to_string()];
-        let g = generate(&e, req(&e, 1, "a", p), 0).unwrap();
+        let g = generate(&e, req(&e, 1, "a", p)).unwrap();
         assert_eq!(g.finish_reason, FinishReason::Stop);
         assert_eq!(g.tokens, vec![98, 99, 100], "generated through the match");
         assert_eq!(g.text, "b", "text is cut at the stop string, tail kept");
@@ -801,15 +849,15 @@ mod tests {
         let (e, _) = test_engine(limits());
         let mut p = params(10);
         p.stop_strs = vec!["cd".to_string()];
-        let r = make_request(&e, 1, vec![96], p).unwrap();
-        let g = generate(&e, r, 0).unwrap();
+        let r = make_request(&e, 1, vec![96], p, 0).unwrap();
+        let g = generate(&e, r).unwrap();
         assert_eq!(g.text, "ab", "text stops at the stop string");
     }
 
     #[test]
     fn max_tokens_is_clamped_by_the_engine_output_limit() {
         let (e, _) = test_engine(limits()); // max_output_tokens = 8
-        let r = make_request(&e, 1, e.encode("a").unwrap(), params(100)).unwrap();
+        let r = make_request(&e, 1, e.encode("a").unwrap(), params(100), 0).unwrap();
         assert_eq!(r.params.max_tokens, 8);
     }
 
@@ -819,9 +867,9 @@ mod tests {
         l.max_output_tokens = 1000;
         l.max_seq_len = 5;
         let (e, _) = test_engine(l);
-        let r = make_request(&e, 1, e.encode("abc").unwrap(), params(100)).unwrap();
+        let r = make_request(&e, 1, e.encode("abc").unwrap(), params(100), 0).unwrap();
         assert_eq!(r.params.max_tokens, 2, "5 - 3 prompt tokens");
-        let g = generate(&e, r, 0).unwrap();
+        let g = generate(&e, r).unwrap();
         assert_eq!(g.finish_reason, FinishReason::Length);
         assert_eq!(g.tokens.len(), 2);
     }
@@ -829,14 +877,14 @@ mod tests {
     #[test]
     fn empty_prompt_is_rejected() {
         let (e, _) = test_engine(limits());
-        assert!(make_request(&e, 1, vec![], params(4)).is_err());
+        assert!(make_request(&e, 1, vec![], params(4), 0).is_err());
     }
 
     #[test]
     fn overlong_prompt_is_rejected() {
         let (e, _) = test_engine(limits());
         let ids = vec![7u32; 65];
-        assert!(make_request(&e, 1, ids, params(4)).is_err());
+        assert!(make_request(&e, 1, ids, params(4), 0).is_err());
     }
 
     #[test]
@@ -847,7 +895,7 @@ mod tests {
             req(&e, 1, "a", params(3)),
             req(&e, 2, "c", params(1)),
         ];
-        let out = generate_batch(&e, reqs, 0).unwrap();
+        let out = generate_batch(&e, reqs).unwrap();
         let uids: Vec<u64> = out.iter().map(|g| g.uid).collect();
         assert_eq!(uids, vec![1, 2, 3], "results are uid ordered");
         assert_eq!(out[0].tokens, vec![98, 99, 100]);
@@ -870,8 +918,12 @@ mod tests {
         let (e, _) = test_engine(limits());
         let mut p = params(8);
         p.temperature = 0.8;
-        let a = generate(&e, req(&e, 1, "hello", p.clone()), 42).unwrap();
-        let b = generate(&e, req(&e, 1, "hello", p), 42).unwrap();
+        let mut ra = req(&e, 1, "hello", p.clone());
+        ra.seed = 42;
+        let a = generate(&e, ra).unwrap();
+        let mut rb = req(&e, 1, "hello", p);
+        rb.seed = 42;
+        let b = generate(&e, rb).unwrap();
         assert_eq!(a.tokens, b.tokens);
     }
 }
