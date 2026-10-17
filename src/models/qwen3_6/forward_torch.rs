@@ -2081,6 +2081,7 @@ impl TorchQwen3_6 {
         let probs = logits.softmax(-1, Kind::Float);
         let (ids, weights) = topk_renorm(&probs, p.top_k as i64);
         profile::end("router", sp);
+        profile::trace_routes(layer_idx, &ids);
 
         // The routing decision is host-side either way: the port hands it to the
         // slot cache, and the inline path indexes the banks with it.

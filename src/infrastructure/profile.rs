@@ -59,6 +59,36 @@ pub fn enabled() -> bool {
     std::env::var("FT_PROFILE").is_ok_and(|v| !v.is_empty() && v != "0" && v != "false")
 }
 
+/// Dev-only routing trace: when `FT_ROUTE_TRACE` is set, append one line
+/// `{"layer": L, "ids": [...]}` for every routed layer to that file. This is a
+/// device-to-host read per layer, so it forces a sync and must run eager
+/// (`FERRUM_SMOKE_NOGRAPH=1`); it exists to collect routing traces for the
+/// speculative-prefetch study (optimization.md R3b), never in serving.
+pub fn trace_routes(layer: usize, ids: &tch::Tensor) {
+    static PATH: OnceLock<Option<std::ffi::OsString>> = OnceLock::new();
+    let Some(path) = PATH
+        .get_or_init(|| std::env::var_os("FT_ROUTE_TRACE"))
+        .as_ref()
+    else {
+        return;
+    };
+    use std::io::Write;
+    let vals: Vec<i64> = ids
+        .flatten(0, -1)
+        .to_kind(tch::Kind::Int64)
+        .to_device(tch::Device::Cpu)
+        .try_into()
+        .unwrap_or_default();
+    let line = format!("{{\"layer\":{layer},\"ids\":{vals:?}}}\n");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
 /// Open the driver and install the timer. Idempotent; `false` when disabled or
 /// the driver/context cannot be set up, in which case every `begin` is a no-op.
 pub fn init(device: usize) -> bool {

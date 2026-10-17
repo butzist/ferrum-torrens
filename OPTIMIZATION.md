@@ -651,9 +651,21 @@ only ~0.74 ms (the copy) against ~0.06 ms of router-independent work (the shared
 expert), so even a working overlap caps at ~2.3 ms/token at bs=1.
 
 To make the window pay, the fetch must leave SM headroom *and* there must be
-more independent work to fill it: a lower-occupancy copy kernel, or real
-lookahead (routing is persistent across tokens, so a one-token-ahead speculative
-prefetch is the candidate -- see the todo). Left as an optional R6 item.
+more independent work to fill it. **Speculative prefetch is ruled out by the
+routing trace** (below). Left as an optional R6 item behind a lower-occupancy
+copy kernel.
+
+**Routing predictability (2026-10-17, `FT_ROUTE_TRACE`).** Traced 156 decode
+steps x 40 layers on the reference's own AIME prompt (eager smoke,
+`FERRUM_SMOKE_NOGRAPH=1 FERRUM_SMOKE_CACHE=auto`). Consecutive-token expert-set
+overlap is only **0.33** (p50 0.38), so routing is not strongly persistent on
+this workload. Replaying an exact LRU over the trace: miss 0.59 / 0.32 / 0.31 at
+512 / 1900 / 2048 slots; of those misses **0.000** were routed by the previous
+token (they are resident by construction), the median miss was last routed
+10-20 steps ago, and 21-41% were never seen in the window. A one-token-ahead
+prefetch therefore predicts the *resident* set, not the misses: it would spend
+PCIe bytes (the copy is already byte-bound) for no hit. Real lookahead needs the
+future tokens themselves (draft/speculative decoding), its own milestone.
 
 
 ### R4 -- MoE-first VRAM budget planner (item 12) -- DONE

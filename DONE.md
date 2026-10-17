@@ -2385,6 +2385,23 @@ settled.
     is deliberately not wired: prefill needs only the 512 buffer slots and the
     resident tower is never evicted.
 
+95. **Speculative expert prefetch is ruled out** (2026-10-17, measured) -- the
+    operator's "predict the experts N tokens ahead" idea, and the make-or-break
+    question for the R3b decode overlap. Added a dev-only `FT_ROUTE_TRACE` hook
+    (`profile::trace_routes`, a D2H read per routed layer, eager-only) and traced
+    156 decode steps x 40 layers on the reference's own AIME prompt. Findings:
+    consecutive-token expert-set overlap is only **0.33** (p50 0.38); replaying
+    an exact LRU over the trace gives miss 0.59 / 0.32 / 0.31 at 512 / 1900 /
+    2048 slots, and of those misses **0.000** were routed by the previous token
+    (they are resident by construction); the median miss was last routed 10-20
+    steps ago and 21-41% were never routed in the window. So the previous token
+    predicts the *resident* set, not the misses, and the copy is byte-bound
+    (~87% of PCIe peak), so a speculative fetch spends bytes for no hit. Real
+    lookahead needs the future tokens themselves (draft/speculative decoding), a
+    separate milestone. The R3b split landed (prefetch/finish, second copy
+    stream, neutral because the copy kernel starves the SMs; see
+    `optimization.md` R3b and TODO.md items 6/7).
+
 ---
 
 ## Progress log (narrative, pre-2026-10-15 compaction)

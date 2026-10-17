@@ -772,13 +772,14 @@ next steps:
    **neutral**: the `index_copy` kernel's resident CTAs hold every SM slot while
    stalled on PCIe, so the shared expert waits for the copy instead of hiding
    behind it (optimization.md R3b). Each remaining item is its own slice.
-7. **Speculative expert prefetch (idea, not started).** Routing is persistent
-   across decode tokens, so a one-token-ahead lookup could prefetch layer `l`'s
-   expected experts on the decode copy stream while the current token computes.
-   Open question: the copy is byte-bound at ~87% of PCIe peak, so a wrong guess
-   costs bytes directly; the misses are the *non*-persistent part, which the
-   previous token predicts worst. Measure routing persistence and miss
-   autocorrelation before building. Blocked on that measurement.
+7. **Speculative expert prefetch -- RULED OUT (measured, decision 95).** An
+   `FT_ROUTE_TRACE` of 156 decode steps x 40 layers on the AIME prompt shows
+   consecutive-token routing overlap of only **0.33**, and **0%** of misses were
+   routed by the previous token (misses are the non-persistent experts; median
+   last-routed 10-20 steps ago, 21-41% never seen). The copy is byte-bound at
+   ~87% of PCIe peak, so prefetching recent routing spends bytes for no hits.
+   Real lookahead needs future tokens (speculative decoding), a separate
+   milestone. See optimization.md R3b.
 
 Caveat (decision 89): the step is now ~33 ms copy (PCIe, miss-bound) + ~30 ms
 compute. FreeToken's 22.5 -> 30.3 tok/s at bs=1 is mostly its larger default
