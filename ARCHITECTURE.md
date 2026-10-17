@@ -511,10 +511,11 @@ is one streamed copy of the layer plus one GEMV pass instead of a per-chunk
 stream while layer `l` computes (`begin`/`ready`/`release` events order the two
 streams; the copy reuses `index_copy` in `BLOCK_K`-row groups with static index
 tensors). The GEMV still runs per route chunk only to bound the `[routes, ...]`
-scratch. A step that drops back below the cap returns to `Decode`; the buffer
-range is freed on entry (`clear_buffer_slots`: only those `2 * num_experts`
-slots, never the whole table) so the decode LRU in `[2*E, slots)` survives the
-prefill (decision 94). `PrefillHarness` (the copy stream, its events and the row
+scratch. A step that drops back below the cap returns to `Decode`; the buffer's
+slots are the `2 * num_experts` **coldest** (chosen by `usage.argsort` on entry,
+freed there, with the per-half copy rows and the `(half, expert) -> slot` map
+rebuilt from them), so the decode LRU's hot set survives the prefill
+(decision 94). `PrefillHarness` (the copy stream, its events and the row
 indices) is retained across transitions; the driver exposes it through owned
 `OwnedStream`/`OwnedEvent` handles that destroy themselves on drop. The blocks
 are the cache's own slots, so this adds no expert VRAM.

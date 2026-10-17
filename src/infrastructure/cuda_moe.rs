@@ -255,6 +255,9 @@ struct PrefillHarness {
     dst_idx: [Vec<Tensor>; 2],
     /// Group size (rows), one int64 scalar each.
     num: Vec<Tensor>,
+    /// The `2 * experts` cache slots this prefill's buffer owns, chosen coldest
+    /// first so the hottest decode experts stay resident.
+    victims: Tensor,
     /// The layer each half currently holds, `-1` when empty.
     half_layer: [i64; 2],
 }
@@ -554,6 +557,7 @@ impl CudaMoE {
                 dsts.push(Tensor::from_slice(&dst).to(dev));
             }
         }
+        let victims = Tensor::arange((2 * experts) as i64, (tch::Kind::Int, dev));
         self.prefill = Some(PrefillHarness {
             copy_stream,
             begin,
@@ -564,6 +568,7 @@ impl CudaMoE {
             src_idx,
             dst_idx,
             num,
+            victims,
             half_layer: [-1, -1],
         });
         Ok(())
@@ -572,6 +577,22 @@ impl CudaMoE {
     /// Whether the whole-layer prefill harness is available.
     pub fn prefill_overlap(&self) -> bool {
         self.prefill.is_some()
+    }
+
+    /// How many slots currently map to a resident expert. A test hook for the
+    /// prefill-retention gate (decision 94); it syncs, so the serving path never
+    /// calls it.
+    pub fn resident_count(&self) -> Result<usize, MoEError> {
+        let Some(st) = self.device_staging.as_ref() else {
+            return Ok(0);
+        };
+        let n = st
+            .id_of_slot
+            .ge(0)
+            .to_kind(tch::Kind::Int64)
+            .sum(tch::Kind::Int64)
+            .int64_value(&[]);
+        Ok(n as usize)
     }
 
     /// Whether a step is prefill-shaped: more routes than one `lru_ensure`
@@ -1113,7 +1134,7 @@ impl CudaMoE {
     /// Only the buffer range is touched; the decode LRU in the rest of the cache
     /// is retained across the prefill (TODO.md item 24, optimization.md R7.2).
     fn enter_prefill(&mut self) -> Result<(), MoEError> {
-        self.clear_buffer_slots()?;
+        self.select_buffer_slots()?;
         let copy_stream = {
             let pf = self
                 .prefill
@@ -1142,26 +1163,57 @@ impl CudaMoE {
         Ok(())
     }
 
-    /// Free the `2 * num_experts` slots the whole-layer double buffer owns:
-    /// evict whatever decode experts were placed there from the reverse map and
-    /// mark the range empty, leaving every other slot's LRU state untouched.
-    fn clear_buffer_slots(&mut self) -> Result<(), MoEError> {
-        let Some(st) = self.device_staging.as_mut() else {
-            return Ok(());
+    /// Pick the `2 * num_experts` slots the whole-layer double buffer owns:
+    /// the coldest by usage, so free slots go first and a warm cache loses only
+    /// its genuinely least-recently-used experts (the MFU set stays resident).
+    /// Those slots are freed from the reverse map and the per-half copy row
+    /// lists are rebuilt from them; every other slot's LRU state is untouched.
+    fn select_buffer_slots(&mut self) -> Result<(), MoEError> {
+        let buffer = {
+            let st = self
+                .device_staging
+                .as_ref()
+                .ok_or_else(|| MoEError::Bad("select_buffer_slots before staging".into()))?;
+            2 * st.experts
         };
-        let buffer = 2 * st.experts;
         let dev = self.device.to_tch();
-        // The flat ids the buffer currently holds (decode may have placed experts
-        // in these slots). Read them before the table is overwritten.
-        let old = st.id_of_slot.narrow(0, 0, buffer as i64);
-        let valid = old.ge(0);
-        let idx = old.masked_select(&valid).to_kind(tch::Kind::Int64);
-        if idx.numel() > 0 {
-            let neg = Tensor::from_slice(&vec![-1i32; idx.numel()]).to(dev);
-            let _ = st.slot_for_id.index_put_(&[Some(&idx)], &neg, false);
+        let victims = {
+            let st = self.device_staging.as_mut().expect("checked above");
+            // Ascending usage: free slots (0) first, then the LRU tail.
+            let order = st.usage.argsort(0, false);
+            let victims = order.narrow(0, 0, buffer as i64).to_kind(tch::Kind::Int);
+            let victims_i64 = victims.to_kind(tch::Kind::Int64);
+            let old = st.id_of_slot.index_select(0, &victims_i64);
+            let ids = old.masked_select(&old.ge(0)).to_kind(tch::Kind::Int64);
+            if ids.numel() > 0 {
+                let neg = Tensor::from_slice(&vec![-1i32; ids.numel()]).to(dev);
+                let _ = st.slot_for_id.index_put_(&[Some(&ids)], &neg, false);
+            }
+            let neg = Tensor::from_slice(&vec![-1i32; buffer]).to(dev);
+            let _ = st.id_of_slot.index_put_(&[Some(&victims_i64)], &neg, false);
+            let zero = Tensor::from_slice(&vec![0i64; buffer]).to(dev);
+            let _ = st.usage.index_put_(&[Some(&victims_i64)], &zero, false);
+            victims
+        };
+        let experts = self
+            .device_staging
+            .as_ref()
+            .map(|st| st.experts)
+            .expect("checked above");
+        let block_k = self.lru_block_k()?;
+        let pf = self
+            .prefill
+            .as_mut()
+            .ok_or_else(|| MoEError::Bad("select_buffer_slots without a harness".into()))?;
+        for (half, dsts) in pf.dst_idx.iter_mut().enumerate() {
+            for (g, dst) in dsts.iter_mut().enumerate() {
+                let start = g * block_k;
+                let n = (experts - start).min(block_k);
+                let off = (half * experts + start) as i64;
+                *dst = victims.narrow(0, off, n as i64).contiguous();
+            }
         }
-        let _ = st.id_of_slot.narrow(0, 0, buffer as i64).fill_(-1);
-        let _ = st.usage.narrow(0, 0, buffer as i64).fill_(0i64);
+        pf.victims = victims;
         Ok(())
     }
 
@@ -1263,11 +1315,19 @@ impl CudaMoE {
             }
         }
         let offset = (half * experts_per_layer) as i64;
-        let slots = experts
+        // The buffer's slot for `(half, expert_id)` is the selected victim, not
+        // the fixed `half * E + id` range (decision 94 follow-up).
+        let idx = experts
             .reshape([routes as i64])
             .to_kind(tch::Kind::Int)
             .contiguous()
             .g_add_scalar(offset);
+        let slots = self
+            .prefill
+            .as_ref()
+            .expect("harness")
+            .victims
+            .index_select(0, &idx);
         let chunk = staged_chunk_tokens(block_k, top_k);
         let dev = self.device.to_tch();
         let mut start = 0usize;

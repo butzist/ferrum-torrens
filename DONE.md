@@ -2372,12 +2372,18 @@ settled.
     prefill wiped the *entire* decode LRU. `enter_prefill` now frees only the
     buffer range (`clear_buffer_slots`: scatter `-1` for the ids the buffer held,
     zero their usage) and `leave_prefill` is a residency flip; `[2*E, slots)`
-    keeps its experts across the prefill. The `Residency::{Decode, Prefill}` enum
-    is the state the operator asked for. Remaining: pick the coldest/MFU experts
-    for the buffer instead of the fixed low range (the `dst_idx` copy plan is
-    static), a two-request miss-count acceptance test, and a KV-vs-expert
-    eviction policy (not needed yet: the buffer is already reserved and the
-    resident tower is never evicted).
+    keeps its experts across the prefill. The buffer then got the operator's
+    second idea: `enter_prefill` now picks the **`2 * num_experts` coldest slots**
+    (`usage.argsort` ascending, so free slots come first and the MFU set stays),
+    frees exactly those, and rebuilds both the per-half copy row lists
+    (`dst_idx`) and the `half * E + expert -> slot` map (`PrefillHarness::victims`,
+    which `prefill_layer` gathers) from them; `leave_prefill` is a residency flip.
+    The `Residency::{Decode, Prefill}` enum is the state. Gated by
+    `a_prefill_retains_the_decode_expert_cache` (resident count unchanged across
+    a whole-layer prefill) and the existing
+    `a_whole_layer_prefill_overlap_matches_the_host_plan`. KV-vs-expert eviction
+    is deliberately not wired: prefill needs only the 512 buffer slots and the
+    resident tower is never evicted.
 
 ---
 

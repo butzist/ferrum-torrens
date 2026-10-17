@@ -814,16 +814,17 @@ Answered, with the code path:
    (two halves of one layer, 512 at 256 experts), not `layers * experts`. The
    harness already sizes it that way (`groups = experts / BLOCK_K`, two buffers).
 5. **State:** `Residency::{Decode, Prefill}` (the enum the operator asked for)
-   gates the path. The buffer range is fixed at `[0, 2*E)`; decode may use the
-   whole cache in `Decode` and only `[2*E, slots)` is guaranteed retained. Next
-   refinement: choose the buffer's slots as the coldest/MFU set instead of the
-   low fixed range (the `dst_idx` copy plan is static today).
+   gates the path. `enter_prefill` now selects the buffer slots as the `2*E`
+   **coldest** by `usage.argsort` (free slots first, MFU set retained), frees
+   exactly those, and rebuilds `dst_idx` + the `victims` slot map from them
+   (prefill is uncaptured, so the formerly static copy plan is rebuilt per
+   prefill). `prefill_layer` gathers `slot = victims[half*E + expert]` instead of
+   `expert + half*E`. Gate: `a_prefill_retains_the_decode_expert_cache`.
 6. **KV/dense eviction under prefill pressure:** not needed yet. The prefill
    only borrows the 512 buffer slots (already reserved out of the auto budget),
    and the resident dense tower is never evicted. If a future prefill needs more
    scratch, the trade order is: request KV pages (re-prefill) first, then the
    expert LRU (PCIe re-fetch), never the resident dense tower.
-7. **Retention policy:** the LRU already keeps the most recent experts in
-   `[2*E, slots)`; the buffer reclaims whatever sat in `[0, 2*E)` (the fixed
-   low range). Using the coldest slots for the buffer would protect the MFU set
-   explicitly; left as the next slice with the two-request miss-count gate.
+7. **Retention policy:** the buffer now takes the coldest `2*E` slots, so the
+   MFU set is protected explicitly; the resident count is unchanged across a
+   whole-layer prefill in the gate.

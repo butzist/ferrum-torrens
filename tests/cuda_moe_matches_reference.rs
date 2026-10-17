@@ -766,6 +766,96 @@ fn a_whole_layer_prefill_overlap_matches_the_host_plan() {
     println!("PASS: {LAYERS} layers x {TOKENS} tokens through the double buffer, then decode");
 }
 
+/// Decision 94: entering a whole-layer prefill frees only its `2 * num_experts`
+/// buffer slots, so the decode LRU survives. Warm the device LRU with
+/// decode-shaped steps, run a whole-layer prefill, and check the resident set is
+/// untouched (the buffer picks the coldest slots, and free slots come first).
+#[test]
+#[ignore = "needs a CUDA device and the converted checkpoint in .model-cache"]
+#[serial]
+fn a_prefill_retains_the_decode_expert_cache() {
+    use ferrum_torrens::infrastructure::banks::FtwPinnedBanks;
+
+    const LAYERS: usize = 2;
+    const EXPERTS: usize = 256;
+    // 2 * E = 512 buffer slots, so the decode LRU has the other 512.
+    const SLOTS: usize = 1024;
+    const WARM_TOKENS: usize = 16; // x top_k 8 = 128 routes == the cap -> flat LRU
+
+    let Some((index, reader)) = open_checkpoint() else {
+        panic!("gate needs the checkpoint in {FTW_DIR}");
+    };
+    let shapes = shapes(&index);
+    let (hidden, inter) = (shapes.hidden, shapes.inter);
+    let source: Arc<dyn ExpertSlabSource> = Arc::new(FtwBanks::new(reader.clone(), index.clone()));
+
+    let mut adapter = gate(
+        "driver API + committed cubins",
+        CudaMoE::new_with_stream(Device::Cuda(0), source, shapes, SLOTS, std::ptr::null_mut()),
+    );
+    let driver = adapter.driver();
+    let pinned = gate(
+        "pinned expert banks",
+        FtwPinnedBanks::load(&driver, &reader, &index, shapes, LAYERS, EXPERTS),
+    );
+    gate(
+        "enable device staging",
+        adapter.enable_device_staging(Box::new(pinned), LAYERS, EXPERTS),
+    );
+    gate("enable prefill overlap", adapter.enable_prefill_overlap());
+    let moe = Arc::new(Mutex::new(adapter));
+    let exec = CachedExperts::with_device_staging(moe.clone(), moe.clone(), LAYERS, EXPERTS, SLOTS);
+    let dev = Device::Cuda(0);
+
+    let run = |exec: &CachedExperts, layer: usize, tokens: usize, expert: usize| {
+        let x: Vec<f32> = (0..tokens * hidden)
+            .map(|i| ((i * 2654435761usize % 1009) as f32 / 1009.0) - 0.5)
+            .collect();
+        let routed: Vec<u32> = (0..tokens * TOP_K)
+            .map(|i| ((i * 7 + expert) % EXPERTS) as u32)
+            .collect();
+        let weights: Vec<f32> = vec![1.0 / TOP_K as f32; tokens * TOP_K];
+        let ids: Vec<f32> = routed.iter().map(|&e| e as f32).collect();
+        let xd = DevTensor::from_f32(&x, &[tokens as i64, hidden as i64], dev);
+        let ed = DevTensor::from_f32(&ids, &[tokens as i64, TOP_K as i64], dev);
+        let wd = DevTensor::from_f32(&weights, &[tokens as i64, TOP_K as i64], dev);
+        let mut out = DevTensor::zeros(&[tokens as i64, hidden as i64], dev);
+        gate(
+            "execute_device",
+            exec.execute_device(
+                &MoEDeviceRequest {
+                    layer,
+                    hidden,
+                    inter,
+                    top_k: TOP_K,
+                    x: &xd,
+                    experts: &ed,
+                    weights: &wd,
+                },
+                &mut out,
+            ),
+        );
+    };
+
+    // 128 distinct experts per layer, spread so the LRU holds a working set.
+    run(&exec, 0, WARM_TOKENS, 0);
+    run(&exec, 1, WARM_TOKENS, 0);
+    let before = gate("resident before", moe.lock().unwrap().resident_count());
+    assert!(
+        before >= 2 * WARM_TOKENS,
+        "warm steps should leave resident experts, got {before}"
+    );
+
+    // A whole-layer prefill: 64 x top_k 8 = 512 routes > the 128 cap.
+    run(&exec, 0, 64, 3);
+    let after = gate("resident after", moe.lock().unwrap().resident_count());
+    assert_eq!(
+        after, before,
+        "a whole-layer prefill must not evict the decode cache (item 24)"
+    );
+    println!("PASS: resident experts {before} before and {after} after a whole-layer prefill");
+}
+
 /// Decision 40 prerequisite 2, the address half of it: a captured graph bakes
 /// the six bank pointers into its nodes, so staging another layer's expert must
 /// overwrite bytes at the same addresses instead of allocating new ones.

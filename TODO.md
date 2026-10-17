@@ -344,12 +344,13 @@ The full log of confirmed decisions (numbers 1..94, stable -- code, tests and
 lists only the decisions that still bind open work; everything else there is
 history.
 
-- **94** -- the whole-layer prefill frees only its `2 * num_experts` double-buffer
-  slots (`CudaMoE::clear_buffer_slots`) and leaves `[2*E, slots)` retained; no
-  code may call `reset_staging()` around a prefill or between requests. The
-  buffer range is fixed at `[0, 2*E)`; choosing the coldest/MFU slots for it is
-  the next slice (the copy plan is static today). KV/state pools are per-request
-  and are freed at `commit`/`end`, never with the expert cache.
+- **94** -- the whole-layer prefill's buffer is the `2 * num_experts` **coldest**
+  slots chosen by `usage.argsort` (`select_buffer_slots`); it frees exactly those
+  and rebuilds the copy rows + `victims` slot map each prefill. No code may call
+  `reset_staging()` around a prefill or between requests, and the decode LRU must
+  survive a prefill (gate: `a_prefill_retains_the_decode_expert_cache`).
+  KV/state pools are per-request and are freed at `commit`/`end`, never with the
+  expert cache.
 - **93** -- the shared expert stays NVFP4 in VRAM: `Dense::apply` runs the dense
   NVFP4 GEMV for `m <= 8` and bf16 above. The dense GEMV takes `K_WORDS` at
   runtime so one cubin serves the head and the shared `down`; do not make it a
@@ -708,17 +709,19 @@ performance work.
      banks and run the dense NVFP4 GEMV for decode (like the lm_head), bf16 for
      prefill (M>1). Saves ~2 ms/token and ~180 MiB. Design in `optimization.md`
      R7.
-24. Prefill/cache residency -- **PARTIAL (2026-10-17, decision 94).** Audit
-     found the whole-layer prefill called `reset_staging()` on enter *and* leave,
-     wiping the entire decode LRU around every prefill. It now frees only the
-     `2 * num_experts` buffer slots (`CudaMoE::clear_buffer_slots`) and leaves
-     `[2*E, slots)` retained; entering/leaving no longer resets. The cache state
-     is the existing `Residency::{Decode, Prefill}` plus the fixed buffer range.
-     Still open: choosing the coldest/MFU experts for the buffer (`dst_idx` is a
-     static plan today), a two-request acceptance test that counts misses
-     before/after a prefill, and the KV-vs-expert eviction policy under pressure
-     (prefill needs only the 512 buffer slots, and the resident tower is never
-     evicted, so no KV eviction is wired yet). Details in `optimization.md` R7.2.
+24. Prefill/cache residency -- **DONE (2026-10-17), decision 94.** Audit found
+     the whole-layer prefill called `reset_staging()` on enter *and* leave,
+     wiping the entire decode LRU around every prefill. Now `enter_prefill` picks
+     the **`2 * num_experts` coldest slots** as its double buffer
+     (`select_buffer_slots`: `usage.argsort` ascending, so free slots go first and
+     the MFU set stays), frees only those, and rebuilds the per-half copy row
+     lists and the `(half, expert) -> slot` map from them; `leave_prefill` is a
+     residency flip. The decode LRU survives the prefill; `Residency::{Decode,
+     Prefill}` is the state. Gated by `a_prefill_retains_the_decode_expert_cache`
+     (resident experts unchanged across a whole-layer prefill) and the existing
+     `a_whole_layer_prefill_overlap_matches_the_host_plan`. KV-vs-expert eviction
+     is deliberately not wired: prefill needs only the 512 buffer slots and the
+     resident tower is never evicted. Details in `optimization.md` R7.2.
 
 ### Decode speed plan (decision 82): status and next steps
 
