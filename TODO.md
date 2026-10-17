@@ -810,6 +810,26 @@ prompt override before comparing miss rates.
   if the LRU rarely revisits an evicted expert, O_DIRECT-everywhere stays simpler
   and strictly better.
 
+### R8 kernel/types plan (foundings in optimization.md R8)
+
+- [ ] **R8.1 Fused Triton router** (their `moe_router._router_triton_kernel`
+  logic). Keep the f32 gate matmul, replace softmax + `topk` + renormalize with
+  one Triton kernel (f32 reduce, iterative top-k). router 1.8 -> ~1.0 ms. Gate:
+  device-decode argmax unchanged.
+- [ ] **R8.2 Fused GDN decode** (adopt the vendored FLA
+  `fused_sigmoid_gating_delta_rule_update`). One Triton kernel for gating +
+  l2norm + recurrence + state I/O, replacing `gdn_conv/gdn_ba/gdn_recur/gdn_tail`.
+  gdn 9.8 -> ~7. Gate: GDN oracle.
+- [ ] **R8.3 Attention kernel** (largest compute gap, 4.4 vs 2.1-2.8). FreeToken
+  uses flashinfer on sm_120; lift our Triton paged kernel (larger tiles, varlen,
+  split-K over KV) first, vendor flashinfer only if still short.
+- [ ] **R8.4 W8A8 Triton `tl.dot` GEMM** for M>1 projections (batching/R5): feed
+  fp8 to `tl.dot` directly instead of the fp8->bf16 upcast.
+- [ ] **R8.5 fp8 KV cache** (checkpoint declares it; we run bf16): frees VRAM for
+  expert slots.
+- [ ] **R8.6 Like-for-like miss measurement** (AIME both sides) to confirm the
+  miss-rate parity in optimization.md R8 Finding 1 before any eviction change.
+
 ### State of play
 
 The hardest infrastructure -- GPU-graph capture over the full MoE forward,

@@ -865,3 +865,81 @@ Answered, with the code path:
 7. **Retention policy:** the buffer now takes the coldest `2*E` slots, so the
    MFU set is protected explicitly; the resident count is unchanged across a
    whole-layer prefill in the gate.
+
+## R8 -- Kernel quality, dtypes, and the miss-rate question (operator request, 2026-10-17)
+
+Findings are from reading `FreeToken/` (read-only) plus our `FT_PROFILE` and the
+decision-95 `FT_ROUTE_TRACE`. Our post-R7 stage profile (auto, bs=1): copy 29.6,
+gdn 9.8, attn 4.37, moe_gemm 4.2, shared 2.26, router 1.8, moe_lru 1.4, head
+1.06. Reference (auto, their AIME): copy 15.1, gdn 6.6-8.2, attn 2.1-2.8,
+moe_gemm 3.5-3.8, shared 1.7-3.8, router 0.8-1.5, moe_lru 0.6-1.5, head 0.82;
+total 33.0 vs our ~54 ms.
+
+### Finding 1 -- the miss-rate "gap" is a prompt artifact
+
+The decision-88 note compared our smoke prompt (74-84% miss) to their AIME
+prompt (34%): different prompts. The policy is the same on both sides: a global
+LRU over the flat `layer*E+expert` id space keyed on `(usage, slot)` (theirs
+`flashlib.kernels.slot_cache.lru_ensure`, its mirror
+`offload_kernels._ensure_experts_hybrid_cpu` picks
+`min(range(cache_size), key=(usage[s], s))`; ours packs the same key and takes
+the smallest). Replaying an exact LRU over our own AIME routing trace gives
+**miss 0.32 at 1900 slots** against their **0.34** on the same prompt at the
+same size. So there is no structural miss-rate advantage; the copy gap was
+bytes = miss count = prompt. Action: measure like-for-like (both on AIME) before
+any eviction work; `FERRUM_SMOKE_PROMPT` now allows it.
+
+### Finding 2 -- the router: adopt their fused kernel
+
+Theirs (`kernel/triton/moe_router.py::_router_triton_kernel`, vendored from
+SGLang) is one Triton launch: load the gate output, `.to(f32)`, f32 row
+softmax, then an iterative top-k (`K` steps of row `tl.max`, lowest-id
+tie-break), renormalize, store weights + ids. Ours is a torch op stack (f32
+matmul, softmax, `torch.topk`, renormalize) at 1.8 vs their 0.8-1.5. Decision
+87's f32 choice is a *matmul* decision and is orthogonal: their kernel casts the
+gate output to f32 before the reduce, so we keep the f32 gate and fuse the rest.
+
+### Finding 3 -- GDN is Triton on their side; adopt the fusion
+
+Theirs (`kernel/fla/fused_sigmoid_gating_recurrent.py`, vendored from
+sglang/flash-linear-attention) is one Triton kernel: gating (sigmoid+softplus) +
+in-kernel q/k l2norm + the delta-rule recurrent update + per-request state
+read/write-by-index. Ours splits the same math over `gdn_conv` + `gdn_ba` +
+`gdn_recur` + `gdn_tail` (`gdn_qkvz` is the projection and is already at the
+~220 GB/s read roofline). So the gap is fusion/glue, not Triton.
+
+### Finding 4 -- attention is the one CUDA dependency
+
+`engine._resolve_auto_attention_backend` on sm_120 resolves `auto` to
+**flashinfer** (`fi`); `trtllm` needs sm_100 and `fa,fi` needs sm_90. Their
+`triton` backend exists (FULL+SWA) but is not selected here. Flashinfer is CUDA,
+so matching it means vendoring it (heavy) or lifting our Triton paged kernel
+toward it. This is the largest compute gap (attn 4.4 vs 2.1-2.8).
+
+### Finding 5 -- dtype gaps
+
+- M>1 projections: theirs use **W8A8 `torch._scaled_mm`** (cuBLASLt fp8 tensor
+  cores); `tch` cannot call it (decision 84). Workaround: a Triton **W8A8
+  `tl.dot`** (both operands e4m3, out f32, per-tensor scale after). Our
+  `_gemm_kernel` already does `tl.dot` on an fp8->bf16 upcast; feeding fp8
+  straight to `tl.dot` removes the upcast. At bs=1 both sides are W8A16, so this
+  is a **batching (R5)** win, not bs=1.
+- Router gate: theirs bf16 matmul + f32 reduce; ours f32 matmul (decision 87).
+- KV: the checkpoint declares an fp8 `kv_cache_quant_algo`; we run bf16.
+- Experts: theirs `nvfp4_marlin`/`b12x` fold the global into the alpha at
+  repack; ours keeps the fp16 global as a bank. Same byte class.
+
+### Plan (ordered, low risk first)
+
+- **R8.1 Fused Triton router** (their logic). 1.8 -> ~1.0 ms. Low risk: keep the
+  f32 gate matmul, replace softmax+topk+renorm with one Triton kernel. Gate:
+  device-decode argmax unchanged.
+- **R8.2 Fused GDN decode** (adopt the FLA kernel). 9.8 -> ~7. Medium risk
+  (state layout `[K,V]`, in-kernel l2norm, GQA); gate on the GDN oracle.
+- **R8.3 Attention kernel** (largest compute gap, most effort): lift our Triton
+  paged kernel (larger tiles, varlen packing, split-K over KV); vendor flashinfer
+  only if still short.
+- **R8.4 W8A8 Triton `tl.dot` GEMM** for M>1 projections (batching win).
+- **R8.5 fp8 KV cache** (type): frees VRAM for more expert slots.
+- **R8.6 Like-for-like miss measurement** (AIME both sides) to confirm Finding 1
+  before any eviction change.
