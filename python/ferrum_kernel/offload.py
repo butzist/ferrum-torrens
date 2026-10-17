@@ -97,18 +97,21 @@ def _ensure_experts_kernel(
     c = tl.arange(0, BLOCK_C)
     cm = c < num_cached
     u = tl.load(usage_ptr + c, mask=cm, other=USAGE_MAX)
-    # Pack (usage, slot) into one sortable int64: ascending sort is exactly the
-    # sequence of `pick_victim` argmins, because the packed keys are distinct.
-    # Free slots and slots bumped by this step's hit store are not evictable and
-    # take `KEY_MAX`, so they sort past every real key.
+    # Pack (usage, slot) into one sortable int64 so ascending order is exactly
+    # the sequence of `pick_victim` argmins. Free slots carry usage 0, so they
+    # are the coldest and get reused first; only this step's hits (u == step)
+    # are pinned out with KEY_MAX and never evicted. We need only the
+    # `num_missing` coldest, so take a bitonic top-k of the complemented key
+    # (largest complement == smallest key) instead of a full sort; the slot
+    # rides in the low bits, which is how the victim index comes back.
     key = tl.where(
         cm & (u != step),
         (u.to(tl.int64) << SLOT_BITS) | c.to(tl.int64),
         KEY_MAX,
     )
-    cand = tl.sort(key)
+    cand = KEY_MAX - tl.topk(KEY_MAX - key, BLOCK_K)
 
-    j = tl.arange(0, BLOCK_C)
+    j = tl.arange(0, BLOCK_K)
     jm = j < num_missing
     victim = (cand & ((1 << SLOT_BITS) - 1)).to(tl.int32)
     # `e` and `old` are flat ids: `id_of_slot` is shared across layers, so the

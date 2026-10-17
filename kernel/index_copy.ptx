@@ -23,87 +23,87 @@
 	.reg .pred 	%p<66>;
 	.reg .b32 	%r<76>;
 	.reg .b64 	%rd<101>;
-	.loc	1 133 0                         // offload.py:133:0
+	.loc	1 136 0                         // offload.py:136:0
 $L__func_begin0:
-	.loc	1 133 0                         // offload.py:133:0
+	.loc	1 136 0                         // offload.py:136:0
 
 // %bb.0:
 	ld.param.b64 	%rd75, [_index_copy_multi_kernel_param_0];
 	ld.param.b64 	%rd76, [_index_copy_multi_kernel_param_1];
 $L__tmp0:
-	.loc	1 143 25                        // offload.py:143:25
+	.loc	1 146 25                        // offload.py:146:25
 	mov.u32 	%r36, %ctaid.x;
-	.loc	1 144 24                        // offload.py:144:24
+	.loc	1 147 24                        // offload.py:147:24
 	mov.u32 	%r37, %ctaid.y;
 	ld.param.b64 	%rd77, [_index_copy_multi_kernel_param_2];
-	.loc	1 145 24                        // offload.py:145:24
+	.loc	1 148 24                        // offload.py:148:24
 	mov.u32 	%r38, %ctaid.z;
 	ld.param.b64 	%rd78, [_index_copy_multi_kernel_param_3];
 	ld.param.b64 	%rd2, [_index_copy_multi_kernel_param_5];
-	.loc	1 150 16                        // offload.py:150:16
+	.loc	1 153 16                        // offload.py:153:16
 	// begin inline asm
 	mov.u64 %rd1, 0x0;
 	ld.global.b64 { %rd1 }, [ %rd2 + 0 ];
 	// end inline asm
 	ld.param.b64 	%rd79, [_index_copy_multi_kernel_param_4];
-	.loc	1 151 32                        // offload.py:151:32
+	.loc	1 154 32                        // offload.py:154:32
 	mul.wide.u32 	%rd80, %r36, 8;
 	add.s64 	%rd4, %rd77, %rd80;
-	.loc	1 151 19                        // offload.py:151:19
+	.loc	1 154 19                        // offload.py:154:19
 	// begin inline asm
 	mov.u64 %rd3, 0x0;
 	ld.global.b64 { %rd3 }, [ %rd4 + 0 ];
 	// end inline asm
-	.loc	1 152 24                        // offload.py:152:24
+	.loc	1 155 24                        // offload.py:155:24
 	shr.s64 	%rd81, %rd3, 63;
 	shr.u64 	%rd82, %rd81, 62;
 	add.s64 	%rd83, %rd3, %rd82;
 	shr.s64 	%rd84, %rd83, 2;
-	.loc	1 152 30                        // offload.py:152:30
+	.loc	1 155 30                        // offload.py:155:30
 	cvt.u32.u64 	%r39, %rd84;
-	.loc	1 153 34                        // offload.py:153:34
+	.loc	1 156 34                        // offload.py:156:34
 	add.s64 	%rd6, %rd75, %rd80;
-	.loc	1 153 23                        // offload.py:153:23
+	.loc	1 156 23                        // offload.py:156:23
 	// begin inline asm
 	mov.u64 %rd5, 0x0;
 	ld.global.b64 { %rd5 }, [ %rd6 + 0 ];
 	// end inline asm
-	.loc	1 154 34                        // offload.py:154:34
+	.loc	1 157 34                        // offload.py:157:34
 	add.s64 	%rd8, %rd76, %rd80;
-	.loc	1 154 23                        // offload.py:154:23
+	.loc	1 157 23                        // offload.py:157:23
 	// begin inline asm
 	mov.u64 %rd7, 0x0;
 	ld.global.b64 { %rd7 }, [ %rd8 + 0 ];
 	// end inline asm
-	.loc	1 155 17                        // offload.py:155:17
+	.loc	1 158 17                        // offload.py:158:17
 	cvt.u64.u32 	%rd85, %r37;
 	setp.gt.s64 	%p1, %rd1, %rd85;
-	.loc	1 156 29                        // offload.py:156:29
+	.loc	1 159 29                        // offload.py:159:29
 	mul.wide.u32 	%rd86, %r37, 4;
 	add.s64 	%rd9, %rd78, %rd86;
 	mov.b32 	%r2, 0;
-	.loc	1 156 19                        // offload.py:156:19
+	.loc	1 159 19                        // offload.py:159:19
 	// begin inline asm
 	mov.u32 %r1, %r2;
 	@%p1 ld.global.b32 { %r1 }, [ %rd9 + 0 ];
 	// end inline asm
-	.loc	1 156 57                        // offload.py:156:57
+	.loc	1 159 57                        // offload.py:159:57
 	cvt.s64.s32 	%rd87, %r1;
-	.loc	1 157 29                        // offload.py:157:29
+	.loc	1 160 29                        // offload.py:160:29
 	add.s64 	%rd10, %rd79, %rd86;
-	.loc	1 157 19                        // offload.py:157:19
+	.loc	1 160 19                        // offload.py:160:19
 	// begin inline asm
 	mov.u32 %r3, %r2;
 	@%p1 ld.global.b32 { %r3 }, [ %rd10 + 0 ];
 	// end inline asm
-	.loc	1 157 57                        // offload.py:157:57
+	.loc	1 160 57                        // offload.py:160:57
 	cvt.s64.s32 	%rd88, %r3;
-	.loc	1 158 16                        // offload.py:158:16
+	.loc	1 161 16                        // offload.py:161:16
 	shl.b32 	%r40, %r38, 12;
-	.loc	1 158 39                        // offload.py:158:39
+	.loc	1 161 39                        // offload.py:161:39
 	mov.u32 	%r41, %tid.x;
 	and.b32 	%r42, %r41, 127;
-	.loc	1 158 26                        // offload.py:158:26
+	.loc	1 161 26                        // offload.py:161:26
 	or.b32 	%r43, %r40, %r42;
 	or.b32 	%r44, %r43, 128;
 	or.b32 	%r45, %r43, 256;
@@ -111,9 +111,9 @@ $L__tmp0:
 	or.b32 	%r47, %r43, 512;
 	or.b32 	%r48, %r43, 640;
 	or.b32 	%r49, %r43, 768;
-	.loc	1 158 39                        // offload.py:158:39
+	.loc	1 161 39                        // offload.py:161:39
 	or.b32 	%r50, %r40, %r41;
-	.loc	1 158 26                        // offload.py:158:26
+	.loc	1 161 26                        // offload.py:161:26
 	or.b32 	%r51, %r50, 896;
 	or.b32 	%r52, %r43, 1024;
 	or.b32 	%r53, %r43, 1152;
@@ -139,7 +139,7 @@ $L__tmp0:
 	or.b32 	%r73, %r43, 3712;
 	or.b32 	%r74, %r43, 3840;
 	or.b32 	%r75, %r50, 3968;
-	.loc	1 159 22                        // offload.py:159:22
+	.loc	1 162 22                        // offload.py:162:22
 	setp.lt.s32 	%p34, %r43, %r39;
 	setp.lt.s32 	%p35, %r44, %r39;
 	setp.lt.s32 	%p36, %r45, %r39;
@@ -172,7 +172,7 @@ $L__tmp0:
 	setp.lt.s32 	%p63, %r73, %r39;
 	setp.lt.s32 	%p64, %r74, %r39;
 	setp.lt.s32 	%p65, %r75, %r39;
-	.loc	1 159 16                        // offload.py:159:16
+	.loc	1 162 16                        // offload.py:162:16
 	and.pred 	%p2, %p1, %p34;
 	and.pred 	%p3, %p1, %p35;
 	and.pred 	%p4, %p1, %p36;
@@ -205,13 +205,13 @@ $L__tmp0:
 	and.pred 	%p31, %p1, %p63;
 	and.pred 	%p32, %p1, %p64;
 	and.pred 	%p33, %p1, %p65;
-	.loc	1 161 34                        // offload.py:161:34
+	.loc	1 164 34                        // offload.py:164:34
 	cvt.s64.s32 	%rd89, %rd84;
 	mul.lo.s64 	%rd90, %rd89, %rd88;
-	.loc	1 161 27                        // offload.py:161:27
+	.loc	1 164 27                        // offload.py:164:27
 	shl.b64 	%rd91, %rd90, 2;
 	add.s64 	%rd92, %rd7, %rd91;
-	.loc	1 161 45                        // offload.py:161:45
+	.loc	1 164 45                        // offload.py:164:45
 	mul.wide.u32 	%rd93, %r43, 4;
 	add.s64 	%rd11, %rd92, %rd93;
 	add.s64 	%rd12, %rd11, 512;
@@ -249,7 +249,7 @@ $L__tmp0:
 	add.s64 	%rd41, %rd11, 15360;
 	mul.wide.u32 	%rd97, %r75, 4;
 	add.s64 	%rd42, %rd92, %rd97;
-	.loc	1 161 16                        // offload.py:161:16
+	.loc	1 164 16                        // offload.py:164:16
 	// begin inline asm
 	mov.u32 %r4, 0x0;
 	@%p2 ld.global.cg.b32 { %r4 }, [ %rd11 + 0 ];
@@ -378,12 +378,12 @@ $L__tmp0:
 	mov.u32 %r35, 0x0;
 	@%p33 ld.global.cg.b32 { %r35 }, [ %rd42 + 0 ];
 	// end inline asm
-	.loc	1 162 31                        // offload.py:162:31
+	.loc	1 165 31                        // offload.py:165:31
 	mul.lo.s64 	%rd98, %rd89, %rd87;
-	.loc	1 162 24                        // offload.py:162:24
+	.loc	1 165 24                        // offload.py:165:24
 	shl.b64 	%rd99, %rd98, 2;
 	add.s64 	%rd100, %rd5, %rd99;
-	.loc	1 162 42                        // offload.py:162:42
+	.loc	1 165 42                        // offload.py:165:42
 	add.s64 	%rd43, %rd100, %rd93;
 	add.s64 	%rd44, %rd43, 512;
 	add.s64 	%rd45, %rd43, 1024;
@@ -416,7 +416,7 @@ $L__tmp0:
 	add.s64 	%rd72, %rd43, 14848;
 	add.s64 	%rd73, %rd43, 15360;
 	add.s64 	%rd74, %rd100, %rd97;
-	.loc	1 162 47                        // offload.py:162:47
+	.loc	1 165 47                        // offload.py:165:47
 	// begin inline asm
 	@%p2 st.global.cs.b32 [ %rd43 + 0 ], { %r4 };
 	// end inline asm
@@ -513,7 +513,7 @@ $L__tmp0:
 	// begin inline asm
 	@%p33 st.global.cs.b32 [ %rd74 + 0 ], { %r35 };
 	// end inline asm
-	.loc	1 162 4                         // offload.py:162:4
+	.loc	1 165 4                         // offload.py:165:4
 	ret;
 $L__tmp1:
 $L__func_end0:
