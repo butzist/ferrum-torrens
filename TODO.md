@@ -726,11 +726,15 @@ next steps:
    aggregate decode **16.6 -> 26.2 tok/s (1.58x)**. It also serializes all model
    work, closing a latent concurrent-forward race.
 6. **R6 -- PARTIAL (decision 90).** Paged attention now runs 8 warps (`attn`
-   4.7 -> 4.37). The rest is blocked: `moe_lru` top-k needs `tl.topk` (the
-   interpreter gate cannot run it); GDN/attn projections need the W8A8
-   `torch._scaled_mm` `tch` does not expose (decision 84); the shared expert
-   needs an M>1 NVFP4 path to stay packed; the copy/compute overlap needs the
-   capture-path port split. Each is its own slice.
+   4.7 -> 4.37). Sub-stage profiling and the negative tuning results are in
+   `optimization.md` "R6 investigation": the GDN qkvz projection is at the read
+   roofline (~220 GB/s), the FP8 GEMV config is already optimal, and the LRU
+   clock is not the miss-rate cause (the copy is workload-bound). The rest is
+   blocked: `moe_lru` top-k needs `tl.topk` (the interpreter gate cannot run it);
+   GDN/attn projections need the W8A8 `torch._scaled_mm` `tch` does not expose
+   (decision 84), though batching routes the projections through the tensor-core
+   `fp8_gemm`; the shared expert needs an M>1 NVFP4 path to stay packed; the
+   copy/compute overlap needs the capture-path port split. Each is its own slice.
 
 Caveat (decision 89): the step is now ~33 ms copy (PCIe, miss-bound) + ~30 ms
 compute. FreeToken's 22.5 -> 30.3 tok/s at bs=1 is mostly its larger default

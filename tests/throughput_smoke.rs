@@ -237,8 +237,13 @@ fn greedy(max_tokens: u32) -> SamplingParams {
     }
 }
 
-/// A prompt of roughly `target` tokens built by repeating one unit.
+/// A prompt of roughly `target` tokens built by repeating one unit, or the exact
+/// `FERRUM_SMOKE_PROMPT` text when set (to compare routing with the reference on
+/// the same prompt, the miss rate is workload-sensitive).
 fn prompt_of(engine: &Engine, target: usize) -> Vec<u32> {
+    if let Ok(text) = std::env::var("FERRUM_SMOKE_PROMPT") {
+        return engine.encode(&text).unwrap();
+    }
     let unit = engine
         .encode("The quick brown fox jumps over the lazy dog. ")
         .unwrap();

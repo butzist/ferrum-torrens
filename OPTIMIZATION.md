@@ -679,6 +679,37 @@ Blocked, with the reason:
 
 None is safe to add as polish; each is its own slice.
 
+### R6 investigation (2026-10-17): what the sub-stage profile says
+
+Added `FT_PROFILE` sub-labels (`gdn_qkvz`/`gdn_ba`/`gdn_conv`/`gdn_recur`/
+`gdn_tail`, `attn_proj`/`attn_mem`/`attn_out`) and a `FERRUM_SMOKE_PROMPT`
+override so the same prompt can be replayed. Measured at auto (~1700 slots),
+ms/token, uncaptured: `gdn_qkvz` 3.46, `gdn_recur` 2.62, `gdn_tail` 1.40,
+`gdn_conv` 0.53, `gdn_ba` 0.41; `attn_proj` 1.85, `attn_out` 0.64. The GDN qkvz
+projection (N=12288, K=2048, fp8) runs at **~220 GB/s**, i.e. at the read
+roofline; the recurrence is the hand-written kernel. So there is no large GDN
+lever left.
+
+Negative results (do not repeat):
+- **FP8 GEMV tuning.** BLOCK_N 64 + 4 warps regressed the projections ~2x
+  (spills); 2 warps at BLOCK_N 16 regressed ~1.8x; a split-K target of 768
+  (vs 1536) was ~4% worse. The committed `BLOCK_N=16, BLOCK_K=128, 1 warp,
+  1536-CTA split-K` is the optimum on this 26-SM part, which is also what
+  FreeToken ships. Its apparent 57 GB/s on the attention qkv is the W8A16
+  fp8->f32 conversion cost that W8A8 tensor cores avoid; `tch` cannot reach
+  `_scaled_mm` (decision 84). At M>1 (batched, R5) the projections take the
+  tensor-core `fp8_gemm`, so batching is the way around it.
+- **LRU recency clock.** The hypothesis that the per-layer step clock makes
+  early-layer experts look colder and thrashes was tested by keying recency by
+  token (`usage // num_layers`): `moe_copy` was unchanged (29.7 vs 28.7 ms,
+  noise). The miss rate is the workload, not a policy bug.
+- **Copy is workload-bound.** On the reference's own AIME prompt at auto we
+  still stage ~220 experts/token (69% miss, 12.5 GB/s) vs the reference's 109
+  (34%) at ~1900 slots. Both run at the PCIe rate; the byte count, not the copy
+  code, is the difference. `plan_cap` is the full slot count (the prefill double
+  buffer is borrowed, not reserved), and the cache is already at auto/ceiling.
+
+
 ### Measurement discipline
 
 - Re-profile with `FT_PROFILE=1 FERRUM_SMOKE_NOGRAPH=1 FERRUM_SMOKE_CACHE=<n>`

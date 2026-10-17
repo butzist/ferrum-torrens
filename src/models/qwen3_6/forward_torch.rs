@@ -1570,47 +1570,60 @@ impl TorchQwen3_6 {
         access: &CacheAccess<'_>,
         pool: &MhaPool,
     ) -> Result<Tensor> {
-        let (q, k, v, gate) = self.project_attention(fa, x, positions);
+        let (q, k, v, gate) = {
+            let sp = profile::begin("attn_proj");
+            let o = self.project_attention(fa, x, positions);
+            profile::end("attn_proj", sp);
+            o
+        };
         let t = k.size()[0];
-        let attn = match access {
-            CacheAccess::Host { cache, q_offset } => {
-                pool.store(layer, cache.tail(t as usize), &k, &v);
-                let (k_all, v_all) = pool.gather(layer, cache.filled());
-                attention_cached(&q, &k_all, &v_all, *q_offset)
-            }
-            CacheAccess::Device {
-                out_locs, kv_locs, ..
-            } => {
-                pool.store_at(layer, out_locs, &k, &v);
-                // The paged kernel reads each row's window straight out of the
-                // pool; the dense gather is the fallback for a CPU device. Both
-                // pool dtypes run it (the bf16 cubin, TODO.md item 14), so the
-                // default bf16 KV no longer takes the libtorch gather.
-                match (&self.attention, pool.dtype()) {
-                    (Some(attn), KvDType::F32) | (Some(attn), KvDType::BFloat16) => {
-                        let (qh, hd) = (q.size()[1], q.size()[2]);
-                        // q/out are the bf16 activation dtype (TODO.md item 19);
-                        // the kernel reduces in f32 and casts on store.
-                        let out = Tensor::zeros([t, qh, hd], (Kind::BFloat16, q.device()));
-                        let (k_ptr, v_ptr) = pool.kv_slab_ptrs(layer);
-                        let kv_bf16 = pool.dtype() == KvDType::BFloat16;
-                        // SAFETY: every address is a live device allocation in
-                        // the launcher's context (the pool and the step's own
-                        // buffers), and `locs` names the tokens the pool holds.
-                        unsafe {
-                            attn.decode(&q, &out, k_ptr, v_ptr, kv_locs, positions, kv_bf16)
-                        }?;
-                        out.reshape([t, qh * hd])
-                    }
-                    _ => {
-                        let (k_all, v_all) = pool.gather_rows(layer, kv_locs);
-                        attention_cached_pos(&q, &k_all, &v_all, positions)
+        let attn = {
+            let sp = profile::begin("attn_mem");
+            let o = match access {
+                CacheAccess::Host { cache, q_offset } => {
+                    pool.store(layer, cache.tail(t as usize), &k, &v);
+                    let (k_all, v_all) = pool.gather(layer, cache.filled());
+                    attention_cached(&q, &k_all, &v_all, *q_offset)
+                }
+                CacheAccess::Device {
+                    out_locs, kv_locs, ..
+                } => {
+                    pool.store_at(layer, out_locs, &k, &v);
+                    // The paged kernel reads each row's window straight out of the
+                    // pool; the dense gather is the fallback for a CPU device. Both
+                    // pool dtypes run it (the bf16 cubin, TODO.md item 14), so the
+                    // default bf16 KV no longer takes the libtorch gather.
+                    match (&self.attention, pool.dtype()) {
+                        (Some(attn), KvDType::F32) | (Some(attn), KvDType::BFloat16) => {
+                            let (qh, hd) = (q.size()[1], q.size()[2]);
+                            // q/out are the bf16 activation dtype (TODO.md item 19);
+                            // the kernel reduces in f32 and casts on store.
+                            let out = Tensor::zeros([t, qh, hd], (Kind::BFloat16, q.device()));
+                            let (k_ptr, v_ptr) = pool.kv_slab_ptrs(layer);
+                            let kv_bf16 = pool.dtype() == KvDType::BFloat16;
+                            // SAFETY: every address is a live device allocation in
+                            // the launcher's context (the pool and the step's own
+                            // buffers), and `locs` names the tokens the pool holds.
+                            unsafe {
+                                attn.decode(&q, &out, k_ptr, v_ptr, kv_locs, positions, kv_bf16)
+                            }?;
+                            out.reshape([t, qh * hd])
+                        }
+                        _ => {
+                            let (k_all, v_all) = pool.gather_rows(layer, kv_locs);
+                            attention_cached_pos(&q, &k_all, &v_all, positions)
+                        }
                     }
                 }
-            }
+            };
+            profile::end("attn_mem", sp);
+            o
         };
+        let sp = profile::begin("attn_out");
         let gated = attn * sigmoid(&gate);
-        Ok(fa.o.apply(&gated))
+        let o = fa.o.apply(&gated);
+        profile::end("attn_out", sp);
+        Ok(o)
     }
 
     fn gdn(&self, gdn: &GatedDeltaNet, x: &Tensor) -> Tensor {
@@ -1705,19 +1718,34 @@ impl TorchQwen3_6 {
         let conv_dim = 2 * key_dim + value_dim;
         let t = x.size()[0];
 
-        let qkvz = gdn.qkvz.apply(x);
+        let qkvz = {
+            let sp = profile::begin("gdn_qkvz");
+            let o = gdn.qkvz.apply(x);
+            profile::end("gdn_qkvz", sp);
+            o
+        };
         trace_tensor("gdn.qkvz", layer, &qkvz);
         let (conv_in, z) = two(qkvz, [conv_dim, value_dim], 1);
-        let ba = f32_(x).matmul(&f32_(&gdn.ba).transpose(0, 1));
+        let ba = {
+            let sp = profile::begin("gdn_ba");
+            let o = f32_(x).matmul(&f32_(&gdn.ba).transpose(0, 1));
+            profile::end("gdn_ba", sp);
+            o
+        };
         let (b, a) = two(ba, [vb, vb], 1);
 
-        let (mixed, conv_out) = conv1d_silu_cached(
-            &conv_in,
-            &f32_(&gdn.conv),
-            conv_dim,
-            p.linear_conv_kernel_dim as i64,
-            conv_state,
-        );
+        let (mixed, conv_out) = {
+            let sp = profile::begin("gdn_conv");
+            let o = conv1d_silu_cached(
+                &conv_in,
+                &f32_(&gdn.conv),
+                conv_dim,
+                p.linear_conv_kernel_dim as i64,
+                conv_state,
+            );
+            profile::end("gdn_conv", sp);
+            o
+        };
         trace_tensor("gdn.conv", layer, &mixed);
         let (qf, kf, vf) = three(mixed, [key_dim, key_dim, value_dim], 1);
         let rep = vb / kb;
@@ -1728,13 +1756,22 @@ impl TorchQwen3_6 {
         let a_log = f32_(&gdn.a_log).exp().neg();
         let g = softplus(&(&a + &f32_(&gdn.dt_bias))) * &a_log;
         let beta = sigmoid(&b);
-        let (core, rec) = gdn_recurrence_cached(&q, &k, &v, &g, &beta, vb, dk, dv, recurrent_state);
+        let (core, rec) = {
+            let sp = profile::begin("gdn_recur");
+            let o = gdn_recurrence_cached(&q, &k, &v, &g, &beta, vb, dk, dv, recurrent_state);
+            profile::end("gdn_recur", sp);
+            o
+        };
         trace_tensor("gdn.core", layer, &core);
 
         let core_n =
             rms_norm(&core.reshape([t, vb, dv]), &gdn.norm, p.rms_norm_eps).reshape([t, value_dim]);
-        let out = core_n * z.silu();
-        let o = gdn.o.apply(&out);
+        let o = {
+            let sp = profile::begin("gdn_tail");
+            let o = gdn.o.apply(&(core_n * z.silu()));
+            profile::end("gdn_tail", sp);
+            o
+        };
         trace_tensor("gdn.out", layer, &o);
         (o, conv_out, rec)
     }
@@ -1823,15 +1860,25 @@ impl TorchQwen3_6 {
         let conv_dim = 2 * key_dim + value_dim;
         let n = x.size()[0];
 
-        let qkvz = gdn.qkvz.apply(x);
+        let qkvz = {
+            let sp = profile::begin("gdn_qkvz");
+            let o = gdn.qkvz.apply(x);
+            profile::end("gdn_qkvz", sp);
+            o
+        };
         trace_tensor("gdn.qkvz", layer, &qkvz);
         let (conv_in, z) = two(qkvz, [conv_dim, value_dim], 1);
         // The gating projection is computed in f32 then narrowed to the kernel's
         // bf16 `ba`: the bf16 matmul alone shifted the decode argmax past the
         // device gate, so keep the f32 accumulation for this small projection.
-        let ba = f32_(x)
-            .matmul(&f32_(&gdn.ba).transpose(0, 1))
-            .to_kind(Kind::BFloat16);
+        let ba = {
+            let sp = profile::begin("gdn_ba");
+            let o = f32_(x)
+                .matmul(&f32_(&gdn.ba).transpose(0, 1))
+                .to_kind(Kind::BFloat16);
+            profile::end("gdn_ba", sp);
+            o
+        };
 
         // Fused conv + silu (item 19): one launch for the depthwise conv, the
         // silu and the in-place state shift. `conv_state` is the gathered f32
@@ -1843,10 +1890,14 @@ impl TorchQwen3_6 {
             .conv
             .reshape([conv_dim, p.linear_conv_kernel_dim as i64]);
         let mixed = Tensor::empty([n, conv_dim], (Kind::BFloat16, x.device()));
-        // SAFETY: `conv_in`/`conv_w`/`conv_state`/`mixed` are live device
-        // allocations and the shapes match the committed conv cubin.
-        unsafe { kernel.conv_decode(&conv_in, &conv_w, conv_state, &mixed) }
-            .expect("gdn conv kernel");
+        {
+            let sp = profile::begin("gdn_conv");
+            // SAFETY: `conv_in`/`conv_w`/`conv_state`/`mixed` are live device
+            // allocations and the shapes match the committed conv cubin.
+            unsafe { kernel.conv_decode(&conv_in, &conv_w, conv_state, &mixed) }
+                .expect("gdn conv kernel");
+            profile::end("gdn_conv", sp);
+        }
         trace_tensor("gdn.conv", layer, &mixed);
         let conv_out = conv_state.shallow_clone();
         // q/k/v are narrows of `mixed`: strided rows, head-major within a row.
@@ -1860,24 +1911,33 @@ impl TorchQwen3_6 {
         // SAFETY: the tensors are live allocations on this model's device, the
         // shapes were checked when the launcher was built, and `recurrent_state`
         // is the layer slab's contiguous f32 row gather.
-        unsafe {
-            kernel.decode(
-                &ba,
-                &gdn.a_log,
-                &gdn.dt_bias,
-                &q,
-                &k,
-                &v,
-                recurrent_state,
-                &out,
-            )
+        {
+            let sp = profile::begin("gdn_recur");
+            unsafe {
+                kernel.decode(
+                    &ba,
+                    &gdn.a_log,
+                    &gdn.dt_bias,
+                    &q,
+                    &k,
+                    &v,
+                    recurrent_state,
+                    &out,
+                )
+            }
+            .expect("gdn decode kernel");
+            profile::end("gdn_recur", sp);
         }
-        .expect("gdn decode kernel");
         trace_tensor("gdn.core", layer, &out);
 
         let core_n =
             rms_norm(&out.reshape([n, vb, dv]), &gdn.norm, p.rms_norm_eps).reshape([n, value_dim]);
-        let o = gdn.o.apply(&(core_n * z.silu()));
+        let o = {
+            let sp = profile::begin("gdn_tail");
+            let o = gdn.o.apply(&(core_n * z.silu()));
+            profile::end("gdn_tail", sp);
+            o
+        };
         trace_tensor("gdn.out", layer, &o);
         (o, conv_out, recurrent_state.shallow_clone())
     }
