@@ -477,7 +477,8 @@ sequenceDiagram
 ```
 
 `lru_ensure` dedups first-occurrences in one CTA, so its committed `BLOCK_K = 128`
-is a route cap. `CudaMoE::grouped_moe_staged` chunks a larger list by tokens
+is a route cap, and its committed `BLOCK_C = 2048` caps the slot cache it can
+address (decision 85). `CudaMoE::grouped_moe_staged` chunks a larger list by tokens
 (`staged_chunk_tokens`) and repeats the sequence per chunk, the device LRU and
 the pinned banks carrying across, so prefill uses the same device path as decode
 (decision 66). `CachedExperts` without device staging still takes the host plan

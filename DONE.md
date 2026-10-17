@@ -2081,6 +2081,39 @@ settled.
       `lru_ensure` bakes `BLOCK_C 512` and refuses more
       (`cuda_moe.rs:438`). Raising `BLOCK_C` is the item-12/13 follow-up.
 
+85. **Expert cache ceiling raised to 2048 slots** (2026-10-17, implemented, E4) --
+    TODO item 21, the last thing decision 84 left blocked.
+    - **What changed.** `signatures.py` `SERVING_BLOCK_C` 512 -> 2048 (`SLOT_BITS`
+      9 -> 11), so the committed `lru_ensure` cubin masks and `tl.sort`s up to
+      2048 slots; `enable_device_staging` no longer refuses a cache past 512.
+      Regenerated `kernel/lru_ensure.{cubin,ptx}` + `kernel/manifest.json`; the
+      `--check` regression caught that `index_copy.cubin`/`gdn_decode.cubin` also
+      needed rewriting (their DWARF line table embeds a source-content hash from
+      before the last `offload.py`/`gdn.py` edit that never touched the PTX), so
+      the committed set now reproduces on any checkout. Rust ABI expectation
+      updated to 2048. 2048 is the largest power of two that still fits the 8 GiB
+      target at the current non-slot footprint (shared 16 KiB, no register spill).
+    - **Gates.** New gated `cuda_moe_matches_reference::
+      a_cache_above_the_old_ceiling_stages_on_device` stages a 1536-slot cache
+      (refused before E4) and matches the host plan byte for byte; the six
+      existing `cuda_moe_matches_reference` gates stay green; `scripts/check-kernels.sh`
+      and `kernel-selftest --interp` pass.
+    - **Measured (RTX 5060 Laptop, bs=1, bf16 KV, `tests/throughput_smoke.rs`).**
+
+      | slots | tg (tok/s) | VRAM (MiB) |
+      |---|---|---|
+      | 512 (default) | 10.6 | 4830 |
+      | 1024 | 11.0 | 5708 |
+      | 1280 | 11.3 | 6140 |
+      | 1536 | 11.5 | 6570 |
+      | 1792 | 11.4 | 7002 |
+      | 2048 (ceiling) | 11.4 | 7434 |
+
+      The knee is ~1536 slots (+8.5%), well short of FreeToken's ~35%: MoE is only
+      ~17% of our decode, so the per-token weight read it amortizes is a small
+      share (decision 81). The default config stays at 512; larger caches are
+      opt-in, and this is the ceiling item 12's budget planner would spend.
+
 ---
 
 ## Progress log (narrative, pre-2026-10-15 compaction)

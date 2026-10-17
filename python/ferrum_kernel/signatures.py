@@ -177,10 +177,11 @@ def reduce_constexprs() -> dict:
 # One decode step's routed set: batch*top_k. The staging pair is only captured
 # on the decode path, so this is the pinned `BLOCK_K`. `BLOCK_C` is the slot
 # cache ceiling and `SLOT_BITS` its log2; both land in the manifest (decision
-# 40 prerequisite 4).
+# 40 prerequisite 4). The ceiling is the largest power of two that can still fit
+# the 8 GiB target, so the config may grow the cache up to it (item 21).
 SERVING_BLOCK_K = 128
-SERVING_CACHE_SLOTS = 512
-SERVING_BLOCK_C = 512
+SERVING_CACHE_SLOTS = 2048
+SERVING_BLOCK_C = 2048
 
 # Copy geometry. The FTW MoE offload has six banks per layer (gate_up/down x
 # packed/scale/global) and `gate_up_packed#L*` is [num_experts, 1024, 1024] =

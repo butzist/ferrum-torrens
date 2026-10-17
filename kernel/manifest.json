@@ -1024,9 +1024,9 @@
     },
     "lru_ensure": {
       "constexprs": {
-        "BLOCK_C": 512,
+        "BLOCK_C": 2048,
         "BLOCK_K": 128,
-        "SLOT_BITS": 9,
+        "SLOT_BITS": 11,
         "USAGE_MAX": 36028797018963967
       },
       "declared_args": [
@@ -1106,7 +1106,7 @@
       ],
       "profile_scratch_size": 0,
       "scratch_params": 2,
-      "shared": 4096
+      "shared": 16384
     }
   },
   "target": {

@@ -41,9 +41,11 @@ The decode gap is now pursued by **vendoring FreeToken's own Triton kernels**
 (decision 82, plan in `FUSED_GDN.md`). Slices 1-2 landed: bf16 paged attention
 (decision 83) and the W8A16 FP8 projections (decision 84), which with the packed
 NVFP4 lm_head (decision 79) take decode **tg 8.2 -> 10.9 tok/s** and VRAM
-**7.9 -> 4.83 GiB**. Next: bf16 mixer activations + a fused conv (slice 3), then
-the prefill chunk kernels (slice 4); libtorch stays the generic/CPU fallback.
-Progress history and the full decision log (numbers 1..84) live in `DONE.md`;
+**7.9 -> 4.83 GiB**. E4 (item 21, decision 85) raised the staging ceiling so the
+cache can grow to 2048 slots: tg 10.6 -> 11.5 at 1536 slots (plateau), VRAM up to
+7.4 GiB. Next: bf16 mixer activations + a fused conv (slice 3), then the prefill
+chunk kernels (slice 4); libtorch stays the generic/CPU fallback.
+Progress history and the full decision log (numbers 1..85) live in `DONE.md`;
 read that for the "why" behind any decision number referenced in code or tests.
 
 Goal: a **minimal, fast, single-GPU** Rust serving engine for **one model** --
@@ -315,6 +317,12 @@ The full log of confirmed decisions (numbers 1..84, stable -- code, tests and
 lists only the decisions that still bind open work; everything else there is
 history.
 
+- **85** -- the staging `lru_ensure` cache ceiling is 2048 slots
+  (`SERVING_BLOCK_C`, `SLOT_BITS` 11). It is the largest power of two that still
+  fits the 8 GiB target at the current non-slot footprint, and it unblocks growing
+  `moe.cache_size_slots` past the old 512 (item 21, E4). The config default stays
+  512; a larger cache is opt-in. MoE is ~17% of decode, so the win plateaus at
+  ~1536 slots (tg 10.6 -> 11.5).
 - **84** -- the FP8 projections are the vendored W8A16 kernels
   (`fp8_gemv`/`fp8_splitk_reduce`/`fp8_gemm`, decision 82 slice 2), reading the
   resident e4m3 weight + per-row scale directly; `Dense` holds either a bf16
@@ -577,13 +585,13 @@ performance work.
 20. Prefill chunk kernels -- **OPEN (decision 82, slice 4).** Vendor FLA
     `chunk_gated_delta_rule` + `causal_conv1d_varlen`; our prefill is still
     libtorch op soup with no FLA chunk kernel.
-21. Expert cache growth (E4) -- **OPEN, now unblocked on VRAM but blocked in code.**
-    The FP8 slice (item 17) freed ~1.2 GiB, so the cache could grow past 512 slots
-    into FreeToken's ~1900-slot regime (it measured ~35% from cache size at bs=1,
-    decision 76). Blocked because device staging bakes `BLOCK_C 512` and refuses
-    more (`cuda_moe.rs:438`, decision 84). Fix: raise the staging `lru_ensure`
-    constexpr and re-check. MoE is only ~17% of decode here, so expect a few ms,
-    not FreeToken's share.
+21. Expert cache growth (E4) -- **DONE (2026-10-17), decision 85.** The staging
+     `lru_ensure` `BLOCK_C` ceiling is raised 512 -> 2048 (decision 84), so a
+     config may grow the cache into the VRAM the FP8 slice freed. Measured on the
+     RTX 5060 Laptop, bs=1, bf16 KV: tg 10.6 tok/s at 512 slots -> 11.5 at 1536
+     (plateau; 11.4 at 2048), VRAM 4830 -> 6570 MiB (1536) / 7434 MiB (2048).
+     Gated by `a_cache_above_the_old_ceiling_stages_on_device`; the default
+     config stays 512.
 
 ### Decode speed plan (decision 82): status and next steps
 
@@ -675,6 +683,7 @@ max_seq_len = 65536            # floor; KV makes ~200k feasible if prompted
 kv_dtype = "bf16"              # [kv] dtype; half of f32, fits the 8 GB target
 moe_cache_size_slots = 512     # 256 (0.43 GB) or 512 (0.87 GB); floor = 256
                                # 512 enables whole-layer prefill overlap (>= 2*E)
+                               # ceiling 2048 (decision 85); ~1536 is the tg knee
 max_running_requests = 4
 max_prefill_length = 8192
 prefill_overlap = true         # takes effect only when cache_size_slots >= 512

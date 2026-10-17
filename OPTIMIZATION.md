@@ -416,14 +416,16 @@ Standing measurement (RTX 5060 Laptop, bs=1, bf16 KV, `tests/throughput_smoke.rs
 | + vendored W8A16 FP8 projections (84, slice 2) | 10.9 | 4.83 | `fea0281` |
 
 FreeToken is 22.5 tok/s (512 slots) / 30.3 (1900 slots); the gap is now ~2.1-2.8x.
-Slices 1-2 are done. The ordered remainder, with what each step actually is:
+Slices 1-2 and E4 are done. The ordered remainder, with what each step actually is:
 
-1. **E4 (item 21): raise the staging `BLOCK_C`.** The FP8 slice freed ~1.2 GiB, but
-   `enable_device_staging` refuses a cache larger than the baked `BLOCK_C 512`
-   (`cuda_moe.rs:438`). Bump the `lru_ensure` constexpr, re-run
-   `scripts/check-kernels.sh` and the offload ABI/plan tests, then sweep slots in
-   the smoke. FreeToken got ~35% from 512 -> 1900 at bs=1; our MoE is only ~17% of
-   decode, so expect a few ms -- but the VRAM is already paid for.
+1. **E4 (item 21): raise the staging `BLOCK_C`. DONE (2026-10-17), decision 85.**
+   The `lru_ensure` ceiling is 512 -> 2048, so `enable_device_staging` no longer
+   refuses a cache past 512. Swept in the smoke (bs=1, bf16 KV, same box):
+   512 slots 4830 MiB / tg 10.6; 1024 5708 / 11.0; 1280 6140 / 11.3; 1536 6570 /
+   11.5; 1792 7002 / 11.4; 2048 7434 / 11.4. The knee is ~1536 slots (+8.5%), not
+   FreeToken's ~35%, because MoE is only ~17% of decode here. The config default
+   stays 512; the ceiling is opt-in. Gated by
+   `cuda_moe_matches_reference::a_cache_above_the_old_ceiling_stages_on_device`.
 2. **Slice 3 (item 19): bf16 mixer activations + `causal_conv1d_decode`.** Move the
    mixer activation stream (rms_norm/conv/attention outputs) from f32 to bf16 so
    FreeToken's kernels take signature-only edits, and vendor their fused conv+silu

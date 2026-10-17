@@ -510,6 +510,105 @@ fn a_chunked_prefill_step_matches_the_host_plan() {
     );
 }
 
+/// Item 21 (E4): the committed `lru_ensure` `BLOCK_C` ceiling was raised from
+/// 512 to 2048 slots, so a config can grow the expert cache into the VRAM the
+/// FP8 slice freed. This stages a cache past the old 512 ceiling and checks the
+/// device plan still equals the host plan; before the raise, `enable_device_staging`
+/// refused anything above 512.
+#[test]
+#[ignore = "needs a CUDA device and the converted checkpoint in .model-cache"]
+#[serial]
+fn a_cache_above_the_old_ceiling_stages_on_device() {
+    use ferrum_torrens::infrastructure::banks::FtwPinnedBanks;
+
+    const L: usize = 0;
+    const EXPERTS: usize = 256;
+    const SLOTS2: usize = 1536;
+    const TOKENS2: usize = 8;
+
+    let Some((index, reader)) = open_checkpoint() else {
+        panic!("gate needs the checkpoint in {FTW_DIR}");
+    };
+    let shapes = shapes(&index);
+    let (hidden, inter) = (shapes.hidden, shapes.inter);
+    let source: Arc<dyn ExpertSlabSource> = Arc::new(FtwBanks::new(reader.clone(), index.clone()));
+
+    let x: Vec<f32> = (0..TOKENS2 * hidden)
+        .map(|i| ((i * 2654435761usize % 1009) as f32 / 1009.0) - 0.5)
+        .collect();
+    let routed: Vec<u32> = (0..TOKENS2 * TOP_K)
+        .map(|i| ((i * 7 + 3) % EXPERTS) as u32)
+        .collect();
+    let weights: Vec<f32> = (0..TOKENS2 * TOP_K)
+        .map(|i| 1.0 / TOP_K as f32 + i as f32 * 1e-3)
+        .collect();
+
+    let mut adapter = gate(
+        "driver API + committed cubins",
+        CudaMoE::new_with_stream(
+            Device::Cuda(0),
+            source,
+            shapes,
+            SLOTS2,
+            std::ptr::null_mut(),
+        ),
+    );
+    let driver = adapter.driver();
+    let pinned = gate(
+        "pinned expert banks",
+        FtwPinnedBanks::load(&driver, &reader, &index, shapes, L + 1, EXPERTS),
+    );
+    gate(
+        "enable device staging past the old ceiling",
+        adapter.enable_device_staging(Box::new(pinned), L + 1, EXPERTS),
+    );
+    let moe = Arc::new(Mutex::new(adapter));
+
+    let step = ExpertStep {
+        hidden,
+        inter,
+        top_k: TOP_K,
+        x: &x,
+        experts: &routed,
+        weights: &weights,
+    };
+    let mut host_cache = ExpertCache::new(L + 1, EXPERTS, SLOTS2);
+    let mut host_out = vec![0.0f32; TOKENS2 * hidden];
+    gate(
+        "run_experts (host plan)",
+        run_experts(&mut host_cache, &*moe, &*moe, L, &step, &mut host_out),
+    );
+
+    let exec = CachedExperts::with_device_staging(moe.clone(), moe, L + 1, EXPERTS, SLOTS2);
+    let dev = Device::Cuda(0);
+    let ids: Vec<f32> = routed.iter().map(|&e| e as f32).collect();
+    let xd = DevTensor::from_f32(&x, &[TOKENS2 as i64, hidden as i64], dev);
+    let ed = DevTensor::from_f32(&ids, &[TOKENS2 as i64, TOP_K as i64], dev);
+    let wd = DevTensor::from_f32(&weights, &[TOKENS2 as i64, TOP_K as i64], dev);
+    let mut out = DevTensor::zeros(&[TOKENS2 as i64, hidden as i64], dev);
+    gate(
+        "execute_device",
+        exec.execute_device(
+            &MoEDeviceRequest {
+                layer: L,
+                hidden,
+                inter,
+                top_k: TOP_K,
+                x: &xd,
+                experts: &ed,
+                weights: &wd,
+            },
+            &mut out,
+        ),
+    );
+    let staged = to_f32_vec(&out.0);
+    assert_eq!(
+        staged, host_out,
+        "a staged step in a {SLOTS2}-slot cache must be byte for byte the host plan"
+    );
+    println!("PASS: {SLOTS2} slots staged, {TOKENS2} tokens over {EXPERTS} experts");
+}
+
 /// Item 8 slice 2 (decision 67): the whole-layer prefill double buffer. Two
 /// prefill-sized layers stream through the two halves of a 512-slot cache while
 /// the next layer's copy rides the non-blocking copy stream, and each layer's
