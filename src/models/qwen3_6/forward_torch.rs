@@ -1296,8 +1296,9 @@ struct TorchLayer {
     input_norm: SharedTensor,
     post_norm: SharedTensor,
     mixer: Mixer,
-    /// Router `[experts, hidden]` bf16.
-    gate: SharedTensor,
+    /// Router `[experts, hidden]` f32. The upcast is done once at load, not per
+    /// forward; decision 87 keeps the router matmul in f32.
+    gate_f32: SharedTensor,
     /// Shared-expert gate `[1, hidden]` bf16.
     shared_gate: SharedTensor,
     shared: SharedExpert,
@@ -1409,11 +1410,11 @@ impl TorchQwen3_6 {
                     )),
                 })
             };
-            let gate = up(bf16_tensor(
+            let gate_f32 = up(f32_(&bf16_tensor(
                 &ld.bf16_vec(&format!("{p}.mlp.gate.weight"), params.num_experts * h)?,
                 &[params.num_experts as i64, h as i64],
                 device,
-            ));
+            )));
             let shared_gate = up(bf16_tensor(
                 &ld.bf16_vec(&format!("{p}.mlp.shared_expert_gate.weight"), h)?,
                 &[1, h as i64],
@@ -1430,7 +1431,7 @@ impl TorchQwen3_6 {
                 input_norm,
                 post_norm,
                 mixer,
-                gate,
+                gate_f32,
                 shared_gate,
                 shared,
             });
@@ -2071,7 +2072,7 @@ impl TorchQwen3_6 {
         // Kept in f32: a bf16 router matmul shifted the decode argmax past the
         // device gate, so the weight is upcast here (unlike the projections).
         let sp = profile::begin("router");
-        let logits = f32_(x_post).matmul(&f32_(&layer.gate).transpose(0, 1));
+        let logits = f32_(x_post).matmul(&layer.gate_f32.transpose(0, 1));
         let probs = logits.softmax(-1, Kind::Float);
         let (ids, weights) = topk_renorm(&probs, p.top_k as i64);
         profile::end("router", sp);
