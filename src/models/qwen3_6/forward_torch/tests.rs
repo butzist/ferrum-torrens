@@ -664,6 +664,7 @@ fn a_dense_projection_is_widened_at_load_and_apply_never_reads_again() {
         index: &index,
         reader: &reader,
         fp8: None,
+        gemv: None,
     };
 
     let d = ld.dense("proj.weight", dev()).unwrap();

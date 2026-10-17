@@ -689,6 +689,20 @@ performance work.
      `stride_pkw` and `kernel_abi.rs` passes word strides; `nvfp4_dense_gemv()`
      drops the LUT and takes K-major strides. Gates green (see DONE.md 89).
      Remaining decode work is R4/R5/R6, not this item.
+23. Shared expert stays NVFP4 -- **IN PROGRESS (operator request, 2026-10-17).**
+     The checkpoint stores `mlp.shared_expert.{gate_up,down}_proj` NVFP4; we widen
+     both to bf16 at load (240 MiB) and read them every token. Keep the packed
+     banks and run the dense NVFP4 GEMV for decode (like the lm_head), bf16 for
+     prefill (M>1). Saves ~2 ms/token and ~180 MiB. Design in `optimization.md`
+     R7.
+24. Prefill/cache residency -- **OPEN (operator request, 2026-10-17).** Audit and
+     redesign how the MoE slot cache, the prefill double buffer and the KV/state
+     pools share VRAM: retain the decode cache across a prefill and between
+     requests instead of evicting it; give the slot cache an explicit state enum
+     (`Experts` vs `DoubleBuffered { retained }`) so a whole-layer prefill only
+     takes `2 * num_experts` slots and keeps LRU/MFU experts in the retained
+     area; and let a prefill under pressure evict KV/dense before the expert
+     cache. Full idea list and evaluation in `optimization.md` R7.
 
 ### Decode speed plan (decision 82): status and next steps
 

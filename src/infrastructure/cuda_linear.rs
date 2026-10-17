@@ -136,6 +136,7 @@ impl DenseGemv {
             c: c.data_ptr() as u64,
             m: m as u32,
             n: n as u32,
+            k_words: k_words as u32,
             stride_am: a.stride()[0] as u32,
             stride_ak: a.stride()[1] as u32,
             // K-major: N is contiguous (stride_pn), K steps by N (stride_pkw).

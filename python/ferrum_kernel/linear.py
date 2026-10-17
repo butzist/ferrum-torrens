@@ -47,11 +47,11 @@ def _nvfp4_dense_gemv_kernel(
     c_ptr,  # [M, N] fp32
     M,
     N,
+    K_WORDS,
     stride_am, stride_ak,
     stride_pn, stride_pkw,
     stride_sn, stride_sblk,
     stride_cm, stride_cn,
-    K_WORDS: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_KW: tl.constexpr,
 ):
@@ -131,7 +131,6 @@ def nvfp4_dense_gemv(
     require_native_e4m3(a.device)
     packed_i32 = packed.view(torch.int32)  # [N, K // 8]
     consts = {
-        "K_WORDS": k // 8,
         "BLOCK_N": block_n,
         "BLOCK_KW": block_kw,
     }
@@ -139,7 +138,7 @@ def nvfp4_dense_gemv(
     grid = (m, triton.cdiv(n, block_n))
     _nvfp4_dense_gemv_kernel[grid](
         a, packed_i32, scale, glob, c,
-        m, n,
+        m, n, k // 8,
         a.stride(0), a.stride(1),
         packed_i32.stride(0), packed_i32.stride(1),
         scale.stride(0), scale.stride(1),

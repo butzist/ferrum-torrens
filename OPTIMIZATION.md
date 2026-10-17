@@ -729,3 +729,65 @@ Expected trajectory (bs=1), revised after R1/R2/R4: 94-98 ms @512 -> R1+R2
 shared/LRU). Closing the rest needs the R6 slices above and R5 batching, which
 multiplies serving throughput beyond anything bs=1 can show.
 
+
+## R7 -- Shared-expert NVFP4 and prefill/cache residency (operator request)
+
+Recorded 2026-10-17 from the operator's review. Item 23 is in progress; item 24 is
+an audit-and-redesign slice. The questions are the acceptance criteria: answer
+each with the code path and, where it matters, a measurement.
+
+### R7.1 Shared expert stays NVFP4 (TODO item 23)
+
+The checkpoint stores `mlp.shared_expert.{gate_up,down}_proj` NVFP4; `Loader::
+dense` widens both to bf16 (240 MiB) and `shared` reads them every token at
+~77 GB/s. Keep the packed K-major banks and run `nvfp4_dense_gemv` for decode
+(M <= 8), keeping the bf16 weight for prefill (M > 1). Expected: `shared`
+3.1 -> ~1 ms, VRAM +60 MiB (both representations) or -180 MiB if the bf16 copy
+is dropped once a prefill path for NVFP4 exists. Gate with the device decode
+oracle and `ftw_cross_check`.
+
+### R7.2 Prefill/cache residency (TODO item 24)
+
+The operator's questions, to be answered from the code and then fixed:
+
+1. **Do we retain the LRU experts in VRAM during prefill, or evict all?**
+   `CudaMoE::enable_prefill_overlap` "borrows the cache's first
+   `2 * num_experts` slots" for the whole-layer double buffer. Audit whether the
+   prefill copy rewrites `slot_for_id`/`id_of_slot` for those slots so a decode
+   step afterwards sees them as invalid, and whether decode experts placed there
+   are lost. Expected answer: they are lost; prefill should touch only its
+   `2 * num_experts` slots and leave the rest mapped.
+2. **Between requests, is the expert cache invalidated?** Check `reset_staging`,
+   any per-request `CudaMoE` construction, and `CachedExperts` lifecycle. The
+   cache must survive the end of a request (only the *KV pages/state slots* of
+   that request are donated/freed).
+3. **Where are the expert and KV caches invalidated?** Enumerate every mutation
+   of `slot_for_id`, `id_of_slot`, `usage`, `step`, the page pool and the state
+   slot pool, and assert none of them clears the whole expert cache except an
+   explicit reset (none should exist in serving).
+4. **How much space does an input batch need?** A whole-layer prefill needs
+   `2 * num_experts` slots (two buffers of one layer's 256 experts, 512 slots),
+   not all 40 layers. Confirm the geometry (`groups = experts / BLOCK_K`, two
+   buffers) and that nothing sizes the prefill path by `layers * experts`.
+5. **Cache state as an enum.** Replace the current boolean-ish wiring with
+   `enum SlotCacheState { Experts, Prefill { retained: Range<usize> } }` (or the
+   Rust-native equivalent) where `Experts` is the decode LRU over every slot and
+   `Prefill` is the double buffer over `2 * num_experts` slots with the decode
+   LRU confined to `retained`. Keep LRU/MFU experts in `retained`: rank eviction
+   inside `retained` by `(usage, slot)` as today, and never let the prefill
+   buffer's slots enter the decode LRU.
+6. **Evict KV/dense before experts under prefill pressure.** Evaluate trading:
+   expert-cache slots (PCIe re-fetch later) vs KV pages (re-prefill) vs dense
+   weights (host re-widen / reload). Prefill is compute-bound and reads whole
+   layers, so the double buffer is the only extra requirement; if VRAM is tight,
+   prefer shrinking the *KV page pool* (or spilling the least-recently-used
+   prompt's pages) over evicting the decode expert working set, and never
+   evict the resident dense tower.
+7. **Retention policy.** When a prefill must take slots from the decode LRU, drop
+   the LRU experts first and keep the MFU set (highest reuse) in the retained
+   area; measure the post-prefill decode miss rate before/after.
+
+Acceptance: a gated test that runs a decode, then a prefill, then another decode
+on the same engine and shows the second decode's `moe_copy` miss count is close
+to the first (the cache was retained), plus the prefill using only
+`2 * num_experts` slots. Re-measure tg after the change.

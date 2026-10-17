@@ -364,6 +364,7 @@ def nvfp4_dense_gemv() -> dict:
         "c_ptr": "*fp32",
         "M": "i32",
         "N": "i32",
+        "K_WORDS": "i32",
         "stride_am": "i32",
         "stride_ak": "i32",
         "stride_pn": "i32",
@@ -372,15 +373,13 @@ def nvfp4_dense_gemv() -> dict:
         "stride_sblk": "i32",
         "stride_cm": "i32",
         "stride_cn": "i32",
-        "K_WORDS": "constexpr",
         "BLOCK_N": "constexpr",
         "BLOCK_KW": "constexpr",
     }
 
 
-def nvfp4_dense_gemv_constexprs(k: int = SERVING_HIDDEN) -> dict:
+def nvfp4_dense_gemv_constexprs() -> dict:
     return {
-        "K_WORDS": k // 8,
         "BLOCK_N": DENSE_BLOCK_N,
         "BLOCK_KW": DENSE_BLOCK_KW,
     }

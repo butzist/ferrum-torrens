@@ -914,8 +914,7 @@
     "nvfp4_dense_gemv": {
       "constexprs": {
         "BLOCK_KW": 16,
-        "BLOCK_N": 32,
-        "K_WORDS": 256
+        "BLOCK_N": 32
       },
       "declared_args": [
         "a_ptr",
@@ -925,6 +924,7 @@
         "c_ptr",
         "M",
         "N",
+        "K_WORDS",
         "stride_am",
         "stride_ak",
         "stride_pn",
@@ -1000,10 +1000,14 @@
         },
         {
           "index": 15,
-          "kind": "ptr"
+          "kind": "u32"
         },
         {
           "index": 16,
+          "kind": "ptr"
+        },
+        {
+          "index": 17,
           "kind": "ptr"
         }
       ],

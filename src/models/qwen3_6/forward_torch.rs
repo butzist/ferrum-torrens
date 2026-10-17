@@ -77,6 +77,10 @@ struct Loader<'a> {
     /// FP8 weight stays packed and the kernel reads it (decision 82 slice 2);
     /// without it the weight is widened to bf16 like every other kind.
     fp8: Option<&'a std::sync::Arc<Fp8Linear>>,
+    /// The dense NVFP4 GEMV launcher (the lm_head's). The shared expert is also
+    /// NVFP4 in the checkpoint, so it keeps its packed banks for decode too
+    /// (TODO.md item 23, optimization.md R7.1).
+    gemv: Option<&'a std::sync::Arc<DenseGemv>>,
 }
 
 impl<'a> Loader<'a> {
@@ -302,8 +306,27 @@ impl<'a> Loader<'a> {
                 rows: d.rows,
                 cols: d.cols,
                 fp8: Some(launcher.clone()),
+                nvfp4: None,
             });
         }
+        // TODO.md item 23: the shared expert is NVFP4 in the checkpoint. Keep its
+        // packed K-major banks for decode (one row per request) and still widen
+        // the bf16 weight for prefill (M > NVFP4_GEMV_MAX_ROWS).
+        let nvfp4 = if matches!(device, Device::Cuda(_))
+            && d.kind == DenseKind::Nvfp4
+            && let Some(gemv) = self.gemv
+        {
+            let (packed, scale, global) =
+                self.head_nvfp4_kmajor(&d.name, d.rows, d.cols, device)?;
+            Some(Nvfp4Dense {
+                packed,
+                scale,
+                global,
+                gemv: gemv.clone(),
+            })
+        } else {
+            None
+        };
         let dev = device.to_tch();
         let w = Tensor::zeros([d.rows as i64, d.cols as i64], (Kind::BFloat16, dev));
         let mut scale: Option<Vec<f32>> = if d.kind == DenseKind::Bf16 {
@@ -328,6 +351,7 @@ impl<'a> Loader<'a> {
             rows: d.rows,
             cols: d.cols,
             fp8: None,
+            nvfp4,
         })
     }
 
@@ -1066,7 +1090,23 @@ struct Dense {
     /// The W8A16 launcher, present iff `w` is FP8. Held per projection so
     /// `apply` needs no launcher argument, the same shape as `Head` + its gemv.
     fp8: Option<std::sync::Arc<Fp8Linear>>,
+    /// The packed NVFP4 banks (K-major) for the shared expert, when it stays
+    /// packed for decode. The bf16 `w` is still built for prefill (M > 1).
+    nvfp4: Option<Nvfp4Dense>,
 }
+
+/// The checkpoint's own NVFP4 bytes in the K-major resident layout, plus the
+/// dense GEMV launcher that reads them (the lm_head's, TODO.md item 23).
+struct Nvfp4Dense {
+    packed: SharedTensor,
+    scale: SharedTensor,
+    global: SharedTensor,
+    gemv: std::sync::Arc<DenseGemv>,
+}
+
+/// Above this many rows the bf16 weight (and a cuBLAS GEMM) beats re-reading the
+/// packed weight once per row, so prefill stays bf16.
+const NVFP4_GEMV_MAX_ROWS: usize = 8;
 
 /// A projection's resident weight: bf16 for every kind wide enough, or the
 /// checkpoint's own e4m3 bytes when a device launcher can read them (decision 82).
@@ -1080,6 +1120,31 @@ impl Dense {
     /// An FP8 weight runs the vendored W8A16 kernel (split-K GEMV at one row,
     /// tiled GEMM above); everything else is cuBLAS bf16.
     fn apply(&self, x: &Tensor) -> Tensor {
+        if let Some(nvfp4) = &self.nvfp4 {
+            let cols = self.cols as i64;
+            let m = x.numel() / self.cols;
+            if m <= NVFP4_GEMV_MAX_ROWS {
+                // Decode (and small batched decode): read the packed weight once
+                // per row instead of the 4x wider bf16 copy (TODO.md item 23).
+                let a = x
+                    .reshape([m as i64, cols])
+                    .to_kind(Kind::BFloat16)
+                    .contiguous();
+                let out = Tensor::zeros([m as i64, self.rows as i64], (Kind::Float, x.device()));
+                // SAFETY: the resident banks and `out` are live device
+                // allocations, and the launcher runs on the step's own stream.
+                unsafe {
+                    nvfp4
+                        .gemv
+                        .gemv(&a, &nvfp4.packed, &nvfp4.scale, &nvfp4.global, &out)
+                }
+                .expect("shared nvfp4 gemv launch");
+                let mut shape = x.size();
+                shape.pop();
+                shape.push(self.rows as i64);
+                return out.to_kind(Kind::BFloat16).reshape(shape);
+            }
+        }
         if let (DenseWeight::Fp8(bytes), Some(launcher)) = (&self.w, &self.fp8) {
             let cols = self.cols as i64;
             let m = (x.numel() / self.cols) as i64;
@@ -1261,6 +1326,7 @@ impl TorchQwen3_6 {
             index: &index,
             reader: reader.as_ref(),
             fp8: fp8_linear.as_ref(),
+            gemv: head_gemv.as_ref(),
         };
         let h = params.hidden_size;
 
@@ -2078,6 +2144,7 @@ impl TorchQwen3_6 {
             index: &self.index,
             reader: self.reader.as_ref(),
             fp8: None,
+            gemv: None,
         };
 
         let (gu, gu_g) = ld.expert_slab("gate_up", layer_idx, expert, 2 * i, p.hidden_size, dev)?;

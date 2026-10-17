@@ -1239,6 +1239,7 @@ pub struct DenseGemvArgs {
     pub c: u64,
     pub m: u32,
     pub n: u32,
+    pub k_words: u32,
     pub stride_am: u32,
     pub stride_ak: u32,
     pub stride_pn: u32,
@@ -1260,6 +1261,7 @@ pub fn nvfp4_dense_gemv_args(abi: &LinearAbi, a: &DenseGemvArgs) -> Result<ArgPa
     p.ptr(a.c)?;
     p.u32(a.m)?;
     p.u32(a.n)?;
+    p.u32(a.k_words)?;
     p.u32(a.stride_am)?;
     p.u32(a.stride_ak)?;
     p.u32(a.stride_pn)?;
@@ -1971,8 +1973,6 @@ mod tests {
     fn the_dense_gemv_manifest_records_the_tile() {
         let abi = LinearAbi::committed().unwrap();
         let kernel = abi.kernel(NVFP4_DENSE_GEMV).unwrap();
-        // One hidden size in a serving checkpoint, so K // 8 = 256 words.
-        assert_eq!(kernel.constexpr("K_WORDS").unwrap(), 256);
         assert_eq!(kernel.constexpr("BLOCK_N").unwrap(), 32);
         assert_eq!(kernel.constexpr("BLOCK_KW").unwrap(), 16);
         assert_eq!(kernel.num_warps, 4);
@@ -1989,6 +1989,7 @@ mod tests {
             c: 0x5000,
             m: 1,
             n: 248320,
+            k_words: 256,
             stride_am: 2048,
             stride_ak: 1,
             // K-major resident head: N is contiguous, K steps by N.
