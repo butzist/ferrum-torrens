@@ -334,7 +334,7 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 
 ## 7. Decisions
 
-The full log of confirmed decisions (numbers 1..90, stable -- code, tests and
+The full log of confirmed decisions (numbers 1..91, stable -- code, tests and
 `ARCHITECTURE.md` reference them by number) lives in `DONE.md`. This section
 lists only the decisions that still bind open work; everything else there is
 history.
@@ -593,11 +593,12 @@ performance work.
    the reference's ~3.5 + 0.8 (verified in `optimization.md`). Item 22 (rewrite
    the NVFP4 GEMVs, R1-R2) is the top lever, the copy/compute overlap (R3) is the
    parity-and-beyond lever, and batching (item 11) stays the serving lever.
-10. GDN state-slot sizing -- **OPEN.** The pool is `max_running_requests (+1 for
-    the captured graph's padding row)`, which leaves no room for hybrid-radix
-    prefix snapshots: at `max_running_requests = 1` the second request panics with
-    "state slots exhausted" (decision 73). Either size the pool with headroom for
-    cached prefixes or make snapshots reclaimable under that pressure.
+10. GDN state-slot sizing -- **DONE (2026-10-17), decision 91.** The state pool
+    is now `2 * max_running_requests + 1 (+1 capture padding)`
+    (`kvcache_dev::state_slots`): one live slot and one locked prompt/chunk
+    snapshot per running request, plus a slot of progress headroom. Sizing at
+    exactly `max_running_requests` panicked on the first prompt-end snapshot
+    (`one_token_through_the_kernel_matches_the_oracle` was red); it now passes.
 11. Server-side batching -- **OPEN (new, from the decode profile).** The server
     runs one `run_batch` per request (batch size always 1), so the GPU is latched
     at low occupancy and `max_running_requests` is dead in the serving path. Add a

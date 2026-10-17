@@ -2312,6 +2312,24 @@ settled.
       `device_decode_matches_refeed` (3/3 argmax exact). `cargo test` 309 green,
       clippy clean with and without `cuda`.
 
+91. **GDN state-slot pool sized for snapshots** (2026-10-17, implemented) --
+    TODO.md item 10. `cuda_moe`'s slot count is unrelated; this is the GDN state
+    pool (`LinearStateSlabs`). A non-finished commit COWs the live state into a
+    tree snapshot for the prompt/chunk boundary, and it does so while the request
+    still holds its previous node's lock, so `max_running_requests` live slots
+    plus up to `max_running_requests` locked snapshots coexist. Sizing at exactly
+    `max_running_requests` (+capture padding) therefore panicked
+    (`alloc_slot` -> `evict_mamba` found nothing evictable) as soon as the first
+    prompt-end snapshot was taken, which is why the oracle gate
+    `one_token_through_the_kernel_matches_the_oracle` was red. The pool is now
+    `kvcache_dev::state_slots(N, padding) = 2N + 1 + padding` (one live + one
+    snapshot per request, one slot of progress headroom, plus the capture padding
+    row), with a unit test; the gate is green again. Cost: at the default N=4 the
+    pool grows 5 -> 10 slots (~315 MiB), which the auto cache (decision 90)
+    absorbs, tg 18.7 -> 18.2 (the smoke still resolves fewer expert slots than
+    before but bootstraps fine). The prefix-reuse gate
+    (`extending_a_committed_prompt_adopts_and_matches_a_cold_refeed`) stays green.
+
 ---
 
 ## Progress log (narrative, pre-2026-10-15 compaction)

@@ -280,9 +280,12 @@ fn kv_cache(
         // Refused at config validation; a real dtype never reaches here.
         KvDtype::Fp8 => unreachable!("kv.dtype = fp8 is rejected at config validation"),
     };
-    // The captured service reserves one state slot for its dummy padding row, so
-    // the pool is one wider than the scheduler's cap.
-    let slots = config.model.max_running_requests + usize::from(reserve_padding);
+    // One live state slot per running request plus one locked snapshot each,
+    // plus progress headroom and the captured graph's padding row (item 10).
+    let slots = crate::infrastructure::kvcache_dev::state_slots(
+        config.model.max_running_requests,
+        reserve_padding,
+    );
     DeviceCache::new(params, config.kv_tokens(), slots, dtype, device)
 }
 

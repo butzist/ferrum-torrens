@@ -204,6 +204,16 @@ impl MhaPool {
     }
 }
 
+/// GDN state slots the pool must hold: one live slot per running request, one
+/// locked prompt/chunk snapshot per running request (a non-finished commit COWs
+/// the live state into a snapshot while the request still holds its previous
+/// lock), plus one slot of progress headroom, plus the captured graph's padding
+/// row. Sizing at exactly `max_running_requests` panicked as soon as a request
+/// committed a prompt-end snapshot (TODO.md item 10).
+pub fn state_slots(max_running_requests: usize, reserve_padding: bool) -> usize {
+    2 * max_running_requests + 1 + usize::from(reserve_padding)
+}
+
 /// GDN state for every linear-attention layer and every live request slot.
 ///
 /// The conv state is `[conv_dim, K-1]` per layer per slot in f32 -- the dtype
@@ -787,6 +797,19 @@ mod tests {
         assert_eq!(v0 - k0, 2 * per as u64, "V follows both K slabs");
         assert_eq!(k1 - k0, per as u64, "slab 1 is one layer after slab 0");
         assert_eq!(pool.dtype(), KvDType::F32);
+    }
+
+    #[test]
+    fn the_state_pool_leaves_room_for_snapshots_and_padding() {
+        // One live slot and one locked snapshot per running request, one slot of
+        // headroom, and the capture padding row.
+        assert_eq!(state_slots(1, false), 3);
+        assert_eq!(state_slots(4, false), 9);
+        assert_eq!(state_slots(4, true), 10);
+        assert!(
+            state_slots(1, false) > 1,
+            "item 10: not just the concurrency"
+        );
     }
 
     #[test]

@@ -587,7 +587,11 @@ and clears the request. Repeated non-finished commits advance the reused span
 without freeing a page (the tree adopts the pages the request already holds).
 Pressure drives eviction: `reserve` reclaims pages via `evict_full`; snapshot
 allocation reclaims slots via `evict_mamba`. The two pools are independent, so no
-partitioning is needed. For this 30-GDN/10-attention tower a match is only
+partitioning is needed. The state pool is sized `2 * max_running_requests + 1`
+(+1 for the capture padding row): one live slot and one locked chunk snapshot per
+running request, plus progress headroom, because a snapshot is COWed while the
+request still holds its previous node's lock (item 10, decision 91). For this
+30-GDN/10-attention tower a match is only
 reusable up to the deepest node with a live GDN state snapshot, which is why the
 snapshot donation (not the KV tree alone) is the point (decision 65). KV is f32
 or bf16: `[kv] dtype` picks it and the default is bf16 (half the bytes; the lever
@@ -736,7 +740,7 @@ it equal to the uncaptured twin, and its batch gate replays `{1,2,4}` equal to
 the uncaptured twin. The composition root (`application/registry.rs`) now owns
 the allocation: with `model.cuda_graph` on, it creates the side stream, builds
 the MoE and attention ports on it, reserves the dummy padding row (which needs
-one extra state slot, hence a `max_running_requests + 1` pool), records the
+one extra state slot, hence the `state_slots(N, padding)` pool), records the
 graphs for `graph_batch_sizes(max_running)` and returns them in
 `BuiltModel::captured`, which `load_engine` passes to `Engine::with_captured`
 (decision 61). A captured build keeps torch on the side stream: `run_step` binds
