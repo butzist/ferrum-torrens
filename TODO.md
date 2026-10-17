@@ -811,8 +811,14 @@ prompt override before comparing miss rates.
   if the LRU rarely revisits an evicted expert, O_DIRECT-everywhere stays simpler
   and strictly better.
 
-### R8 kernel/types plan (foundings in optimization.md R8)
+### R8 kernel/types plan (findings in optimization.md R8)
 
+- [ ] **R8.0 Grid-stride `index_copy`** (Finding 5, the big one). The copy kernel
+  launches one program per `(bank, row, seg)` = 49152/layer, ~94% no-op at decode;
+  `moe_copy` is ~25.6 ms/token fixed + ~0.03 ms/miss (misses fall 150 -> 50 from
+  512 -> 2048 slots, copy stays 30 -> 27 ms). Baking the grid to `[6,8,1]` drops
+  it to 0.40 ms. Rewrite with a small fixed grid + grid-stride over `n` (like
+  FreeToken's C++ copy, `blocks_per_bank=8`). Expected ~20 ms/token off; do first.
 - [ ] **R8.1 Fused Triton router** (their `moe_router._router_triton_kernel`
   logic). Keep the f32 gate matmul, replace softmax + `topk` + renormalize with
   one Triton kernel (f32 reduce, iterative top-k). router 1.8 -> ~1.0 ms. Gate:

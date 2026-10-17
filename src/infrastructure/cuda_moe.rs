@@ -1117,6 +1117,29 @@ impl CudaMoE {
         Ok(())
     }
 
+    /// Dev-only: with `FT_MISS_TRACE` set, accumulate this layer's miss count (a
+    /// D2H read of the plan's `num`) and print the per-step total at the last
+    /// layer. A D2H cannot be captured, so run eager (`FERRUM_SMOKE_NOGRAPH=1`);
+    /// it is a measurement probe for the copy investigation, never in serving.
+    fn probe_misses(&self, layer: usize) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static TOTAL: AtomicU64 = AtomicU64::new(0);
+        if std::env::var_os("FT_MISS_TRACE").is_none() {
+            return;
+        }
+        let Some(st) = &self.device_staging else {
+            return;
+        };
+        if layer == 0 {
+            TOTAL.store(0, Ordering::Relaxed);
+        }
+        let n = st.num.int64_value(&[]) as u64;
+        let total = TOTAL.fetch_add(n, Ordering::Relaxed) + n;
+        if layer + 1 == st.layers {
+            eprintln!("[miss] step_experts={total}");
+        }
+    }
+
     /// The committed `lru_ensure` `BLOCK_K`: the route cap one launch handles.
     fn lru_block_k(&self) -> Result<usize, MoEError> {
         self.staging_abi
@@ -1397,6 +1420,7 @@ impl CudaMoE {
         let sp = crate::infrastructure::profile::begin("moe_copy");
         self.copy_missing(layer)?;
         crate::infrastructure::profile::end("moe_copy", sp);
+        self.probe_misses(layer);
 
         let dev = self.device.to_tch();
         let token_t = Tensor::arange(tokens as i64, (tch::Kind::Int, dev))

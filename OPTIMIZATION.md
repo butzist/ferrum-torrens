@@ -916,7 +916,28 @@ read/write-by-index. Ours splits the same math over `gdn_conv` + `gdn_ba` +
 so matching it means vendoring it (heavy) or lifting our Triton paged kernel
 toward it. This is the largest compute gap (attn 4.4 vs 2.1-2.8).
 
-### Finding 5 -- dtype gaps
+### Finding 5 -- the decode copy is fixed-grid-overhead-bound, not PCIe (the big one)
+
+`_index_copy_multi_kernel` is launched as one program per `(bank, row, seg)`,
+grid `(6, BLOCK_K=128, splits=64)` = **49152 programs per layer**, and gates the
+work with `row < n`. At decode only ~8 of the 128 rows are live, so **~94% of the
+programs are no-ops that still pay the CTA preamble**. Measured (AIME, `FT_PROFILE`,
+eager): `moe_copy` 30.3 / 28.2 / 27.6 / 27.2 ms at 512 / 1024 / 1664 / 2048 slots,
+while the actual misses (`FT_MISS_TRACE`) fall from **~150 to ~50 experts/token**.
+The copy is flat where the bytes fall 3x: fitting `copy = c*misses + F` gives
+**F ~ 25.6 ms/token** and only ~0.03 ms/miss. Decisive probe: baking the grid to
+`[6, 8, 1]` (96 CTAs/layer) drops `moe_copy` to **0.40 ms** (incomplete copy, but
+the timing isolates the overhead). So ~25 ms of the ~54 ms step -- ~44% -- is
+launch grid overhead, not the PCIe transfer. FreeToken's copy is a C++
+(`fast_index_copy.py`) kernel with a **fixed grid of `banks * blocks_per_bank`
+(8) and a grid-stride loop**, which is why it has no such cost.
+
+This is the biggest single lever found and it reorders the plan: a grid-stride
+`index_copy` (small fixed grid, loop over `n` on the device) should take the
+copy to ~PCIe time (~7-10 ms at 2048), i.e. **~20 ms/token off the step -> tg
+~18.5 -> low 30s**, near or past FreeToken's 30.7.
+
+### Finding 6 -- dtype gaps
 
 - M>1 projections: theirs use **W8A8 `torch._scaled_mm`** (cuBLASLt fp8 tensor
   cores); `tch` cannot call it (decision 84). Workaround: a Triton **W8A8
@@ -931,6 +952,11 @@ toward it. This is the largest compute gap (attn 4.4 vs 2.1-2.8).
 
 ### Plan (ordered, low risk first)
 
+- **R8.0 Grid-stride `index_copy`** (Finding 5). Rewrite the copy kernel with a
+  small fixed grid (`banks * blocks_per_bank`, like FreeToken) and a grid-stride
+  loop over the plan on the device, instead of one program per `(bank, row, seg)`.
+  Expected copy 27 -> ~7-10 ms, i.e. ~20 ms/token off the step. Largest lever;
+  do it first.
 - **R8.1 Fused Triton router** (their logic). 1.8 -> ~1.0 ms. Low risk: keep the
   f32 gate matmul, replace softmax+topk+renorm with one Triton kernel. Gate:
   device-decode argmax unchanged.
