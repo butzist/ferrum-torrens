@@ -13,6 +13,11 @@ weight is streamed once per step, and each output element is a fixed K-order dot
 so (unlike a cuBLAS bf16 GEMM whose tiling moves with the batch) the result for a
 row does not depend on the batch shape.
 
+The decode GEMV is marlin-style (optimization.md R2): the packed bank is read as
+int32 `[N, K // 8]` (8 e2m1 codes per word) with a deferred `[BLOCK_KW, BLOCK_N]`
+partial, and the dequant is the fp16-bitcast trick (`_nvfp4_pair_f32`) instead of
+a 16-entry LUT gather, so the LSU is not the bottleneck of the streaming read.
+
 Layout per tensor `W[N, K]`: `packed [N, K // 2]` uint8 with the low nibble
 holding the even k, `scale [N, K // 16]` e4m3fn, `global [N]` f16 -- the same
 NVFP4 packing the converter emits for the experts.
@@ -24,67 +29,89 @@ import torch
 import triton
 import triton.language as tl
 
-from .nvfp4_moe import _E2M1_VALUES, _check_constexprs, _e2m1_lut, require_native_e4m3
+from .nvfp4_moe import _E2M1_VALUES, _check_constexprs, _nvfp4_pair_f32, _split8, require_native_e4m3
 
-# One program per (row, N block): a wide N block and a K loop, no tl.dot. Fixed
-# rather than autotuned because decode runs inside a CUDA graph.
-DENSE_BLOCK_N = 128
-DENSE_BLOCK_KB = 64
+# One program per (row, N block): a 32-wide N block and a deferred K reduction,
+# no tl.dot. Fixed rather than autotuned because decode runs inside a CUDA graph.
+DENSE_BLOCK_N = 32
+DENSE_BLOCK_KW = 16
 DENSE_WARPS = 4
 
 
 @triton.jit
 def _nvfp4_dense_gemv_kernel(
     a_ptr,  # [M, K] activations, compute dtype
-    packed_ptr,  # [N, K // 2] uint8
+    packed_ptr,  # [N, K // 8] int32 (8 e2m1 codes per word, nibble j -> k = 8*w + j)
     scale_ptr,  # [N, K // 16] e4m3fn
     global_ptr,  # [N] f16
     c_ptr,  # [M, N] fp32
-    lut_ptr,  # [16] f32
     M,
     N,
     stride_am, stride_ak,
-    stride_pn, stride_pkb,
+    stride_pn, stride_pkw,
     stride_sn, stride_sblk,
     stride_cm, stride_cn,
-    K_BYTES: tl.constexpr,
+    K_WORDS: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    BLOCK_KB: tl.constexpr,
+    BLOCK_KW: tl.constexpr,
 ):
     """`c[m, n] = global[n] * sum_k a[m, k] * W[n, k]`, W dequantized inline.
 
     The row global is constant along K, so it is applied once after the loop.
+    The `[BLOCK_KW, BLOCK_N]` partial accumulates across every K-iteration and is
+    reduced once; a per-iteration `tl.sum` would barrier the loop and stop the
+    wide weight loads from pipelining.
     """
     m = tl.program_id(0)
     offs_n = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
     n_mask = offs_n < N
 
     a_base = a_ptr + m * stride_am
-    offs_kb = tl.arange(0, BLOCK_KB)
-    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    offs_kw = tl.arange(0, BLOCK_KW)
+    p_base = packed_ptr + offs_n[None, :] * stride_pn
+    s_base = scale_ptr + offs_n[None, :] * stride_sn
+    partial = tl.zeros((BLOCK_KW, BLOCK_N), dtype=tl.float32)
 
-    for kb_start in range(0, K_BYTES, BLOCK_KB):
-        byte_idx = kb_start + offs_kb
-        byte_mask = byte_idx < K_BYTES
+    for kw_start in range(0, tl.cdiv(K_WORDS, BLOCK_KW)):
+        widx = kw_start * BLOCK_KW + offs_kw
+        w_mask = widx < K_WORDS
 
-        p_ptrs = packed_ptr + offs_n[None, :] * stride_pn + byte_idx[:, None] * stride_pkb
-        bytes_ = tl.load(p_ptrs, mask=byte_mask[:, None] & n_mask[None, :], other=0).to(tl.int32)
-        b_scale = tl.load(
-            scale_ptr + offs_n[None, :] * stride_sn + (byte_idx // 8)[:, None] * stride_sblk,
-            mask=byte_mask[:, None] & n_mask[None, :],
+        word = tl.load(
+            p_base + widx[:, None] * stride_pkw,
+            mask=w_mask[:, None] & n_mask[None, :],
+            other=0,
+        )
+        # 8 codes/word fall in one or two 16-wide blocks -> one scale per word.
+        # `* 16384.0` (2^14) undoes the pair trick's 2^-14 exactly.
+        scale = tl.load(
+            s_base + (widx[:, None] // 2) * stride_sblk,
+            mask=w_mask[:, None] & n_mask[None, :],
             other=0.0,
+        ).to(tl.float32) * 16384.0
+
+        offs_a = 8 * kw_start * BLOCK_KW + tl.arange(0, BLOCK_KW * 8)
+        a_vec = tl.load(
+            a_base + offs_a * stride_ak, mask=offs_a < 8 * K_WORDS, other=0.0
         ).to(tl.float32)
-        b_lo = tl.load(lut_ptr + (bytes_ & 0xF)) * b_scale
-        b_hi = tl.load(lut_ptr + ((bytes_ >> 4) & 0xF)) * b_scale
+        a0, a1, a2, a3, a4, a5, a6, a7 = _split8(a_vec, BLOCK_KW)
+        acc_w = tl.zeros((BLOCK_KW, BLOCK_N), dtype=tl.float32)
+        b_lo, b_hi = _nvfp4_pair_f32(word)
+        acc_w += a0[:, None] * b_lo
+        acc_w += a4[:, None] * b_hi
+        b_lo, b_hi = _nvfp4_pair_f32(word >> 4)
+        acc_w += a1[:, None] * b_lo
+        acc_w += a5[:, None] * b_hi
+        b_lo, b_hi = _nvfp4_pair_f32(word >> 8)
+        acc_w += a2[:, None] * b_lo
+        acc_w += a6[:, None] * b_hi
+        b_lo, b_hi = _nvfp4_pair_f32(word >> 12)
+        acc_w += a3[:, None] * b_lo
+        acc_w += a7[:, None] * b_hi
+        partial += acc_w * scale
 
-        a_lo = tl.load(a_base + (2 * byte_idx) * stride_ak, mask=byte_mask, other=0.0).to(tl.float32)
-        a_hi = tl.load(a_base + (2 * byte_idx + 1) * stride_ak, mask=byte_mask, other=0.0).to(tl.float32)
-        acc += tl.sum(a_lo[:, None] * b_lo, axis=0)
-        acc += tl.sum(a_hi[:, None] * b_hi, axis=0)
-
+    acc = tl.sum(partial, axis=0)
     g = tl.load(global_ptr + offs_n, mask=n_mask, other=0.0).to(tl.float32)
-    acc = acc * g
-    tl.store(c_ptr + m * stride_cm + offs_n * stride_cn, acc, mask=n_mask)
+    tl.store(c_ptr + m * stride_cm + offs_n * stride_cn, acc * g, mask=n_mask)
 
 
 def nvfp4_dense_gemv(
@@ -94,25 +121,27 @@ def nvfp4_dense_gemv(
     glob: torch.Tensor,
     c: torch.Tensor,
     block_n: int = DENSE_BLOCK_N,
-    block_kb: int = DENSE_BLOCK_KB,
+    block_kw: int = DENSE_BLOCK_KW,
 ) -> None:
     """`c = a @ dequant(packed, scale, glob)^T`, c `[M, N]` fp32, written in place."""
     m, k = a.shape
     n, k_bytes = packed.shape
     assert k // 2 == k_bytes, f"K {k} vs packed {k_bytes}"
+    assert k % 8 == 0, f"K {k} must be a multiple of 8 for int32 wide loads"
     require_native_e4m3(a.device)
+    packed_i32 = packed.view(torch.int32)  # [N, K // 8]
     consts = {
-        "K_BYTES": k // 2,
+        "K_WORDS": k // 8,
         "BLOCK_N": block_n,
-        "BLOCK_KB": block_kb,
+        "BLOCK_KW": block_kw,
     }
     _check_constexprs(consts)
     grid = (m, triton.cdiv(n, block_n))
     _nvfp4_dense_gemv_kernel[grid](
-        a, packed, scale, glob, c, _e2m1_lut(a.device),
+        a, packed_i32, scale, glob, c,
         m, n,
         a.stride(0), a.stride(1),
-        packed.stride(0), packed.stride(1),
+        packed_i32.stride(0), packed_i32.stride(1),
         scale.stride(0), scale.stride(1),
         c.stride(0), c.stride(1),
         **consts,
@@ -141,7 +170,7 @@ def nvfp4_dense_gemv_reference(
 
 
 __all__ = [
-    "DENSE_BLOCK_KB",
+    "DENSE_BLOCK_KW",
     "DENSE_BLOCK_N",
     "nvfp4_dense_gemv",
     "nvfp4_dense_gemv_reference",

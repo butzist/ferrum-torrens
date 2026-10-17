@@ -82,6 +82,7 @@ flowchart TB
       KvcDev["kvcache_dev\nMHA pool + GDN state slabs"]
       DecBuf["decode_buffers\nfixed-address decode staging"]
       DecGraph["decode_graph\nper-size graphs + engine service"]
+      Prof["profile\nFT_PROFILE stage timer (dev)"]
       Http["http\naxum routes + SSE"]
       Toker["tokenizers_hf\nHF tokenizer + chat template"]
     end
@@ -152,12 +153,22 @@ stays pure: `Tensor` and CUDA handles never cross it (section 4).
 | Slot residency plan (`lru_ensure` / whole-layer) | Device (host plan fallback) | `python/ferrum_kernel/offload.py`, `application/run_experts.rs` |
 | KV pool, GDN state slabs, paged GQA attention | Device | `infrastructure/kvcache_dev.rs`, `infrastructure/cuda_attention.rs` |
 | CUDA-graph capture/replay, torch graph pool | Device | `infrastructure/decode_graph.rs`, `infrastructure/cuda_graph.rs`, `infrastructure/cuda_driver.rs` |
+| Decode stage profile (dev only, `FT_PROFILE=1`) | Device timing events | `infrastructure/profile.rs`; reference probe in `scripts/freetoken_probe/` |
 
 Crossings per step: token ids H2D, streamed expert rows H2D (misses only), logits
 D2H (for host sampling). The pinned expert banks and the dense weights are set up
 once at load. A build without the `cuda` feature, or with `model.device = "cpu"`,
 takes the scalar oracle instead and runs every stage on the host
 (`models/qwen3_6/forward.rs`, decision 12).
+
+**Profiling (dev only).** `FT_PROFILE=1` opens timing events on the forward's
+torch stream and labels stages in `forward_torch.rs` (`embed`, `norm_in`,
+`attn`/`gdn`, `norm_post`, `head`, `router`, `shared`) and `cuda_moe.rs`
+(`moe_lru`, `moe_copy`, `moe_gemm`), dumping `/tmp/ft_profile.{txt,json}` after N
+decode steps. It needs `cuda_graph = false` (a captured graph has no Python-side
+stage boundary); `single_request_throughput_smoke` with `FERRUM_SMOKE_NOGRAPH=1`
+drives it. `scripts/freetoken_probe/` times the read-only reference the same way
+by monkeypatch (decision 88), which is how the per-stage comparison was made.
 
 ---
 
@@ -353,14 +364,16 @@ sequenceDiagram
   participant Rd as FtwReader
   participant Dev as device
   participant MoE as registry::moe_port
-  Reg->>Ld: load(params, device, index, reader, moe, cache)
+  Reg->>Ld: load(params, device, index, reader, moe=None, cache)
   loop each dense projection / embedding / lm_head
     Ld->>Rd: read_range (4096-row window)
     Ld->>Ld: dequant to f32, cast to bf16
     Ld->>Dev: copy window into resident tensor
   end
   Note over Ld: ~4.5 GiB resident bf16;<br/>apply/gather never re-read
-  Reg->>MoE: if kernel.triton: CudaMoE + FtwPinnedBanks
+  Reg->>Reg: resolve_cache_slots (auto: cuMemGetInfo - reserve) / expert_bytes
+  Reg->>MoE: if kernel.triton: CudaMoE(slots) + FtwPinnedBanks
+  Reg->>Ld: attach_moe(port)
 ```
 
 ### 3.4 Model tower `[core]`
@@ -479,7 +492,10 @@ sequenceDiagram
 
 `lru_ensure` dedups first-occurrences in one CTA, so its committed `BLOCK_K = 128`
 is a route cap, and its committed `BLOCK_C = 2048` caps the slot cache it can
-address (decision 85). `CudaMoE::grouped_moe_staged` chunks a larger list by tokens
+address (decision 85). The slot count itself is `moe.cache_size_slots`: an
+integer or `"auto"` (default), where auto sizes it from the free device memory
+once the tower and KV pool are resident (item 12, decision 90,
+`registry::resolve_cache_slots`). `CudaMoE::grouped_moe_staged` chunks a larger list by tokens
 (`staged_chunk_tokens`) and repeats the sequence per chunk, the device LRU and
 the pinned banks carrying across, so prefill uses the same device path as decode
 (decision 66). `CachedExperts` without device staging still takes the host plan

@@ -106,6 +106,7 @@ type MemFreeFn = unsafe extern "C" fn(CUdeviceptr) -> CUresult;
 type MemcpyHtoDFn = unsafe extern "C" fn(CUdeviceptr, *const c_void, usize) -> CUresult;
 type MemcpyDtoHFn = unsafe extern "C" fn(*mut c_void, CUdeviceptr, usize) -> CUresult;
 type MemHostAllocFn = unsafe extern "C" fn(*mut *mut c_void, usize, u32) -> CUresult;
+type MemGetInfoFn = unsafe extern "C" fn(*mut usize, *mut usize) -> CUresult;
 type MemHostGetDevicePointerFn =
     unsafe extern "C" fn(*mut CUdeviceptr, *mut c_void, u32) -> CUresult;
 type MemFreeHostFn = unsafe extern "C" fn(*mut c_void) -> CUresult;
@@ -120,6 +121,7 @@ type GraphExecDestroyFn = unsafe extern "C" fn(CUgraphExec) -> CUresult;
 type EventCreateFn = unsafe extern "C" fn(*mut CUevent, u32) -> CUresult;
 type EventDestroyFn = unsafe extern "C" fn(CUevent) -> CUresult;
 type EventRecordFn = unsafe extern "C" fn(CUevent, CUstream) -> CUresult;
+type EventElapsedTimeFn = unsafe extern "C" fn(*mut f32, CUevent, CUevent) -> CUresult;
 type StreamWaitEventFn = unsafe extern "C" fn(CUstream, CUevent, u32) -> CUresult;
 
 struct Fns {
@@ -140,6 +142,7 @@ struct Fns {
     cu_mem_host_alloc: MemHostAllocFn,
     cu_mem_host_get_device_pointer: MemHostGetDevicePointerFn,
     cu_mem_free_host: MemFreeHostFn,
+    cu_mem_get_info: MemGetInfoFn,
     cu_stream_create: StreamCreateFn,
     cu_stream_destroy: StreamDestroyFn,
     cu_stream_begin_capture: StreamBeginCaptureFn,
@@ -151,6 +154,7 @@ struct Fns {
     cu_event_create: EventCreateFn,
     cu_event_destroy: EventDestroyFn,
     cu_event_record: EventRecordFn,
+    cu_event_elapsed_time: EventElapsedTimeFn,
     cu_stream_wait_event: StreamWaitEventFn,
 }
 
@@ -237,6 +241,8 @@ impl Driver {
                 MemHostGetDevicePointerFn
             ),
             cu_mem_free_host: sym!("cuMemFreeHost", MemFreeHostFn),
+            // Free/total device memory for the auto cache-budget planner (item 12).
+            cu_mem_get_info: sym!("cuMemGetInfo_v2", MemGetInfoFn),
             cu_stream_create: sym!("cuStreamCreate", StreamCreateFn),
             cu_stream_destroy: sym!("cuStreamDestroy_v2", StreamDestroyFn),
             cu_stream_begin_capture: sym!("cuStreamBeginCapture_v2", StreamBeginCaptureFn),
@@ -253,6 +259,8 @@ impl Driver {
             cu_event_create: sym!("cuEventCreate", EventCreateFn),
             cu_event_destroy: sym!("cuEventDestroy_v2", EventDestroyFn),
             cu_event_record: sym!("cuEventRecord", EventRecordFn),
+            // Durations for the `FT_PROFILE` stage timer (timing-enabled events).
+            cu_event_elapsed_time: sym!("cuEventElapsedTime", EventElapsedTimeFn),
             cu_stream_wait_event: sym!("cuStreamWaitEvent", StreamWaitEventFn),
         };
         Ok(Self { _lib: lib, fns })
@@ -301,6 +309,15 @@ impl Driver {
         // SAFETY: `n` is a live i32 for the call's duration.
         self.check(unsafe { (self.fns.cu_device_get_count)(&raw mut n) })?;
         Ok(n)
+    }
+
+    /// `(free, total)` device memory in bytes for the current context, the input
+    /// to the auto expert-cache budget (item 12, `registry::resolve_cache_slots`).
+    pub fn mem_info(&self) -> Result<(usize, usize), CudaError> {
+        let (mut free, mut total) = (0usize, 0usize);
+        // SAFETY: both are live `usize` slots for the call's duration.
+        self.check(unsafe { (self.fns.cu_mem_get_info)(&raw mut free, &raw mut total) })?;
+        Ok((free, total))
     }
 
     /// Retain the primary context of `device` and make it current on this
@@ -437,6 +454,30 @@ impl Driver {
             driver: Arc::clone(self),
             raw,
         })
+    }
+
+    /// An owned event with timing enabled, for `OwnedEvent::elapsed`.
+    pub fn owned_timing_event(self: &Arc<Self>) -> Result<OwnedEvent, CudaError> {
+        // SAFETY: as `owned_event`, the caller's context is current.
+        let raw = unsafe { self.create_timing_event() }?;
+        Ok(OwnedEvent {
+            driver: Arc::clone(self),
+            raw,
+        })
+    }
+
+    /// Create a timing-enabled event (`flags = 0`). `FT_PROFILE` uses these to
+    /// bracket stages; a duration event costs a device timestamp per record, so
+    /// the ordering-only `create_event` stays the default.
+    ///
+    /// # Safety
+    /// The caller must have a CUDA context current; the returned event belongs
+    /// to it.
+    pub unsafe fn create_timing_event(&self) -> Result<CUevent, CudaError> {
+        let mut event: CUevent = std::ptr::null_mut();
+        // SAFETY: `event` is a live out slot; flags 0 enables timing.
+        self.check(unsafe { (self.fns.cu_event_create)(&raw mut event, 0) })?;
+        Ok(event)
     }
 
     /// Destroy a stream created by `create_stream`.
@@ -804,6 +845,17 @@ impl OwnedEvent {
         // SAFETY: the caller guarantees a live stream in the current context.
         self.driver
             .check(unsafe { (self.driver.fns.cu_stream_wait_event)(stream, self.raw, 0) })
+    }
+
+    /// Milliseconds between this event and a later `end` event, both recorded
+    /// and completed (`cuEventElapsedTime`). Both must be timing-enabled.
+    pub fn elapsed(&self, end: &OwnedEvent) -> Result<f32, CudaError> {
+        let mut ms: f32 = 0.0;
+        // SAFETY: both handles are live timing events in this driver's context.
+        self.driver.check(unsafe {
+            (self.driver.fns.cu_event_elapsed_time)(&raw mut ms, self.raw, end.raw)
+        })?;
+        Ok(ms)
     }
 }
 

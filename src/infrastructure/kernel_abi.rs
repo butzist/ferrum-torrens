@@ -947,8 +947,10 @@ pub fn gemv_gate_up_args(abi: &Abi, a: &MoEArgs) -> Result<ArgPack, MoEError> {
     p.u32(k.n as u32)?;
     p.u32(hidden as u32)?;
     p.u32(1)?;
-    p.u64((rows * (hidden / 2)) as u64)?;
-    p.u32((hidden / 2) as u32)?;
+    // The packed bank is read as int32 words (8 e2m1 codes each), so its row /
+    // slot strides are in words, not bytes (optimization.md R1).
+    p.u64((rows * (hidden / 8)) as u64)?;
+    p.u32((hidden / 8) as u32)?;
     p.u32(1)?;
     p.u64((rows * (hidden / 16)) as u64)?;
     p.u32((hidden / 16) as u32)?;
@@ -980,8 +982,8 @@ pub fn gemv_down_args(abi: &Abi, a: &MoEArgs) -> Result<ArgPack, MoEError> {
     p.u32(k.n as u32)?;
     p.u32(inter as u32)?;
     p.u32(1)?;
-    p.u64((rows * (inter / 2)) as u64)?;
-    p.u32((inter / 2) as u32)?;
+    p.u64((rows * (inter / 8)) as u64)?;
+    p.u32((inter / 8) as u32)?;
     p.u32(1)?;
     p.u64((rows * (inter / 16)) as u64)?;
     p.u32((inter / 16) as u32)?;
@@ -1225,8 +1227,9 @@ pub fn conv_grid(rows: usize, kernel: &LinearKernel) -> Result<(u32, u32, u32), 
 
 /// Device addresses and shapes for one dense NVFP4 GEMV launch. `a` is
 /// `[M, K]` bf16 activations, `packed`/`scale`/`global` are the NVFP4 weight
-/// banks (`[N, K // 2]` u8, `[N, K // 16]` e4m3 bytes, `[N]` f16 bytes), `c` is
-/// the `[M, N]` fp32 output and `lut` the 16-entry e2m1 table.
+/// banks (`[N, K // 2]` u8 read as int32 words, `[N, K // 16]` e4m3 bytes,
+/// `[N]` f16 bytes) and `c` is the `[M, N]` fp32 output. The packed strides are
+/// in int32 words (optimization.md R2).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DenseGemvArgs {
     pub a: u64,
@@ -1234,13 +1237,12 @@ pub struct DenseGemvArgs {
     pub scale: u64,
     pub global: u64,
     pub c: u64,
-    pub lut: u64,
     pub m: u32,
     pub n: u32,
     pub stride_am: u32,
     pub stride_ak: u32,
     pub stride_pn: u32,
-    pub stride_pkb: u32,
+    pub stride_pkw: u32,
     pub stride_sn: u32,
     pub stride_sblk: u32,
     pub stride_cm: u32,
@@ -1256,13 +1258,12 @@ pub fn nvfp4_dense_gemv_args(abi: &LinearAbi, a: &DenseGemvArgs) -> Result<ArgPa
     p.ptr(a.scale)?;
     p.ptr(a.global)?;
     p.ptr(a.c)?;
-    p.ptr(a.lut)?;
     p.u32(a.m)?;
     p.u32(a.n)?;
     p.u32(a.stride_am)?;
     p.u32(a.stride_ak)?;
     p.u32(a.stride_pn)?;
-    p.u32(a.stride_pkb)?;
+    p.u32(a.stride_pkw)?;
     p.u32(a.stride_sn)?;
     p.u32(a.stride_sblk)?;
     p.u32(a.stride_cm)?;
@@ -1607,10 +1608,13 @@ mod tests {
         let abi = abi();
         let gate_up = abi.kernel(GEMV_GATE_UP).unwrap();
         let routes = 3 * abi.top_k;
-        assert_eq!(grid(routes, gate_up), (routes as u32, 8, 1));
+        // The routed GEMV tiles 16 output columns per program (optimization.md
+        // R1): gate_up N=1024, down N=2048. The silu tile is 256, the reduce 128.
+        assert_eq!(gate_up.block, 16);
+        assert_eq!(grid(routes, gate_up), (routes as u32, 64, 1));
         assert_eq!(
             grid(routes, abi.kernel(GEMV_DOWN).unwrap()),
-            (routes as u32, 16, 1)
+            (routes as u32, 128, 1)
         );
         assert_eq!(
             grid(routes, abi.kernel(SILU_MUL).unwrap()),
@@ -1738,7 +1742,8 @@ mod tests {
     fn the_attention_manifest_lists_the_paged_kernel() {
         let abi = AttentionAbi::committed().expect("the committed manifest must parse");
         let kernel = abi.kernel(PAGED_ATTENTION).unwrap();
-        assert_eq!(kernel.block_threads(), 128);
+        // 8 warps spread the `[BLOCK_N, HEAD_DIM]` f32 tile so it does not spill.
+        assert_eq!(kernel.block_threads(), 256);
         assert_eq!(kernel.args.len(), 7);
         assert_eq!(kernel.args[..6], [ArgKind::Ptr; 6]);
         assert_eq!(kernel.args[6], ArgKind::U32);
@@ -1966,9 +1971,10 @@ mod tests {
     fn the_dense_gemv_manifest_records_the_tile() {
         let abi = LinearAbi::committed().unwrap();
         let kernel = abi.kernel(NVFP4_DENSE_GEMV).unwrap();
-        // One hidden size in a serving checkpoint, so K // 2 = 1024.
-        assert_eq!(kernel.constexpr("K_BYTES").unwrap(), 1024);
-        assert_eq!(kernel.constexpr("BLOCK_N").unwrap(), 128);
+        // One hidden size in a serving checkpoint, so K // 8 = 256 words.
+        assert_eq!(kernel.constexpr("K_WORDS").unwrap(), 256);
+        assert_eq!(kernel.constexpr("BLOCK_N").unwrap(), 32);
+        assert_eq!(kernel.constexpr("BLOCK_KW").unwrap(), 16);
         assert_eq!(kernel.num_warps, 4);
     }
 
@@ -1981,15 +1987,15 @@ mod tests {
             scale: 0x3000,
             global: 0x4000,
             c: 0x5000,
-            lut: 0x6000,
             m: 1,
             n: 248320,
             stride_am: 2048,
             stride_ak: 1,
-            stride_pn: 1024,
-            stride_pkb: 1,
-            stride_sn: 128,
-            stride_sblk: 1,
+            // K-major resident head: N is contiguous, K steps by N.
+            stride_pn: 1,
+            stride_pkw: 248320,
+            stride_sn: 1,
+            stride_sblk: 248320,
             stride_cm: 248320,
             stride_cn: 1,
         };
@@ -2006,10 +2012,10 @@ mod tests {
     fn the_dense_gemv_grid_tiles_the_vocab() {
         let abi = LinearAbi::committed().unwrap();
         let kernel = abi.kernel(NVFP4_DENSE_GEMV).unwrap();
-        // 248320 vocab / 128 tile = 1940 blocks in y, one program per row in x.
+        // 248320 vocab / 32 tile = 7760 blocks in y, one program per row in x.
         assert_eq!(
             nvfp4_dense_gemv_grid(1, 248320, kernel).unwrap(),
-            (1, 1940, 1)
+            (1, 7760, 1)
         );
     }
 

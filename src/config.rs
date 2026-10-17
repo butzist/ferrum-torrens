@@ -68,6 +68,54 @@ pub enum ComputeDevice {
     Cuda,
 }
 
+/// `moe.cache_size_slots`: an explicit slot count, or `"auto"` to size the
+/// device expert cache from the free VRAM once the tower and KV pool are
+/// resident (item 12, `registry::resolve_cache_slots`). Auto is the default,
+/// matching FreeToken's MoE-priority planner; the cache is the "rest of the
+/// budget" rather than a hardcoded number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CacheSize {
+    #[default]
+    Auto,
+    Slots(usize),
+}
+
+impl CacheSize {
+    /// The explicit slot count, or `None` for auto.
+    pub fn explicit(self) -> Option<usize> {
+        match self {
+            Self::Slots(n) => Some(n),
+            Self::Auto => None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for CacheSize {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl serde::de::Visitor<'_> for V {
+            type Value = CacheSize;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a slot count or \"auto\"")
+            }
+            fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E> {
+                Ok(CacheSize::Slots(v as usize))
+            }
+            fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E> {
+                Ok(CacheSize::Slots(v.max(0) as usize))
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                if v == "auto" {
+                    Ok(CacheSize::Auto)
+                } else {
+                    Err(E::custom("cache_size_slots must be an integer or \"auto\""))
+                }
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Serve {
@@ -122,8 +170,8 @@ pub struct Moe {
     pub strategy: MoeStrategy,
     #[serde(default)]
     pub expert_load: ExpertLoad,
-    #[serde(default = "default_cache_size_slots")]
-    pub cache_size_slots: usize,
+    #[serde(default)]
+    pub cache_size_slots: CacheSize,
     #[serde(default = "default_prefill_overlap")]
     pub prefill_overlap: bool,
     #[serde(default)]
@@ -135,7 +183,7 @@ impl Default for Moe {
         Self {
             strategy: MoeStrategy::Offload,
             expert_load: ExpertLoad::Serial,
-            cache_size_slots: DEFAULT_CACHE_SIZE_SLOTS,
+            cache_size_slots: CacheSize::Auto,
             prefill_overlap: DEFAULT_PREFILL_OVERLAP,
             cache_policy: CachePolicy::Lru,
         }
@@ -281,7 +329,11 @@ impl Config {
         }
 
         let moe = &mut self.moe;
-        if moe.cache_size_slots < MIN_CACHE_SIZE_SLOTS {
+        if moe
+            .cache_size_slots
+            .explicit()
+            .is_some_and(|n| n < MIN_CACHE_SIZE_SLOTS)
+        {
             return Err(err(
                 "moe.cache_size_slots must be >= 256 (one layer); >= 512 enables prefill overlap",
             ));
@@ -348,9 +400,6 @@ fn default_max_output_tokens() -> usize {
 }
 fn default_page_size() -> usize {
     1
-}
-fn default_cache_size_slots() -> usize {
-    DEFAULT_CACHE_SIZE_SLOTS
 }
 fn default_prefill_overlap() -> bool {
     DEFAULT_PREFILL_OVERLAP
@@ -433,7 +482,7 @@ triton = true
         assert_eq!(c.model.attention_backend, AttentionBackend::Fi);
         assert_eq!(c.moe.strategy, MoeStrategy::Offload);
         assert_eq!(c.moe.expert_load, ExpertLoad::Serial);
-        assert_eq!(c.moe.cache_size_slots, 512);
+        assert_eq!(c.moe.cache_size_slots, CacheSize::Slots(512));
         assert!(c.moe.prefill_overlap);
         assert_eq!(c.moe.cache_policy, CachePolicy::Lru);
         assert_eq!(c.kv.num_pages, Some(131072));
@@ -461,7 +510,7 @@ path = "/tmp/Qwen.ftw"
         );
         assert_eq!(c.model.max_seq_len, DEFAULT_MAX_SEQ_LEN);
         assert_eq!(c.model.page_size, 1);
-        assert_eq!(c.moe.cache_size_slots, DEFAULT_CACHE_SIZE_SLOTS);
+        assert_eq!(c.moe.cache_size_slots, CacheSize::Auto);
         assert!(c.moe.prefill_overlap);
         assert_eq!(c.kv_tokens(), DEFAULT_NUM_TOKENS);
         assert_eq!(c.sampling.temperature, 0.0);
@@ -617,6 +666,23 @@ num_tokens = 1024
         assert!(
             Config::from_str("[model]\npath=\"/tmp/Qwen.ftw\"\n[moe]\ncache_size_slots = 100")
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn cache_size_accepts_auto_or_a_slot_count() {
+        let c =
+            Config::from_str("[model]\npath=\"/tmp/Qwen.ftw\"\n[moe]\ncache_size_slots = \"auto\"")
+                .unwrap();
+        assert_eq!(c.moe.cache_size_slots, CacheSize::Auto);
+        let c = Config::from_str("[model]\npath=\"/tmp/Qwen.ftw\"\n[moe]\ncache_size_slots = 2048")
+            .unwrap();
+        assert_eq!(c.moe.cache_size_slots, CacheSize::Slots(2048));
+        assert!(
+            Config::from_str("[model]\npath=\"/tmp/Qwen.ftw\"\n[moe]\ncache_size_slots = \"lots\"")
+                .unwrap_err()
+                .to_string()
+                .contains("integer or")
         );
     }
 

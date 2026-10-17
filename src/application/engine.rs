@@ -264,9 +264,9 @@ pub fn load_engine(config: &crate::config::Config) -> Result<Engine, LoadError> 
             params.max_position_embeddings,
         ));
     }
-    if config.moe.cache_size_slots < params.num_experts {
+    if built.cache_size_slots < params.num_experts {
         return Err(LoadError::CacheTooSmall {
-            slots: config.moe.cache_size_slots,
+            slots: built.cache_size_slots,
             experts: params.num_experts,
         });
     }

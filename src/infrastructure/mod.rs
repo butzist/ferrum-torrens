@@ -23,5 +23,7 @@ pub mod http;
 pub mod kernel_abi;
 #[cfg(feature = "cuda")]
 pub mod kvcache_dev;
+#[cfg(feature = "cuda")]
+pub mod profile;
 pub mod tokenizers_hf;
 pub mod torch;

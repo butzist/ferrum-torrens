@@ -17,6 +17,14 @@ K-loop, so a BF16 copy of the experts is never materialized. Layout per expert
 `W[N, K]` (decision 23): `packed [S, N, K // 2]` uint8 with the low nibble
 holding the even k, `scale [S, N, K // 16]` e4m3fn, `global [S, N]` f16.
 
+The decode GEMV is marlin-style (optimization.md R1, decision 88 verification):
+the packed bank is read as int32 `[S, N, K // 8]` (same bytes, 8 codes per word)
+and the K reduction is deferred, so the wide coalesced loads of successive
+iterations pipeline instead of serializing on a per-iteration cross-lane sum.
+The e2m1 dequant is still the 16-entry LUT: wide loads + deferral are the ~8x
+lever (the wide-load ceiling is ~65% -> ~85% of peak read BW, the LUT gather is
+the residual ALU cost).
+
 The whole target GPU is sm_120, which has a native fp8e4nv unit, so the scale
 tensors are passed as `torch.float8_e4m3fn` and the emulation branch upstream
 needs for pre-sm_89 targets is deliberately absent; `require_native_e4m3()`
@@ -42,16 +50,59 @@ _E2M1_VALUES = (
 )
 
 # Decode (M small) is HBM bandwidth bound: one program per (route, N block) with
-# a wide N block, no tl.dot. These came from upstream's offline sweep and are
+# a narrow N block and a deferred [BLOCK_KW, BLOCK_N] partial. These came from
+# upstream's offline sweep (BLOCK_N=16, BLOCK_KW=16 == 128 k-values/iter) and are
 # fixed rather than autotuned, because decode runs inside a CUDA graph.
-DECODE_BLOCK_N = 128
-DECODE_BLOCK_KB = 64
-DECODE_WARPS = 4
+GEMV_BLOCK_N = 16
+GEMV_BLOCK_KW = 16
+GEMV_WARPS = 4
+
+# The top_k collapse at the end of a layer reads one row per route and is not
+# bandwidth bound, so it keeps the wide tile.
+REDUCE_BLOCK_N = 128
+REDUCE_WARPS = 4
 
 
 @functools.lru_cache(maxsize=None)
 def _e2m1_lut(device: torch.device) -> torch.Tensor:
     return torch.tensor(_E2M1_VALUES, dtype=torch.float32, device=device)
+
+
+@triton.jit
+def _nvfp4_pair_f32(v):
+    """Dequant two e2m1 codes held in an int32 at bits [3:0] and [19:16].
+
+    Returns `(lo, hi)` fp32 = `e2m1_value * 2^-14`; the caller multiplies by
+    `block_scale * 2^14` (exact, power of two). The magnitude bits land in fp16
+    [11:9] and the sign in [15]; fp16's subnormal encoding puts the `e == 0`
+    codes on the same 2^-14 factor. Five integer ops per pair instead of an L1
+    gather per code (FreeToken's `nvfp4_linear._nvfp4_pair_f32`, Apache-2.0);
+    bit-identical in f32.
+    """
+    r = ((v << 9) & 0x0E000E00) | ((v & 0x00080008) << 12)
+    lo = (r & 0xFFFF).to(tl.uint16).to(tl.float16, bitcast=True).to(tl.float32)
+    hi = (r >> 16).to(tl.uint16).to(tl.float16, bitcast=True).to(tl.float32)
+    return lo, hi
+
+
+@triton.jit
+def _split8(a_vec, BLOCK_KW: tl.constexpr):
+    """Contiguous `[BLOCK_KW * 8]` activations -> 8 `[BLOCK_KW]`, `a_j[w] = a[8w+j]`.
+
+    Register-only reshape/split tree, so the activation is one wide coalesced
+    load instead of eight stride-8 gathers (FreeToken's `nvfp4_linear._split8`).
+    """
+    a3 = tl.reshape(a_vec, (BLOCK_KW, 4, 2))
+    ev, od = tl.split(a3)
+    e = tl.reshape(ev, (BLOCK_KW, 2, 2))
+    o = tl.reshape(od, (BLOCK_KW, 2, 2))
+    e0, e1 = tl.split(e)
+    o0, o1 = tl.split(o)
+    a0, a4 = tl.split(e0)
+    a2, a6 = tl.split(e1)
+    a1, a5 = tl.split(o0)
+    a3_, a7 = tl.split(o1)
+    return a0, a1, a2, a3_, a4, a5, a6, a7
 
 
 def require_native_e4m3(device: torch.device) -> None:
@@ -87,7 +138,7 @@ def _check_constexprs(values: dict) -> None:
 @triton.jit
 def _nvfp4_gemv_kernel(
     a_ptr,  # [M, K] activations, compute dtype
-    packed_ptr,  # [S, N, K // 2] uint8
+    packed_ptr,  # [S, N, K // 8] int32 (8 e2m1 codes per word, nibble j -> k = 8*w + j)
     scale_ptr,  # [S, N, K // 16] e4m3fn
     global_ptr,  # [S, N] f16
     c_ptr,  # [R, N] compute dtype
@@ -98,13 +149,13 @@ def _nvfp4_gemv_kernel(
     M,
     N,
     stride_am, stride_ak,
-    stride_pe, stride_pn, stride_pkb,
+    stride_pe, stride_pn, stride_pkw,
     stride_se, stride_sn, stride_sblk,
     stride_ge, stride_gn,
     stride_cm, stride_cn,
-    K_BYTES: tl.constexpr,
+    K_WORDS: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    BLOCK_KB: tl.constexpr,
+    BLOCK_KW: tl.constexpr,
     MUL_WEIGHT: tl.constexpr,
     A_ROW_IS_ROUTE: tl.constexpr,
 ):
@@ -117,6 +168,10 @@ def _nvfp4_gemv_kernel(
     `A_ROW_IS_ROUTE` picks the activation row: the first GEMM reads `x`, which
     has one row per token, while the second reads `silu_mul`'s output, which has
     one row per route.
+
+    The `[BLOCK_KW, BLOCK_N]` partial accumulates across every K-iteration and is
+    reduced once; a per-iteration `tl.sum` would put a cross-lane barrier in the
+    loop and stop the wide weight loads from pipelining.
     """
     route = tl.program_id(0)
     offs_n = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -131,45 +186,51 @@ def _nvfp4_gemv_kernel(
     a_row = route if A_ROW_IS_ROUTE else token
     a_base = a_ptr + a_row * stride_am
 
-    offs_kb = tl.arange(0, BLOCK_KB)
+    offs_kw = tl.arange(0, BLOCK_KW)
     packed_slot = packed_ptr + slot * stride_pe
     scale_slot = scale_ptr + slot * stride_se
-    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    partial = tl.zeros((BLOCK_KW, BLOCK_N), dtype=tl.float32)
 
-    for kb_start in range(0, K_BYTES, BLOCK_KB):
-        # kb_start already counts bytes: range() steps by BLOCK_KB, so multiplying
-        # it again would jump a full block per iteration and mask every k but the first.
-        byte_idx = kb_start + offs_kb
-        byte_mask = byte_idx < K_BYTES
+    for kw_start in range(0, tl.cdiv(K_WORDS, BLOCK_KW)):
+        widx = kw_start * BLOCK_KW + offs_kw
+        w_mask = widx < K_WORDS
 
-        p_ptrs = packed_slot + offs_n[None, :] * stride_pn + byte_idx[:, None] * stride_pkb
-        bytes_ = tl.load(
-            p_ptrs, mask=byte_mask[:, None] & n_mask[None, :], other=0
-        ).to(tl.int32)
-        b_lo = tl.load(lut_ptr + (bytes_ & 0xF)) * tl.load(
+        word = tl.load(
+            packed_slot + offs_n[None, :] * stride_pn + widx[:, None] * stride_pkw,
+            mask=w_mask[:, None] & n_mask[None, :],
+            other=0,
+        )
+        # 8 codes/word fall in one or two 16-wide blocks -> one scale per word.
+        # `* 16384.0` (2^14) undoes the pair trick's 2^-14 exactly.
+        scale = tl.load(
             scale_slot
             + offs_n[None, :] * stride_sn
-            + (byte_idx // 8)[:, None] * stride_sblk,
-            mask=byte_mask[:, None] & n_mask[None, :],
+            + (widx[:, None] // 2) * stride_sblk,
+            mask=w_mask[:, None] & n_mask[None, :],
             other=0.0,
-        ).to(tl.float32)
-        b_hi = tl.load(lut_ptr + ((bytes_ >> 4) & 0xF)) * tl.load(
-            scale_slot
-            + offs_n[None, :] * stride_sn
-            + (byte_idx // 8)[:, None] * stride_sblk,
-            mask=byte_mask[:, None] & n_mask[None, :],
-            other=0.0,
-        ).to(tl.float32)
+        ).to(tl.float32) * 16384.0
 
-        a_lo = tl.load(
-            a_base + (2 * byte_idx) * stride_ak, mask=byte_mask, other=0.0
+        offs_a = 8 * kw_start * BLOCK_KW + tl.arange(0, BLOCK_KW * 8)
+        a_vec = tl.load(
+            a_base + offs_a * stride_ak, mask=offs_a < 8 * K_WORDS, other=0.0
         ).to(tl.float32)
-        a_hi = tl.load(
-            a_base + (2 * byte_idx + 1) * stride_ak, mask=byte_mask, other=0.0
-        ).to(tl.float32)
-        acc += tl.sum(a_lo[:, None] * b_lo, axis=0)
-        acc += tl.sum(a_hi[:, None] * b_hi, axis=0)
+        a0, a1, a2, a3, a4, a5, a6, a7 = _split8(a_vec, BLOCK_KW)
+        acc_w = tl.zeros((BLOCK_KW, BLOCK_N), dtype=tl.float32)
+        b_lo, b_hi = _nvfp4_pair_f32(word)
+        acc_w += a0[:, None] * b_lo
+        acc_w += a4[:, None] * b_hi
+        b_lo, b_hi = _nvfp4_pair_f32(word >> 4)
+        acc_w += a1[:, None] * b_lo
+        acc_w += a5[:, None] * b_hi
+        b_lo, b_hi = _nvfp4_pair_f32(word >> 8)
+        acc_w += a2[:, None] * b_lo
+        acc_w += a6[:, None] * b_hi
+        b_lo, b_hi = _nvfp4_pair_f32(word >> 12)
+        acc_w += a3[:, None] * b_lo
+        acc_w += a7[:, None] * b_hi
+        partial += acc_w * scale
 
+    acc = tl.sum(partial, axis=0)
     g = tl.load(
         global_ptr + slot * stride_ge + offs_n * stride_gn, mask=n_mask, other=0.0
     ).to(tl.float32)
@@ -249,27 +310,29 @@ def _gemv(
     M, K = a.shape
     slots, N, k_bytes = packed.shape
     assert K // 2 == k_bytes, f"K {K} vs packed {k_bytes}"
+    assert K % 8 == 0, f"K {K} must be a multiple of 8 for int32 wide loads"
     require_native_e4m3(a.device)
-    grid = (route_slot.numel(), triton.cdiv(N, DECODE_BLOCK_N))
+    packed_i32 = packed.view(torch.int32)  # [S, N, K // 8]
+    grid = (route_slot.numel(), triton.cdiv(N, GEMV_BLOCK_N))
     consts = {
-        "K_BYTES": K // 2,
-        "BLOCK_N": DECODE_BLOCK_N,
-        "BLOCK_KB": DECODE_BLOCK_KB,
+        "K_WORDS": K // 8,
+        "BLOCK_N": GEMV_BLOCK_N,
+        "BLOCK_KW": GEMV_BLOCK_KW,
         "MUL_WEIGHT": mul_weight,
         "A_ROW_IS_ROUTE": a_row_is_route,
     }
     _check_constexprs(consts)
     _nvfp4_gemv_kernel[grid](
-        a, packed, scale, glob, c, route_token, route_slot, route_weight,
+        a, packed_i32, scale, glob, c, route_token, route_slot, route_weight,
         _e2m1_lut(a.device),
         M, N,
         a.stride(0), a.stride(1),
-        packed.stride(0), packed.stride(1), packed.stride(2),
+        packed_i32.stride(0), packed_i32.stride(1), packed_i32.stride(2),
         scale.stride(0), scale.stride(1), scale.stride(2),
         glob.stride(0), glob.stride(1),
         c.stride(0), c.stride(1),
         **consts,
-        num_warps=DECODE_WARPS,
+        num_warps=GEMV_WARPS,
     )
 
 
@@ -315,11 +378,17 @@ def grouped_moe(
         route_token, route_slot, route_weight, True, True,
     )
     out = torch.empty((tokens, hidden), device=dev, dtype=dt)
-    _sum_reduce_kernel[(tokens, triton.cdiv(hidden, DECODE_BLOCK_N))](
+    _sum_reduce_kernel[(tokens, triton.cdiv(hidden, REDUCE_BLOCK_N))](
         ic3, out, hidden, top_k, ic3.stride(0), ic3.stride(1), out.stride(0), out.stride(1),
-        BLOCK_N=DECODE_BLOCK_N, num_warps=DECODE_WARPS,
+        BLOCK_N=REDUCE_BLOCK_N, num_warps=REDUCE_WARPS,
     )
     return out
 
 
-__all__ = ["DECODE_BLOCK_KB", "DECODE_BLOCK_N", "grouped_moe", "require_native_e4m3"]
+__all__ = [
+    "GEMV_BLOCK_KW",
+    "GEMV_BLOCK_N",
+    "REDUCE_BLOCK_N",
+    "grouped_moe",
+    "require_native_e4m3",
+]

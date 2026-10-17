@@ -43,7 +43,8 @@ from .fp8_linear import (
 )
 from .linear import DENSE_WARPS, _nvfp4_dense_gemv_kernel
 from .nvfp4_moe import (
-    DECODE_BLOCK_N,
+    GEMV_BLOCK_N,
+    REDUCE_BLOCK_N,
     _nvfp4_gemv_kernel,
     _silu_mul_kernel,
     _sum_reduce_kernel,
@@ -101,14 +102,14 @@ KERNELS: dict[str, dict] = {
         "signature": gemv(),
         "constexprs": gate_up_constexprs(),
         "n": SERVING_INTER * 2,
-        "block": DECODE_BLOCK_N,
+        "block": GEMV_BLOCK_N,
     },
     "gemv_down": {
         "fn": _nvfp4_gemv_kernel,
         "signature": gemv(),
         "constexprs": down_constexprs(),
         "n": SERVING_HIDDEN,
-        "block": DECODE_BLOCK_N,
+        "block": GEMV_BLOCK_N,
     },
     "silu_mul": {
         "fn": _silu_mul_kernel,
@@ -122,7 +123,7 @@ KERNELS: dict[str, dict] = {
         "signature": reduce(),
         "constexprs": reduce_constexprs(),
         "n": SERVING_HIDDEN,
-        "block": DECODE_BLOCK_N,
+        "block": REDUCE_BLOCK_N,
     },
 }
 
@@ -157,11 +158,15 @@ ATTENTION_KERNELS: dict[str, dict] = {
         "fn": _paged_attention_decode_kernel,
         "signature": paged_attention(kv_dtype="fp32"),
         "constexprs": paged_attention_constexprs(),
+        # A `[BLOCK_N, HEAD_DIM]` f32 tile per program (HEAD_DIM 256); 8 warps
+        # spread it so the K/V loads and softmax do not spill.
+        "num_warps": 8,
     },
     "paged_attention_bf16": {
         "fn": _paged_attention_decode_kernel,
         "signature": paged_attention(kv_dtype=SERVING_DTYPE),
         "constexprs": paged_attention_constexprs(),
+        "num_warps": 8,
     },
 }
 

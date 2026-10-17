@@ -18,7 +18,7 @@
       ],
       "entry": "_paged_attention_decode_kernel",
       "global_scratch_size": 0,
-      "num_warps": 4,
+      "num_warps": 8,
       "params": [
         {
           "index": 0,
@@ -59,7 +59,7 @@
       ],
       "profile_scratch_size": 0,
       "scratch_params": 2,
-      "shared": 1024
+      "shared": 2048
     },
     "paged_attention_bf16": {
       "constexprs": {
@@ -79,7 +79,7 @@
       ],
       "entry": "_paged_attention_decode_kernel",
       "global_scratch_size": 0,
-      "num_warps": 4,
+      "num_warps": 8,
       "params": [
         {
           "index": 0,
@@ -120,17 +120,17 @@
       ],
       "profile_scratch_size": 0,
       "scratch_params": 2,
-      "shared": 1024
+      "shared": 2048
     }
   },
   "kernels": {
     "gemv_down": {
-      "block": 128,
+      "block": 16,
       "constexprs": {
         "A_ROW_IS_ROUTE": true,
-        "BLOCK_KB": 64,
-        "BLOCK_N": 128,
-        "K_BYTES": 256,
+        "BLOCK_KW": 16,
+        "BLOCK_N": 16,
+        "K_WORDS": 64,
         "MUL_WEIGHT": true
       },
       "declared_args": [
@@ -149,7 +149,7 @@
         "stride_ak",
         "stride_pe",
         "stride_pn",
-        "stride_pkb",
+        "stride_pkw",
         "stride_se",
         "stride_sn",
         "stride_sblk",
@@ -266,15 +266,15 @@
       ],
       "profile_scratch_size": 0,
       "scratch_params": 2,
-      "shared": 0
+      "shared": 256
     },
     "gemv_gate_up": {
-      "block": 128,
+      "block": 16,
       "constexprs": {
         "A_ROW_IS_ROUTE": false,
-        "BLOCK_KB": 64,
-        "BLOCK_N": 128,
-        "K_BYTES": 1024,
+        "BLOCK_KW": 16,
+        "BLOCK_N": 16,
+        "K_WORDS": 256,
         "MUL_WEIGHT": false
       },
       "declared_args": [
@@ -293,7 +293,7 @@
         "stride_ak",
         "stride_pe",
         "stride_pn",
-        "stride_pkb",
+        "stride_pkw",
         "stride_se",
         "stride_sn",
         "stride_sblk",
@@ -410,7 +410,7 @@
       ],
       "profile_scratch_size": 0,
       "scratch_params": 2,
-      "shared": 0
+      "shared": 256
     },
     "silu_mul": {
       "block": 256,
@@ -913,9 +913,9 @@
     },
     "nvfp4_dense_gemv": {
       "constexprs": {
-        "BLOCK_KB": 64,
-        "BLOCK_N": 128,
-        "K_BYTES": 1024
+        "BLOCK_KW": 16,
+        "BLOCK_N": 32,
+        "K_WORDS": 256
       },
       "declared_args": [
         "a_ptr",
@@ -923,13 +923,12 @@
         "scale_ptr",
         "global_ptr",
         "c_ptr",
-        "lut_ptr",
         "M",
         "N",
         "stride_am",
         "stride_ak",
         "stride_pn",
-        "stride_pkb",
+        "stride_pkw",
         "stride_sn",
         "stride_sblk",
         "stride_cm",
@@ -961,7 +960,7 @@
         },
         {
           "index": 5,
-          "kind": "ptr"
+          "kind": "u32"
         },
         {
           "index": 6,
@@ -1001,20 +1000,16 @@
         },
         {
           "index": 15,
-          "kind": "u32"
-        },
-        {
-          "index": 16,
           "kind": "ptr"
         },
         {
-          "index": 17,
+          "index": 16,
           "kind": "ptr"
         }
       ],
       "profile_scratch_size": 0,
       "scratch_params": 2,
-      "shared": 0
+      "shared": 512
     }
   },
   "shapes": {

@@ -150,7 +150,7 @@ fn one_token_through_the_kernel_matches_the_oracle() {
     eprintln!(
         "kernel on: {slots} slots, prompt {PROMPT:?} -> {} tokens",
         ids.len(),
-        slots = cfg.moe.cache_size_slots
+        slots = cfg.moe.cache_size_slots.explicit().unwrap_or(0)
     );
     assert_eq!(engine.expert_steps(), 0, "nothing has run yet");
 

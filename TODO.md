@@ -38,7 +38,7 @@ feature. Open work: tool calling, the `[opt] /v1/responses` surface, server-side
 batching, the bf16-attention/remaining decode gap (items 14, 17), and the
 section 8 experiments.
 The decode gap is now pursued by **vendoring FreeToken's own Triton kernels**
-(decision 82, plan in `FUSED_GDN.md`). Slices 1-2 landed: bf16 paged attention
+(decision 82, plan in `optimization.md`). Slices 1-2 landed: bf16 paged attention
 (decision 83) and the W8A16 FP8 projections (decision 84), which with the packed
 NVFP4 lm_head (decision 79) take decode **tg 8.2 -> 10.9 tok/s** and VRAM
 **7.9 -> 4.83 GiB**. E4 (item 21, decision 85) raised the staging ceiling so the
@@ -49,7 +49,22 @@ bf16, both correct and throughput neutral (the substrate matches FreeToken; the
 cost is elsewhere). Remaining: the prefill chunk kernels (slice 4) and item 11
 (server-side batching) as the largest serving lever; libtorch stays the
 generic/CPU fallback.
-Progress history and the full decision log (numbers 1..87) live in `DONE.md`;
+**The two NVFP4 GEMVs were rewritten marlin-style (decision 89, optimization.md
+R1/R2):** int32 wide loads + a deferred K reduction + the fp16-bitcast dequant
+(`_split8` register activation split), and the lm_head is now resident K-major.
+`moe_gemm` 29.0 -> **4.2 ms/token** and `head` 12.6 -> **1.06** (the reference is
+3.5 / 0.82), taking captured **tg 10.6 -> 16.7 tok/s at 512 slots** and **11.5 ->
+18.1 at 1536**. R3 (decode copy/compute overlap) is **withdrawn**: the decoder's
+MoE is the last op of its layer, so the next layer's expert ids are not known
+during this layer's compute -- there is nothing to prefetch. **R4 landed
+(decision 90):** `[moe] cache_size_slots` is now `"auto"` by default and sizes
+the expert cache from the free VRAM after the tower and KV pool are resident; it
+resolves ~1900 slots on the 8 GiB target and gives **tg 18.7 tok/s**. **R6 is
+partial:** the paged attention kernel now runs 8 warps (`attn` 4.7 -> 4.37); the
+other R6 items have hard blockers (see `optimization.md`). Remaining levers: the
+PCIe copy (miss-bound) and the spread compute (GDN/attn/shared/LRU), plus
+batching (R5). Instruments: `FT_PROFILE=1` and `scripts/freetoken_probe/`.
+Progress history and the full decision log (numbers 1..88) live in `DONE.md`;
 read that for the "why" behind any decision number referenced in code or tests.
 
 Goal: a **minimal, fast, single-GPU** Rust serving engine for **one model** --
@@ -89,7 +104,9 @@ with `--text-model-only`). Known-good bf16/Fp8 siblings: `Qwen/Qwen3.6-35B-A3B`,
 - `cache_type = "hybrid_radix"` semantics: radix prefix cache + GDN state reuse (see optional note), `page_size = 1`.
 - Text-only. Never build vision towers; reject image inputs.
 - Single GPU, single process, in-process tokenizer (no ZMQ/tokenizer worker split).
-- Explicit sizing in a config file. **No `memory_ratio`**, no auto cache-budget planner.
+- Explicit sizing in a config file. **No `memory_ratio`**; the one auto planner is
+  `moe.cache_size_slots = "auto"` (item 12, decision 90), which takes the free
+  VRAM after the tower and KV pool as the cache budget.
 - All dense compute via libtorch (`tch`); the NVFP4 expert GEMV is the one
   hand-written Triton kernel (decision 2). No build-time `nvcc`/fatbin step, no
   cubin loading, no runtime JIT.
@@ -216,7 +233,8 @@ attention_backend = "fi"                         # paged GQA, NHD, page 1
 [moe]
 strategy = "offload"
 expert_load = "serial"
-cache_size_slots = 512                           # >= 256 (one layer); >= 512 enables prefill overlap
+cache_size_slots = "auto"                        # "auto" sizes from free VRAM; or an int
+                                                 # >= 256 (one layer); >= 512 enables prefill overlap
 prefill_overlap = true                           # two-buffer streaming (needs >= 2*num_experts)
 cache_policy = "lru"
 
@@ -316,11 +334,36 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 
 ## 7. Decisions
 
-The full log of confirmed decisions (numbers 1..84, stable -- code, tests and
+The full log of confirmed decisions (numbers 1..90, stable -- code, tests and
 `ARCHITECTURE.md` reference them by number) lives in `DONE.md`. This section
 lists only the decisions that still bind open work; everything else there is
 history.
 
+- **90** -- `[moe] cache_size_slots` is an integer or `"auto"`, **default auto**
+  (decision 90). `registry::resolve_cache_slots` sizes the expert cache from the
+  free device memory after the tower and KV pool are resident, minus a 1 GiB
+  reserve, clamped to `[256, BLOCK_C 2048]`. The config field is
+  `config::CacheSize`; `BuiltModel::cache_size_slots` carries the resolved value.
+  This binds the config surface (TODO section 4) and the R6 blockers recorded in
+  `optimization.md`: the `moe_lru` top-k is gated on the interpreter not running
+  `tl.topk`; the GDN/attn projection gap is the absent W8A8 `torch._scaled_mm`;
+  the shared expert stays bf16 until our dense NVFP4 kernel has an M>1 path.
+- **88** -- decode is profiled per stage on both engines, and the top Rust lever
+  is the two NVFP4 GEMV kernels, not staging or activation dtype. Instruments:
+  `scripts/freetoken_probe/` (non-invasive CUDA-event/torch-profiler probe of the
+  read-only reference) and `FT_PROFILE=1` (`infrastructure/profile.rs`, driver
+  timing events on the uncaptured `run_tower`). **Verified 2026-10-17 in
+  `optimization.md`** (which corrects two of its own claims): the reference's MoE
+  GEMV is ~3.5-3.8 ms/token (the 8.8-at-1900 figure was one outlier step), our
+  `moe_copy` is miss-proportional and PCIe-bound (NOT a fixed-cost launch -- the
+  flatness was our 74-84% miss rate at 512-2048 slots), and the ratio causes are
+  source-confirmed (byte loads + per-iter `tl.sum` + LUT, vs int32 wide loads +
+  deferred reduction + bit-trick dequant). It bound item 22 and the R1-R6
+  remediation plan in `optimization.md`. **R1/R2 are now applied (decision 89)**
+  -- the two GEMVs are marlin-style and the head is K-major, taking captured tg
+  10.6 -> 16.7 at 512 slots; R3 is withdrawn (the next layer's ids are unknowable
+  during this layer's compute), so the remaining levers are R4/R5/R6. This
+  supersedes decision 82's "keep our own NVFP4-MoE kernel" for decode.
 - **87** -- the mixer activation stream is **bf16**, matching FreeToken's model
   dtype (decision 82's "one real divergence"). `rms_norm`, `linear`/`Dense::apply`,
   `conv_decode`, the GDN `gdn_decode` q/k/v/ba/out, the paged attention q/out and
@@ -332,7 +375,7 @@ history.
   device gate, so the router stays f32.
 - **86** -- the GDN decode conv is the vendored fused `conv_decode` kernel
   (fused depthwise causal conv + silu, in-place `[rows, conv_dim, K-1]` f32
-  state), replacing `conv1d_silu_step_batch` on the device path (FUSED_GDN slice
+  state), replacing `conv1d_silu_step_batch` on the device path (optimization.md slice
   3, the conv half). It reads the checkpoint's `[conv_dim, 1, K]` filter as
   `[conv_dim, K]`, takes `x`'s row stride so the qkvz narrow goes straight in,
   and outputs a contiguous `[rows, conv_dim]` buffer the recurrence reads. The
@@ -365,7 +408,7 @@ history.
   anyway. Ordered slices: (1) bf16 paged attention, (2) vendor `fp8_pertensor_linear`
   for the FP8 projections, (3) bf16 mixer activations + `causal_conv1d_decode`,
   (4) prefill chunk kernels (`chunk_gated_delta_rule`, `causal_conv1d_varlen`).
-  See `FUSED_GDN.md` "Plan". This supersedes the E1-deprioritization that rested
+  See `optimization.md` "Plan". This supersedes the E1-deprioritization that rested
   on the E2 result: our lm_head GEMV was neutral because its 4-bit LUT unpack is
   arithmetic-heavy, where W8A16 is a trivial per-byte convert (FreeToken measured
   the bf16-widened cuBLAS path as ~54% of their step before W8A16).
@@ -544,6 +587,12 @@ performance work.
    0.16 GiB, graphs ~0.01 GiB, free-after 0.44 GiB. It batches server-side (shared
    `Scheduler`), but the bench pinned `--max-running-requests 1`, so the numbers
    above are pure bs=1 (batching did not influence the test).
+   **Superseded by decision 88 (2026-10-17).** The per-stage `FT_PROFILE=1`
+   re-measure says our step is not "latency-bound at one row" across the board:
+   `moe_gemm` 29.0 + `head` 12.6 ms at 512 slots are pure kernel inefficiency vs
+   the reference's ~3.5 + 0.8 (verified in `optimization.md`). Item 22 (rewrite
+   the NVFP4 GEMVs, R1-R2) is the top lever, the copy/compute overlap (R3) is the
+   parity-and-beyond lever, and batching (item 11) stays the serving lever.
 10. GDN state-slot sizing -- **OPEN.** The pool is `max_running_requests (+1 for
     the captured graph's padding row)`, which leaves no room for hybrid-radix
     prefix snapshots: at `max_running_requests = 1` the second request panics with
@@ -555,13 +604,13 @@ performance work.
     central dispatcher that admits concurrent requests into one `generate_batch`
     so decode batches, then re-measure. This is the main utilization lever before
     any kernel rewrite.
-12. VRAM budget planner -- **OPEN (from the FreeToken comparison, decision 76).**
-    FreeToken sizes pools from `memory_ratio * free_before_model - weights -
-    fixed_caches`, MoE-priority (reserve KV, experts take the rest), and gets 1900
-    slots in 6.85 GiB. We hardcode `cache_size_slots` and sit at 7.9 GiB with 512
-    slots; our non-slot GPU footprint is ~2.5 GiB larger. Adopt a budget planner
-    and audit what holds that 2.5 GiB (on-device bf16 tower / lm_head / embed, GDN
-    state slabs, graph pools) -- this both frees memory and auto-sizes the cache.
+12. VRAM budget planner -- **DONE (2026-10-17), decision 90 (R4).**
+    `[moe] cache_size_slots` accepts an integer or `"auto"` (default `Auto`).
+    `registry::resolve_cache_slots` reads free device memory after the tower and
+    KV pool are resident (`cuMemGetInfo_v2`, `TorchQwen3_6::attach_moe` detaches
+    the MoE port for the duration), subtracts a 1 GiB reserve and divides by
+    `cuda_moe::expert_slot_bytes`, clamped to `[256, BLOCK_C 2048]`. ~1900 slots
+    on the 8 GiB target, captured tg 18.7 tok/s. MoE-priority by construction.
 13. Tool-call anchor (agentic) -- **OPEN, pairs with tool calling (decision 74).**
     FreeToken freezes the hybrid GDN state and retains the SWA window at the
     tool-call token, so a multi-turn loop (tool call -> result -> continue) reuses
@@ -620,6 +669,16 @@ performance work.
      (plateau; 11.4 at 2048), VRAM 4830 -> 6570 MiB (1536) / 7434 MiB (2048).
      Gated by `a_cache_above_the_old_ceiling_stages_on_device`; the default
      config stays 512.
+22. NVFP4 GEMV kernels (routed MoE + dense head) -- **DONE (2026-10-17),
+     decision 89.** R1/R2 applied: `nvfp4_moe.py` and `linear.py` are marlin-style
+     (int32 wide loads, deferred `[BLOCK_KW, BLOCK_N]` reduction, the fp16-bitcast
+     pair trick, `_split8`), and the lm_head is resident K-major (`[K//8, N]`
+     int32 + `[K//16, N]` u8, transposed once at load). `moe_gemm` 29.0 -> 4.2
+     ms/token, `head` 12.6 -> 1.06 (ref 3.5 / 0.82), captured tg 10.6 -> 16.7 at
+     512 slots. The ABI moved: `gemv()` takes `packed_ptr *i32` / `K_WORDS` /
+     `stride_pkw` and `kernel_abi.rs` passes word strides; `nvfp4_dense_gemv()`
+     drops the LUT and takes K-major strides. Gates green (see DONE.md 89).
+     Remaining decode work is R4/R5/R6, not this item.
 
 ### Decode speed plan (decision 82): status and next steps
 
@@ -635,28 +694,39 @@ Measured on the RTX 5060 Laptop, bs=1, bf16 KV, `tests/throughput_smoke.rs`
 
 FreeToken `offload` on the same GPU/FTW does **22.5 tok/s** (512 slots) / **30.3**
 (1900 slots), so the gap is now **~2.1-2.8x** (was ~3.7x). The plan and its
-FreeToken facts live in `FUSED_GDN.md` "Plan"; slices 1-2 are landed. Ordered
+FreeToken facts live in `optimization.md` "Plan"; slices 1-2 are landed. Ordered
 next steps:
 
-1. **E4 / item 21 -- raise the staging `BLOCK_C`.** Turns the VRAM the FP8 slice
-   freed into expert-cache slots. Small and self-contained (one constexpr +
-   `check-kernels.sh` + the offload ABI tests), measured with the smoke.
-2. **Slice 3 (item 19) -- bf16 mixer activations + `causal_conv1d_decode`.** The
-   tower-wide numerics change (rms_norm/conv/attention outputs to bf16) that lets
-   FreeToken's kernels drop in with signature-only edits; re-run every gate (the
-   decision 80 bounds already anticipate bf16).
-3. **Slice 4 (item 20) -- prefill chunk kernels** (`chunk_gated_delta_rule`,
+1. **R1/R2 / item 22 -- DONE (decision 89).** The routed GEMV and the dense head
+   are marlin-style now (int32 wide loads, deferred reduction, bit-trick,
+   `_split8`) and the head is resident K-major. `moe_gemm` 29.0 -> 4.2 ms/token,
+   `head` 12.6 -> 1.06 (ref 3.5 / 0.82); captured tg **10.6 -> 16.7 at 512** and
+   **11.5 -> 18.1 at 1536**. Gates green.
+2. **R3 -- withdrawn (decision 89).** A decoder's MoE is the last op of its
+   layer (`forward_torch.rs::run_sequence`), so layer l+1's expert ids are not
+   known during layer l's compute; there is nothing to prefetch across layers,
+   and the reference is serialized the same way. The only sound overlap is the
+   routed copy against the same layer's shared expert (~3 ms), folded into R6.
+3. **R4 / item 12 -- DONE (decision 90).** Auto cache sizing from free VRAM;
+   ~1900 slots on the 8 GiB target, captured tg **16.7 -> 18.7 tok/s**.
+4. **Slice 4 (item 20) -- prefill chunk kernels** (`chunk_gated_delta_rule`,
    `causal_conv1d_varlen`). This is the **pp** lever, not tg.
-4. **Item 11 -- server-side batching.** Not a kernel, but the largest *serving*
-   lever: at bs>1 the per-token weight read amortizes and `max_running_requests`
-   engages. It pairs with the per-batch-size decode graphs already built.
+5. **R5 / item 11 -- server-side batching.** The largest *serving* lever once
+   the per-step cost is sane: at bs>1 the per-token weight read amortizes and
+   `max_running_requests` engages. It pairs with the per-batch-size decode graphs
+   already built.
+6. **R6 -- PARTIAL (decision 90).** Paged attention now runs 8 warps (`attn`
+   4.7 -> 4.37). The rest is blocked: `moe_lru` top-k needs `tl.topk` (the
+   interpreter gate cannot run it); GDN/attn projections need the W8A8
+   `torch._scaled_mm` `tch` does not expose (decision 84); the shared expert
+   needs an M>1 NVFP4 path to stay packed; the copy/compute overlap needs the
+   capture-path port split. Each is its own slice.
 
-Caveat: FreeToken's last ~35% at bs=1 came from **cache size** (22.5 -> 30.3),
-i.e. item 21, not a kernel. Our step is also spread across attention and norms
-rather than projection-dominated, so slices 3-4 win less than their FreeToken
-share. If **tg parity at bs=1** is the goal, item 21 + slice 3 are the path; if
-**serving throughput** is the goal, item 11 dominates and should be measured
-before more kernel work.
+Caveat (decision 89): the step is now ~33 ms copy (PCIe, miss-bound) + ~30 ms
+compute. FreeToken's 22.5 -> 30.3 tok/s at bs=1 is mostly its larger default
+cache because its step is staging-bound; ours is more balanced. The smoke's
+prompts miss 74-84% (broad routing) vs FreeToken's 34-66% on AIME -- add a
+prompt override before comparing miss rates.
 
 ### Experiments to try (not on the critical path)
 
@@ -709,9 +779,9 @@ default do not fit the 8 GiB device (item 6).
 ```
 max_seq_len = 65536            # floor; KV makes ~200k feasible if prompted
 kv_dtype = "bf16"              # [kv] dtype; half of f32, fits the 8 GB target
-moe_cache_size_slots = 512     # 256 (0.43 GB) or 512 (0.87 GB); floor = 256
-                               # 512 enables whole-layer prefill overlap (>= 2*E)
-                               # ceiling 2048 (decision 85); ~1536 is the tg knee
+moe_cache_size_slots = "auto"  # auto sizes from free VRAM (decision 90); or 256..2048
+                               # floor 256; >= 512 enables whole-layer prefill overlap (>= 2*E)
+                               # ceiling 2048 (decision 85)
 max_running_requests = 4
 max_prefill_length = 8192
 prefill_overlap = true         # takes effect only when cache_size_slots >= 512

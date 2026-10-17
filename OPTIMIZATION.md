@@ -1,9 +1,12 @@
-# Fused GDN decode kernel -- implementation instructions
+# Optimization plan of record -- closing the decode gap to FreeToken
 
-Target and context: `TODO.md` section 8 item 15. This document is the spec for
-replacing our libtorch-op GDN decode with one AOT Triton kernel per layer,
-matching FreeToken's `fused_sigmoid_gating_delta_rule_update`. It records the
-FreeToken facts for our exact model/hardware so the kernel is written to match.
+Originally `FUSED_GDN.md` (the fused-GDN kernel spec, TODO item 15); renamed
+2026-10-17 when it became the running home of the whole decode-optimization
+campaign: the GDN kernel spec and result (decision 77), the decode-gap review
+(decisions 78-81), the vendoring plan (decision 82) and its slices, and now the
+decision-88 verification and the remediation plan to FreeToken parity. `TODO.md`
+section 8 holds the open-item numbering; this file holds the measured facts and
+the ordered plan.
 
 ## Why
 
@@ -382,6 +385,15 @@ of decision 80 already anticipate it).
   it. FreeToken uses it when available and their Triton `fp8_pertensor_linear`
   otherwise -- so the Triton kernel is our route anyway.
 
+**Correction (decision 88, 2026-10-17).** This list originally assumed our NVFP4
+routed-expert and dense-head GEMVs were fine to keep. The `FT_PROFILE=1` stage
+profile says otherwise: at 512 slots our `moe_gemm` is 29.0 ms/token vs the
+reference's `_decode_nvfp4_marlin_kernel` 3.5, and our `head` 12.6 vs its
+`_nvfp4_gemv_kernel` 0.8. These are ordinary Triton kernels in
+`FreeToken/python/freetoken/kernel/triton/nvfp4_linear.py`, so they are
+vendor-able like the others; doing so is item 22 and the current top decode
+lever, ahead of cache growth.
+
 ### Ordered slices
 
 1. **E3: bf16 paged attention. DONE (decision 83).** q/output stay f32 (the mixer
@@ -456,3 +468,227 @@ a per-byte e4m3 convert is cheap, so its bandwidth win landed (+6% and -1.22 GiB
 But our step is spread across attention and norms, so slices 3-4 win less than
 their FreeToken share; batching (item 11) and cache growth (item 21) may dominate
 the remaining serving gap.
+
+---
+
+## Decision 88 verification (2026-10-17): what held, what was wrong
+
+Re-checked against the saved probe outputs (`/tmp/opencode/ftprobe*`,
+`/tmp/ft_profile_*`), the kernel sources on both sides, fresh cache sweeps with
+`FT_PROFILE=1`, and fresh roofline microbenches on this GPU (RTX 5060 Laptop,
+**26 SMs**, 8 GiB).
+
+Roofline anchors (measured here, not assumed):
+
+| probe | rate |
+|---|---|
+| D2D copy (read+write) | 265 GB/s |
+| pure-read reduce (torch) | 282 GB/s (read roofline ~330-350) |
+| pinned H2D | 14.4 GB/s |
+| theoretical HBM | ~384 GB/s |
+
+**Corrected numbers.**
+
+- FreeToken's decode MoE GEMV at ~1900 slots is **3.8 ms/token (p50)**, not 8.8:
+  the event mean was poisoned by one 164 ms outlier step. At 512 slots it is
+  3.5 (p50 3.6; torch-profiler kernel self-CUDA 2.95). The `head` number is
+  rock stable: **0.82 ms/token** (min 0.80, max 0.85) at both cache sizes --
+  that is ~350 GB/s effective, i.e. essentially at the read roofline.
+- **Our `moe_copy` is NOT a fixed-cost launch.** Decision 88's "copy time is
+  ~flat 512 -> 1536" conclusion was wrong. The sweep (same prompt, `FT_PROFILE`,
+  ms/token): 256 slots 43.0, 512 32.7, 1536 29.1, 2048 28.9. It scales with the
+  miss count and runs at the PCIe rate (12.6-13.9 GB/s effective vs 14.4 pinned
+  H2D), exactly like FreeToken's copy (theirs: 28.5 -> 15.1 ms tracking their
+  210 -> 109 misses/token, also ~12.5 GB/s). The flatness was the **miss rate**:
+  ours stays 74-84% at 512-2048 slots on the smoke's prompts, vs FreeToken's
+  66% at 512 / 34% at ~1900 on their AIME prompt. Partly workload (a like-for-
+  like prompt override should be added when this is next measured), partly that
+  a broad routing distribution defeats any cache under ~20% of the expert space.
+- **The two headline ratios held up:**
+  - `moe_gemm` 29.0-29.7 ms vs theirs ~3.5: **~8x**, and it is cache-independent
+    (the GEMV reads the same 320 slots at any cache size).
+  - `head` 12.6 ms vs theirs 0.82: **~15x**; ours streams the same ~286 MiB at
+    ~23 GB/s, i.e. ~8% of the measured read rate.
+- Our AIME-style-prompt run (512 slots) lands in the same place as the fox
+  prompt (copy 29.4, gemm 29.7, total 96.9), so the GEMV findings are not a
+  prompt artifact.
+
+**Confirmed structural causes (source-level, both kernels).**
+Our `_nvfp4_gemv_kernel` (routed) and `_nvfp4_dense_gemv_kernel` (head) share
+three properties that FreeToken's marlin-style kernels (`_decode_nvfp4_marlin_kernel`,
+`_nvfp4_gemv_kernel` in `kernel/triton/nvfp4_linear.py`) do not:
+
+1. **Byte-at-a-time packed loads** (uint8, `BLOCK_KB=64` *bytes*) vs **int32
+   wide loads** (8 codes per word). Their docstring: wide loads take the gate/up
+   GEMV's mem-only ceiling from ~65% to ~85% of peak read BW.
+2. **A cross-lane `tl.sum` reduction every K-iteration** vs a **deferred
+   `[BLOCK_KW, BLOCK_N]` partial reduced once at the end**. The per-iter
+   barrier serializes the whole K loop; deferral lets successive iters pipeline.
+3. **A 16-entry LUT gather per nibble** vs the **fp16-bitcast dequant trick**
+   (`((c & 7) << 9) | ((c & 8) << 12)`, `2^-14` folded into the block scale) --
+   ~5 integer ops per code pair instead of an L1 gather per code. Their
+   docstring: the LUT capped the decode GEMV at ~36% of the weight-bandwidth
+   roofline, the ALU version reaches ~64% (and ~350 GB/s here).
+4. Occupancy makes 1-3 worse for the routed kernel: this GPU has **26 SMs**
+   and our grid is `(routes, cdiv(N, 128))` = **64 programs** (gate_up, N=1024)
+   and 128 (down, N=2048) per layer -- ~2.5-5 programs/SM, each serialized by
+   the per-iter barrier. Their `BLOCK_N=16` grid is 512/1024 programs.
+5. Their resident head is **transposed to K-major int32 `[K//8, N]` at load**
+   (`nvfp4_transpose_resident`), so the GEMV's wide loads coalesce along N.
+   Ours stays row-major `[N, K//2]` uint8.
+
+**Also confirmed:** our `moe_lru` (2.4 ms) sorts the whole `BLOCK_C` usage table
+per layer (theirs 0.6-1.5); our `gdn` 9.4 vs theirs 6.6-8.2, `attn` 4.4 vs
+2.1-2.8, `shared` 3.0 vs 1.7-3.8, `router` 1.7 vs 0.8-1.5 (ours is the f32
+matmul decision 87 keeps) -- all secondary.
+
+## Remediation plan: match, then beat FreeToken (ordered)
+
+Standing reference (same GPU/FTW, bs=1, graph-captured): FreeToken
+**43.7 ms/token (24.2 tok/s) at 512 slots**, **33.0 ms (30.7 tok/s) at ~1900**.
+Ours: 94-98 ms (tg 10.6-10.8) at 512. Every number below is the stage profile
+(ms/token, uncaptured, event-instrumented ~+4 ms over captured).
+
+### Status (applied 2026-10-17)
+
+R1, R2 and R4 landed; R3 is **withdrawn** (its premise was wrong, see below);
+R6 is partial (one win, the rest blocked). Measured on the RTX 5060 Laptop,
+bs=1, bf16 KV, graph-captured smoke:
+
+| | before | after R1+R2 | after R4+R6 |
+|---|---|---|---|
+| tg @512 slots | 10.6 tok/s | 16.7 | **16.8** |
+| tg @1536 slots | 11.5 tok/s | 18.1 | **18.3** |
+| tg @auto (~1900) | -- | -- | **18.7** |
+| `moe_gemm` (uncaptured) | 29.0 ms | 4.2 | 4.2 |
+| `head` (uncaptured) | 12.6 ms | 1.06 | 1.03 |
+| `attn` (uncaptured) | 4.4 ms | -- | **4.37** |
+| total @auto (uncaptured) | -- | -- | **59.7** |
+
+The reference's `moe_gemm` 3.5 and `head` 0.82 are now within 1.2x / 1.3x (were
+8x / 15x); the auto cache matches its ~1900-slot default. The residual @auto is
+copy ~29.6 (PCIe, miss-bound) + gdn 9.8 + attn 4.4 + gemm 4.2 + shared 3.2 +
+lru 2.5 + router 1.8 + norms 2.0. See DONE.md decisions 89 (R1/R2) and 90
+(R4/R6); the section below is the original plan text, kept as the record, with
+the R3 correction inline.
+
+### R1 -- Routed-expert decode GEMV, marlin-style (the big lever) -- DONE
+
+Vendor FreeToken's `_decode_nvfp4_marlin_kernel` into
+`python/ferrum_kernel/nvfp4_moe.py`, keeping our flat-route-list ABI
+(`route_slot`/`route_token`/`route_weight`) so the Rust side changes only the
+cubin entry and arg pack:
+
+- reinterpret the packed bank as int32 `[S, N, K//8]` (contiguous; K % 8 == 0
+  holds for H=2048 and I=512),
+- deferred `[BLOCK_KW, BLOCK_N]` partial, one final reduction,
+- `BLOCK_N = 16`, `BLOCK_KW = 16` (128 k-values per iter; the deep-K variant is
+  not needed at K <= 2048),
+- keep our `silu_mul` + `sum_reduce` (their act/reduce equivalents measure
+  ~0.5 + 0.7 ms/token),
+- AOT through the existing `offload.py` signatures/manifest,
+  `scripts/check-kernels.sh`, `--interp` selftest vs the existing torch
+  reference, and the gated `cuda_moe_matches_reference` (argmax-exact).
+
+Applied with the pair-trick dequant + `_split8` activation split on top.
+Expected `~3.5-5`; measured **4.2** (`-24.8 ms/token`). tg at 512 -> 16.7.
+
+### R2 -- Dense head GEMV, same three fixes -- DONE
+
+Rewrite `_nvfp4_dense_gemv_kernel`:
+
+- int32 wide loads + deferred reduction (`BLOCK_N = 32`, `BLOCK_KW = 16`),
+- the `_nvfp4_pair_f32` bit-trick dequant instead of the LUT (drop `_e2m1_lut`
+  from this kernel), folding the `2^-14` into the block scale like theirs
+  (`scale * 16384.0`),
+- transpose the resident head once at load to K-major int32 `[K//8, N]`
+  (`Head` storage, a `finalize`-style step) so loads coalesce along N,
+- apply the f16 row global after the loop (unchanged semantics).
+
+Gates: `--interp` selftest, `ftw_cross_check` argmax 11751, the decision-80
+shape-invariance bounds (a fixed-K-order GEMV should tighten them, not loosen).
+
+Expected: `head` 12.6 -> **~1.0-1.5** (-11 ms/token). Cumulative after R1+R2:
+step ~98 -> **~62** (tg ~16 uncaptured, ~17 captured at 512).
+
+### R3 -- Decode copy/compute overlap (the "beat" lever) -- WITHDRAWN
+
+Both engines serialize `copy_missing` on the compute stream, so at 512-2048
+slots the step pays copy + compute. The plan assumed the copy could be hidden
+by prefetching layer `l+1`'s misses during layer `l`'s compute. **That premise
+is wrong:** a decoder's MoE is the last op of its layer, so layer `l+1`'s router
+(and therefore its expert ids) is unknown until layer `l`'s MoE finishes -- there
+is nothing to prefetch. Confirmed in `forward_torch.rs::run_sequence` (`x =
+self.moe(li, h2)` closes each layer) and by the reference's own profile, which is
+serialized the same way (staging 28.5 + compute ~16 = 44.4 ms measured). A
+speculative next-step prefetch (the previous token's routing) is a heuristic, not
+the parity lever this section promised.
+
+What remains sound is small: the routed copy for layer `l` can overlap that
+**same layer's shared-expert** compute (independent of the routed slots), worth
+~3.2 ms/token at 512 (~5%). It needs the MoE port split into prefetch/compute and
+cross-stream events inside the captured step; left as an optional R6 item rather
+than a milestone.
+
+
+### R4 -- MoE-first VRAM budget planner (item 12) -- DONE
+
+`[moe] cache_size_slots` is now an integer or `"auto"` (default `Auto`). The
+composition root loads the tower with the MoE port detached, then
+`registry::resolve_cache_slots` reads free device memory after the tower and KV
+pool are resident (`cuMemGetInfo_v2`), subtracts a 1 GiB reserve for the
+captured graphs/activations/fragmentation, divides by the per-expert slot bytes
+and clamps to `[256, BLOCK_C 2048]`, rounded to a multiple of 128. On the 8 GiB
+target it resolves ~1900 slots, matching FreeToken's auto default, and lifts
+captured tg to 18.7 tok/s. On a broad routing distribution it buys little (the
+miss rate stays 74-84% even at 2048); on skewed/agentic routing it is the lever
+FreeToken relies on.
+
+### R5 -- Server-side batching (item 11)
+
+The per-token weight read amortizes at bs>1 and `max_running_requests` engages
+the per-batch-size graphs already built. This is the serving-throughput
+multiplier on top of parity; measure bs={1,2,4} before investing further in
+single-stream kernels.
+
+### R6 -- Secondary polish (optional, post-parity) -- PARTIAL
+
+Done: the paged attention kernel runs 8 warps (`attn` 4.7 -> 4.37 ms/token; the
+`[64, 256]` f32 tile spilled at 4). `BLOCK_N` 32/128 measured neutral.
+
+Blocked, with the reason:
+- `moe_lru` 2.5 ms is the full `BLOCK_C` sort. A bitonic top-k (`tl.topk`) over
+  the `num_missing` coldest would be cheaper, but Triton's interpreter cannot run
+  `tl.topk` and `--interp` is a required gate; a manual selection loop is worse
+  than the sort. FreeToken's own `_lru_ensure` profiled at ~2.2 ms, so this is
+  near parity anyway.
+- `gdn` 9.8 and `attn` 4.4 vs the reference's 6.6 / 2.1 is FreeToken's W8A8
+  `torch._scaled_mm` for the projections; `tch` does not expose it (decision 84),
+  so our W8A16 split-K GEMV stays.
+- `shared` 3.2 vs 1.7: the shared expert is NVFP4 in the checkpoint but our dense
+  NVFP4 kernel is GEMV-only, so keeping it NVFP4 needs an M>1 (prefill) path.
+- the ~3 ms shared-expert/routed-copy overlap (R3 residue) needs the MoE port
+  split into prefetch/compute inside the captured step.
+- `router` 1.8 vs 0.8 stays f32 (decision 87).
+
+None is safe to add as polish; each is its own slice.
+
+### Measurement discipline
+
+- Re-profile with `FT_PROFILE=1 FERRUM_SMOKE_NOGRAPH=1 FERRUM_SMOKE_CACHE=<n>`
+  before/after each step (`/tmp/ft_profile*.{txt,json}`), and re-run the plain
+  captured smoke for the tg number.
+- Add a prompt-file override to the smoke before comparing miss rates to
+  FreeToken's AIME runs: the miss rate is workload-sensitive (74-84% on the
+  smoke's prompts at 512-2048 slots vs FreeToken's 34-66%), and R4 pays
+  differently on broad vs skewed routing.
+- The event-instrumented profile carries ~+4-5 ms/token over the captured
+  step; compare stage deltas, not absolute totals, across engines.
+
+Expected trajectory (bs=1), revised after R1/R2/R4: 94-98 ms @512 -> R1+R2
+**64 ms (16.7 tok/s) measured** -> R4 auto **~1900 slots, 18.7 tok/s measured**
+(the reference is 24.2 @512 and 30.7 @~1900). The remaining @auto split is
+~29.6 ms copy (PCIe, miss-bound on this prompt) + ~30 ms compute (GDN/attn/
+shared/LRU). Closing the rest needs the R6 slices above and R5 batching, which
+multiplies serving throughput beyond anything bs=1 can show.
+

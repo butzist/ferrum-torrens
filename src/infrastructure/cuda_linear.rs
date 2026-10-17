@@ -25,7 +25,7 @@ use crate::infrastructure::kernel_abi::{
     fp8_reduce_grid, fp8_split_k, fp8_splitk_reduce_args, nvfp4_dense_gemv_args,
     nvfp4_dense_gemv_grid,
 };
-use crate::infrastructure::torch::{Device, f32_tensor};
+use crate::infrastructure::torch::Device;
 
 fn driver(e: CudaError) -> MoEError {
     MoEError::Bad(format!("driver: {e}"))
@@ -35,14 +35,8 @@ fn bad_abi(e: MoEError) -> MoEError {
     MoEError::Bad(format!("abi: {e}"))
 }
 
-/// e2m1 magnitudes by nibble, the decode table the kernel indexes. The low nibble
-/// is the magnitude and the high bit the sign, so the negatives follow.
-const E2M1: [f32; 16] = [
-    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
-];
-
-/// The dense NVFP4 GEMV launcher: the committed cubin, the e2m1 table the kernel
-/// reads, and the stream its launches land on.
+/// The dense NVFP4 GEMV launcher: the committed cubin and the stream its launches
+/// land on.
 ///
 /// The stream matters for the same reason it does for `GdnDecode`: a captured
 /// decode step records on a side stream, so the launcher must carry that stream
@@ -50,7 +44,6 @@ const E2M1: [f32; 16] = [
 pub struct DenseGemv {
     kernels: GdnKernels,
     abi: LinearAbi,
-    lut: Tensor,
     stream: CUstream,
 }
 
@@ -61,8 +54,7 @@ unsafe impl Send for DenseGemv {}
 unsafe impl Sync for DenseGemv {}
 
 impl DenseGemv {
-    /// Open the driver, load the committed dense-gemv cubin, and keep the e2m1
-    /// table resident so a captured graph bakes one stable address.
+    /// Open the driver and load the committed dense-gemv cubin.
     pub fn new(device: Device, stream: CUstream) -> Result<Self, MoEError> {
         let Device::Cuda(ordinal) = device else {
             return Err(MoEError::Bad(
@@ -80,7 +72,6 @@ impl DenseGemv {
         Ok(Self {
             kernels,
             abi,
-            lut: f32_tensor(&E2M1, &[16], device),
             stream,
         })
     }
@@ -91,9 +82,10 @@ impl DenseGemv {
 
     /// Launch `c = a @ dequant(packed, scale, global)^T`.
     ///
-    /// `a` is `[M, K]` bf16, `packed` is `[N, K // 2]` uint8 (e2m1 nibbles),
-    /// `scale` is `[N, K // 16]` uint8 (e4m3 bytes) and `global` is a `[N * 2]`
-    /// uint8 byte bank (f16 row globals). `c` is `[M, N]` fp32, fully overwritten.
+    /// `a` is `[M, K]` bf16, `packed` is the K-major resident bank `[K // 8, N]`
+    /// int32 (e2m1 words), `scale` is `[K // 16, N]` uint8 (e4m3 bytes) and
+    /// `global` is a `[N * 2]` uint8 byte bank (f16 row globals). `c` is `[M, N]`
+    /// fp32, fully overwritten.
     ///
     /// # Safety
     /// Every tensor must be a live device allocation in this launcher's context,
@@ -115,15 +107,20 @@ impl DenseGemv {
             ))
         };
         if a_size.len() != 2 || p_size.len() != 2 {
-            return Err(bad("a = [M, K] and packed = [N, K // 2]"));
+            return Err(bad("a = [M, K] and packed = [K // 8, N]"));
         }
         let (m, k) = (a_size[0], a_size[1]);
-        let (n, k_bytes) = (p_size[0], p_size[1]);
-        if k_bytes * 2 != k {
-            return Err(bad("packed = [N, K // 2]"));
+        let (k_words, n) = (p_size[0], p_size[1]);
+        if k_words * 8 != k {
+            return Err(bad("packed = [K // 8, N]"));
         }
-        if scale.size() != [n, k / 16] {
-            return Err(bad("scale = [N, K // 16]"));
+        // The kernel reads packed as int32 words, so the row (N) must be
+        // contiguous within a K strip and the K stride a whole number of words.
+        if packed.stride()[1] != 1 || packed.stride()[0] == 0 {
+            return Err(bad("packed = [K // 8, N] contiguous in N"));
+        }
+        if scale.size() != [k / 16, n] {
+            return Err(bad("scale = [K // 16, N]"));
         }
         if global.numel() != (n * 2) as usize {
             return Err(bad("global = [N] f16 (N * 2 bytes)"));
@@ -137,15 +134,15 @@ impl DenseGemv {
             scale: scale.data_ptr() as u64,
             global: global.data_ptr() as u64,
             c: c.data_ptr() as u64,
-            lut: self.lut.data_ptr() as u64,
             m: m as u32,
             n: n as u32,
             stride_am: a.stride()[0] as u32,
             stride_ak: a.stride()[1] as u32,
-            stride_pn: packed.stride()[0] as u32,
-            stride_pkb: packed.stride()[1] as u32,
-            stride_sn: scale.stride()[0] as u32,
-            stride_sblk: scale.stride()[1] as u32,
+            // K-major: N is contiguous (stride_pn), K steps by N (stride_pkw).
+            stride_pn: packed.stride()[1] as u32,
+            stride_pkw: packed.stride()[0] as u32,
+            stride_sn: scale.stride()[1] as u32,
+            stride_sblk: scale.stride()[0] as u32,
             stride_cm: c.stride()[0] as u32,
             stride_cn: c.stride()[1] as u32,
         };

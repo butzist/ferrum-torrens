@@ -22,8 +22,8 @@ from .fp8_linear import (
     GEMV_BLOCK_N as FP8_GEMV_BLOCK_N,
     GEMV_REDUCE_BLOCK as FP8_GEMV_REDUCE_BLOCK,
 )
-from .linear import DENSE_BLOCK_KB, DENSE_BLOCK_N
-from .nvfp4_moe import DECODE_BLOCK_KB, DECODE_BLOCK_N
+from .linear import DENSE_BLOCK_KW, DENSE_BLOCK_N
+from .nvfp4_moe import GEMV_BLOCK_KW, GEMV_BLOCK_N, REDUCE_BLOCK_N
 from .offload import COPY_SEG_I32, USAGE_MAX, copy_splits
 
 # The serving attention geometry (Qwen3.6-35B-A3B): 16 query heads over 2 KV
@@ -46,11 +46,13 @@ SERVING_DTYPE = "bf16"
 
 def gemv(
     a_dtype: str = SERVING_DTYPE,
-    packed_dtype: str = "u8",
+    packed_dtype: str = "i32",
     scale_dtype: str = "fp8e4nv",
     glob_dtype: str = "fp16",
     c_dtype: str | None = None,
 ) -> dict:
+    """The routed decode GEMV (optimization.md R1): the packed bank is int32
+    `[S, N, K // 8]` (8 e2m1 codes per word) and the K reduction is deferred."""
     return {
         "a_ptr": f"*{a_dtype}",
         "packed_ptr": f"*{packed_dtype}",
@@ -63,12 +65,12 @@ def gemv(
         "lut_ptr": "*fp32",
         "M": "i32",
         "N": "i32",
-        "K_BYTES": "constexpr",
+        "K_WORDS": "constexpr",
         "stride_am": "i32",
         "stride_ak": "i32",
         "stride_pe": "i64",
         "stride_pn": "i32",
-        "stride_pkb": "i32",
+        "stride_pkw": "i32",
         "stride_se": "i64",
         "stride_sn": "i32",
         "stride_sblk": "i32",
@@ -78,7 +80,7 @@ def gemv(
         "stride_cn": "i32",
         "A_ROW_IS_ROUTE": "constexpr",
         "BLOCK_N": "constexpr",
-        "BLOCK_KB": "constexpr",
+        "BLOCK_KW": "constexpr",
         "MUL_WEIGHT": "constexpr",
     }
 
@@ -148,9 +150,9 @@ def index_copy() -> dict:
 def gate_up_constexprs() -> dict:
     """`x[token] @ gate_up^T`, one row per route, no route weight applied."""
     return {
-        "K_BYTES": SERVING_HIDDEN // 2,
-        "BLOCK_N": DECODE_BLOCK_N,
-        "BLOCK_KB": DECODE_BLOCK_KB,
+        "K_WORDS": SERVING_HIDDEN // 8,
+        "BLOCK_N": GEMV_BLOCK_N,
+        "BLOCK_KW": GEMV_BLOCK_KW,
         "MUL_WEIGHT": False,
         "A_ROW_IS_ROUTE": False,
     }
@@ -159,9 +161,9 @@ def gate_up_constexprs() -> dict:
 def down_constexprs() -> dict:
     """`ic2[route] @ down^T`, activations one row per route, weight applied."""
     return {
-        "K_BYTES": SERVING_INTER // 2,
-        "BLOCK_N": DECODE_BLOCK_N,
-        "BLOCK_KB": DECODE_BLOCK_KB,
+        "K_WORDS": SERVING_INTER // 8,
+        "BLOCK_N": GEMV_BLOCK_N,
+        "BLOCK_KW": GEMV_BLOCK_KW,
         "MUL_WEIGHT": True,
         "A_ROW_IS_ROUTE": True,
     }
@@ -172,7 +174,7 @@ def silu_constexprs() -> dict:
 
 
 def reduce_constexprs() -> dict:
-    return {"top_k": SERVING_TOP_K, "BLOCK_N": DECODE_BLOCK_N}
+    return {"top_k": SERVING_TOP_K, "BLOCK_N": REDUCE_BLOCK_N}
 
 
 # One decode step's routed set: batch*top_k. The staging pair is only captured
@@ -344,42 +346,43 @@ def conv_decode_constexprs(
 
 
 def nvfp4_dense_gemv() -> dict:
-    """The dense NVFP4 GEMV the lm_head runs (TODO.md section 8 item 18).
+    """The dense NVFP4 GEMV the lm_head runs (TODO.md section 8 item 18,
+    optimization.md R2): int32 wide loads, a deferred K reduction and the
+    fp16-bitcast dequant.
 
-    `a` is bf16 activations `[M, K]`, the weight is NVFP4 (packed u8, e4m3
-    block scales, f16 row global) and `c` is fp32 `[M, N]`. The scale pointer is
-    declared `*fp8e4nv` but carries a uint8 tensor: libtorch cannot build an
-    fp8 view from a host slice through tch, so the kernel reinterprets the
-    address, the same contract the MoE scale banks use.
+    `a` is bf16 activations `[M, K]`, the weight is NVFP4 (packed read as int32,
+    e4m3 block scales, f16 row global) and `c` is fp32 `[M, N]`. The scale
+    pointer is declared `*fp8e4nv` but carries a uint8 tensor: libtorch cannot
+    build an fp8 view from a host slice through tch, so the kernel reinterprets
+    the address, the same contract the MoE scale banks use.
     """
     return {
         "a_ptr": f"*{SERVING_DTYPE}",
-        "packed_ptr": "*u8",
+        "packed_ptr": "*i32",
         "scale_ptr": "*fp8e4nv",
         "global_ptr": "*fp16",
         "c_ptr": "*fp32",
-        "lut_ptr": "*fp32",
         "M": "i32",
         "N": "i32",
         "stride_am": "i32",
         "stride_ak": "i32",
         "stride_pn": "i32",
-        "stride_pkb": "i32",
+        "stride_pkw": "i32",
         "stride_sn": "i32",
         "stride_sblk": "i32",
         "stride_cm": "i32",
         "stride_cn": "i32",
-        "K_BYTES": "constexpr",
+        "K_WORDS": "constexpr",
         "BLOCK_N": "constexpr",
-        "BLOCK_KB": "constexpr",
+        "BLOCK_KW": "constexpr",
     }
 
 
 def nvfp4_dense_gemv_constexprs(k: int = SERVING_HIDDEN) -> dict:
     return {
-        "K_BYTES": k // 2,
+        "K_WORDS": k // 8,
         "BLOCK_N": DENSE_BLOCK_N,
-        "BLOCK_KB": DENSE_BLOCK_KB,
+        "BLOCK_KW": DENSE_BLOCK_KW,
     }
 
 

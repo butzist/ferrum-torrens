@@ -26,8 +26,9 @@ from triton.backends.compiler import GPUTarget
 from triton.compiler import ASTSource, compile as triton_compile
 
 from .nvfp4_moe import (
-    DECODE_BLOCK_KB,
-    DECODE_BLOCK_N,
+    GEMV_BLOCK_KW,
+    GEMV_BLOCK_N,
+    REDUCE_BLOCK_N,
     _nvfp4_gemv_kernel,
     _silu_mul_kernel,
     _sum_reduce_kernel,
@@ -93,9 +94,9 @@ def main() -> int:
                     {
                         # One hidden size and one intermediate size in a serving
                         # checkpoint; both are constexpr trip counts.
-                        "K_BYTES": 1024,
-                        "BLOCK_N": DECODE_BLOCK_N,
-                        "BLOCK_KB": DECODE_BLOCK_KB,
+                        "K_WORDS": 256,
+                        "BLOCK_N": GEMV_BLOCK_N,
+                        "BLOCK_KW": GEMV_BLOCK_KW,
                         "MUL_WEIGHT": weighted,
                         # The down GEMV's activations have one row per route.
                         "A_ROW_IS_ROUTE": True,
@@ -110,7 +111,7 @@ def main() -> int:
         failures += 1
         print(f"silu_mul FAILED: {type(e).__name__}: {str(e)[:200]}")
     try:
-        check("sum_reduce", _sum_reduce_kernel, _reduce_sig(), {"top_k": 8, "BLOCK_N": DECODE_BLOCK_N})
+        check("sum_reduce", _sum_reduce_kernel, _reduce_sig(), {"top_k": 8, "BLOCK_N": REDUCE_BLOCK_N})
     except Exception as e:  # noqa: BLE001
         failures += 1
         print(f"sum_reduce FAILED: {type(e).__name__}: {str(e)[:200]}")

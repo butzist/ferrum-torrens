@@ -1305,8 +1305,12 @@ impl CudaMoE {
             .reshape([routes as i64])
             .to_kind(tch::Kind::Int)
             .contiguous();
+        let sp = crate::infrastructure::profile::begin("moe_lru");
         self.ensure_experts(layer, &slots)?;
+        crate::infrastructure::profile::end("moe_lru", sp);
+        let sp = crate::infrastructure::profile::begin("moe_copy");
         self.copy_missing(layer)?;
+        crate::infrastructure::profile::end("moe_copy", sp);
 
         let dev = self.device.to_tch();
         let token_t = Tensor::arange(tokens as i64, (tch::Kind::Int, dev))
@@ -1316,9 +1320,12 @@ impl CudaMoE {
             .reshape([routes as i64]);
         let xd = DevTensor(x.shallow_clone());
         let wd = DevTensor(weights.shallow_clone());
+        let sp = crate::infrastructure::profile::begin("moe_gemm");
         let g = self.group_with_slots(&xd, &wd, slots, token_t, tokens, top_k)?;
         self.launch(&g)?;
-        self.collect_dev(&g, out)
+        let out = self.collect_dev(&g, out);
+        crate::infrastructure::profile::end("moe_gemm", sp);
+        out
     }
 }
 
@@ -1333,6 +1340,12 @@ fn staged_chunk_tokens(block_k: usize, top_k: usize) -> usize {
 fn per_expert(shapes: ExpertShapes) -> usize {
     let per = |(rows, cols): (usize, usize)| rows * cols / 2 + rows * cols / 16 + rows * 2;
     per(shapes.slab_shape(Part::GateUp)) + per(shapes.slab_shape(Part::Down))
+}
+
+/// Bytes one expert slot occupies in the device cache. The auto cache budget
+/// (item 12) divides the free device memory by this.
+pub fn expert_slot_bytes(shapes: ExpertShapes) -> usize {
+    per_expert(shapes)
 }
 
 /// The committed cubins are constexpr-specialized, so a model they were not built

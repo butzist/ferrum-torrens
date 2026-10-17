@@ -29,6 +29,8 @@ pub enum RegistryError {
 pub struct BuiltModel {
     pub model: Box<dyn CachedModel>,
     pub captured: Option<Arc<dyn CapturedDecode>>,
+    /// The resolved expert-cache slot count (explicit or auto-sized, item 12).
+    pub cache_size_slots: usize,
 }
 
 /// The arch label from `config.json` `architectures[0]`, used to dispatch.
@@ -80,25 +82,26 @@ pub fn build(
                     && config.kernel.triton
                     && matches!(device, Device::Cuda(_));
                 let (lib, stream) = side_stream(capture, device)?;
-                let moe = moe_port(
-                    config,
-                    &params,
-                    index.clone(),
-                    reader.clone(),
-                    device,
-                    stream,
-                )?;
+                // The `FT_PROFILE` stage timer times the eager forward, so it is
+                // only meaningful with capture off (see profile.rs).
+                if let Device::Cuda(ordinal) = device {
+                    let _ = crate::infrastructure::profile::init(ordinal);
+                }
                 let attention = attention_port(&params, device, stream)?;
                 let gdn = gdn_port(&params, device, stream)?;
                 let head_gemv = head_port(device, stream)?;
                 let fp8_linear = fp8_port(device, stream)?;
                 let cache = Arc::new(kv_cache(config, &params, device, capture));
-                let model = crate::models::qwen3_6::forward_torch::TorchQwen3_6::load(
-                    params,
+                // Load the tower with the MoE port detached: the auto cache
+                // budget (item 12) reads the free VRAM after the tower, the KV
+                // pool and the ports are all resident, then sizes the expert
+                // cache and attaches it.
+                let mut model = crate::models::qwen3_6::forward_torch::TorchQwen3_6::load(
+                    params.clone(),
                     device,
-                    index,
-                    reader,
-                    moe,
+                    index.clone(),
+                    reader.clone(),
+                    None,
                     attention,
                     gdn,
                     head_gemv,
@@ -106,6 +109,9 @@ pub fn build(
                     cache.clone(),
                 )
                 .map_err(|e| RegistryError::Build(e.to_string()))?;
+                let slots = resolve_cache_slots(config, &params, device, lib.as_deref())?;
+                let moe = moe_port(config, &params, index, reader, device, stream, slots)?;
+                model.attach_moe(moe);
                 let captured = match lib {
                     Some(lib) => Some(capture_decode(config, &model, cache, lib, stream, device)?),
                     None => None,
@@ -113,6 +119,7 @@ pub fn build(
                 Ok(BuiltModel {
                     model: Box::new(model),
                     captured,
+                    cache_size_slots: slots,
                 })
             }
             #[cfg(not(feature = "cuda"))]
@@ -122,6 +129,11 @@ pub fn build(
                         .map_err(|e| RegistryError::Build(e.to_string()))?,
                 ),
                 captured: None,
+                cache_size_slots: config
+                    .moe
+                    .cache_size_slots
+                    .explicit()
+                    .unwrap_or(crate::config::DEFAULT_CACHE_SIZE_SLOTS),
             })
         }
         other => Err(RegistryError::Unsupported(other.to_string())),
@@ -290,6 +302,7 @@ fn moe_port(
     reader: Arc<dyn WeightsReader>,
     device: Device,
     stream: crate::infrastructure::cuda_driver::CUstream,
+    slots: usize,
 ) -> Result<Option<Arc<dyn MoEExecutor>>, RegistryError> {
     use crate::application::run_experts::CachedExperts;
     use crate::domain::expert_kernel::ExpertShapes;
@@ -308,7 +321,7 @@ fn moe_port(
         device,
         Arc::new(FtwBanks::new(reader.clone(), index.clone())),
         shapes,
-        config.moe.cache_size_slots,
+        slots,
         stream,
     )
     .map_err(|e| build_err(e.to_string()))?;
@@ -333,7 +346,7 @@ fn moe_port(
     // first `2 * num_experts` slots, so it needs them to exist. With the config
     // gate on, a cache at or above that size streams whole layers; below it the
     // adapter keeps the chunked LRU (decision 67).
-    if config.moe.prefill_overlap && config.moe.cache_size_slots >= 2 * params.num_experts {
+    if config.moe.prefill_overlap && slots >= 2 * params.num_experts {
         adapter
             .enable_prefill_overlap()
             .map_err(|e| build_err(e.to_string()))?;
@@ -344,9 +357,69 @@ fn moe_port(
         moe,
         params.num_layers,
         params.num_experts,
-        config.moe.cache_size_slots,
+        slots,
     ))))
 }
+
+/// The device expert-cache slot count. An explicit `[moe] cache_size_slots` wins;
+/// `"auto"` sizes it from the free device memory right after the tower and KV
+/// pool are resident (item 12): the MoE cache is the "rest of the budget", minus
+/// a reserve for the captured decode graphs and transient activations. The
+/// result is clamped to `[MIN_CACHE_SIZE_SLOTS, the cubin's BLOCK_C ceiling]` and
+/// rounded down to a multiple of 128.
+#[cfg(feature = "cuda")]
+fn resolve_cache_slots(
+    config: &crate::config::Config,
+    params: &ModelParams,
+    device: Device,
+    lib: Option<&crate::infrastructure::cuda_driver::Driver>,
+) -> Result<usize, RegistryError> {
+    use crate::domain::expert_kernel::ExpertShapes;
+    use crate::infrastructure::cuda_driver::Driver;
+    use crate::infrastructure::kernel_abi::StagingAbi;
+
+    if let Some(n) = config.moe.cache_size_slots.explicit() {
+        return Ok(n);
+    }
+    let Device::Cuda(ordinal) = device else {
+        // No device to budget from: keep the conservative explicit default.
+        return Ok(crate::config::DEFAULT_CACHE_SIZE_SLOTS);
+    };
+    let build_err = |e: String| RegistryError::Build(e);
+    // Free VRAM as the driver sees it: the tower, the KV pool and the moe ports
+    // are already resident, so this is exactly the expert-cache budget.
+    let owned = match lib {
+        Some(_) => None,
+        None => {
+            let d = Driver::open().map_err(|e| build_err(e.to_string()))?;
+            d.init().map_err(|e| build_err(e.to_string()))?;
+            d.attach_primary_context(ordinal as i32)
+                .map_err(|e| build_err(e.to_string()))?;
+            Some(d)
+        }
+    };
+    let lib = lib.or(owned.as_ref()).expect("a driver is open");
+    let (free, _total) = lib.mem_info().map_err(|e| build_err(e.to_string()))?;
+    let shapes = ExpertShapes::new(params.hidden_size, params.moe_intermediate_size)
+        .map_err(|e| build_err(e.to_string()))?;
+    let slot_bytes = crate::infrastructure::cuda_moe::expert_slot_bytes(shapes);
+    let ceiling = StagingAbi::committed()
+        .and_then(|abi| {
+            abi.kernel(crate::infrastructure::kernel_abi::LRU_ENSURE)?
+                .constexpr("BLOCK_C")
+        })
+        .map_err(|e| build_err(e.to_string()))? as usize;
+    let budget = free.saturating_sub(AUTO_CACHE_RESERVE_BYTES);
+    let slots = (budget / slot_bytes.max(1)).clamp(crate::config::MIN_CACHE_SIZE_SLOTS, ceiling);
+    Ok(slots / 128 * 128)
+}
+
+/// Bytes held back from the auto cache budget for the captured decode graphs,
+/// transient activations and allocator fragmentation. Measured: at 2048 slots
+/// the run sits at 7434/8151 MiB with graph replay live, so ~0.7 GiB is enough;
+/// this rounds up for a healthy margin on a shared desktop GPU.
+#[cfg(feature = "cuda")]
+const AUTO_CACHE_RESERVE_BYTES: usize = 1024 * 1024 * 1024;
 
 /// The paged attention launcher, when the engine runs on a CUDA device. The
 /// device decode path reads each row's KV window straight out of the pool
@@ -558,6 +631,7 @@ mod tests {
             Arc::new(MockReader),
             Device::Cpu,
             std::ptr::null_mut(),
+            512,
         )
         .unwrap();
         assert!(port.is_none());

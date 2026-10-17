@@ -32,6 +32,7 @@ use crate::infrastructure::cuda_linear::{DenseGemv, Fp8Linear};
 use crate::infrastructure::decode_buffers::DecodeBuffers;
 use crate::infrastructure::ftw::FtwIndex;
 use crate::infrastructure::kvcache_dev::{DeviceCache, KvDType, LinearStateSlabs, MhaPool};
+use crate::infrastructure::profile;
 use crate::infrastructure::torch::{DevTensor, Device, bf16_tensor, f32_tensor, to_f32_vec};
 
 #[derive(Debug, thiserror::Error)]
@@ -366,6 +367,65 @@ impl<'a> Loader<'a> {
             .to_device(device.to_tch())))
     }
 
+    /// The lm_head's NVFP4 banks in the K-major resident layout (optimization.md
+    /// R2): `packed [K // 8, N]` int32 and `scale [K // 16, N]` u8, so the dense
+    /// GEMV's weight loads coalesce along N (the tile's wide axis) instead of
+    /// along the 64-byte K strip. The checkpoint stores row-major `[N, K // 2]`;
+    /// the transpose is an exact byte permutation done once at load. `global`
+    /// stays `[N]` f16.
+    fn head_nvfp4_kmajor(
+        &self,
+        name: &str,
+        rows: usize,
+        cols: usize,
+        device: Device,
+    ) -> Result<(SharedTensor, SharedTensor, SharedTensor)> {
+        let k_words = cols / 8;
+        let raw = self.raw(name)?;
+        if raw.len() != rows * k_words * 4 {
+            return Err(TorchError::Bad(
+                "shape",
+                format!("{name} is {} bytes for {rows}x{k_words} words", raw.len()),
+            ));
+        }
+        let words: Vec<i32> = raw
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| i32::from_le_bytes(*c))
+            .collect();
+        let mut packed = vec![0i32; rows * k_words];
+        for ni in 0..rows {
+            for w in 0..k_words {
+                packed[w * rows + ni] = words[ni * k_words + w];
+            }
+        }
+        let packed = up(Tensor::from_slice(&packed)
+            .view([k_words as i64, rows as i64])
+            .to_device(device.to_tch()));
+
+        let sblk = cols / 16;
+        let sraw = self.raw(&format!("{name}_scale"))?;
+        if sraw.len() != rows * sblk {
+            return Err(TorchError::Bad(
+                "shape",
+                format!("{name}_scale is {} bytes for {rows}x{sblk}", sraw.len()),
+            ));
+        }
+        let mut scale = vec![0u8; rows * sblk];
+        for ni in 0..rows {
+            for w in 0..sblk {
+                scale[w * rows + ni] = sraw[ni * sblk + w];
+            }
+        }
+        let scale = up(Tensor::from_slice(&scale)
+            .view([sblk as i64, rows as i64])
+            .to_device(device.to_tch()));
+        // The global is f16 per row, so its byte bank is twice as long.
+        let global = self.bytes_device(&format!("{name}_global"), &[(rows * 2) as i64], device)?;
+        Ok((packed, scale, global))
+    }
+
     /// The lm_head, kept NVFP4 on a CUDA device (the dense GEMV reads the packed
     /// bytes) and widened to bf16 otherwise. The head is applied to a single row
     /// (a prefill answers only its last token), so the packed form is always
@@ -373,15 +433,8 @@ impl<'a> Loader<'a> {
     fn head(&self, name: &str, device: Device) -> Result<Head> {
         let d = self.dense_desc(name)?;
         if matches!(device, Device::Cuda(_)) && d.kind == DenseKind::Nvfp4 {
-            let rows = d.rows as i64;
-            let packed = self.bytes_device(&d.name, &[rows, (d.cols / 2) as i64], device)?;
-            let scale = self.bytes_device(
-                &format!("{}_scale", d.name),
-                &[rows, (d.cols / 16) as i64],
-                device,
-            )?;
-            // The global is f16 per row, so its byte bank is twice as long.
-            let global = self.bytes_device(&format!("{}_global", d.name), &[rows * 2], device)?;
+            let (packed, scale, global) =
+                self.head_nvfp4_kmajor(&d.name, d.rows, d.cols, device)?;
             return Ok(Head {
                 rows: d.rows,
                 weight: HeadWeight::Nvfp4 {
@@ -1343,6 +1396,14 @@ impl TorchQwen3_6 {
         })
     }
 
+    /// Attach the MoE port after `load`. The composition root needs the tower and
+    /// KV pool resident before it can auto-size the expert cache (item 12), so it
+    /// loads the tower detached and attaches the port once the slot count is
+    /// resolved. `None` keeps the inline host-widening path.
+    pub fn attach_moe(&mut self, moe: Option<std::sync::Arc<dyn MoEExecutor>>) {
+        self.moe = moe;
+    }
+
     /// Logits for the last token of one contiguous sequence.
     /// Point torch at the stream this model's own launches land on. A captured
     /// build puts the attention launcher and the MoE offload on a side stream so
@@ -1883,12 +1944,15 @@ impl TorchQwen3_6 {
         // router: `[t, experts]`, softmax over experts, then top-k renormalized.
         // Kept in f32: a bf16 router matmul shifted the decode argmax past the
         // device gate, so the weight is upcast here (unlike the projections).
+        let sp = profile::begin("router");
         let logits = f32_(x_post).matmul(&f32_(&layer.gate).transpose(0, 1));
         let probs = logits.softmax(-1, Kind::Float);
         let (ids, weights) = topk_renorm(&probs, p.top_k as i64);
+        profile::end("router", sp);
 
         // shared expert, always routed, gated by its own sigmoid gate
         // `[t, 1]`: one scalar per token, broadcast over the hidden dim.
+        let sp = profile::begin("shared");
         let se_gate = f32_(x_post).matmul(&f32_(&layer.shared_gate).transpose(0, 1));
         let ic1 = layer.shared.gate_up.apply(x_post);
         let si = p.shared_expert_intermediate_size as i64;
@@ -1897,6 +1961,7 @@ impl TorchQwen3_6 {
         // `apply` and the silu product are bf16 (the mixer stream); cast the f32
         // gate to match before multiplying so the shared-expert term stays bf16.
         let se = layer.shared.down.apply(&ic2) * se_gate.sigmoid().to_kind(Kind::BFloat16);
+        profile::end("shared", sp);
 
         // The routing decision is host-side either way: the port hands it to the
         // slot cache, and the inline path indexes the banks with it.
@@ -2062,8 +2127,11 @@ impl TorchQwen3_6 {
         let p = &self.params;
         let t = ids.size()[0];
         let slab = self.cache.as_ref().expect("no kv cache attached");
+        profile::begin_step(t == 1);
 
+        let sp = profile::begin("embed");
         let mut x = self.embed.gather_dev(ids);
+        profile::end("embed", sp);
         let mut residual: Option<Tensor> = None;
 
         for (li, layer) in self.layers.iter().enumerate() {
@@ -2071,22 +2139,33 @@ impl TorchQwen3_6 {
                 None => x.shallow_clone(),
                 Some(r) => &x + &r,
             };
+            let sp = profile::begin("norm_in");
             let h1 = rms_norm(&xsum, &layer.input_norm, p.rms_norm_eps);
+            profile::end("norm_in", sp);
             let mixer_out = if ablated("mixer") {
                 Tensor::zeros_like(&h1)
             } else {
                 match &layer.mixer {
                     Mixer::Full(fa) if !ablated("attn") => {
-                        self.full_attention_cached(li, fa, &h1, positions, access, slab.mha())?
+                        let sp = profile::begin("attn");
+                        let out =
+                            self.full_attention_cached(li, fa, &h1, positions, access, slab.mha())?;
+                        profile::end("attn", sp);
+                        out
                     }
                     Mixer::Linear(gdn) if !ablated("gdn") => {
-                        self.gdn_cached(li, gdn, &h1, access, slab.state())
+                        let sp = profile::begin("gdn");
+                        let out = self.gdn_cached(li, gdn, &h1, access, slab.state());
+                        profile::end("gdn", sp);
+                        out
                     }
                     _ => Tensor::zeros_like(&h1),
                 }
             };
             let sum2 = &mixer_out + &xsum;
+            let sp = profile::begin("norm_post");
             let h2 = rms_norm(&sum2, &layer.post_norm, p.rms_norm_eps);
+            profile::end("norm_post", sp);
             x = if ablated("moe") {
                 h2.shallow_clone()
             } else {
@@ -2102,6 +2181,7 @@ impl TorchQwen3_6 {
         // A prefill answers only its last token, so its `[1, hidden]` row is the
         // tail; a decode step answers every row, and each is that row's next
         // token. Both write `[rows, vocab]` and the caller reads what it staged.
+        let sp = profile::begin("head");
         let normed = match access {
             CacheAccess::Host { .. } => rms_norm(
                 &stream.narrow(0, t - 1, 1),
@@ -2114,6 +2194,8 @@ impl TorchQwen3_6 {
         if !ablated("head") {
             lm_head_logits_into(&self.lm_head, self.head_gemv.as_deref(), &normed, &logits);
         }
+        profile::end("head", sp);
+        profile::end_step();
         Ok(())
     }
 }

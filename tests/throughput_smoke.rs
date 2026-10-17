@@ -204,7 +204,15 @@ fn config() -> Config {
         "true"
     };
     let kv = std::env::var("FERRUM_SMOKE_KV").unwrap_or_else(|_| "bf16".into());
-    let slots = std::env::var("FERRUM_SMOKE_CACHE").unwrap_or_else(|_| "512".into());
+    // The config default is `auto` (item 12); `FERRUM_SMOKE_CACHE` pins a slot
+    // count for a cache-size sweep, or `auto` for the planner.
+    let slots = std::env::var("FERRUM_SMOKE_CACHE").unwrap_or_else(|_| "auto".into());
+    // `auto` is a string value in TOML; a number is written bare.
+    let slots = if slots == "auto" {
+        "\"auto\"".to_string()
+    } else {
+        slots
+    };
     format!(
         "[model]\npath = \"{FTW_DIR}\"\ndevice = \"cuda\"\nmax_seq_len = 4096\n\
          max_output_tokens = {}\nmax_prefill_length = 1024\n\
