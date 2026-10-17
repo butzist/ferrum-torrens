@@ -964,6 +964,12 @@ fn gdn_recurrence_step_batch(
     (out, state)
 }
 
+/// Top-k ids and renormalized weights from the router probabilities.
+///
+/// Top-k-then-softmax-the-k-values would be mathematically the same and cheaper
+/// (`exp(l_i)/sum_j exp(l_j)` is order-independent), but its float rounding
+/// shifts a near-tie routing decision and fails the exact-token oracle, so the
+/// full softmax stays.
 fn topk_renorm(probs: &Tensor, k: i64) -> (Tensor, Tensor) {
     let (vals, ids) = probs.topk(k, -1, true, true);
     let total = vals.sum_dim_intlist(-1, true, Kind::Float);

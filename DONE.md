@@ -2445,6 +2445,21 @@ settled.
     cache-above-ceiling, retention). Further headroom: the copy still runs
     ~10 GB/s vs the 14.4 pinned H2D, so the grid/segment split wants a sweep.
 
+99. **The router: precompute the f32 gate, keep the full softmax** (2026-10-17,
+    implemented/reverted) -- optimization.md R8.1. The router upcast the
+    `[experts, hidden]` bf16 gate to f32 inside `moe()`, i.e. a fresh 2 MiB
+    alloc+copy per layer per token; decision 87 keeps the router matmul in f32,
+    but the upcast only has to happen once, so `TorchLayer` now holds `gate_f32`
+    (and drops the bf16 copy). `router` 2.20 -> 1.50 ms/token (`router_cast` 0.63
+    gone); captured bs=1 tg ~23.4 -> 24.0. Numerically identical.
+    A second cut -- top-k the logits then `softmax` only the `k` selected values
+    (mathematically the same renormalization, 3 ops instead of 5: full softmax +
+    topk + sum + div, `router` 1.50 -> ~1.26) -- was **reverted**: its different
+    float rounding flips a near-tie routing decision and fails the exact-token
+    oracle (`one_token_through_the_kernel_matches_the_oracle`), the same class of
+    failure decision 87 hit. A fused Triton router kernel would cut the launches
+    without changing the arithmetic, and is the remaining option.
+
 ---
 
 ## Progress log (narrative, pre-2026-10-15 compaction)

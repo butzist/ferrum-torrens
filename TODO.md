@@ -822,10 +822,11 @@ prompt override before comparing miss rates.
   packed key). Options: a formulation the interpreter accepts, a device-only path
   with a `--interp` sort fallback behind a constexpr branch, or a two-pass bucket
   select. Worth ~1.1 ms/token (`moe_lru` 2.54 -> 1.42).
-- [ ] **R8.1 Fused Triton router** (their `moe_router._router_triton_kernel`
-  logic). Keep the f32 gate matmul, replace softmax + `topk` + renormalize with
-  one Triton kernel (f32 reduce, iterative top-k). router 1.8 -> ~1.0 ms. Gate:
-  device-decode argmax unchanged.
+- [~] **R8.1 Fused Triton router** -- PARTIAL. Done: precompute the f32 gate at
+  load (decision 99), `router` 2.20 -> 1.50 ms; captured bs=1 tg ~23.4 -> 24.0.
+  Reverted: topk-the-logits-then-softmax-the-k (same math, fewer ops, `router`
+  ~1.26) breaks the exact-token oracle (float rounding flips a near-tie routing
+  decision). Remaining: a fused kernel keeping the full-softmax arithmetic.
 - [ ] **R8.2 Fused GDN decode** (adopt the vendored FLA
   `fused_sigmoid_gating_delta_rule_update`). One Triton kernel for gating +
   l2norm + recurrence + state I/O, replacing `gdn_conv/gdn_ba/gdn_recur/gdn_tail`.

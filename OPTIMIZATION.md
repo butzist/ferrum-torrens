@@ -958,9 +958,14 @@ copy to ~PCIe time (~7-10 ms at 2048), i.e. **~20 ms/token off the step -> tg
   9.0 ms, uncaptured total 55.9 -> 41.8 ms, **bs=1 captured tg 18.4 -> 23.4**
   (~27%). Headroom: the copy still runs ~10 GB/s vs 14.4 pinned H2D; sweep the
   segment size / block count.
-- **R8.1 Fused Triton router** (their logic). 1.8 -> ~1.0 ms. Low risk: keep the
-  f32 gate matmul, replace softmax+topk+renorm with one Triton kernel. Gate:
-  device-decode argmax unchanged.
+- **R8.1 Fused Triton router -- PARTIAL so far.** Keep the f32 gate matmul,
+  replace softmax + `topk` + renormalize with one Triton kernel (f32 reduce,
+  iterative top-k). Done: precompute the f32 gate at load, `router` 2.20 -> 1.50
+  ms (decision 99). Tried and reverted: top-k the logits then `softmax` the `k`
+  values (same math, fewer ops, `router` -> ~1.26) -- its float rounding flips a
+  near-tie routing decision and fails the exact-token oracle. Remaining: a fused
+  kernel that keeps the full-softmax arithmetic, gated on the device-decode
+  argmax unchanged.
 - **R8.2 Fused GDN decode** (adopt the FLA kernel). 9.8 -> ~7. Medium risk
   (state layout `[K,V]`, in-kernel l2norm, GQA); gate on the GDN oracle.
 - **R8.3 Attention kernel** (largest compute gap, most effort): lift our Triton
