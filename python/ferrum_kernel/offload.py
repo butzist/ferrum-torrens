@@ -37,7 +37,9 @@ USAGE_MAX = (1 << 55) - 1
 
 # The non-evictable victim key. It is assigned after the shift, never packed
 # through it: `USAGE_MAX << SLOT_BITS` overflows int64 to a negative key, which
-# would make a free or step-touched slot sort as if it were the coldest.
+# would make a free or step-touched slot sort as if it were the coldest. It is a
+# `tl.constexpr` so `tl.where` types the false arm as int64 (a plain int is
+# mis-typed to int32 and fails to compile).
 KEY_MAX = tl.constexpr(0x7FFFFFFFFFFFFFFF)
 
 # Copy geometry. One program per (bank, row, segment): `SEG_I32` int32 words of a
@@ -97,21 +99,21 @@ def _ensure_experts_kernel(
     c = tl.arange(0, BLOCK_C)
     cm = c < num_cached
     u = tl.load(usage_ptr + c, mask=cm, other=USAGE_MAX)
-    # Pack (usage, slot) into one sortable int64 so ascending order is exactly
-    # the sequence of `pick_victim` argmins. Free slots carry usage 0, so they
-    # are the coldest and get reused first; only this step's hits (u == step)
-    # are pinned out with KEY_MAX and never evicted. We need only the
-    # `num_missing` coldest, so take a bitonic top-k of the complemented key
-    # (largest complement == smallest key) instead of a full sort; the slot
-    # rides in the low bits, which is how the victim index comes back.
+    # Pack (usage, slot) into one sortable int64: ascending sort is exactly the
+    # sequence of `pick_victim` argmins, because the packed keys are distinct.
+    # Free slots carry usage 0, so they are the coldest and get reused first;
+    # only this step's hits (u == step) are pinned to KEY_MAX and never evicted.
+    # A bitonic top-k (`tl.topk`) would be cheaper than the full sort but its
+    # result mis-types under the interpreter (triton 3.7.1) on this packed
+    # tensor, and `--interp` is a required gate, so the sort stays.
     key = tl.where(
         cm & (u != step),
         (u.to(tl.int64) << SLOT_BITS) | c.to(tl.int64),
         KEY_MAX,
     )
-    cand = KEY_MAX - tl.topk(KEY_MAX - key, BLOCK_K)
+    cand = tl.sort(key)
 
-    j = tl.arange(0, BLOCK_K)
+    j = tl.arange(0, BLOCK_C)
     jm = j < num_missing
     victim = (cand & ((1 << SLOT_BITS) - 1)).to(tl.int32)
     # `e` and `old` are flat ids: `id_of_slot` is shared across layers, so the
@@ -144,25 +146,27 @@ def _index_copy_multi_kernel(
     SEG_I32: tl.constexpr,
 ):
     bank = tl.program_id(0)
-    row = tl.program_id(1)
-    seg = tl.program_id(2)
-    # `row < num` gates the indices; the row/segment index enters only through
-    # scalar loads, so each program's access is one contiguous `SEG_I32`-word run
-    # of a single row (uniform source row) -- that is what lets Triton emit wide
-    # vector loads instead of a per-lane gather.
+    seg = tl.program_id(1)
     n = tl.load(num_ptr)
     feat = tl.load(feat_bytes + bank)
     feat_i32 = (feat // 4).to(tl.int32)
-    base_dst = tl.load(dst_ptrs + bank).to(tl.pointer_type(tl.int32))
-    base_src = tl.load(src_ptrs + bank).to(tl.pointer_type(tl.int32))
-    live = row < n
-    drow = tl.load(dst_idx + row, mask=live, other=0).to(tl.int64)
-    srow = tl.load(src_idx + row, mask=live, other=0).to(tl.int64)
-    off = seg * SEG_I32 + tl.arange(0, SEG_I32)
-    m = live & (off < feat_i32)
-    # `.cg` skips L1 for the streaming host read; `.cs` streams the store.
-    v = tl.load(base_src + srow * feat_i32 + off, mask=m, other=0, cache_modifier=".cg")
-    tl.store(base_dst + drow * feat_i32 + off, v, mask=m, cache_modifier=".cs")
+    base = seg * SEG_I32
+    # One program per (bank, segment): the whole plan (n rows) walks that
+    # segment in a loop. n is on the device, so the grid is fixed and
+    # capture-safe. The old grid launched one program per (bank, row, seg) --
+    # BLOCK_K rows per bank, all but ~n of them no-op at decode -- and that CTA
+    # overhead was ~25 ms/token (optimization.md R8 Finding 5).
+    if base < feat_i32:
+        off = base + tl.arange(0, SEG_I32)
+        m = off < feat_i32
+        dst = tl.load(dst_ptrs + bank).to(tl.pointer_type(tl.int32))
+        src = tl.load(src_ptrs + bank).to(tl.pointer_type(tl.int32))
+        for row in tl.range(0, n):
+            drow = tl.load(dst_idx + row).to(tl.int64)
+            srow = tl.load(src_idx + row).to(tl.int64)
+            # `.cg` skips L1 for the streaming host read; `.cs` streams the store.
+            v = tl.load(src + srow * feat_i32 + off, mask=m, other=0, cache_modifier=".cg")
+            tl.store(dst + drow * feat_i32 + off, v, mask=m, cache_modifier=".cs")
 
 
 def block_c(cache_size: int) -> int:
@@ -220,19 +224,18 @@ def index_copy_multi(
     dst_idx: torch.Tensor,
     src_idx: torch.Tensor,
     num_ptr: torch.Tensor,
-    plan_cap: int,
     seg_i32: int = COPY_SEG_I32,
 ) -> None:
     """Launch the fused multi-bank copy. Reads `num_ptr` on the device.
 
-    Grid is `(banks, plan_cap, splits)`: `plan_cap` bounds the rows a launch
-    carries (the pinned `BLOCK_K`), `splits` covers one full row of the largest
-    bank. Both are fixed for the launch, which is what keeps it capture-safe.
+    Grid is `(banks, splits)`: each program walks one segment of its bank across
+    all `num` rows. Both are fixed for the launch, and the row count is read on
+    the device, which is what keeps it capture-safe.
     """
     n_banks = int(dst_ptrs.numel())
     max_feat = int(feat_bytes.max().item())
     splits = copy_splits(max_feat, seg_i32)
-    _index_copy_multi_kernel[(n_banks, plan_cap, splits)](
+    _index_copy_multi_kernel[(n_banks, splits)](
         dst_ptrs,
         src_ptrs,
         feat_bytes,

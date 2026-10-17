@@ -813,12 +813,15 @@ prompt override before comparing miss rates.
 
 ### R8 kernel/types plan (findings in optimization.md R8)
 
-- [ ] **R8.0 Grid-stride `index_copy`** (Finding 5, the big one). The copy kernel
-  launches one program per `(bank, row, seg)` = 49152/layer, ~94% no-op at decode;
-  `moe_copy` is ~25.6 ms/token fixed + ~0.03 ms/miss (misses fall 150 -> 50 from
-  512 -> 2048 slots, copy stays 30 -> 27 ms). Baking the grid to `[6,8,1]` drops
-  it to 0.40 ms. Rewrite with a small fixed grid + grid-stride over `n` (like
-  FreeToken's C++ copy, `blocks_per_bank=8`). Expected ~20 ms/token off; do first.
+- [x] **R8.0 Grid-stride `index_copy`** (Finding 5, the big one) -- DONE
+  (decision 98). One program per `(bank, segment)` + a `tl.range(0, n)` loop
+  replaced one per `(bank, row, seg)`. `moe_copy` 27.4 -> 9.0 ms; bs=1 captured
+  tg 18.4 -> 23.4 (~27%). Headroom: copy still ~10 GB/s vs 14.4 pinned H2D.
+- [ ] **R8.0b Retry the LRU bitonic top-k** (decision 96 was reverted: it breaks
+  the `--interp` gate -- triton 3.7.1's interpreter mis-types `tl.topk` on the
+  packed key). Options: a formulation the interpreter accepts, a device-only path
+  with a `--interp` sort fallback behind a constexpr branch, or a two-pass bucket
+  select. Worth ~1.1 ms/token (`moe_lru` 2.54 -> 1.42).
 - [ ] **R8.1 Fused Triton router** (their `moe_router._router_triton_kernel`
   logic). Keep the f32 gate matmul, replace softmax + `topk` + renormalize with
   one Triton kernel (f32 reduce, iterative top-k). router 1.8 -> ~1.0 ms. Gate:

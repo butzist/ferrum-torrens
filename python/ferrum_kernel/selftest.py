@@ -181,7 +181,6 @@ def check_offload(device: torch.device) -> int:
         dst_idx,
         src_idx,
         num,
-        plan_cap=8,
     )
     ok = all(
         torch.equal(dst[dst_idx[i]], src[src_idx[i]])
@@ -205,7 +204,6 @@ def check_offload(device: torch.device) -> int:
         torch.tensor([0, 2], dtype=torch.int32, device=device),
         torch.tensor([3, 0], dtype=torch.int32, device=device),
         torch.tensor([2], dtype=torch.int64, device=device),
-        plan_cap=4,
     )
     ok_wide = (
         torch.equal(dst[0], src[3])

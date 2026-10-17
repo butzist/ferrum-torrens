@@ -56,7 +56,6 @@ from .attention import _paged_attention_decode_kernel
 # (`min(next_power_of_2(inter), 256)`), so the AOT build pins the serving value.
 SILU_BLOCK_I = 256
 from .signatures import (
-    SERVING_BLOCK_K,
     SERVING_COPY_SPLITS,
     SERVING_DTYPE,
     SERVING_HIDDEN,
@@ -143,7 +142,7 @@ STAGING_KERNELS: dict[str, dict] = {
         "fn": _index_copy_multi_kernel,
         "signature": index_copy(),
         "constexprs": index_copy_constexprs(),
-        "grid": [SERVING_NUM_BANKS, SERVING_BLOCK_K, SERVING_COPY_SPLITS],
+        "grid": [SERVING_NUM_BANKS, SERVING_COPY_SPLITS, 1],
     },
 }
 

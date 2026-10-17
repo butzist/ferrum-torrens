@@ -1040,8 +1040,8 @@
       "global_scratch_size": 0,
       "grid": [
         6,
-        128,
-        64
+        64,
+        1
       ],
       "num_warps": 4,
       "params": [

@@ -952,11 +952,12 @@ copy to ~PCIe time (~7-10 ms at 2048), i.e. **~20 ms/token off the step -> tg
 
 ### Plan (ordered, low risk first)
 
-- **R8.0 Grid-stride `index_copy`** (Finding 5). Rewrite the copy kernel with a
-  small fixed grid (`banks * blocks_per_bank`, like FreeToken) and a grid-stride
-  loop over the plan on the device, instead of one program per `(bank, row, seg)`.
-  Expected copy 27 -> ~7-10 ms, i.e. ~20 ms/token off the step. Largest lever;
-  do it first.
+- **R8.0 Grid-stride `index_copy` -- DONE** (decision 98). One program per
+  `(bank, segment)` (grid `(6, 64)`) with a `tl.range(0, n)` loop over the
+  device plan, replacing one program per `(bank, row, seg)`. `moe_copy` 27.4 ->
+  9.0 ms, uncaptured total 55.9 -> 41.8 ms, **bs=1 captured tg 18.4 -> 23.4**
+  (~27%). Headroom: the copy still runs ~10 GB/s vs 14.4 pinned H2D; sweep the
+  segment size / block count.
 - **R8.1 Fused Triton router** (their logic). 1.8 -> ~1.0 ms. Low risk: keep the
   f32 gate matmul, replace softmax+topk+renorm with one Triton kernel. Gate:
   device-decode argmax unchanged.

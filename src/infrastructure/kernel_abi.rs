@@ -1637,9 +1637,9 @@ mod tests {
         assert_eq!(lru.constexpr("BLOCK_K").unwrap(), 128);
         assert_eq!(lru.constexpr("BLOCK_C").unwrap(), 2048);
         let copy = abi.kernel(INDEX_COPY).unwrap();
-        // One program per (bank, row, segment): `BLOCK_K` rows of the plan, each
-        // tiled into `COPY_SEG_I32`-word segments.
-        assert_eq!(copy.grid, [6, 128, 64]);
+        // One program per (bank, segment): `COPY_SEG_I32`-word segments of a row,
+        // each walking the plan's `n` rows (device-read) in a loop.
+        assert_eq!(copy.grid, [6, 64, 1]);
         assert_eq!(copy.block_threads(), 128);
         assert_eq!(copy.constexpr("NUM_BANKS").unwrap(), 6);
         assert_eq!(copy.constexpr("SEG_I32").unwrap(), 4096);

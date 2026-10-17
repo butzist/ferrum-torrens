@@ -2401,21 +2401,22 @@ settled.
     separate milestone. (The R3b split this measured against was tried as
     decision 97 and then reverted.)
 
-96. **The LRU victim selection uses a bitonic top-k** (2026-10-17, implemented)
-    -- `python/ferrum_kernel/offload.py`. `_ensure_experts_kernel` sorted the
-    whole `BLOCK_C` usage table to find the `num_missing` coldest slots; it needs
-    only the `k` smallest, so `tl.sort(key)` became
-    `KEY_MAX - tl.topk(KEY_MAX - key, BLOCK_K)` (a bitonic top-k of the
-    complemented packed key; the victim slot still rides in the low bits). The
-    earlier note that the Triton interpreter cannot run `tl.topk` was wrong for
-    triton 3.7.1 -- it runs, values only -- so no interpreter variant is needed.
-    `BLOCK_K` (128) is a power of two and bounds the distinct misses one launch
-    can carry. Also corrected the free-slot comment: free slots carry usage 0 and
-    are evicted first; only this step's hits are pinned out. `moe_lru` 2.54 ->
-    1.42 ms/token (-44%), the lru_ensure cubin 806992 -> 548304 B; bs=1 captured
-    tg 18.1 -> 18.3-18.4 at 256 tokens (A/B by reverting the cubin). Gated by the
-    device LRU tests (`the_device_handoff_agrees_with_the_host_handoff`, the
-    chunked/whole-layer prefill and retention gates).
+96. **The LRU victim selection -- bitonic top-k tried, reverted; retry later**
+    (2026-10-17) -- `python/ferrum_kernel/offload.py`. `_ensure_experts_kernel`
+    sorted the whole `BLOCK_C` usage table to find the `num_missing` coldest
+    slots; it needs only the `k` smallest, so `tl.sort(key)` became a bitonic
+    `tl.topk` of the complemented packed key. It compiled, was device-correct,
+    and was ~44% faster on the kernel (`moe_lru` 2.54 -> 1.42 ms/token; bs=1 tg
+    18.1 -> 18.3-18.4 at 256 tokens). But it **broke the `--interp` gate**: in
+    triton 3.7.1's interpreter `tl.topk` mis-types this packed int64 tensor
+    (`'dtype' object has no attribute 'numel'` in `sort_impl`), and neither a
+    `tl.constexpr` nor an inline-literal complement fixes it. `--interp` is a
+    required gate, so the change was **reverted to `tl.sort`** (cubin back to
+    807000 B, `moe_lru` 2.54). It also corrected the free-slot comment (free
+    slots carry usage 0 and are evicted first; only this step's hits are pinned
+    out). **Retry the top-k later** -- candidates: a `tl.topk`-only formulation
+    the interpreter accepts, a device-only path with a sort fallback under
+    `--interp` (a constexpr branch), or a two-pass bucket select.
 
 97. **The decode prefetch/finish MoE split was removed** (2026-10-17, reverted)
     -- TODO.md item 6, optimization.md R3b. Decisions 93/95 split the staged MoE
@@ -2428,6 +2429,21 @@ settled.
     Removed to keep the port simple; the port is `execute_device` again and the
     copy runs on the compute stream. The model-agnostic routing trace
     (`FT_ROUTE_TRACE`, decision 95) is kept.
+
+98. **The decode expert copy is grid-stride, not one program per row** (2026-10-17,
+    implemented) -- optimization.md R8.0, Finding 5. `_index_copy_multi_kernel`
+    launched one program per `(bank, row, seg)` = `(6, BLOCK_K=128, 64)` = 49152
+    programs per layer, gated by `row < n`; at decode only ~8 rows are live, so
+    ~94% were no-op CTAs, and `moe_copy` was `~25.6 ms/token fixed + 0.03
+    ms/miss` (it stayed 30 -> 27 ms while misses fell ~150 -> 50 from 512 -> 2048
+    slots). The copy is now one program per `(bank, segment)` -- grid `(6, 64)`
+    -- with a `tl.range(0, n)` loop over the device-resident plan, and the
+    segment guard is the `off < feat_i32` mask. `moe_copy` 27.4 -> 9.0 ms at auto
+    (p50 9.5), uncaptured total 55.9 -> 41.8 ms, and **bs=1 captured tg 18.4 ->
+    23.4-23.5 at 256 tokens (~27%)** -- the single biggest decode win so far.
+    Gated by the device LRU/copy tests (handoff, chunked and whole-layer prefill,
+    cache-above-ceiling, retention). Further headroom: the copy still runs
+    ~10 GB/s vs the 14.4 pinned H2D, so the grid/segment split wants a sweep.
 
 ---
 
