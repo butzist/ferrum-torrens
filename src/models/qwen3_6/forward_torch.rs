@@ -979,12 +979,6 @@ fn topk_renorm(probs: &Tensor, k: i64) -> (Tensor, Tensor) {
 /// the ids and the weights go over as the buffers they already are and the
 /// routed sum comes back as one, so crossing a layer boundary costs no host
 /// round trip and nothing here converts a tensor to talk to the port.
-///
-/// The serving forward no longer goes through this: `moe` inlines the split
-/// `prefetch_device`/`finish_device` hand-off so the shared expert can hide
-/// behind the copy. This composite stays as the single-call reference the port
-/// tests drive.
-#[cfg(test)]
 fn routed_via_port(
     port: &dyn MoEExecutor,
     layer_idx: usize,
@@ -2083,48 +2077,7 @@ impl TorchQwen3_6 {
         profile::end("router", sp);
         profile::trace_routes(layer_idx, &ids);
 
-        // The routing decision is host-side either way: the port hands it to the
-        // slot cache, and the inline path indexes the banks with it.
-        let Some(port) = &self.moe else {
-            let se = self.shared_expert(layer_idx, x_post)?;
-            let routed = self.routed_inline(layer_idx, x_post, &ids, &weights)?;
-            return Ok(&se + &routed);
-        };
-
-        // Device port: issue the slot plan and the missed-expert copy first,
-        // compute the shared expert while that H2D copy is in flight (it does not
-        // depend on the routing), then finish the routed sum, which waits only
-        // for the copy. The shared term joins the bf16 activation stream.
-        let (hidden, inter, top_k) = (p.hidden_size, p.moe_intermediate_size, p.top_k);
-        let tokens = x_post.size()[0] as usize;
-        let x = DevTensor(x_post.shallow_clone());
-        let experts = DevTensor(ids.shallow_clone());
-        let w = DevTensor(weights.shallow_clone());
-        let mut out = DevTensor(Tensor::zeros(
-            [tokens as i64, hidden as i64],
-            (Kind::BFloat16, dev.to_tch()),
-        ));
-        let req = MoEDeviceRequest {
-            layer: layer_idx,
-            hidden,
-            inter,
-            top_k,
-            x: &x,
-            experts: &experts,
-            weights: &w,
-        };
-        port.prefetch_device(&req)?;
-        let se = self.shared_expert(layer_idx, x_post)?;
-        port.finish_device(&req, &mut out)?;
-        Ok(&se + &out.0)
-    }
-
-    /// The shared expert, always routed, gated by its own sigmoid gate. It is
-    /// independent of the routing, which is what lets the device path hide it
-    /// behind the routed-expert copy (see `moe`).
-    fn shared_expert(&self, layer_idx: usize, x_post: &Tensor) -> Result<Tensor> {
-        let layer = &self.layers[layer_idx];
-        let p = &self.params;
+        // shared expert, always routed, gated by its own sigmoid gate
         // `[t, 1]`: one scalar per token, broadcast over the hidden dim.
         let sp = profile::begin("shared");
         let se_gate = f32_(x_post).matmul(&f32_(&layer.shared_gate).transpose(0, 1));
@@ -2136,7 +2089,16 @@ impl TorchQwen3_6 {
         // gate to match before multiplying so the shared-expert term stays bf16.
         let se = layer.shared.down.apply(&ic2) * se_gate.sigmoid().to_kind(Kind::BFloat16);
         profile::end("shared", sp);
-        Ok(se)
+
+        // The routing decision is host-side either way: the port hands it to the
+        // slot cache, and the inline path indexes the banks with it.
+        let routed = match &self.moe {
+            Some(port) => {
+                routed_via_port(port.as_ref(), layer_idx, x_post, &ids, &weights, p, dev)?
+            }
+            None => self.routed_inline(layer_idx, x_post, &ids, &weights)?,
+        };
+        Ok(&se + &routed)
     }
 
     /// The routed sum without a kernel: per token, per top-k expert, widen both

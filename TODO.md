@@ -763,15 +763,16 @@ next steps:
    `optimization.md` "R6 investigation": the GDN qkvz projection is at the read
    roofline (~220 GB/s), the FP8 GEMV config is already optimal, and the LRU
    clock is not the miss-rate cause (the copy is workload-bound). The rest is
-   blocked or neutral: `moe_lru` top-k needs `tl.topk` (the interpreter gate
-   cannot run it); GDN/attn projections need the W8A8 `torch._scaled_mm` `tch`
-   does not expose (decision 84), though batching routes the projections through
-   the tensor-core `fp8_gemm`; the shared expert needs an M>1 NVFP4 path to stay
-   packed. The copy/compute split **landed** (`MoEExecutor::prefetch_device` /
-   `finish_device`, the adapter's second copy stream) but the overlap is
-   **neutral**: the `index_copy` kernel's resident CTAs hold every SM slot while
-   stalled on PCIe, so the shared expert waits for the copy instead of hiding
-   behind it (optimization.md R3b). Each remaining item is its own slice.
+   blocked or done: `moe_lru` now takes a bitonic `tl.topk` instead of the full
+   sort (decision 96; `tl.topk` does run in the interpreter on triton 3.7.1, so
+   the earlier note was wrong). GDN/attn projections need the W8A8
+   `torch._scaled_mm` `tch` does not expose (decision 84), though batching
+   routes the projections through the tensor-core `fp8_gemm`; the shared expert
+   needs an M>1 NVFP4 path to stay packed. The copy/compute split was **tried
+   and reverted** (decision 97): neutral, because the `index_copy` kernel's
+   resident CTAs hold every SM slot while stalled on PCIe, so the shared expert
+   waits for the copy instead of hiding behind it (optimization.md R3b). Each
+   remaining item is its own slice.
 7. **Speculative expert prefetch -- RULED OUT (measured, decision 95).** An
    `FT_ROUTE_TRACE` of 156 decode steps x 40 layers on the AIME prompt shows
    consecutive-token routing overlap of only **0.33**, and **0%** of misses were

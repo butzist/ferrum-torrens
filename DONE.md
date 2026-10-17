@@ -2398,9 +2398,36 @@ settled.
     predicts the *resident* set, not the misses, and the copy is byte-bound
     (~87% of PCIe peak), so a speculative fetch spends bytes for no hit. Real
     lookahead needs the future tokens themselves (draft/speculative decoding), a
-    separate milestone. The R3b split landed (prefetch/finish, second copy
-    stream, neutral because the copy kernel starves the SMs; see
-    `optimization.md` R3b and TODO.md items 6/7).
+    separate milestone. (The R3b split this measured against was tried as
+    decision 97 and then reverted.)
+
+96. **The LRU victim selection uses a bitonic top-k** (2026-10-17, implemented)
+    -- `python/ferrum_kernel/offload.py`. `_ensure_experts_kernel` sorted the
+    whole `BLOCK_C` usage table to find the `num_missing` coldest slots; it needs
+    only the `k` smallest, so `tl.sort(key)` became
+    `KEY_MAX - tl.topk(KEY_MAX - key, BLOCK_K)` (a bitonic top-k of the
+    complemented packed key; the victim slot still rides in the low bits). The
+    earlier note that the Triton interpreter cannot run `tl.topk` was wrong for
+    triton 3.7.1 -- it runs, values only -- so no interpreter variant is needed.
+    `BLOCK_K` (128) is a power of two and bounds the distinct misses one launch
+    can carry. Also corrected the free-slot comment: free slots carry usage 0 and
+    are evicted first; only this step's hits are pinned out. `moe_lru` 2.54 ->
+    1.42 ms/token (-44%), the lru_ensure cubin 806992 -> 548304 B; bs=1 captured
+    tg 18.1 -> 18.3-18.4 at 256 tokens (A/B by reverting the cubin). Gated by the
+    device LRU tests (`the_device_handoff_agrees_with_the_host_handoff`, the
+    chunked/whole-layer prefill and retention gates).
+
+97. **The decode prefetch/finish MoE split was removed** (2026-10-17, reverted)
+    -- TODO.md item 6, optimization.md R3b. Decisions 93/95 split the staged MoE
+    step into `prefetch_device`/`finish_device` and ran the miss copy on a second
+    stream so the shared expert could hide behind it. It was correct and
+    capture-safe but **neutral**: the `index_copy` kernel's resident CTAs hold
+    every SM slot while PCIe-stalled, so the shared expert waits for the copy
+    (profile: `shared` 2.3 -> 30.1 ms, `moe_copy` -> 0.03), and the per-layer
+    window is only ~0.06 ms of router-independent work against ~0.74 ms of copy.
+    Removed to keep the port simple; the port is `execute_device` again and the
+    copy runs on the compute stream. The model-agnostic routing trace
+    (`FT_ROUTE_TRACE`, decision 95) is kept.
 
 ---
 

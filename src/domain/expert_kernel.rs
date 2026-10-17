@@ -232,28 +232,6 @@ pub trait ExpertGemm: Send + Sync {
         out: &mut dyn MoETensor,
     ) -> Result<(), MoEError>;
 
-    /// Issue the slot plan (`lru_ensure`) and the missed-expert copy
-    /// (`index_copy`) for one decode-shaped step without waiting for the copy,
-    /// so the caller can run independent compute (the shared expert) on the
-    /// compute stream while the H2D copy is in flight. `staged_finish` must
-    /// complete the step with the same `req` and the same `out`. A no-op for a
-    /// step the adapter does not split (prefill, a multi-chunk route list, or no
-    /// device staging), in which case `staged_finish` does the whole step.
-    /// Default: no-op.
-    fn staged_prefetch<'a>(&self, _req: &MoEDeviceRequest<'a>) -> Result<(), MoEError> {
-        Ok(())
-    }
-
-    /// Complete a step started by `staged_prefetch`. Default: the whole step,
-    /// so an adapter without a split keeps working unchanged.
-    fn staged_finish<'a>(
-        &self,
-        req: &MoEDeviceRequest<'a>,
-        out: &mut dyn MoETensor,
-    ) -> Result<(), MoEError> {
-        self.grouped_moe_staged(req, out)
-    }
-
     /// The largest `tokens * top_k` one `grouped_moe_staged` step can take, or
     /// zero when this adapter has no device staging. The committed `lru_ensure`
     /// bakes this bound, so the executor reports it and falls back to the host
@@ -340,23 +318,6 @@ pub trait MoEExecutor: Send + Sync {
         req: &MoEDeviceRequest<'a>,
         out: &mut dyn MoETensor,
     ) -> Result<(), MoEError>;
-
-    /// Issue the layer's slot plan and missed-expert copy without waiting for
-    /// the copy, so the caller can hide compute behind it; the port runs the
-    /// copy on a second stream. `finish_device` must follow with the same `req`
-    /// and `out`. Default: nothing (the whole step runs in `finish_device`).
-    fn prefetch_device<'a>(&self, _req: &MoEDeviceRequest<'a>) -> Result<(), MoEError> {
-        Ok(())
-    }
-
-    /// Complete a step started by `prefetch_device`. Default: the whole step.
-    fn finish_device<'a>(
-        &self,
-        req: &MoEDeviceRequest<'a>,
-        out: &mut dyn MoETensor,
-    ) -> Result<(), MoEError> {
-        self.execute_device(req, out)
-    }
 
     /// How many steps this executor has run since it was built. A forward that
     /// widens routed experts on the host answers with the same logits as one
