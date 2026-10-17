@@ -308,12 +308,12 @@ def random_gdn_case(
     def bf16(shape):
         return f32(shape).to(torch.bfloat16)
 
-    # The forward's conv runs f32, so q/k/v are f32; a_log/dt_bias are the model
-    # dtype (bf16) and ba the f32 projection output.
-    q = f32((rows, k_heads, kd))
-    k = f32((rows, k_heads, kd))
-    v = f32((rows, v_heads, vdim))
-    ba = (torch.randn((rows, 2 * v_heads), generator=g, dtype=torch.float32) * 0.5).to(dev)
+    # The mixer activation stream is bf16 (TODO.md item 19): q/k/v/ba and the
+    # gating params are bf16, the recurrent state stays f32.
+    q = bf16((rows, k_heads, kd))
+    k = bf16((rows, k_heads, kd))
+    v = bf16((rows, v_heads, vdim))
+    ba = (torch.randn((rows, 2 * v_heads), generator=g, dtype=torch.float32) * 0.5).to(dev).to(torch.bfloat16)
     a_log = bf16((v_heads,))
     dt_bias = bf16((v_heads,))
     state = (torch.randn((rows, v_heads, kd, vdim), generator=g, dtype=torch.float32) * 0.5).to(dev)
@@ -360,8 +360,8 @@ def check_gdn(device: torch.device, tol: float, full: bool) -> int:
 def random_conv_case(device: str, rows: int, conv_dim: int, k: int, seed: int):
     g = torch.Generator(device="cpu").manual_seed(seed)
     dev = torch.device(device)
-    x = (torch.randn((rows, conv_dim), generator=g, dtype=torch.float32) * 0.5).to(dev)
-    w = (torch.randn((conv_dim, k), generator=g, dtype=torch.float32) * 0.5).to(dev)
+    x = (torch.randn((rows, conv_dim), generator=g, dtype=torch.float32) * 0.5).to(dev).to(torch.bfloat16)
+    w = (torch.randn((conv_dim, k), generator=g, dtype=torch.float32) * 0.5).to(dev).to(torch.bfloat16)
     state = (torch.randn((rows, conv_dim, k - 1), generator=g, dtype=torch.float32) * 0.5).to(dev)
     return x, w, state
 
@@ -380,7 +380,7 @@ def check_conv(device: torch.device, tol: float, full: bool) -> int:
             x, w, state = random_conv_case(str(device), seed=seed, **shape)
             want_out, want_state = conv_mod.conv_decode_reference(x, w, state)
             rows, conv_dim = x.shape
-            got_out = torch.empty((rows, conv_dim), dtype=torch.float32, device=device)
+            got_out = torch.empty((rows, conv_dim), dtype=torch.bfloat16, device=device)
             state_in = state.clone()
             conv_mod.conv_decode(x, w, state_in, got_out)
             rel_out = (got_out - want_out).abs().max() / want_out.abs().max().clamp(min=1e-6)
@@ -396,10 +396,10 @@ def check_conv(device: torch.device, tol: float, full: bool) -> int:
     # hands the kernel (a narrow of the qkvz projection), so `stride_x` is real.
     x, w, state = random_conv_case(str(device), seed=7, rows=2, conv_dim=64, k=4)
     want_out, want_state = conv_mod.conv_decode_reference(x, w, state)
-    padded = torch.cat([x, torch.zeros((2, 8), dtype=torch.float32, device=device)], dim=1)
+    padded = torch.cat([x, torch.zeros((2, 8), dtype=torch.bfloat16, device=device)], dim=1)
     xs = padded[:, :64]
     assert xs.stride(0) == 72, "the strided case must not be contiguous"
-    got_out = torch.empty((2, 64), dtype=torch.float32, device=device)
+    got_out = torch.empty((2, 64), dtype=torch.bfloat16, device=device)
     state_in = state.clone()
     conv_mod.conv_decode(xs, w, state_in, got_out)
     rel = ((got_out - want_out).abs().max() / want_out.abs().max().clamp(min=1e-6)).item()
@@ -466,7 +466,7 @@ def check_fp8_linear(device: torch.device, tol: float, interp: bool) -> int:
             for seed in range(2):
                 a, w, scale = random_fp8_case(str(device), m, n, k, seed)
                 want = fp8_mod.fp8_linear_reference(a, w, scale)
-                got = torch.empty((m, n), dtype=torch.float32, device=device)
+                got = torch.empty((m, n), dtype=torch.bfloat16, device=device)
                 if m == 1:
                     fp8_mod.fp8_gemv(a.reshape(k), w, scale, got.reshape(n))
                 else:

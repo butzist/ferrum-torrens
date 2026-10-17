@@ -43,12 +43,13 @@ The decode gap is now pursued by **vendoring FreeToken's own Triton kernels**
 NVFP4 lm_head (decision 79) take decode **tg 8.2 -> 10.9 tok/s** and VRAM
 **7.9 -> 4.83 GiB**. E4 (item 21, decision 85) raised the staging ceiling so the
 cache can grow to 2048 slots: tg 10.6 -> 11.5 at 1536 slots (plateau), VRAM up to
-7.4 GiB. Slice 3's fused conv landed (item 19, decision 86): `conv_decode`
-replaces the grouped-conv op soup on the device path, correct and throughput
-neutral. Remaining: bf16 mixer activations (slice 3), the prefill chunk kernels
-(slice 4), and item 11 (server-side batching) as the largest serving lever;
-libtorch stays the generic/CPU fallback.
-Progress history and the full decision log (numbers 1..86) live in `DONE.md`;
+7.4 GiB. Slice 3 landed (item 19, decisions 86, 87): the fused `conv_decode`
+kernel replaces the grouped-conv op soup and the mixer activation stream is now
+bf16, both correct and throughput neutral (the substrate matches FreeToken; the
+cost is elsewhere). Remaining: the prefill chunk kernels (slice 4) and item 11
+(server-side batching) as the largest serving lever; libtorch stays the
+generic/CPU fallback.
+Progress history and the full decision log (numbers 1..87) live in `DONE.md`;
 read that for the "why" behind any decision number referenced in code or tests.
 
 Goal: a **minimal, fast, single-GPU** Rust serving engine for **one model** --
@@ -320,6 +321,15 @@ The full log of confirmed decisions (numbers 1..84, stable -- code, tests and
 lists only the decisions that still bind open work; everything else there is
 history.
 
+- **87** -- the mixer activation stream is **bf16**, matching FreeToken's model
+  dtype (decision 82's "one real divergence"). `rms_norm`, `linear`/`Dense::apply`,
+  `conv_decode`, the GDN `gdn_decode` q/k/v/ba/out, the paged attention q/out and
+  the MoE/shared-expert outputs are bf16; the recurrent/conv state, the router
+  softmax/top-k, the per-row scales and the logits stay f32. The vendored cubins
+  take bf16 pointers (store casts in-kernel). Throughput neutral (activation bytes
+  are negligible vs the weight read, decision 81); kept for reference parity. A
+  bf16 router matmul was tried and reverted: it shifted the decode argmax past the
+  device gate, so the router stays f32.
 - **86** -- the GDN decode conv is the vendored fused `conv_decode` kernel
   (fused depthwise causal conv + silu, in-place `[rows, conv_dim, K-1]` f32
   state), replacing `conv1d_silu_step_batch` on the device path (FUSED_GDN slice
@@ -590,15 +600,16 @@ performance work.
     11751, 0.21% shift); VRAM -0.81 GiB; throughput neutral (the 4-bit LUT unpack
     is arithmetic-bound, unlike W8A16). The reusable pattern for item 17; its freed
     VRAM feeds item 21.
-19. bf16 mixer activations + fused conv -- **PARTIAL (decision 82, slice 3).**
-    **Fused conv DONE (2026-10-17), decision 86:** `conv_decode` (fused depthwise
-    causal conv + silu, in-place `[rows, conv_dim, K-1]` state) replaces
-    `conv1d_silu_step_batch` on the device decode path; correct at ~1e-7 (interp)
-    and argmax-exact in `device_decode_matches_refeed`, throughput neutral (the
-    conv was never the cost, decision 77) but removes the `w.repeat` allocation
-    and the grouped-conv op soup. **OPEN:** move the mixer activation stream
-    (rms_norm/conv/attention outputs) from f32 to bf16 to match FreeToken; a
-    tower-wide numerics change that needs every logit gate re-measured.
+19. bf16 mixer activations + fused conv -- **DONE (2026-10-17), decisions 86, 87**
+    (decision 82 slice 3). `conv_decode` (fused depthwise causal conv + silu,
+    in-place `[rows, conv_dim, K-1]` state) replaces `conv1d_silu_step_batch` on
+    the device decode path, and the mixer activation stream is now bf16: `rms_norm`,
+    `linear`/`Dense::apply`, the conv, the GDN q/k/v and the paged attention q/out
+    are bf16, with only the recurrent state, the router softmax and the scales left
+    f32 (decision 87). Correct (interp ~4e-3; device gate 3/3 argmax-exact;
+    `ftw_cross_check` argmax 11751, top-5 identical) and **throughput neutral**:
+    tg 11.3 at 1536 slots, unchanged, because the activation stream is negligible
+    against the per-token weight read (decision 81). Kept for reference parity.
 20. Prefill chunk kernels -- **OPEN (decision 82, slice 4).** Vendor FLA
     `chunk_gated_delta_rule` + `causal_conv1d_varlen`; our prefill is still
     libtorch op soup with no FLA chunk kernel.

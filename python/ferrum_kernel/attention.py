@@ -81,7 +81,10 @@ def _paged_attention_decode_kernel(
         acc += tl.sum(p[:, None] * v, axis=0)
         m_i = m_new
     out = tl.where(l_i > 0.0, acc / l_i, 0.0)
-    tl.store(out_ptr + (row * NUM_Q_HEADS + qh) * HEAD_DIM + offs_d, out)
+    tl.store(
+        out_ptr + (row * NUM_Q_HEADS + qh) * HEAD_DIM + offs_d,
+        out.to(out_ptr.dtype.element_ty),
+    )
 
 
 def paged_attention_decode(

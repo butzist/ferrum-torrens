@@ -210,13 +210,13 @@ def index_copy_constexprs(num_banks: int = SERVING_NUM_BANKS) -> dict:
     }
 
 
-def paged_attention(dtype: str = "fp32", kv_dtype: str | None = None) -> dict:
+def paged_attention(dtype: str = SERVING_DTYPE, kv_dtype: str | None = None) -> dict:
     """Paged GQA decode attention (TODO.md M3 paged attention).
 
-    `dtype` is the query/output activation type (f32: the mixer runs f32); `kv_dtype`
-    the pool's K/V element type, defaulting to `dtype`. The kernel reduces in f32
-    after casting whatever it loads, so a bf16 pool shares the body and only the
-    pointer types move (TODO.md item 14).
+    `dtype` is the query/output activation type (bf16: the mixer runs bf16, TODO.md
+    item 19); `kv_dtype` the pool's K/V element type, defaulting to `dtype`. The kernel
+    reduces in f32 after casting whatever it loads, so a bf16 pool shares the body and
+    only the pointer types move (TODO.md item 14).
     """
     kv = kv_dtype or dtype
     return {
@@ -266,19 +266,19 @@ SERVING_CONV_WIDTH = 4
 def gdn_decode(dtype: str = SERVING_DTYPE) -> dict:
     """The fused GDN decode step (TODO.md M5 fused GDN decode).
 
-    `ba`, `q`, `k`, `v`, `state` and `out` are f32: the conv runs in f32 and the
-    whole linear mixer is f32 in the forward. `a_log`/`dt_bias` are the model
-    dtype, loaded bf16 in the checkpoint.
+    `ba`, `q`, `k`, `v` and `out` are the model dtype (bf16; the mixer activation
+    stream, TODO.md item 19), while `state` stays f32 (the recurrence state is
+    precision-sensitive). `a_log`/`dt_bias` are the model dtype too.
     """
     return {
-        "ba_ptr": "*fp32",
+        "ba_ptr": f"*{dtype}",
         "a_log_ptr": f"*{dtype}",
         "dt_bias_ptr": f"*{dtype}",
-        "q_ptr": "*fp32",
-        "k_ptr": "*fp32",
-        "v_ptr": "*fp32",
+        "q_ptr": f"*{dtype}",
+        "k_ptr": f"*{dtype}",
+        "v_ptr": f"*{dtype}",
         "state_ptr": "*fp32",
-        "out_ptr": "*fp32",
+        "out_ptr": f"*{dtype}",
         "stride_q": "i32",
         "stride_k": "i32",
         "stride_v": "i32",
@@ -311,15 +311,15 @@ def gdn_decode_constexprs(
 def conv_decode() -> dict:
     """The fused single-token GDN causal conv + silu (TODO.md item 19).
 
-    `x`/`w`/`state`/`out` are f32: the forward's conv runs f32 (`conv1d_silu_step_batch`
-    casts to f32), and only the recurrence's state precision is load-bearing. `x`
-    may be a strided view, so its row stride is a runtime arg.
+    `x`/`w`/`out` are the model dtype (bf16; the mixer activation stream), while the
+    conv `state` stays f32 (it feeds the recurrence's f32 math). `x` may be a strided
+    view, so its row stride is a runtime arg.
     """
     return {
-        "x_ptr": "*fp32",
-        "w_ptr": "*fp32",
+        "x_ptr": f"*{SERVING_DTYPE}",
+        "w_ptr": f"*{SERVING_DTYPE}",
         "state_ptr": "*fp32",
-        "out_ptr": "*fp32",
+        "out_ptr": f"*{SERVING_DTYPE}",
         "stride_x": "i32",
         "stride_state": "i32",
         "stride_out": "i32",
@@ -408,11 +408,15 @@ def fp8_gemv_constexprs() -> dict:
 
 
 def fp8_splitk_reduce() -> dict:
-    """The split-K partial reduce (its `SPLIT_K` is runtime: it varies per shape)."""
+    """The split-K partial reduce (its `SPLIT_K` is runtime: it varies per shape).
+
+    The output is the model dtype (bf16): the projection result joins the mixer's
+    bf16 activation stream (TODO.md item 19). The partials stay f32.
+    """
     return {
         "part_ptr": "*fp32",
         "scale_ptr": "*fp32",
-        "out_ptr": "*fp32",
+        "out_ptr": f"*{SERVING_DTYPE}",
         "N": "i32",
         "SPLIT_K": "i32",
         "stride_pk": "i32",
@@ -431,7 +435,7 @@ def fp8_gemm() -> dict:
         "a_ptr": f"*{SERVING_DTYPE}",
         "w_ptr": "*fp8e4nv",
         "scale_ptr": "*fp32",
-        "c_ptr": "*fp32",
+        "c_ptr": f"*{SERVING_DTYPE}",
         "M": "i32",
         "N": "i32",
         "K": "i32",

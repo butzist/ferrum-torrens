@@ -2147,6 +2147,36 @@ settled.
       shares (decision 81), which is why item 11 (batching) is the larger serving
       lever.
 
+87. **bf16 mixer activations** (2026-10-17, implemented) -- FUSED_GDN slice 3, the
+    dtype half, TODO item 19. The last piece of decision 82's plan.
+    - **Why.** Decision 82 calls activation dtype "the one real divergence": our
+      mixer ran f32 (rms_norm/conv/attention outputs) where FreeToken runs bf16,
+      the model dtype. Converging it is what lets FreeToken's kernels drop in with
+      signature-only edits.
+    - **What changed.** The activation stream is bf16 end to end: `rms_norm`
+      computes the mean square in f32 and stores bf16 (FreeToken's `GemmaRMSNorm`);
+      `linear`/`Dense::apply` output bf16; the GDN `conv_decode`/`gdn_decode` and
+      the paged attention take bf16 q/k/v/ba/out and the MoE/shared-expert results
+      are bf16. The vendored cubins changed only pointer dtypes plus a store cast
+      (`conv_decode`, `gdn_decode`, `fp8_gemv`/`fp8_splitk_reduce`/`fp8_gemm`,
+      `paged_attention`); the recurrent/conv state, `a_log`/`dt_bias`, the router
+      softmax/top-k, the fp8/scales and the head logits stay f32. The dense
+      libtorch attention fallback casts its inputs to f32 (a pool gather is f32)
+      and the caller narrows the result.
+    - **Correctness.** `kernel-selftest --interp` ~4e-3 (bf16 rounding);
+      `device_decode_matches_refeed` 3/3, argmax exact, `max|dlogit|/scale`
+      5.6e-3..1.07e-1 (the decision 80 bound); `ftw_cross_check` argmax 11751,
+      top-5 identical, worst relative 2.4% (was ~1-2%). A bf16 router matmul was
+      tried and **reverted**: it shifted the decode argmax past the device gate, so
+      the router stays f32 (a reminder that argmax is exact even where logits are
+      allowed 0.2 of scale).
+    - **Result: throughput neutral.** tg 11.3 tok/s at 1536 slots, unchanged from
+      the decision-86 baseline, and VRAM flat (6572 MiB). The activation stream is
+      a few hundred KB per layer against ~4 GB of per-token weight traffic, so the
+      dtype is not the lever -- the confirmation of decision 81's "latency/launch
+      bound, bytes secondary". Kept because it is the substrate FreeToken's kernels
+      expect (and the numerics now match the reference's storage), not for speed.
+
 ---
 
 ## Progress log (narrative, pre-2026-10-15 compaction)

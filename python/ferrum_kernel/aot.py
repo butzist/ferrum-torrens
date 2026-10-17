@@ -155,7 +155,7 @@ STAGING_KERNELS: dict[str, dict] = {
 ATTENTION_KERNELS: dict[str, dict] = {
     "paged_attention": {
         "fn": _paged_attention_decode_kernel,
-        "signature": paged_attention(),
+        "signature": paged_attention(kv_dtype="fp32"),
         "constexprs": paged_attention_constexprs(),
     },
     "paged_attention_bf16": {

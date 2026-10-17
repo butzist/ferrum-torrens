@@ -29,43 +29,43 @@
 .reqntid 128
 {
 	.reg .pred 	%p<326>;
-	.reg .b16 	%rs<290>;
-	.reg .b32 	%r<826>;
-	.reg .b64 	%rd<329>;
-	.loc	1 112 0                         // fp8_linear.py:112:0
+	.reg .b16 	%rs<354>;
+	.reg .b32 	%r<813>;
+	.reg .b64 	%rd<341>;
+	.loc	1 116 0                         // fp8_linear.py:116:0
 $L__func_begin0:
-	.loc	1 112 0                         // fp8_linear.py:112:0
+	.loc	1 116 0                         // fp8_linear.py:116:0
 
 // %bb.0:
 	ld.param.b32 	%r66, [_fp8_gemm_kernel_param_12];
 	ld.param.b32 	%r65, [_fp8_gemm_kernel_param_11];
-	ld.param.b32 	%r759, [_fp8_gemm_kernel_param_6];
+	ld.param.b32 	%r746, [_fp8_gemm_kernel_param_6];
 	ld.param.b32 	%r61, [_fp8_gemm_kernel_param_5];
 	ld.param.b32 	%r60, [_fp8_gemm_kernel_param_4];
 	ld.param.b64 	%rd71, [_fp8_gemm_kernel_param_3];
 	ld.param.b64 	%rd70, [_fp8_gemm_kernel_param_2];
 $L__tmp0:
-	.loc	1 128 26                        // fp8_linear.py:128:26
+	.loc	1 132 26                        // fp8_linear.py:132:26
 	mov.u32 	%r67, %ctaid.x;
-	.loc	1 129 26                        // fp8_linear.py:129:26
+	.loc	1 133 26                        // fp8_linear.py:133:26
 	mov.u32 	%r68, %ctaid.y;
-	.loc	1 130 21                        // fp8_linear.py:130:21
+	.loc	1 134 21                        // fp8_linear.py:134:21
 	shl.b32 	%r1, %r67, 6;
-	.loc	1 130 44                        // fp8_linear.py:130:44
+	.loc	1 134 44                        // fp8_linear.py:134:44
 	mov.u32 	%r2, %tid.x;
-	.loc	1 131 21                        // fp8_linear.py:131:21
+	.loc	1 135 21                        // fp8_linear.py:135:21
 	shl.b32 	%r70, %r68, 7;
-	.loc	1 131 44                        // fp8_linear.py:131:44
+	.loc	1 135 44                        // fp8_linear.py:135:44
 	and.b32 	%r37, %r2, 127;
-	.loc	1 131 31                        // fp8_linear.py:131:31
+	.loc	1 135 31                        // fp8_linear.py:135:31
 	or.b32 	%r38, %r70, %r37;
 $L__tmp1:
-	.loc	2 43 17                         // standard.py:43:17 @[ fp8_linear.py:139:30 ]
-	add.s32 	%r72, %r759, 63;
+	.loc	2 43 17                         // standard.py:43:17 @[ fp8_linear.py:143:30 ]
+	add.s32 	%r72, %r746, 63;
 $L__tmp2:
-	.loc	1 139 19                        // fp8_linear.py:139:19
+	.loc	1 143 19                        // fp8_linear.py:143:19
 	setp.gt.s32 	%p1, %r72, 63;
-	mov.b32 	%r758, global_smem;
+	mov.b32 	%r745, global_smem;
 	setp.lt.s32 	%p325, %r38, %r61;
 	@%p1 bra 	$L__BB0_2;
 	bra.uni 	$L__BB0_1;
@@ -117,270 +117,270 @@ $L__BB0_2:                              // %.lr.ph
 	shr.s32 	%r73, %r72, 31;
 	shr.u32 	%r74, %r73, 26;
 	add.s32 	%r75, %r72, %r74;
-	shr.s32 	%r760, %r75, 6;
-	.loc	1 149 28                        // fp8_linear.py:149:28
+	shr.s32 	%r747, %r75, 6;
+	.loc	1 153 28                        // fp8_linear.py:153:28
 	shl.b32 	%r76, %r64, 6;
-	.loc	1 148 28                        // fp8_linear.py:148:28
+	.loc	1 152 28                        // fp8_linear.py:152:28
 	shl.b32 	%r77, %r63, 6;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r78, %r64, 63;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd2, %r78;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r79, %r64, 62;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd3, %r79;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r80, %r64, 61;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd4, %r80;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r81, %r64, 60;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd5, %r81;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r82, %r64, 59;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd6, %r82;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r83, %r64, 58;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd7, %r83;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r84, %r64, 57;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd8, %r84;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r85, %r64, 56;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd9, %r85;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r86, %r64, 55;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd10, %r86;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r87, %r64, 54;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd11, %r87;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r88, %r64, 53;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd12, %r88;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r89, %r64, 52;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd13, %r89;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r90, %r64, 51;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd14, %r90;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r91, %r64, 50;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd15, %r91;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r92, %r64, 49;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd16, %r92;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r93, %r64, 48;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd17, %r93;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r94, %r64, 47;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd18, %r94;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r95, %r64, 46;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd19, %r95;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r96, %r64, 45;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd20, %r96;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r97, %r64, 44;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd21, %r97;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r98, %r64, 43;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd22, %r98;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r99, %r64, 42;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd23, %r99;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r100, %r64, 41;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd24, %r100;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r101, %r64, 40;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd25, %r101;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r102, %r64, 39;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd26, %r102;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r103, %r64, 38;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd27, %r103;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r104, %r64, 37;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd28, %r104;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r105, %r64, 36;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd29, %r105;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r106, %r64, 35;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd30, %r106;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r107, %r64, 34;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd31, %r107;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r108, %r64, 33;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd32, %r108;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	shl.b32 	%r109, %r64, 5;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd33, %r109;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r110, %r64, 31;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd34, %r110;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r111, %r64, 30;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd35, %r111;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r112, %r64, 29;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd36, %r112;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r113, %r64, 28;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd37, %r113;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r114, %r64, 27;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd38, %r114;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r115, %r64, 26;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd39, %r115;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r116, %r64, 25;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd40, %r116;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r117, %r64, 24;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd41, %r117;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r118, %r64, 23;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd42, %r118;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r119, %r64, 22;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd43, %r119;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r120, %r64, 21;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd44, %r120;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r121, %r64, 20;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd45, %r121;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r122, %r64, 19;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd46, %r122;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r123, %r64, 18;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd47, %r123;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r124, %r64, 17;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd48, %r124;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	shl.b32 	%r125, %r64, 4;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd49, %r125;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r126, %r64, 15;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd50, %r126;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r127, %r64, 14;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd51, %r127;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r128, %r64, 13;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd52, %r128;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r129, %r64, 12;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd53, %r129;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r130, %r64, 11;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd54, %r130;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r131, %r64, 10;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd55, %r131;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r132, %r64, 9;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd56, %r132;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	shl.b32 	%r133, %r64, 3;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd57, %r133;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r134, %r64, 7;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd58, %r134;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r135, %r64, 6;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd59, %r135;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r136, %r64, 5;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd60, %r136;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	shl.b32 	%r137, %r64, 2;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd61, %r137;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	mul.lo.s32 	%r138, %r64, 3;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd62, %r138;
-	.loc	1 137 39                        // fp8_linear.py:137:39
+	.loc	1 141 39                        // fp8_linear.py:141:39
 	shl.b32 	%r139, %r64, 1;
-	.loc	1 137 21                        // fp8_linear.py:137:21
+	.loc	1 141 21                        // fp8_linear.py:141:21
 	cvt.s64.s32 	%rd63, %r139;
 	cvt.s64.s32 	%rd64, %r64;
-	.loc	1 137 51                        // fp8_linear.py:137:51
-	add.s64 	%rd328, %rd69, %rd1;
-	.loc	1 135 69                        // fp8_linear.py:135:69
+	.loc	1 141 51                        // fp8_linear.py:141:51
+	add.s64 	%rd336, %rd69, %rd1;
+	.loc	1 139 69                        // fp8_linear.py:139:69
 	mul.lo.s32 	%r140, %r63, %r39;
-	.loc	1 130 44                        // fp8_linear.py:130:44
+	.loc	1 134 44                        // fp8_linear.py:134:44
 	setp.eq.b32 	%p2, %r3, 0;
 	shl.b32 	%r141, %r39, 1;
 	selp.b32 	%r142, 0, 160, %p2;
 	xor.b32 	%r143, %r142, %r141;
-	add.s32 	%r267, %r758, %r143;
+	add.s32 	%r267, %r745, %r143;
 	add.s32 	%r268, %r267, 512;
 	add.s32 	%r269, %r267, 1024;
 	add.s32 	%r270, %r267, 1536;
@@ -397,7 +397,7 @@ $L__BB0_2:                              // %.lr.ph
 	add.s32 	%r281, %r267, 7168;
 	add.s32 	%r282, %r267, 7680;
 	xor.b32 	%r144, %r143, 64;
-	add.s32 	%r145, %r758, %r144;
+	add.s32 	%r145, %r745, %r144;
 	add.s32 	%r283, %r145, 256;
 	add.s32 	%r284, %r145, 768;
 	add.s32 	%r285, %r145, 1280;
@@ -414,317 +414,317 @@ $L__BB0_2:                              // %.lr.ph
 	add.s32 	%r296, %r145, 6912;
 	add.s32 	%r297, %r145, 7424;
 	add.s32 	%r298, %r145, 7936;
-	add.s32 	%r146, %r758, %r37;
+	add.s32 	%r146, %r745, %r37;
 	add.s32 	%r299, %r146, 8192;
 	add.s32 	%r300, %r146, 10240;
 	add.s32 	%r301, %r146, 12288;
 	add.s32 	%r302, %r146, 14336;
 	xor.b32 	%r147, %r37, 8;
-	add.s32 	%r148, %r758, %r147;
+	add.s32 	%r148, %r745, %r147;
 	add.s32 	%r303, %r148, 8320;
 	add.s32 	%r304, %r148, 10368;
 	add.s32 	%r305, %r148, 12416;
 	add.s32 	%r306, %r148, 14464;
 	xor.b32 	%r149, %r37, 16;
-	add.s32 	%r150, %r758, %r149;
+	add.s32 	%r150, %r745, %r149;
 	add.s32 	%r307, %r150, 8448;
 	add.s32 	%r308, %r150, 10496;
 	add.s32 	%r309, %r150, 12544;
 	add.s32 	%r310, %r150, 14592;
 	xor.b32 	%r151, %r37, 24;
-	add.s32 	%r152, %r758, %r151;
+	add.s32 	%r152, %r745, %r151;
 	add.s32 	%r311, %r152, 8576;
 	add.s32 	%r312, %r152, 10624;
 	add.s32 	%r313, %r152, 12672;
 	add.s32 	%r314, %r152, 14720;
 	xor.b32 	%r153, %r37, 32;
-	add.s32 	%r154, %r758, %r153;
+	add.s32 	%r154, %r745, %r153;
 	add.s32 	%r315, %r154, 8704;
 	add.s32 	%r316, %r154, 10752;
 	add.s32 	%r317, %r154, 12800;
 	add.s32 	%r318, %r154, 14848;
 	xor.b32 	%r155, %r37, 40;
-	add.s32 	%r156, %r758, %r155;
+	add.s32 	%r156, %r745, %r155;
 	add.s32 	%r319, %r156, 8832;
 	add.s32 	%r320, %r156, 10880;
 	add.s32 	%r321, %r156, 12928;
 	add.s32 	%r322, %r156, 14976;
 	xor.b32 	%r157, %r37, 48;
-	add.s32 	%r158, %r758, %r157;
+	add.s32 	%r158, %r745, %r157;
 	add.s32 	%r323, %r158, 8960;
 	add.s32 	%r324, %r158, 11008;
 	add.s32 	%r325, %r158, 13056;
 	add.s32 	%r326, %r158, 15104;
 	xor.b32 	%r159, %r37, 56;
-	add.s32 	%r160, %r758, %r159;
+	add.s32 	%r160, %r745, %r159;
 	add.s32 	%r327, %r160, 9088;
 	add.s32 	%r328, %r160, 11136;
 	add.s32 	%r329, %r160, 13184;
 	add.s32 	%r330, %r160, 15232;
 	xor.b32 	%r161, %r37, 64;
-	add.s32 	%r162, %r758, %r161;
+	add.s32 	%r162, %r745, %r161;
 	add.s32 	%r331, %r162, 9216;
 	add.s32 	%r332, %r162, 11264;
 	add.s32 	%r333, %r162, 13312;
 	add.s32 	%r334, %r162, 15360;
 	xor.b32 	%r163, %r37, 72;
-	add.s32 	%r164, %r758, %r163;
+	add.s32 	%r164, %r745, %r163;
 	add.s32 	%r335, %r164, 9344;
 	add.s32 	%r336, %r164, 11392;
 	add.s32 	%r337, %r164, 13440;
 	add.s32 	%r338, %r164, 15488;
 	xor.b32 	%r165, %r37, 80;
-	add.s32 	%r166, %r758, %r165;
+	add.s32 	%r166, %r745, %r165;
 	add.s32 	%r339, %r166, 9472;
 	add.s32 	%r340, %r166, 11520;
 	add.s32 	%r341, %r166, 13568;
 	add.s32 	%r342, %r166, 15616;
 	xor.b32 	%r167, %r37, 88;
-	add.s32 	%r168, %r758, %r167;
+	add.s32 	%r168, %r745, %r167;
 	add.s32 	%r343, %r168, 9600;
 	add.s32 	%r344, %r168, 11648;
 	add.s32 	%r345, %r168, 13696;
 	add.s32 	%r346, %r168, 15744;
 	xor.b32 	%r169, %r37, 96;
-	add.s32 	%r170, %r758, %r169;
+	add.s32 	%r170, %r745, %r169;
 	add.s32 	%r347, %r170, 9728;
 	add.s32 	%r348, %r170, 11776;
 	add.s32 	%r349, %r170, 13824;
 	add.s32 	%r350, %r170, 15872;
 	xor.b32 	%r171, %r37, 104;
-	add.s32 	%r172, %r758, %r171;
+	add.s32 	%r172, %r745, %r171;
 	add.s32 	%r351, %r172, 9856;
 	add.s32 	%r352, %r172, 11904;
 	add.s32 	%r353, %r172, 13952;
 	add.s32 	%r354, %r172, 16000;
 	xor.b32 	%r173, %r37, 112;
-	add.s32 	%r174, %r758, %r173;
+	add.s32 	%r174, %r745, %r173;
 	add.s32 	%r355, %r174, 9984;
 	add.s32 	%r356, %r174, 12032;
 	add.s32 	%r357, %r174, 14080;
 	add.s32 	%r358, %r174, 16128;
 	xor.b32 	%r175, %r37, 120;
-	add.s32 	%r176, %r758, %r175;
+	add.s32 	%r176, %r745, %r175;
 	add.s32 	%r359, %r176, 10112;
 	add.s32 	%r360, %r176, 12160;
 	add.s32 	%r361, %r176, 14208;
 	add.s32 	%r362, %r176, 16256;
-	and.b32 	%r825, %r2, 3;
-	bfe.u32 	%r177, %r2, 2, 5;
-	mul.lo.s32 	%r178, %r825, 544;
-	or.b32 	%r179, %r178, %r177;
-	add.s32 	%r40, %r758, %r179;
-	xor.b32 	%r180, %r179, 136;
-	add.s32 	%r41, %r758, %r180;
-	xor.b32 	%r181, %r179, 272;
-	add.s32 	%r42, %r758, %r181;
-	xor.b32 	%r182, %r179, 408;
-	add.s32 	%r43, %r758, %r182;
-	xor.b32 	%r183, %r179, 32;
-	add.s32 	%r44, %r758, %r183;
-	xor.b32 	%r184, %r179, 168;
-	add.s32 	%r45, %r758, %r184;
-	xor.b32 	%r185, %r179, 304;
-	add.s32 	%r46, %r758, %r185;
-	xor.b32 	%r186, %r179, 440;
-	add.s32 	%r47, %r758, %r186;
-	xor.b32 	%r187, %r179, 64;
-	add.s32 	%r48, %r758, %r187;
-	xor.b32 	%r188, %r179, 200;
-	add.s32 	%r49, %r758, %r188;
-	xor.b32 	%r189, %r179, 336;
-	add.s32 	%r50, %r758, %r189;
-	xor.b32 	%r190, %r179, 472;
-	add.s32 	%r51, %r758, %r190;
-	xor.b32 	%r191, %r179, 96;
-	add.s32 	%r52, %r758, %r191;
-	xor.b32 	%r192, %r179, 232;
-	add.s32 	%r53, %r758, %r192;
-	xor.b32 	%r193, %r179, 368;
-	add.s32 	%r54, %r758, %r193;
-	xor.b32 	%r194, %r179, 504;
-	add.s32 	%r55, %r758, %r194;
-	shl.b32 	%r195, %r2, 5;
-	and.b32 	%r196, %r195, 896;
-	shl.b32 	%r197, %r2, 3;
-	and.b32 	%r198, %r197, 120;
-	or.b32 	%r199, %r198, %r196;
-	add.s32 	%r56, %r758, %r199;
+	and.b32 	%r177, %r2, 3;
+	bfe.u32 	%r178, %r2, 2, 5;
+	mul.lo.s32 	%r179, %r177, 544;
+	or.b32 	%r180, %r179, %r178;
+	add.s32 	%r40, %r745, %r180;
+	xor.b32 	%r181, %r180, 136;
+	add.s32 	%r41, %r745, %r181;
+	xor.b32 	%r182, %r180, 272;
+	add.s32 	%r42, %r745, %r182;
+	xor.b32 	%r183, %r180, 408;
+	add.s32 	%r43, %r745, %r183;
+	xor.b32 	%r184, %r180, 32;
+	add.s32 	%r44, %r745, %r184;
+	xor.b32 	%r185, %r180, 168;
+	add.s32 	%r45, %r745, %r185;
+	xor.b32 	%r186, %r180, 304;
+	add.s32 	%r46, %r745, %r186;
+	xor.b32 	%r187, %r180, 440;
+	add.s32 	%r47, %r745, %r187;
+	xor.b32 	%r188, %r180, 64;
+	add.s32 	%r48, %r745, %r188;
+	xor.b32 	%r189, %r180, 200;
+	add.s32 	%r49, %r745, %r189;
+	xor.b32 	%r190, %r180, 336;
+	add.s32 	%r50, %r745, %r190;
+	xor.b32 	%r191, %r180, 472;
+	add.s32 	%r51, %r745, %r191;
+	xor.b32 	%r192, %r180, 96;
+	add.s32 	%r52, %r745, %r192;
+	xor.b32 	%r193, %r180, 232;
+	add.s32 	%r53, %r745, %r193;
+	xor.b32 	%r194, %r180, 368;
+	add.s32 	%r54, %r745, %r194;
+	xor.b32 	%r195, %r180, 504;
+	add.s32 	%r55, %r745, %r195;
+	shl.b32 	%r196, %r2, 5;
+	and.b32 	%r197, %r196, 896;
+	shl.b32 	%r812, %r2, 3;
+	and.b32 	%r198, %r812, 120;
+	or.b32 	%r199, %r198, %r197;
+	add.s32 	%r56, %r745, %r199;
 	xor.b32 	%r200, %r199, 32;
-	add.s32 	%r57, %r758, %r200;
+	add.s32 	%r57, %r745, %r200;
 	xor.b32 	%r201, %r199, 64;
-	add.s32 	%r58, %r758, %r201;
+	add.s32 	%r58, %r745, %r201;
 	xor.b32 	%r202, %r199, 96;
-	add.s32 	%r59, %r758, %r202;
+	add.s32 	%r59, %r745, %r202;
 	cvt.s64.s32 	%rd65, %r76;
-	.loc	1 139 19                        // fp8_linear.py:139:19
+	.loc	1 143 19                        // fp8_linear.py:143:19
 	mul.wide.s32 	%rd66, %r140, 2;
 	add.s32 	%r203, %r1, %r4;
 	add.s32 	%r204, %r203, 62;
 	mul.lo.s32 	%r205, %r62, %r204;
-	mad.wide.s32 	%rd327, %r205, 2, %rd68;
+	mad.wide.s32 	%rd335, %r205, 2, %rd68;
 	mul.wide.s32 	%rd67, %r77, 2;
 	add.s32 	%r206, %r203, 60;
 	mul.lo.s32 	%r207, %r62, %r206;
-	mad.wide.s32 	%rd326, %r207, 2, %rd68;
+	mad.wide.s32 	%rd334, %r207, 2, %rd68;
 	add.s32 	%r208, %r203, 58;
 	mul.lo.s32 	%r209, %r62, %r208;
-	mad.wide.s32 	%rd325, %r209, 2, %rd68;
+	mad.wide.s32 	%rd333, %r209, 2, %rd68;
 	add.s32 	%r210, %r203, 56;
 	mul.lo.s32 	%r211, %r62, %r210;
-	mad.wide.s32 	%rd324, %r211, 2, %rd68;
+	mad.wide.s32 	%rd332, %r211, 2, %rd68;
 	add.s32 	%r212, %r203, 54;
 	mul.lo.s32 	%r213, %r62, %r212;
-	mad.wide.s32 	%rd323, %r213, 2, %rd68;
+	mad.wide.s32 	%rd331, %r213, 2, %rd68;
 	add.s32 	%r214, %r203, 52;
 	mul.lo.s32 	%r215, %r62, %r214;
-	mad.wide.s32 	%rd322, %r215, 2, %rd68;
+	mad.wide.s32 	%rd330, %r215, 2, %rd68;
 	add.s32 	%r216, %r203, 50;
 	mul.lo.s32 	%r217, %r62, %r216;
-	mad.wide.s32 	%rd321, %r217, 2, %rd68;
+	mad.wide.s32 	%rd329, %r217, 2, %rd68;
 	add.s32 	%r218, %r203, 48;
 	mul.lo.s32 	%r219, %r62, %r218;
-	mad.wide.s32 	%rd320, %r219, 2, %rd68;
+	mad.wide.s32 	%rd328, %r219, 2, %rd68;
 	add.s32 	%r220, %r203, 46;
 	mul.lo.s32 	%r221, %r62, %r220;
-	mad.wide.s32 	%rd319, %r221, 2, %rd68;
+	mad.wide.s32 	%rd327, %r221, 2, %rd68;
 	add.s32 	%r222, %r203, 44;
 	mul.lo.s32 	%r223, %r62, %r222;
-	mad.wide.s32 	%rd318, %r223, 2, %rd68;
+	mad.wide.s32 	%rd326, %r223, 2, %rd68;
 	add.s32 	%r224, %r203, 42;
 	mul.lo.s32 	%r225, %r62, %r224;
-	mad.wide.s32 	%rd317, %r225, 2, %rd68;
+	mad.wide.s32 	%rd325, %r225, 2, %rd68;
 	add.s32 	%r226, %r203, 40;
 	mul.lo.s32 	%r227, %r62, %r226;
-	mad.wide.s32 	%rd316, %r227, 2, %rd68;
+	mad.wide.s32 	%rd324, %r227, 2, %rd68;
 	add.s32 	%r228, %r203, 38;
 	mul.lo.s32 	%r229, %r62, %r228;
-	mad.wide.s32 	%rd315, %r229, 2, %rd68;
+	mad.wide.s32 	%rd323, %r229, 2, %rd68;
 	add.s32 	%r230, %r203, 36;
 	mul.lo.s32 	%r231, %r62, %r230;
-	mad.wide.s32 	%rd314, %r231, 2, %rd68;
+	mad.wide.s32 	%rd322, %r231, 2, %rd68;
 	add.s32 	%r232, %r203, 34;
 	mul.lo.s32 	%r233, %r62, %r232;
-	mad.wide.s32 	%rd313, %r233, 2, %rd68;
+	mad.wide.s32 	%rd321, %r233, 2, %rd68;
 	add.s32 	%r234, %r203, 32;
 	mul.lo.s32 	%r235, %r62, %r234;
-	mad.wide.s32 	%rd312, %r235, 2, %rd68;
+	mad.wide.s32 	%rd320, %r235, 2, %rd68;
 	add.s32 	%r236, %r203, 30;
 	mul.lo.s32 	%r237, %r62, %r236;
-	mad.wide.s32 	%rd311, %r237, 2, %rd68;
+	mad.wide.s32 	%rd319, %r237, 2, %rd68;
 	add.s32 	%r238, %r203, 28;
 	mul.lo.s32 	%r239, %r62, %r238;
-	mad.wide.s32 	%rd310, %r239, 2, %rd68;
+	mad.wide.s32 	%rd318, %r239, 2, %rd68;
 	add.s32 	%r240, %r203, 26;
 	mul.lo.s32 	%r241, %r62, %r240;
-	mad.wide.s32 	%rd309, %r241, 2, %rd68;
+	mad.wide.s32 	%rd317, %r241, 2, %rd68;
 	add.s32 	%r242, %r203, 24;
 	mul.lo.s32 	%r243, %r62, %r242;
-	mad.wide.s32 	%rd308, %r243, 2, %rd68;
+	mad.wide.s32 	%rd316, %r243, 2, %rd68;
 	add.s32 	%r244, %r203, 22;
 	mul.lo.s32 	%r245, %r62, %r244;
-	mad.wide.s32 	%rd307, %r245, 2, %rd68;
+	mad.wide.s32 	%rd315, %r245, 2, %rd68;
 	add.s32 	%r246, %r203, 20;
 	mul.lo.s32 	%r247, %r62, %r246;
-	mad.wide.s32 	%rd306, %r247, 2, %rd68;
+	mad.wide.s32 	%rd314, %r247, 2, %rd68;
 	add.s32 	%r248, %r203, 18;
 	mul.lo.s32 	%r249, %r62, %r248;
-	mad.wide.s32 	%rd305, %r249, 2, %rd68;
+	mad.wide.s32 	%rd313, %r249, 2, %rd68;
 	add.s32 	%r250, %r203, 16;
 	mul.lo.s32 	%r251, %r62, %r250;
-	mad.wide.s32 	%rd304, %r251, 2, %rd68;
+	mad.wide.s32 	%rd312, %r251, 2, %rd68;
 	add.s32 	%r252, %r203, 14;
 	mul.lo.s32 	%r253, %r62, %r252;
-	mad.wide.s32 	%rd303, %r253, 2, %rd68;
+	mad.wide.s32 	%rd311, %r253, 2, %rd68;
 	add.s32 	%r254, %r203, 12;
 	mul.lo.s32 	%r255, %r62, %r254;
-	mad.wide.s32 	%rd302, %r255, 2, %rd68;
+	mad.wide.s32 	%rd310, %r255, 2, %rd68;
 	add.s32 	%r256, %r203, 10;
 	mul.lo.s32 	%r257, %r62, %r256;
-	mad.wide.s32 	%rd301, %r257, 2, %rd68;
+	mad.wide.s32 	%rd309, %r257, 2, %rd68;
 	add.s32 	%r258, %r203, 8;
 	mul.lo.s32 	%r259, %r62, %r258;
-	mad.wide.s32 	%rd300, %r259, 2, %rd68;
+	mad.wide.s32 	%rd308, %r259, 2, %rd68;
 	add.s32 	%r260, %r203, 6;
 	mul.lo.s32 	%r261, %r62, %r260;
-	mad.wide.s32 	%rd299, %r261, 2, %rd68;
+	mad.wide.s32 	%rd307, %r261, 2, %rd68;
 	add.s32 	%r262, %r203, 4;
 	mul.lo.s32 	%r263, %r62, %r262;
-	mad.wide.s32 	%rd298, %r263, 2, %rd68;
+	mad.wide.s32 	%rd306, %r263, 2, %rd68;
 	add.s32 	%r264, %r203, 2;
 	mul.lo.s32 	%r265, %r62, %r264;
-	mad.wide.s32 	%rd297, %r265, 2, %rd68;
+	mad.wide.s32 	%rd305, %r265, 2, %rd68;
 	mul.lo.s32 	%r266, %r62, %r203;
-	mad.wide.s32 	%rd296, %r266, 2, %rd68;
-	mov.b32 	%r761, 0f00000000;
+	mad.wide.s32 	%rd304, %r266, 2, %rd68;
+	mov.b32 	%r750, 0f00000000;
 	setp.lt.s32 	%p99, %r36, %r60;
 	setp.lt.s32 	%p100, %r35, %r60;
 	setp.lt.s32 	%p101, %r34, %r60;
-	mov.b32 	%r762, %r761;
-	mov.b32 	%r763, %r761;
-	mov.b32 	%r764, %r761;
-	mov.b32 	%r765, %r761;
-	mov.b32 	%r766, %r761;
-	mov.b32 	%r767, %r761;
-	mov.b32 	%r768, %r761;
-	mov.b32 	%r769, %r761;
-	mov.b32 	%r770, %r761;
-	mov.b32 	%r771, %r761;
-	mov.b32 	%r772, %r761;
-	mov.b32 	%r773, %r761;
-	mov.b32 	%r774, %r761;
-	mov.b32 	%r775, %r761;
-	mov.b32 	%r776, %r761;
-	mov.b32 	%r777, %r761;
-	mov.b32 	%r778, %r761;
-	mov.b32 	%r779, %r761;
-	mov.b32 	%r780, %r761;
-	mov.b32 	%r781, %r761;
-	mov.b32 	%r782, %r761;
-	mov.b32 	%r783, %r761;
-	mov.b32 	%r784, %r761;
-	mov.b32 	%r785, %r761;
-	mov.b32 	%r786, %r761;
-	mov.b32 	%r787, %r761;
-	mov.b32 	%r788, %r761;
-	mov.b32 	%r789, %r761;
-	mov.b32 	%r790, %r761;
-	mov.b32 	%r791, %r761;
-	mov.b32 	%r792, %r761;
-	mov.b32 	%r793, %r761;
-	mov.b32 	%r794, %r761;
-	mov.b32 	%r795, %r761;
-	mov.b32 	%r796, %r761;
-	mov.b32 	%r797, %r761;
-	mov.b32 	%r798, %r761;
-	mov.b32 	%r799, %r761;
-	mov.b32 	%r800, %r761;
-	mov.b32 	%r801, %r761;
-	mov.b32 	%r802, %r761;
-	mov.b32 	%r803, %r761;
-	mov.b32 	%r804, %r761;
-	mov.b32 	%r805, %r761;
-	mov.b32 	%r806, %r761;
-	mov.b32 	%r807, %r761;
-	mov.b32 	%r808, %r761;
-	mov.b32 	%r809, %r761;
-	mov.b32 	%r810, %r761;
-	mov.b32 	%r811, %r761;
-	mov.b32 	%r812, %r761;
-	mov.b32 	%r813, %r761;
-	mov.b32 	%r814, %r761;
-	mov.b32 	%r815, %r761;
-	mov.b32 	%r816, %r761;
-	mov.b32 	%r817, %r761;
-	mov.b32 	%r818, %r761;
-	mov.b32 	%r819, %r761;
-	mov.b32 	%r820, %r761;
-	mov.b32 	%r821, %r761;
-	mov.b32 	%r822, %r761;
-	mov.b32 	%r823, %r761;
-	mov.b32 	%r824, %r761;
+	mov.b32 	%r748, %r750;
+	mov.b32 	%r749, %r750;
+	mov.b32 	%r751, %r750;
+	mov.b32 	%r752, %r750;
+	mov.b32 	%r753, %r750;
+	mov.b32 	%r754, %r750;
+	mov.b32 	%r755, %r750;
+	mov.b32 	%r756, %r750;
+	mov.b32 	%r757, %r750;
+	mov.b32 	%r758, %r750;
+	mov.b32 	%r759, %r750;
+	mov.b32 	%r760, %r750;
+	mov.b32 	%r761, %r750;
+	mov.b32 	%r762, %r750;
+	mov.b32 	%r763, %r750;
+	mov.b32 	%r764, %r750;
+	mov.b32 	%r765, %r750;
+	mov.b32 	%r766, %r750;
+	mov.b32 	%r767, %r750;
+	mov.b32 	%r768, %r750;
+	mov.b32 	%r769, %r750;
+	mov.b32 	%r770, %r750;
+	mov.b32 	%r771, %r750;
+	mov.b32 	%r772, %r750;
+	mov.b32 	%r773, %r750;
+	mov.b32 	%r774, %r750;
+	mov.b32 	%r775, %r750;
+	mov.b32 	%r776, %r750;
+	mov.b32 	%r777, %r750;
+	mov.b32 	%r778, %r750;
+	mov.b32 	%r779, %r750;
+	mov.b32 	%r780, %r750;
+	mov.b32 	%r781, %r750;
+	mov.b32 	%r782, %r750;
+	mov.b32 	%r783, %r750;
+	mov.b32 	%r784, %r750;
+	mov.b32 	%r785, %r750;
+	mov.b32 	%r786, %r750;
+	mov.b32 	%r787, %r750;
+	mov.b32 	%r788, %r750;
+	mov.b32 	%r789, %r750;
+	mov.b32 	%r790, %r750;
+	mov.b32 	%r791, %r750;
+	mov.b32 	%r792, %r750;
+	mov.b32 	%r793, %r750;
+	mov.b32 	%r794, %r750;
+	mov.b32 	%r795, %r750;
+	mov.b32 	%r796, %r750;
+	mov.b32 	%r797, %r750;
+	mov.b32 	%r798, %r750;
+	mov.b32 	%r799, %r750;
+	mov.b32 	%r800, %r750;
+	mov.b32 	%r801, %r750;
+	mov.b32 	%r802, %r750;
+	mov.b32 	%r803, %r750;
+	mov.b32 	%r804, %r750;
+	mov.b32 	%r805, %r750;
+	mov.b32 	%r806, %r750;
+	mov.b32 	%r807, %r750;
+	mov.b32 	%r808, %r750;
+	mov.b32 	%r809, %r750;
+	mov.b32 	%r810, %r750;
+	mov.b32 	%r811, %r750;
 $L__BB0_3:                              // =>This Inner Loop Header: Depth=1
-	.loc	1 133 22                        // fp8_linear.py:133:22
+	.loc	1 137 22                        // fp8_linear.py:137:22
 	setp.lt.s32 	%p102, %r33, %r60;
 	setp.lt.s32 	%p103, %r32, %r60;
 	setp.lt.s32 	%p104, %r31, %r60;
@@ -754,105 +754,105 @@ $L__BB0_3:                              // =>This Inner Loop Header: Depth=1
 	setp.lt.s32 	%p128, %r7, %r60;
 	setp.lt.s32 	%p129, %r6, %r60;
 	setp.lt.s32 	%p130, %r5, %r60;
-	.loc	1 140 24                        // fp8_linear.py:140:24
-	add.s64 	%rd166, %rd328, %rd2;
-	add.s64 	%rd165, %rd328, %rd3;
-	add.s64 	%rd164, %rd328, %rd4;
-	add.s64 	%rd163, %rd328, %rd5;
-	add.s64 	%rd162, %rd328, %rd6;
-	add.s64 	%rd161, %rd328, %rd7;
-	add.s64 	%rd160, %rd328, %rd8;
-	add.s64 	%rd159, %rd328, %rd9;
-	add.s64 	%rd158, %rd328, %rd10;
-	add.s64 	%rd157, %rd328, %rd11;
-	add.s64 	%rd156, %rd328, %rd12;
-	add.s64 	%rd155, %rd328, %rd13;
-	add.s64 	%rd154, %rd328, %rd14;
-	add.s64 	%rd153, %rd328, %rd15;
-	add.s64 	%rd152, %rd328, %rd16;
-	add.s64 	%rd151, %rd328, %rd17;
-	add.s64 	%rd150, %rd328, %rd18;
-	add.s64 	%rd149, %rd328, %rd19;
-	add.s64 	%rd148, %rd328, %rd20;
-	add.s64 	%rd147, %rd328, %rd21;
-	add.s64 	%rd146, %rd328, %rd22;
-	add.s64 	%rd145, %rd328, %rd23;
-	add.s64 	%rd144, %rd328, %rd24;
-	add.s64 	%rd143, %rd328, %rd25;
-	add.s64 	%rd142, %rd328, %rd26;
-	add.s64 	%rd141, %rd328, %rd27;
-	add.s64 	%rd140, %rd328, %rd28;
-	add.s64 	%rd139, %rd328, %rd29;
-	add.s64 	%rd138, %rd328, %rd30;
-	add.s64 	%rd137, %rd328, %rd31;
-	add.s64 	%rd136, %rd328, %rd32;
-	add.s64 	%rd135, %rd328, %rd33;
-	add.s64 	%rd134, %rd328, %rd34;
-	add.s64 	%rd133, %rd328, %rd35;
-	add.s64 	%rd132, %rd328, %rd36;
-	add.s64 	%rd131, %rd328, %rd37;
-	add.s64 	%rd130, %rd328, %rd38;
-	add.s64 	%rd129, %rd328, %rd39;
-	add.s64 	%rd128, %rd328, %rd40;
-	add.s64 	%rd127, %rd328, %rd41;
-	add.s64 	%rd126, %rd328, %rd42;
-	add.s64 	%rd125, %rd328, %rd43;
-	add.s64 	%rd124, %rd328, %rd44;
-	add.s64 	%rd123, %rd328, %rd45;
-	add.s64 	%rd122, %rd328, %rd46;
-	add.s64 	%rd121, %rd328, %rd47;
-	add.s64 	%rd120, %rd328, %rd48;
-	add.s64 	%rd119, %rd328, %rd49;
-	add.s64 	%rd118, %rd328, %rd50;
-	add.s64 	%rd117, %rd328, %rd51;
-	add.s64 	%rd116, %rd328, %rd52;
-	add.s64 	%rd115, %rd328, %rd53;
-	add.s64 	%rd114, %rd328, %rd54;
-	add.s64 	%rd113, %rd328, %rd55;
-	add.s64 	%rd112, %rd328, %rd56;
-	add.s64 	%rd111, %rd328, %rd57;
-	add.s64 	%rd110, %rd328, %rd58;
-	add.s64 	%rd109, %rd328, %rd59;
-	add.s64 	%rd108, %rd328, %rd60;
-	add.s64 	%rd107, %rd328, %rd61;
-	add.s64 	%rd106, %rd328, %rd62;
-	add.s64 	%rd105, %rd328, %rd63;
-	add.s64 	%rd104, %rd328, %rd64;
-	add.s64 	%rd103, %rd327, %rd66;
-	add.s64 	%rd102, %rd326, %rd66;
-	add.s64 	%rd101, %rd325, %rd66;
-	add.s64 	%rd100, %rd324, %rd66;
-	add.s64 	%rd99, %rd323, %rd66;
-	add.s64 	%rd98, %rd322, %rd66;
-	add.s64 	%rd97, %rd321, %rd66;
-	add.s64 	%rd96, %rd320, %rd66;
-	add.s64 	%rd95, %rd319, %rd66;
-	add.s64 	%rd94, %rd318, %rd66;
-	add.s64 	%rd93, %rd317, %rd66;
-	add.s64 	%rd92, %rd316, %rd66;
-	add.s64 	%rd91, %rd315, %rd66;
-	add.s64 	%rd90, %rd314, %rd66;
-	add.s64 	%rd89, %rd313, %rd66;
-	add.s64 	%rd88, %rd312, %rd66;
-	add.s64 	%rd87, %rd311, %rd66;
-	add.s64 	%rd86, %rd310, %rd66;
-	add.s64 	%rd85, %rd309, %rd66;
-	add.s64 	%rd84, %rd308, %rd66;
-	add.s64 	%rd83, %rd307, %rd66;
-	add.s64 	%rd82, %rd306, %rd66;
-	add.s64 	%rd81, %rd305, %rd66;
-	add.s64 	%rd80, %rd304, %rd66;
-	add.s64 	%rd79, %rd303, %rd66;
-	add.s64 	%rd78, %rd302, %rd66;
-	add.s64 	%rd77, %rd301, %rd66;
-	add.s64 	%rd76, %rd300, %rd66;
-	add.s64 	%rd75, %rd299, %rd66;
-	add.s64 	%rd74, %rd298, %rd66;
-	add.s64 	%rd73, %rd297, %rd66;
-	add.s64 	%rd72, %rd296, %rd66;
-	.loc	1 141 70                        // fp8_linear.py:141:70
-	setp.lt.s32 	%p131, %r39, %r759;
-	.loc	1 141 52                        // fp8_linear.py:141:52
+	.loc	1 144 24                        // fp8_linear.py:144:24
+	add.s64 	%rd166, %rd336, %rd2;
+	add.s64 	%rd165, %rd336, %rd3;
+	add.s64 	%rd164, %rd336, %rd4;
+	add.s64 	%rd163, %rd336, %rd5;
+	add.s64 	%rd162, %rd336, %rd6;
+	add.s64 	%rd161, %rd336, %rd7;
+	add.s64 	%rd160, %rd336, %rd8;
+	add.s64 	%rd159, %rd336, %rd9;
+	add.s64 	%rd158, %rd336, %rd10;
+	add.s64 	%rd157, %rd336, %rd11;
+	add.s64 	%rd156, %rd336, %rd12;
+	add.s64 	%rd155, %rd336, %rd13;
+	add.s64 	%rd154, %rd336, %rd14;
+	add.s64 	%rd153, %rd336, %rd15;
+	add.s64 	%rd152, %rd336, %rd16;
+	add.s64 	%rd151, %rd336, %rd17;
+	add.s64 	%rd150, %rd336, %rd18;
+	add.s64 	%rd149, %rd336, %rd19;
+	add.s64 	%rd148, %rd336, %rd20;
+	add.s64 	%rd147, %rd336, %rd21;
+	add.s64 	%rd146, %rd336, %rd22;
+	add.s64 	%rd145, %rd336, %rd23;
+	add.s64 	%rd144, %rd336, %rd24;
+	add.s64 	%rd143, %rd336, %rd25;
+	add.s64 	%rd142, %rd336, %rd26;
+	add.s64 	%rd141, %rd336, %rd27;
+	add.s64 	%rd140, %rd336, %rd28;
+	add.s64 	%rd139, %rd336, %rd29;
+	add.s64 	%rd138, %rd336, %rd30;
+	add.s64 	%rd137, %rd336, %rd31;
+	add.s64 	%rd136, %rd336, %rd32;
+	add.s64 	%rd135, %rd336, %rd33;
+	add.s64 	%rd134, %rd336, %rd34;
+	add.s64 	%rd133, %rd336, %rd35;
+	add.s64 	%rd132, %rd336, %rd36;
+	add.s64 	%rd131, %rd336, %rd37;
+	add.s64 	%rd130, %rd336, %rd38;
+	add.s64 	%rd129, %rd336, %rd39;
+	add.s64 	%rd128, %rd336, %rd40;
+	add.s64 	%rd127, %rd336, %rd41;
+	add.s64 	%rd126, %rd336, %rd42;
+	add.s64 	%rd125, %rd336, %rd43;
+	add.s64 	%rd124, %rd336, %rd44;
+	add.s64 	%rd123, %rd336, %rd45;
+	add.s64 	%rd122, %rd336, %rd46;
+	add.s64 	%rd121, %rd336, %rd47;
+	add.s64 	%rd120, %rd336, %rd48;
+	add.s64 	%rd119, %rd336, %rd49;
+	add.s64 	%rd118, %rd336, %rd50;
+	add.s64 	%rd117, %rd336, %rd51;
+	add.s64 	%rd116, %rd336, %rd52;
+	add.s64 	%rd115, %rd336, %rd53;
+	add.s64 	%rd114, %rd336, %rd54;
+	add.s64 	%rd113, %rd336, %rd55;
+	add.s64 	%rd112, %rd336, %rd56;
+	add.s64 	%rd111, %rd336, %rd57;
+	add.s64 	%rd110, %rd336, %rd58;
+	add.s64 	%rd109, %rd336, %rd59;
+	add.s64 	%rd108, %rd336, %rd60;
+	add.s64 	%rd107, %rd336, %rd61;
+	add.s64 	%rd106, %rd336, %rd62;
+	add.s64 	%rd105, %rd336, %rd63;
+	add.s64 	%rd104, %rd336, %rd64;
+	add.s64 	%rd103, %rd335, %rd66;
+	add.s64 	%rd102, %rd334, %rd66;
+	add.s64 	%rd101, %rd333, %rd66;
+	add.s64 	%rd100, %rd332, %rd66;
+	add.s64 	%rd99, %rd331, %rd66;
+	add.s64 	%rd98, %rd330, %rd66;
+	add.s64 	%rd97, %rd329, %rd66;
+	add.s64 	%rd96, %rd328, %rd66;
+	add.s64 	%rd95, %rd327, %rd66;
+	add.s64 	%rd94, %rd326, %rd66;
+	add.s64 	%rd93, %rd325, %rd66;
+	add.s64 	%rd92, %rd324, %rd66;
+	add.s64 	%rd91, %rd323, %rd66;
+	add.s64 	%rd90, %rd322, %rd66;
+	add.s64 	%rd89, %rd321, %rd66;
+	add.s64 	%rd88, %rd320, %rd66;
+	add.s64 	%rd87, %rd319, %rd66;
+	add.s64 	%rd86, %rd318, %rd66;
+	add.s64 	%rd85, %rd317, %rd66;
+	add.s64 	%rd84, %rd316, %rd66;
+	add.s64 	%rd83, %rd315, %rd66;
+	add.s64 	%rd82, %rd314, %rd66;
+	add.s64 	%rd81, %rd313, %rd66;
+	add.s64 	%rd80, %rd312, %rd66;
+	add.s64 	%rd79, %rd311, %rd66;
+	add.s64 	%rd78, %rd310, %rd66;
+	add.s64 	%rd77, %rd309, %rd66;
+	add.s64 	%rd76, %rd308, %rd66;
+	add.s64 	%rd75, %rd307, %rd66;
+	add.s64 	%rd74, %rd306, %rd66;
+	add.s64 	%rd73, %rd305, %rd66;
+	add.s64 	%rd72, %rd304, %rd66;
+	.loc	1 145 70                        // fp8_linear.py:145:70
+	setp.lt.s32 	%p131, %r39, %r746;
+	.loc	1 145 52                        // fp8_linear.py:145:52
 	and.pred 	%p3, %p130, %p131;
 	and.pred 	%p4, %p129, %p131;
 	and.pred 	%p5, %p128, %p131;
@@ -886,7 +886,7 @@ $L__BB0_3:                              // =>This Inner Loop Header: Depth=1
 	and.pred 	%p33, %p100, %p131;
 	and.pred 	%p34, %p99, %p131;
 	mov.b16 	%rs2, 0;
-	.loc	1 141 20                        // fp8_linear.py:141:20
+	.loc	1 145 20                        // fp8_linear.py:145:20
 	// begin inline asm
 	mov.u16 %rs1, %rs2;
 	@%p3 ld.global.b16 { %rs1 }, [ %rd72 + 0 ];
@@ -1112,72 +1112,72 @@ $L__BB0_3:                              // =>This Inner Loop Header: Depth=1
 	// begin inline asm
 	st.shared.b16 [ %r298 + 0 ], %rs33;
 	// end inline asm
-	.loc	1 144 36                        // fp8_linear.py:144:36
-	setp.gt.s32 	%p132, %r759, 0;
-	setp.gt.s32 	%p133, %r759, 1;
-	setp.gt.s32 	%p134, %r759, 2;
-	setp.gt.s32 	%p135, %r759, 3;
-	setp.gt.s32 	%p136, %r759, 4;
-	setp.gt.s32 	%p137, %r759, 5;
-	setp.gt.s32 	%p138, %r759, 6;
-	setp.gt.s32 	%p139, %r759, 7;
-	setp.gt.s32 	%p140, %r759, 8;
-	setp.gt.s32 	%p141, %r759, 9;
-	setp.gt.s32 	%p142, %r759, 10;
-	setp.gt.s32 	%p143, %r759, 11;
-	setp.gt.s32 	%p144, %r759, 12;
-	setp.gt.s32 	%p145, %r759, 13;
-	setp.gt.s32 	%p146, %r759, 14;
-	setp.gt.s32 	%p147, %r759, 15;
-	setp.gt.s32 	%p148, %r759, 16;
-	setp.gt.s32 	%p149, %r759, 17;
-	setp.gt.s32 	%p150, %r759, 18;
-	setp.gt.s32 	%p151, %r759, 19;
-	setp.gt.s32 	%p152, %r759, 20;
-	setp.gt.s32 	%p153, %r759, 21;
-	setp.gt.s32 	%p154, %r759, 22;
-	setp.gt.s32 	%p155, %r759, 23;
-	setp.gt.s32 	%p156, %r759, 24;
-	setp.gt.s32 	%p157, %r759, 25;
-	setp.gt.s32 	%p158, %r759, 26;
-	setp.gt.s32 	%p159, %r759, 27;
-	setp.gt.s32 	%p160, %r759, 28;
-	setp.gt.s32 	%p161, %r759, 29;
-	setp.gt.s32 	%p162, %r759, 30;
-	setp.gt.s32 	%p163, %r759, 31;
-	setp.gt.s32 	%p164, %r759, 32;
-	setp.gt.s32 	%p165, %r759, 33;
-	setp.gt.s32 	%p166, %r759, 34;
-	setp.gt.s32 	%p167, %r759, 35;
-	setp.gt.s32 	%p168, %r759, 36;
-	setp.gt.s32 	%p169, %r759, 37;
-	setp.gt.s32 	%p170, %r759, 38;
-	setp.gt.s32 	%p171, %r759, 39;
-	setp.gt.s32 	%p172, %r759, 40;
-	setp.gt.s32 	%p173, %r759, 41;
-	setp.gt.s32 	%p174, %r759, 42;
-	setp.gt.s32 	%p175, %r759, 43;
-	setp.gt.s32 	%p176, %r759, 44;
-	setp.gt.s32 	%p177, %r759, 45;
-	setp.gt.s32 	%p178, %r759, 46;
-	setp.gt.s32 	%p179, %r759, 47;
-	setp.gt.s32 	%p180, %r759, 48;
-	setp.gt.s32 	%p181, %r759, 49;
-	setp.gt.s32 	%p182, %r759, 50;
-	setp.gt.s32 	%p183, %r759, 51;
-	setp.gt.s32 	%p184, %r759, 52;
-	setp.gt.s32 	%p185, %r759, 53;
-	setp.gt.s32 	%p186, %r759, 54;
-	setp.gt.s32 	%p187, %r759, 55;
-	setp.gt.s32 	%p188, %r759, 56;
-	setp.gt.s32 	%p189, %r759, 57;
-	setp.gt.s32 	%p190, %r759, 58;
-	setp.gt.s32 	%p191, %r759, 59;
-	setp.gt.s32 	%p192, %r759, 60;
-	setp.gt.s32 	%p193, %r759, 61;
-	setp.gt.s32 	%p194, %r759, 62;
-	setp.gt.s32 	%p195, %r759, 63;
-	.loc	1 144 45                        // fp8_linear.py:144:45
+	.loc	1 148 36                        // fp8_linear.py:148:36
+	setp.gt.s32 	%p132, %r746, 0;
+	setp.gt.s32 	%p133, %r746, 1;
+	setp.gt.s32 	%p134, %r746, 2;
+	setp.gt.s32 	%p135, %r746, 3;
+	setp.gt.s32 	%p136, %r746, 4;
+	setp.gt.s32 	%p137, %r746, 5;
+	setp.gt.s32 	%p138, %r746, 6;
+	setp.gt.s32 	%p139, %r746, 7;
+	setp.gt.s32 	%p140, %r746, 8;
+	setp.gt.s32 	%p141, %r746, 9;
+	setp.gt.s32 	%p142, %r746, 10;
+	setp.gt.s32 	%p143, %r746, 11;
+	setp.gt.s32 	%p144, %r746, 12;
+	setp.gt.s32 	%p145, %r746, 13;
+	setp.gt.s32 	%p146, %r746, 14;
+	setp.gt.s32 	%p147, %r746, 15;
+	setp.gt.s32 	%p148, %r746, 16;
+	setp.gt.s32 	%p149, %r746, 17;
+	setp.gt.s32 	%p150, %r746, 18;
+	setp.gt.s32 	%p151, %r746, 19;
+	setp.gt.s32 	%p152, %r746, 20;
+	setp.gt.s32 	%p153, %r746, 21;
+	setp.gt.s32 	%p154, %r746, 22;
+	setp.gt.s32 	%p155, %r746, 23;
+	setp.gt.s32 	%p156, %r746, 24;
+	setp.gt.s32 	%p157, %r746, 25;
+	setp.gt.s32 	%p158, %r746, 26;
+	setp.gt.s32 	%p159, %r746, 27;
+	setp.gt.s32 	%p160, %r746, 28;
+	setp.gt.s32 	%p161, %r746, 29;
+	setp.gt.s32 	%p162, %r746, 30;
+	setp.gt.s32 	%p163, %r746, 31;
+	setp.gt.s32 	%p164, %r746, 32;
+	setp.gt.s32 	%p165, %r746, 33;
+	setp.gt.s32 	%p166, %r746, 34;
+	setp.gt.s32 	%p167, %r746, 35;
+	setp.gt.s32 	%p168, %r746, 36;
+	setp.gt.s32 	%p169, %r746, 37;
+	setp.gt.s32 	%p170, %r746, 38;
+	setp.gt.s32 	%p171, %r746, 39;
+	setp.gt.s32 	%p172, %r746, 40;
+	setp.gt.s32 	%p173, %r746, 41;
+	setp.gt.s32 	%p174, %r746, 42;
+	setp.gt.s32 	%p175, %r746, 43;
+	setp.gt.s32 	%p176, %r746, 44;
+	setp.gt.s32 	%p177, %r746, 45;
+	setp.gt.s32 	%p178, %r746, 46;
+	setp.gt.s32 	%p179, %r746, 47;
+	setp.gt.s32 	%p180, %r746, 48;
+	setp.gt.s32 	%p181, %r746, 49;
+	setp.gt.s32 	%p182, %r746, 50;
+	setp.gt.s32 	%p183, %r746, 51;
+	setp.gt.s32 	%p184, %r746, 52;
+	setp.gt.s32 	%p185, %r746, 53;
+	setp.gt.s32 	%p186, %r746, 54;
+	setp.gt.s32 	%p187, %r746, 55;
+	setp.gt.s32 	%p188, %r746, 56;
+	setp.gt.s32 	%p189, %r746, 57;
+	setp.gt.s32 	%p190, %r746, 58;
+	setp.gt.s32 	%p191, %r746, 59;
+	setp.gt.s32 	%p192, %r746, 60;
+	setp.gt.s32 	%p193, %r746, 61;
+	setp.gt.s32 	%p194, %r746, 62;
+	setp.gt.s32 	%p195, %r746, 63;
+	.loc	1 148 45                        // fp8_linear.py:148:45
 	and.pred 	%p35, %p325, %p132;
 	and.pred 	%p36, %p325, %p133;
 	and.pred 	%p37, %p325, %p134;
@@ -1242,10 +1242,10 @@ $L__BB0_3:                              // =>This Inner Loop Header: Depth=1
 	and.pred 	%p96, %p325, %p193;
 	and.pred 	%p97, %p325, %p194;
 	and.pred 	%p98, %p325, %p195;
-	.loc	1 143 12                        // fp8_linear.py:143:12
+	.loc	1 147 12                        // fp8_linear.py:147:12
 	// begin inline asm
 	mov.u16 %rs34, %rs2;
-	@%p35 ld.global.b8 { %rs34 }, [ %rd328 + 0 ];
+	@%p35 ld.global.b8 { %rs34 }, [ %rd336 + 0 ];
 	// end inline asm
 	// begin inline asm
 	mov.u16 %rs35, %rs2;
@@ -1499,7 +1499,7 @@ $L__BB0_3:                              // =>This Inner Loop Header: Depth=1
 	mov.u16 %rs97, %rs2;
 	@%p98 ld.global.b8 { %rs97 }, [ %rd166 + 0 ];
 	// end inline asm
-	.loc	1 146 13                        // fp8_linear.py:146:13
+	.loc	1 150 13                        // fp8_linear.py:150:13
 	cvt.s16.s8 	%rs98, %rs34;
 	// begin inline asm
 	st.shared.b8 [ %r299 + 0 ], %rs98;
@@ -2269,7 +2269,7 @@ cvt.bf16.f16 b1, a1;
 mov.b32 %r446, {b0, b1};                   
 }
 	// end inline asm
-	.loc	1 141 20                        // fp8_linear.py:141:20
+	.loc	1 145 20                        // fp8_linear.py:145:20
 	ld.shared.v2.b32 	{%r363, %r387}, [%r56];
 	ld.shared.v2.b32 	{%r364, %r388}, [%r56+1024];
 	ld.shared.v2.b32 	{%r375, %r399}, [%r56+2048];
@@ -2302,202 +2302,210 @@ mov.b32 %r446, {b0, b1};
 	ld.shared.v2.b32 	{%r430, %r454}, [%r59+5120];
 	ld.shared.v2.b32 	{%r433, %r457}, [%r59+6144];
 	ld.shared.v2.b32 	{%r434, %r458}, [%r59+7168];
-	.loc	1 147 25                        // fp8_linear.py:147:25
+	.loc	1 151 25                        // fp8_linear.py:151:25
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r761, %r762, %r763, %r764 }, { %r363, %r364, %r365, %r366 }, { %r367, %r368 }, { %r761, %r762, %r763, %r764 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r748, %r749, %r750, %r751 }, { %r363, %r364, %r365, %r366 }, { %r367, %r368 }, { %r748, %r749, %r750, %r751 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r765, %r766, %r767, %r768 }, { %r363, %r364, %r365, %r366 }, { %r369, %r370 }, { %r765, %r766, %r767, %r768 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r752, %r753, %r754, %r755 }, { %r363, %r364, %r365, %r366 }, { %r369, %r370 }, { %r752, %r753, %r754, %r755 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r769, %r770, %r771, %r772 }, { %r363, %r364, %r365, %r366 }, { %r371, %r372 }, { %r769, %r770, %r771, %r772 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r756, %r757, %r758, %r759 }, { %r363, %r364, %r365, %r366 }, { %r371, %r372 }, { %r756, %r757, %r758, %r759 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r773, %r774, %r775, %r776 }, { %r363, %r364, %r365, %r366 }, { %r373, %r374 }, { %r773, %r774, %r775, %r776 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r760, %r761, %r762, %r763 }, { %r363, %r364, %r365, %r366 }, { %r373, %r374 }, { %r760, %r761, %r762, %r763 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r777, %r778, %r779, %r780 }, { %r375, %r376, %r377, %r378 }, { %r367, %r368 }, { %r777, %r778, %r779, %r780 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r764, %r765, %r766, %r767 }, { %r375, %r376, %r377, %r378 }, { %r367, %r368 }, { %r764, %r765, %r766, %r767 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r781, %r782, %r783, %r784 }, { %r375, %r376, %r377, %r378 }, { %r369, %r370 }, { %r781, %r782, %r783, %r784 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r768, %r769, %r770, %r771 }, { %r375, %r376, %r377, %r378 }, { %r369, %r370 }, { %r768, %r769, %r770, %r771 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r785, %r786, %r787, %r788 }, { %r375, %r376, %r377, %r378 }, { %r371, %r372 }, { %r785, %r786, %r787, %r788 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r772, %r773, %r774, %r775 }, { %r375, %r376, %r377, %r378 }, { %r371, %r372 }, { %r772, %r773, %r774, %r775 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r789, %r790, %r791, %r792 }, { %r375, %r376, %r377, %r378 }, { %r373, %r374 }, { %r789, %r790, %r791, %r792 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r776, %r777, %r778, %r779 }, { %r375, %r376, %r377, %r378 }, { %r373, %r374 }, { %r776, %r777, %r778, %r779 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r793, %r794, %r795, %r796 }, { %r379, %r380, %r381, %r382 }, { %r367, %r368 }, { %r793, %r794, %r795, %r796 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r780, %r781, %r782, %r783 }, { %r379, %r380, %r381, %r382 }, { %r367, %r368 }, { %r780, %r781, %r782, %r783 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r797, %r798, %r799, %r800 }, { %r379, %r380, %r381, %r382 }, { %r369, %r370 }, { %r797, %r798, %r799, %r800 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r784, %r785, %r786, %r787 }, { %r379, %r380, %r381, %r382 }, { %r369, %r370 }, { %r784, %r785, %r786, %r787 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r801, %r802, %r803, %r804 }, { %r379, %r380, %r381, %r382 }, { %r371, %r372 }, { %r801, %r802, %r803, %r804 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r788, %r789, %r790, %r791 }, { %r379, %r380, %r381, %r382 }, { %r371, %r372 }, { %r788, %r789, %r790, %r791 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r805, %r806, %r807, %r808 }, { %r379, %r380, %r381, %r382 }, { %r373, %r374 }, { %r805, %r806, %r807, %r808 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r792, %r793, %r794, %r795 }, { %r379, %r380, %r381, %r382 }, { %r373, %r374 }, { %r792, %r793, %r794, %r795 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r809, %r810, %r811, %r812 }, { %r383, %r384, %r385, %r386 }, { %r367, %r368 }, { %r809, %r810, %r811, %r812 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r796, %r797, %r798, %r799 }, { %r383, %r384, %r385, %r386 }, { %r367, %r368 }, { %r796, %r797, %r798, %r799 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r813, %r814, %r815, %r816 }, { %r383, %r384, %r385, %r386 }, { %r369, %r370 }, { %r813, %r814, %r815, %r816 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r800, %r801, %r802, %r803 }, { %r383, %r384, %r385, %r386 }, { %r369, %r370 }, { %r800, %r801, %r802, %r803 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r817, %r818, %r819, %r820 }, { %r383, %r384, %r385, %r386 }, { %r371, %r372 }, { %r817, %r818, %r819, %r820 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r804, %r805, %r806, %r807 }, { %r383, %r384, %r385, %r386 }, { %r371, %r372 }, { %r804, %r805, %r806, %r807 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r821, %r822, %r823, %r824 }, { %r383, %r384, %r385, %r386 }, { %r373, %r374 }, { %r821, %r822, %r823, %r824 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r808, %r809, %r810, %r811 }, { %r383, %r384, %r385, %r386 }, { %r373, %r374 }, { %r808, %r809, %r810, %r811 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r761, %r762, %r763, %r764 }, { %r387, %r388, %r389, %r390 }, { %r391, %r392 }, { %r761, %r762, %r763, %r764 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r748, %r749, %r750, %r751 }, { %r387, %r388, %r389, %r390 }, { %r391, %r392 }, { %r748, %r749, %r750, %r751 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r765, %r766, %r767, %r768 }, { %r387, %r388, %r389, %r390 }, { %r393, %r394 }, { %r765, %r766, %r767, %r768 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r752, %r753, %r754, %r755 }, { %r387, %r388, %r389, %r390 }, { %r393, %r394 }, { %r752, %r753, %r754, %r755 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r769, %r770, %r771, %r772 }, { %r387, %r388, %r389, %r390 }, { %r395, %r396 }, { %r769, %r770, %r771, %r772 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r756, %r757, %r758, %r759 }, { %r387, %r388, %r389, %r390 }, { %r395, %r396 }, { %r756, %r757, %r758, %r759 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r773, %r774, %r775, %r776 }, { %r387, %r388, %r389, %r390 }, { %r397, %r398 }, { %r773, %r774, %r775, %r776 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r760, %r761, %r762, %r763 }, { %r387, %r388, %r389, %r390 }, { %r397, %r398 }, { %r760, %r761, %r762, %r763 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r777, %r778, %r779, %r780 }, { %r399, %r400, %r401, %r402 }, { %r391, %r392 }, { %r777, %r778, %r779, %r780 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r764, %r765, %r766, %r767 }, { %r399, %r400, %r401, %r402 }, { %r391, %r392 }, { %r764, %r765, %r766, %r767 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r781, %r782, %r783, %r784 }, { %r399, %r400, %r401, %r402 }, { %r393, %r394 }, { %r781, %r782, %r783, %r784 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r768, %r769, %r770, %r771 }, { %r399, %r400, %r401, %r402 }, { %r393, %r394 }, { %r768, %r769, %r770, %r771 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r785, %r786, %r787, %r788 }, { %r399, %r400, %r401, %r402 }, { %r395, %r396 }, { %r785, %r786, %r787, %r788 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r772, %r773, %r774, %r775 }, { %r399, %r400, %r401, %r402 }, { %r395, %r396 }, { %r772, %r773, %r774, %r775 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r789, %r790, %r791, %r792 }, { %r399, %r400, %r401, %r402 }, { %r397, %r398 }, { %r789, %r790, %r791, %r792 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r776, %r777, %r778, %r779 }, { %r399, %r400, %r401, %r402 }, { %r397, %r398 }, { %r776, %r777, %r778, %r779 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r793, %r794, %r795, %r796 }, { %r403, %r404, %r405, %r406 }, { %r391, %r392 }, { %r793, %r794, %r795, %r796 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r780, %r781, %r782, %r783 }, { %r403, %r404, %r405, %r406 }, { %r391, %r392 }, { %r780, %r781, %r782, %r783 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r797, %r798, %r799, %r800 }, { %r403, %r404, %r405, %r406 }, { %r393, %r394 }, { %r797, %r798, %r799, %r800 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r784, %r785, %r786, %r787 }, { %r403, %r404, %r405, %r406 }, { %r393, %r394 }, { %r784, %r785, %r786, %r787 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r801, %r802, %r803, %r804 }, { %r403, %r404, %r405, %r406 }, { %r395, %r396 }, { %r801, %r802, %r803, %r804 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r788, %r789, %r790, %r791 }, { %r403, %r404, %r405, %r406 }, { %r395, %r396 }, { %r788, %r789, %r790, %r791 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r805, %r806, %r807, %r808 }, { %r403, %r404, %r405, %r406 }, { %r397, %r398 }, { %r805, %r806, %r807, %r808 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r792, %r793, %r794, %r795 }, { %r403, %r404, %r405, %r406 }, { %r397, %r398 }, { %r792, %r793, %r794, %r795 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r809, %r810, %r811, %r812 }, { %r407, %r408, %r409, %r410 }, { %r391, %r392 }, { %r809, %r810, %r811, %r812 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r796, %r797, %r798, %r799 }, { %r407, %r408, %r409, %r410 }, { %r391, %r392 }, { %r796, %r797, %r798, %r799 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r813, %r814, %r815, %r816 }, { %r407, %r408, %r409, %r410 }, { %r393, %r394 }, { %r813, %r814, %r815, %r816 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r800, %r801, %r802, %r803 }, { %r407, %r408, %r409, %r410 }, { %r393, %r394 }, { %r800, %r801, %r802, %r803 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r817, %r818, %r819, %r820 }, { %r407, %r408, %r409, %r410 }, { %r395, %r396 }, { %r817, %r818, %r819, %r820 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r804, %r805, %r806, %r807 }, { %r407, %r408, %r409, %r410 }, { %r395, %r396 }, { %r804, %r805, %r806, %r807 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r821, %r822, %r823, %r824 }, { %r407, %r408, %r409, %r410 }, { %r397, %r398 }, { %r821, %r822, %r823, %r824 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r808, %r809, %r810, %r811 }, { %r407, %r408, %r409, %r410 }, { %r397, %r398 }, { %r808, %r809, %r810, %r811 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r761, %r762, %r763, %r764 }, { %r411, %r412, %r413, %r414 }, { %r415, %r416 }, { %r761, %r762, %r763, %r764 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r748, %r749, %r750, %r751 }, { %r411, %r412, %r413, %r414 }, { %r415, %r416 }, { %r748, %r749, %r750, %r751 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r765, %r766, %r767, %r768 }, { %r411, %r412, %r413, %r414 }, { %r417, %r418 }, { %r765, %r766, %r767, %r768 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r752, %r753, %r754, %r755 }, { %r411, %r412, %r413, %r414 }, { %r417, %r418 }, { %r752, %r753, %r754, %r755 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r769, %r770, %r771, %r772 }, { %r411, %r412, %r413, %r414 }, { %r419, %r420 }, { %r769, %r770, %r771, %r772 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r756, %r757, %r758, %r759 }, { %r411, %r412, %r413, %r414 }, { %r419, %r420 }, { %r756, %r757, %r758, %r759 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r773, %r774, %r775, %r776 }, { %r411, %r412, %r413, %r414 }, { %r421, %r422 }, { %r773, %r774, %r775, %r776 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r760, %r761, %r762, %r763 }, { %r411, %r412, %r413, %r414 }, { %r421, %r422 }, { %r760, %r761, %r762, %r763 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r777, %r778, %r779, %r780 }, { %r423, %r424, %r425, %r426 }, { %r415, %r416 }, { %r777, %r778, %r779, %r780 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r764, %r765, %r766, %r767 }, { %r423, %r424, %r425, %r426 }, { %r415, %r416 }, { %r764, %r765, %r766, %r767 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r781, %r782, %r783, %r784 }, { %r423, %r424, %r425, %r426 }, { %r417, %r418 }, { %r781, %r782, %r783, %r784 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r768, %r769, %r770, %r771 }, { %r423, %r424, %r425, %r426 }, { %r417, %r418 }, { %r768, %r769, %r770, %r771 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r785, %r786, %r787, %r788 }, { %r423, %r424, %r425, %r426 }, { %r419, %r420 }, { %r785, %r786, %r787, %r788 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r772, %r773, %r774, %r775 }, { %r423, %r424, %r425, %r426 }, { %r419, %r420 }, { %r772, %r773, %r774, %r775 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r789, %r790, %r791, %r792 }, { %r423, %r424, %r425, %r426 }, { %r421, %r422 }, { %r789, %r790, %r791, %r792 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r776, %r777, %r778, %r779 }, { %r423, %r424, %r425, %r426 }, { %r421, %r422 }, { %r776, %r777, %r778, %r779 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r793, %r794, %r795, %r796 }, { %r427, %r428, %r429, %r430 }, { %r415, %r416 }, { %r793, %r794, %r795, %r796 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r780, %r781, %r782, %r783 }, { %r427, %r428, %r429, %r430 }, { %r415, %r416 }, { %r780, %r781, %r782, %r783 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r797, %r798, %r799, %r800 }, { %r427, %r428, %r429, %r430 }, { %r417, %r418 }, { %r797, %r798, %r799, %r800 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r784, %r785, %r786, %r787 }, { %r427, %r428, %r429, %r430 }, { %r417, %r418 }, { %r784, %r785, %r786, %r787 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r801, %r802, %r803, %r804 }, { %r427, %r428, %r429, %r430 }, { %r419, %r420 }, { %r801, %r802, %r803, %r804 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r788, %r789, %r790, %r791 }, { %r427, %r428, %r429, %r430 }, { %r419, %r420 }, { %r788, %r789, %r790, %r791 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r805, %r806, %r807, %r808 }, { %r427, %r428, %r429, %r430 }, { %r421, %r422 }, { %r805, %r806, %r807, %r808 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r792, %r793, %r794, %r795 }, { %r427, %r428, %r429, %r430 }, { %r421, %r422 }, { %r792, %r793, %r794, %r795 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r809, %r810, %r811, %r812 }, { %r431, %r432, %r433, %r434 }, { %r415, %r416 }, { %r809, %r810, %r811, %r812 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r796, %r797, %r798, %r799 }, { %r431, %r432, %r433, %r434 }, { %r415, %r416 }, { %r796, %r797, %r798, %r799 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r813, %r814, %r815, %r816 }, { %r431, %r432, %r433, %r434 }, { %r417, %r418 }, { %r813, %r814, %r815, %r816 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r800, %r801, %r802, %r803 }, { %r431, %r432, %r433, %r434 }, { %r417, %r418 }, { %r800, %r801, %r802, %r803 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r817, %r818, %r819, %r820 }, { %r431, %r432, %r433, %r434 }, { %r419, %r420 }, { %r817, %r818, %r819, %r820 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r804, %r805, %r806, %r807 }, { %r431, %r432, %r433, %r434 }, { %r419, %r420 }, { %r804, %r805, %r806, %r807 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r821, %r822, %r823, %r824 }, { %r431, %r432, %r433, %r434 }, { %r421, %r422 }, { %r821, %r822, %r823, %r824 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r808, %r809, %r810, %r811 }, { %r431, %r432, %r433, %r434 }, { %r421, %r422 }, { %r808, %r809, %r810, %r811 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r761, %r762, %r763, %r764 }, { %r435, %r436, %r437, %r438 }, { %r439, %r440 }, { %r761, %r762, %r763, %r764 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r748, %r749, %r750, %r751 }, { %r435, %r436, %r437, %r438 }, { %r439, %r440 }, { %r748, %r749, %r750, %r751 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r765, %r766, %r767, %r768 }, { %r435, %r436, %r437, %r438 }, { %r441, %r442 }, { %r765, %r766, %r767, %r768 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r752, %r753, %r754, %r755 }, { %r435, %r436, %r437, %r438 }, { %r441, %r442 }, { %r752, %r753, %r754, %r755 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r769, %r770, %r771, %r772 }, { %r435, %r436, %r437, %r438 }, { %r443, %r444 }, { %r769, %r770, %r771, %r772 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r756, %r757, %r758, %r759 }, { %r435, %r436, %r437, %r438 }, { %r443, %r444 }, { %r756, %r757, %r758, %r759 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r773, %r774, %r775, %r776 }, { %r435, %r436, %r437, %r438 }, { %r445, %r446 }, { %r773, %r774, %r775, %r776 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r760, %r761, %r762, %r763 }, { %r435, %r436, %r437, %r438 }, { %r445, %r446 }, { %r760, %r761, %r762, %r763 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r777, %r778, %r779, %r780 }, { %r447, %r448, %r449, %r450 }, { %r439, %r440 }, { %r777, %r778, %r779, %r780 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r764, %r765, %r766, %r767 }, { %r447, %r448, %r449, %r450 }, { %r439, %r440 }, { %r764, %r765, %r766, %r767 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r781, %r782, %r783, %r784 }, { %r447, %r448, %r449, %r450 }, { %r441, %r442 }, { %r781, %r782, %r783, %r784 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r768, %r769, %r770, %r771 }, { %r447, %r448, %r449, %r450 }, { %r441, %r442 }, { %r768, %r769, %r770, %r771 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r785, %r786, %r787, %r788 }, { %r447, %r448, %r449, %r450 }, { %r443, %r444 }, { %r785, %r786, %r787, %r788 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r772, %r773, %r774, %r775 }, { %r447, %r448, %r449, %r450 }, { %r443, %r444 }, { %r772, %r773, %r774, %r775 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r789, %r790, %r791, %r792 }, { %r447, %r448, %r449, %r450 }, { %r445, %r446 }, { %r789, %r790, %r791, %r792 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r776, %r777, %r778, %r779 }, { %r447, %r448, %r449, %r450 }, { %r445, %r446 }, { %r776, %r777, %r778, %r779 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r793, %r794, %r795, %r796 }, { %r451, %r452, %r453, %r454 }, { %r439, %r440 }, { %r793, %r794, %r795, %r796 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r780, %r781, %r782, %r783 }, { %r451, %r452, %r453, %r454 }, { %r439, %r440 }, { %r780, %r781, %r782, %r783 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r797, %r798, %r799, %r800 }, { %r451, %r452, %r453, %r454 }, { %r441, %r442 }, { %r797, %r798, %r799, %r800 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r784, %r785, %r786, %r787 }, { %r451, %r452, %r453, %r454 }, { %r441, %r442 }, { %r784, %r785, %r786, %r787 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r801, %r802, %r803, %r804 }, { %r451, %r452, %r453, %r454 }, { %r443, %r444 }, { %r801, %r802, %r803, %r804 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r788, %r789, %r790, %r791 }, { %r451, %r452, %r453, %r454 }, { %r443, %r444 }, { %r788, %r789, %r790, %r791 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r805, %r806, %r807, %r808 }, { %r451, %r452, %r453, %r454 }, { %r445, %r446 }, { %r805, %r806, %r807, %r808 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r792, %r793, %r794, %r795 }, { %r451, %r452, %r453, %r454 }, { %r445, %r446 }, { %r792, %r793, %r794, %r795 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r809, %r810, %r811, %r812 }, { %r455, %r456, %r457, %r458 }, { %r439, %r440 }, { %r809, %r810, %r811, %r812 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r796, %r797, %r798, %r799 }, { %r455, %r456, %r457, %r458 }, { %r439, %r440 }, { %r796, %r797, %r798, %r799 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r813, %r814, %r815, %r816 }, { %r455, %r456, %r457, %r458 }, { %r441, %r442 }, { %r813, %r814, %r815, %r816 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r800, %r801, %r802, %r803 }, { %r455, %r456, %r457, %r458 }, { %r441, %r442 }, { %r800, %r801, %r802, %r803 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r817, %r818, %r819, %r820 }, { %r455, %r456, %r457, %r458 }, { %r443, %r444 }, { %r817, %r818, %r819, %r820 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r804, %r805, %r806, %r807 }, { %r455, %r456, %r457, %r458 }, { %r443, %r444 }, { %r804, %r805, %r806, %r807 };
 	// end inline asm
 	// begin inline asm
-	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r821, %r822, %r823, %r824 }, { %r455, %r456, %r457, %r458 }, { %r445, %r446 }, { %r821, %r822, %r823, %r824 };
+	mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 { %r808, %r809, %r810, %r811 }, { %r455, %r456, %r457, %r458 }, { %r445, %r446 }, { %r808, %r809, %r810, %r811 };
 	// end inline asm
-	.loc	1 149 18                        // fp8_linear.py:149:18
-	add.s64 	%rd328, %rd328, %rd65;
-	.loc	1 139 19                        // fp8_linear.py:139:19
+	.loc	1 153 18                        // fp8_linear.py:153:18
+	add.s64 	%rd336, %rd336, %rd65;
+	.loc	1 143 19                        // fp8_linear.py:143:19
+	add.s64 	%rd335, %rd335, %rd67;
+	add.s64 	%rd334, %rd334, %rd67;
+	add.s64 	%rd333, %rd333, %rd67;
+	add.s64 	%rd332, %rd332, %rd67;
+	add.s64 	%rd331, %rd331, %rd67;
+	add.s64 	%rd330, %rd330, %rd67;
+	add.s64 	%rd329, %rd329, %rd67;
+	add.s64 	%rd328, %rd328, %rd67;
 	add.s64 	%rd327, %rd327, %rd67;
 	add.s64 	%rd326, %rd326, %rd67;
 	add.s64 	%rd325, %rd325, %rd67;
@@ -2522,567 +2530,493 @@ mov.b32 %r446, {b0, b1};
 	add.s64 	%rd306, %rd306, %rd67;
 	add.s64 	%rd305, %rd305, %rd67;
 	add.s64 	%rd304, %rd304, %rd67;
-	add.s64 	%rd303, %rd303, %rd67;
-	add.s64 	%rd302, %rd302, %rd67;
-	add.s64 	%rd301, %rd301, %rd67;
-	add.s64 	%rd300, %rd300, %rd67;
-	add.s64 	%rd299, %rd299, %rd67;
-	add.s64 	%rd298, %rd298, %rd67;
-	add.s64 	%rd297, %rd297, %rd67;
-	add.s64 	%rd296, %rd296, %rd67;
-	add.s32 	%r760, %r760, -1;
-	add.s32 	%r759, %r759, -64;
-	setp.ne.b32 	%p196, %r760, 0;
+	add.s32 	%r747, %r747, -1;
+	add.s32 	%r746, %r746, -64;
+	setp.ne.b32 	%p196, %r747, 0;
 	@%p196 bra 	$L__BB0_3;
-	bra.uni 	$L__BB0_4;
+// %bb.4:                               // %._crit_edge.loopexit
+	.loc	1 0 19                          // fp8_linear.py:0:19
+	mov.b64 	%rd340, {%r748, %r749};
+	mov.b64 	%rd339, {%r752, %r753};
+	mov.b64 	%rd338, {%r756, %r757};
+	mov.b64 	%rd337, {%r760, %r761};
+	bra.uni 	$L__BB0_5;
 $L__BB0_1:                              // %.._crit_edge_crit_edge
-	.loc	1 151 16                        // fp8_linear.py:151:16
-	and.b32 	%r825, %r2, 3;
-	mov.b32 	%r761, 0f00000000;
-	mov.b32 	%r762, %r761;
-	mov.b32 	%r763, %r761;
-	mov.b32 	%r764, %r761;
-	mov.b32 	%r765, %r761;
-	mov.b32 	%r766, %r761;
-	mov.b32 	%r767, %r761;
-	mov.b32 	%r768, %r761;
-	mov.b32 	%r769, %r761;
-	mov.b32 	%r770, %r761;
-	mov.b32 	%r771, %r761;
-	mov.b32 	%r772, %r761;
-	mov.b32 	%r773, %r761;
-	mov.b32 	%r774, %r761;
-	mov.b32 	%r775, %r761;
-	mov.b32 	%r776, %r761;
-	mov.b32 	%r777, %r761;
-	mov.b32 	%r778, %r761;
-	mov.b32 	%r779, %r761;
-	mov.b32 	%r780, %r761;
-	mov.b32 	%r781, %r761;
-	mov.b32 	%r782, %r761;
-	mov.b32 	%r783, %r761;
-	mov.b32 	%r784, %r761;
-	mov.b32 	%r785, %r761;
-	mov.b32 	%r786, %r761;
-	mov.b32 	%r787, %r761;
-	mov.b32 	%r788, %r761;
-	mov.b32 	%r789, %r761;
-	mov.b32 	%r790, %r761;
-	mov.b32 	%r791, %r761;
-	mov.b32 	%r792, %r761;
-	mov.b32 	%r793, %r761;
-	mov.b32 	%r794, %r761;
-	mov.b32 	%r795, %r761;
-	mov.b32 	%r796, %r761;
-	mov.b32 	%r797, %r761;
-	mov.b32 	%r798, %r761;
-	mov.b32 	%r799, %r761;
-	mov.b32 	%r800, %r761;
-	mov.b32 	%r801, %r761;
-	mov.b32 	%r802, %r761;
-	mov.b32 	%r803, %r761;
-	mov.b32 	%r804, %r761;
-	mov.b32 	%r805, %r761;
-	mov.b32 	%r806, %r761;
-	mov.b32 	%r807, %r761;
-	mov.b32 	%r808, %r761;
-	mov.b32 	%r809, %r761;
-	mov.b32 	%r810, %r761;
-	mov.b32 	%r811, %r761;
-	mov.b32 	%r812, %r761;
-	mov.b32 	%r813, %r761;
-	mov.b32 	%r814, %r761;
-	mov.b32 	%r815, %r761;
-	mov.b32 	%r816, %r761;
-	mov.b32 	%r817, %r761;
-	mov.b32 	%r818, %r761;
-	mov.b32 	%r819, %r761;
-	mov.b32 	%r820, %r761;
-	mov.b32 	%r821, %r761;
-	mov.b32 	%r822, %r761;
-	mov.b32 	%r823, %r761;
-	mov.b32 	%r824, %r761;
-$L__BB0_4:                              // %._crit_edge
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r598, %r1, 63;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p261, %r598, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r599, %r1, 62;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p262, %r599, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r600, %r1, 61;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p263, %r600, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r601, %r1, 60;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p264, %r601, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r602, %r1, 59;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p265, %r602, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r603, %r1, 58;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p266, %r603, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r604, %r1, 57;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p267, %r604, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r605, %r1, 56;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p268, %r605, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r606, %r1, 55;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p269, %r606, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r607, %r1, 54;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p270, %r607, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r608, %r1, 53;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p271, %r608, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r609, %r1, 52;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p272, %r609, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r610, %r1, 51;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p273, %r610, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r611, %r1, 50;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p274, %r611, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r612, %r1, 49;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p275, %r612, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r613, %r1, 48;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p276, %r613, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r614, %r1, 47;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p277, %r614, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r615, %r1, 46;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p278, %r615, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r616, %r1, 45;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p279, %r616, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r617, %r1, 44;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p280, %r617, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r618, %r1, 43;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p281, %r618, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r619, %r1, 42;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p282, %r619, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r620, %r1, 41;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p283, %r620, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r621, %r1, 40;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p284, %r621, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r622, %r1, 39;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p285, %r622, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r623, %r1, 38;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p286, %r623, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r624, %r1, 37;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p287, %r624, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r625, %r1, 36;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p288, %r625, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r626, %r1, 35;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p289, %r626, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r627, %r1, 34;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p290, %r627, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r628, %r1, 33;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p291, %r628, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r629, %r1, 32;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p292, %r629, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r630, %r1, 31;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p293, %r630, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r631, %r1, 30;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p294, %r631, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r632, %r1, 29;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p295, %r632, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r633, %r1, 28;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p296, %r633, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r634, %r1, 27;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p297, %r634, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r635, %r1, 26;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p298, %r635, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r636, %r1, 25;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p299, %r636, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r637, %r1, 24;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p300, %r637, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r638, %r1, 23;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p301, %r638, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r639, %r1, 22;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p302, %r639, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r640, %r1, 21;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p303, %r640, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r641, %r1, 20;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p304, %r641, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r642, %r1, 19;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p305, %r642, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r643, %r1, 18;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p306, %r643, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r644, %r1, 17;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p307, %r644, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r645, %r1, 16;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p308, %r645, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r646, %r1, 15;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p309, %r646, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r647, %r1, 14;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p310, %r647, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r648, %r1, 13;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p311, %r648, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r649, %r1, 12;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p312, %r649, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r650, %r1, 11;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p313, %r650, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r651, %r1, 10;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p314, %r651, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r652, %r1, 9;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p315, %r652, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r653, %r1, 8;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p316, %r653, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r654, %r1, 7;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p317, %r654, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r655, %r1, 6;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p318, %r655, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r656, %r1, 5;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p319, %r656, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r657, %r1, 4;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p320, %r657, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r658, %r1, 3;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p321, %r658, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r659, %r1, 2;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p322, %r659, %r60;
-	.loc	1 130 31                        // fp8_linear.py:130:31
-	or.b32 	%r660, %r1, 1;
-	.loc	1 133 22                        // fp8_linear.py:133:22
-	setp.lt.s32 	%p323, %r660, %r60;
+	mov.b32 	%r750, 0f00000000;
+	mov.b64 	%rd337, {%r750, %r750};
+	.loc	1 155 16                        // fp8_linear.py:155:16
+	shl.b32 	%r812, %r2, 3;
+	mov.b32 	%r751, %r750;
+	mov.b32 	%r754, %r750;
+	mov.b32 	%r755, %r750;
+	mov.b32 	%r758, %r750;
+	mov.b32 	%r759, %r750;
+	mov.b32 	%r762, %r750;
+	mov.b32 	%r763, %r750;
+	mov.b32 	%r764, %r750;
+	mov.b32 	%r765, %r750;
+	mov.b32 	%r766, %r750;
+	mov.b32 	%r767, %r750;
+	mov.b32 	%r768, %r750;
+	mov.b32 	%r769, %r750;
+	mov.b32 	%r770, %r750;
+	mov.b32 	%r771, %r750;
+	mov.b32 	%r772, %r750;
+	mov.b32 	%r773, %r750;
+	mov.b32 	%r774, %r750;
+	mov.b32 	%r775, %r750;
+	mov.b32 	%r776, %r750;
+	mov.b32 	%r777, %r750;
+	mov.b32 	%r778, %r750;
+	mov.b32 	%r779, %r750;
+	mov.b32 	%r780, %r750;
+	mov.b32 	%r781, %r750;
+	mov.b32 	%r782, %r750;
+	mov.b32 	%r783, %r750;
+	mov.b32 	%r784, %r750;
+	mov.b32 	%r785, %r750;
+	mov.b32 	%r786, %r750;
+	mov.b32 	%r787, %r750;
+	mov.b32 	%r788, %r750;
+	mov.b32 	%r789, %r750;
+	mov.b32 	%r790, %r750;
+	mov.b32 	%r791, %r750;
+	mov.b32 	%r792, %r750;
+	mov.b32 	%r793, %r750;
+	mov.b32 	%r794, %r750;
+	mov.b32 	%r795, %r750;
+	mov.b32 	%r796, %r750;
+	mov.b32 	%r797, %r750;
+	mov.b32 	%r798, %r750;
+	mov.b32 	%r799, %r750;
+	mov.b32 	%r800, %r750;
+	mov.b32 	%r801, %r750;
+	mov.b32 	%r802, %r750;
+	mov.b32 	%r803, %r750;
+	mov.b32 	%r804, %r750;
+	mov.b32 	%r805, %r750;
+	mov.b32 	%r806, %r750;
+	mov.b32 	%r807, %r750;
+	mov.b32 	%r808, %r750;
+	mov.b32 	%r809, %r750;
+	mov.b32 	%r810, %r750;
+	mov.b32 	%r811, %r750;
+	mov.b64 	%rd338, %rd337;
+	mov.b64 	%rd339, %rd337;
+	mov.b64 	%rd340, %rd337;
+$L__BB0_5:                              // %._crit_edge
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r462, %r1, 63;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p261, %r462, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r463, %r1, 62;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p262, %r463, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r464, %r1, 61;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p263, %r464, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r465, %r1, 60;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p264, %r465, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r466, %r1, 59;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p265, %r466, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r467, %r1, 58;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p266, %r467, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r468, %r1, 57;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p267, %r468, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r469, %r1, 56;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p268, %r469, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r470, %r1, 55;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p269, %r470, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r471, %r1, 54;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p270, %r471, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r472, %r1, 53;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p271, %r472, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r473, %r1, 52;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p272, %r473, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r474, %r1, 51;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p273, %r474, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r475, %r1, 50;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p274, %r475, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r476, %r1, 49;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p275, %r476, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r477, %r1, 48;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p276, %r477, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r478, %r1, 47;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p277, %r478, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r479, %r1, 46;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p278, %r479, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r480, %r1, 45;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p279, %r480, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r481, %r1, 44;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p280, %r481, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r482, %r1, 43;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p281, %r482, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r483, %r1, 42;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p282, %r483, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r484, %r1, 41;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p283, %r484, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r485, %r1, 40;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p284, %r485, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r486, %r1, 39;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p285, %r486, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r487, %r1, 38;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p286, %r487, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r488, %r1, 37;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p287, %r488, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r489, %r1, 36;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p288, %r489, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r490, %r1, 35;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p289, %r490, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r491, %r1, 34;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p290, %r491, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r492, %r1, 33;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p291, %r492, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r493, %r1, 32;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p292, %r493, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r494, %r1, 31;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p293, %r494, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r495, %r1, 30;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p294, %r495, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r496, %r1, 29;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p295, %r496, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r497, %r1, 28;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p296, %r497, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r498, %r1, 27;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p297, %r498, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r499, %r1, 26;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p298, %r499, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r500, %r1, 25;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p299, %r500, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r501, %r1, 24;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p300, %r501, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r502, %r1, 23;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p301, %r502, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r503, %r1, 22;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p302, %r503, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r504, %r1, 21;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p303, %r504, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r505, %r1, 20;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p304, %r505, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r506, %r1, 19;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p305, %r506, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r507, %r1, 18;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p306, %r507, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r508, %r1, 17;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p307, %r508, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r509, %r1, 16;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p308, %r509, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r510, %r1, 15;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p309, %r510, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r511, %r1, 14;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p310, %r511, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r512, %r1, 13;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p311, %r512, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r513, %r1, 12;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p312, %r513, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r514, %r1, 11;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p313, %r514, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r515, %r1, 10;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p314, %r515, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r516, %r1, 9;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p315, %r516, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r517, %r1, 8;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p316, %r517, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r518, %r1, 7;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p317, %r518, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r519, %r1, 6;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p318, %r519, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r520, %r1, 5;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p319, %r520, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r521, %r1, 4;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p320, %r521, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r522, %r1, 3;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p321, %r522, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r523, %r1, 2;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p322, %r523, %r60;
+	.loc	1 134 31                        // fp8_linear.py:134:31
+	or.b32 	%r524, %r1, 1;
+	.loc	1 137 22                        // fp8_linear.py:137:22
+	setp.lt.s32 	%p323, %r524, %r60;
 	setp.lt.s32 	%p324, %r1, %r60;
-	.loc	1 150 32                        // fp8_linear.py:150:32
+	.loc	1 154 32                        // fp8_linear.py:154:32
 	mad.wide.u32 	%rd167, %r38, 4, %rd70;
 	mov.b32 	%r459, 0;
-	.loc	1 150 20                        // fp8_linear.py:150:20
+	.loc	1 154 20                        // fp8_linear.py:154:20
 	// begin inline asm
 	mov.u32 %r461, %r459;
 	@%p325 ld.global.b32 { %r461 }, [ %rd167 + 0 ];
 	// end inline asm
-	.loc	1 151 16                        // fp8_linear.py:151:16
+	.loc	1 155 16                        // fp8_linear.py:155:16
 	bar.sync 	0;
-	shl.b32 	%r661, %r37, 2;
-	add.s32 	%r460, %r758, %r661;
+	shl.b32 	%r525, %r37, 2;
+	add.s32 	%r460, %r745, %r525;
 	// begin inline asm
 	st.shared.b32 [ %r460 + 0 ], %r461;
 	// end inline asm
 	bar.sync 	0;
-	shl.b32 	%r662, %r825, 3;
-	and.b32 	%r663, %r2, 96;
-	add.s32 	%r664, %r758, %r662;
-	add.s32 	%r665, %r664, %r663;
-	ld.shared.v2.b32 	{%r666, %r667}, [%r665];
-	ld.shared.v2.b32 	{%r668, %r669}, [%r665+128];
-	ld.shared.v2.b32 	{%r670, %r671}, [%r665+256];
-	ld.shared.v2.b32 	{%r672, %r673}, [%r665+384];
-	mul.f32 	%r463, %r761, %r666;
-	mul.f32 	%r483, %r762, %r667;
-	mul.f32 	%r464, %r763, %r666;
-	mul.f32 	%r484, %r764, %r667;
-	mul.f32 	%r468, %r765, %r668;
-	mul.f32 	%r488, %r766, %r669;
-	mul.f32 	%r469, %r767, %r668;
-	mul.f32 	%r489, %r768, %r669;
-	mul.f32 	%r473, %r769, %r670;
-	mul.f32 	%r493, %r770, %r671;
-	mul.f32 	%r474, %r771, %r670;
-	mul.f32 	%r494, %r772, %r671;
-	mul.f32 	%r478, %r773, %r672;
-	mul.f32 	%r498, %r774, %r673;
-	mul.f32 	%r479, %r775, %r672;
-	mul.f32 	%r499, %r776, %r673;
-	mul.f32 	%r465, %r777, %r666;
-	mul.f32 	%r485, %r778, %r667;
-	mul.f32 	%r466, %r779, %r666;
-	mul.f32 	%r486, %r780, %r667;
-	mul.f32 	%r470, %r781, %r668;
-	mul.f32 	%r490, %r782, %r669;
-	mul.f32 	%r471, %r783, %r668;
-	mul.f32 	%r491, %r784, %r669;
-	mul.f32 	%r475, %r785, %r670;
-	mul.f32 	%r495, %r786, %r671;
-	mul.f32 	%r476, %r787, %r670;
-	mul.f32 	%r496, %r788, %r671;
-	mul.f32 	%r480, %r789, %r672;
-	mul.f32 	%r500, %r790, %r673;
-	mul.f32 	%r481, %r791, %r672;
-	mul.f32 	%r501, %r792, %r673;
-	mul.f32 	%r502, %r793, %r666;
-	mul.f32 	%r518, %r794, %r667;
-	mul.f32 	%r503, %r795, %r666;
-	mul.f32 	%r519, %r796, %r667;
-	mul.f32 	%r506, %r797, %r668;
-	mul.f32 	%r522, %r798, %r669;
-	mul.f32 	%r507, %r799, %r668;
-	mul.f32 	%r523, %r800, %r669;
-	mul.f32 	%r510, %r801, %r670;
-	mul.f32 	%r526, %r802, %r671;
-	mul.f32 	%r511, %r803, %r670;
-	mul.f32 	%r527, %r804, %r671;
-	mul.f32 	%r514, %r805, %r672;
-	mul.f32 	%r530, %r806, %r673;
-	mul.f32 	%r515, %r807, %r672;
-	mul.f32 	%r531, %r808, %r673;
-	mul.f32 	%r504, %r809, %r666;
-	mul.f32 	%r520, %r810, %r667;
-	mul.f32 	%r505, %r811, %r666;
-	mul.f32 	%r521, %r812, %r667;
-	mul.f32 	%r508, %r813, %r668;
-	mul.f32 	%r524, %r814, %r669;
-	mul.f32 	%r509, %r815, %r668;
-	mul.f32 	%r525, %r816, %r669;
-	mul.f32 	%r512, %r817, %r670;
-	mul.f32 	%r528, %r818, %r671;
-	mul.f32 	%r513, %r819, %r670;
-	mul.f32 	%r529, %r820, %r671;
-	mul.f32 	%r516, %r821, %r672;
-	mul.f32 	%r532, %r822, %r673;
-	mul.f32 	%r517, %r823, %r672;
-	mul.f32 	%r533, %r824, %r673;
-	.loc	1 152 39                        // fp8_linear.py:152:39
-	mul.lo.s32 	%r674, %r65, %r1;
-	shl.b32 	%r675, %r65, 1;
-	add.s32 	%r676, %r674, %r675;
-	mad.lo.s32 	%r677, %r65, 3, %r674;
-	shl.b32 	%r678, %r65, 2;
-	add.s32 	%r679, %r674, %r678;
-	mad.lo.s32 	%r680, %r65, 5, %r674;
-	mad.lo.s32 	%r681, %r65, 6, %r674;
-	mad.lo.s32 	%r682, %r65, 7, %r674;
-	shl.b32 	%r683, %r65, 3;
-	add.s32 	%r684, %r674, %r683;
-	mad.lo.s32 	%r685, %r65, 9, %r674;
-	mad.lo.s32 	%r686, %r65, 10, %r674;
-	mad.lo.s32 	%r687, %r65, 11, %r674;
-	mad.lo.s32 	%r688, %r65, 12, %r674;
-	mad.lo.s32 	%r689, %r65, 13, %r674;
-	mad.lo.s32 	%r690, %r65, 14, %r674;
-	mad.lo.s32 	%r691, %r65, 15, %r674;
-	shl.b32 	%r692, %r65, 4;
-	add.s32 	%r693, %r674, %r692;
-	mad.lo.s32 	%r694, %r65, 17, %r674;
-	mad.lo.s32 	%r695, %r65, 18, %r674;
-	mad.lo.s32 	%r696, %r65, 19, %r674;
-	mad.lo.s32 	%r697, %r65, 20, %r674;
-	mad.lo.s32 	%r698, %r65, 21, %r674;
-	mad.lo.s32 	%r699, %r65, 22, %r674;
-	mad.lo.s32 	%r700, %r65, 23, %r674;
-	mad.lo.s32 	%r701, %r65, 24, %r674;
-	mad.lo.s32 	%r702, %r65, 25, %r674;
-	mad.lo.s32 	%r703, %r65, 26, %r674;
-	mad.lo.s32 	%r704, %r65, 27, %r674;
-	mad.lo.s32 	%r705, %r65, 28, %r674;
-	mad.lo.s32 	%r706, %r65, 29, %r674;
-	mad.lo.s32 	%r707, %r65, 30, %r674;
-	mad.lo.s32 	%r708, %r65, 31, %r674;
-	shl.b32 	%r709, %r65, 5;
-	add.s32 	%r710, %r674, %r709;
-	mad.lo.s32 	%r711, %r65, 33, %r674;
-	mad.lo.s32 	%r712, %r65, 34, %r674;
-	mad.lo.s32 	%r713, %r65, 35, %r674;
-	mad.lo.s32 	%r714, %r65, 36, %r674;
-	mad.lo.s32 	%r715, %r65, 37, %r674;
-	mad.lo.s32 	%r716, %r65, 38, %r674;
-	mad.lo.s32 	%r717, %r65, 39, %r674;
-	mad.lo.s32 	%r718, %r65, 40, %r674;
-	mad.lo.s32 	%r719, %r65, 41, %r674;
-	mad.lo.s32 	%r720, %r65, 42, %r674;
-	mad.lo.s32 	%r721, %r65, 43, %r674;
-	mad.lo.s32 	%r722, %r65, 44, %r674;
-	mad.lo.s32 	%r723, %r65, 45, %r674;
-	mad.lo.s32 	%r724, %r65, 46, %r674;
-	mad.lo.s32 	%r725, %r65, 47, %r674;
-	mad.lo.s32 	%r726, %r65, 48, %r674;
-	mad.lo.s32 	%r727, %r65, 49, %r674;
-	mad.lo.s32 	%r728, %r65, 50, %r674;
-	mad.lo.s32 	%r729, %r65, 51, %r674;
-	mad.lo.s32 	%r730, %r65, 52, %r674;
-	mad.lo.s32 	%r731, %r65, 53, %r674;
-	mad.lo.s32 	%r732, %r65, 54, %r674;
-	mad.lo.s32 	%r733, %r65, 55, %r674;
-	mad.lo.s32 	%r734, %r65, 56, %r674;
-	mad.lo.s32 	%r735, %r65, 57, %r674;
-	mad.lo.s32 	%r736, %r65, 58, %r674;
-	mad.lo.s32 	%r737, %r65, 59, %r674;
-	mad.lo.s32 	%r738, %r65, 60, %r674;
-	mad.lo.s32 	%r739, %r65, 61, %r674;
-	mad.lo.s32 	%r740, %r65, 62, %r674;
-	mad.lo.s32 	%r741, %r65, 63, %r674;
-	.loc	1 152 21                        // fp8_linear.py:152:21
-	mad.wide.s32 	%rd232, %r674, 4, %rd71;
-	mad.wide.s32 	%rd233, %r676, 4, %rd71;
-	mad.wide.s32 	%rd234, %r677, 4, %rd71;
-	mad.wide.s32 	%rd235, %r679, 4, %rd71;
-	mad.wide.s32 	%rd236, %r680, 4, %rd71;
-	mad.wide.s32 	%rd237, %r681, 4, %rd71;
-	mad.wide.s32 	%rd238, %r682, 4, %rd71;
-	mad.wide.s32 	%rd239, %r684, 4, %rd71;
-	mad.wide.s32 	%rd240, %r685, 4, %rd71;
-	mad.wide.s32 	%rd241, %r686, 4, %rd71;
-	mad.wide.s32 	%rd242, %r687, 4, %rd71;
-	mad.wide.s32 	%rd243, %r688, 4, %rd71;
-	mad.wide.s32 	%rd244, %r689, 4, %rd71;
-	mad.wide.s32 	%rd245, %r690, 4, %rd71;
-	mad.wide.s32 	%rd246, %r691, 4, %rd71;
-	mad.wide.s32 	%rd247, %r693, 4, %rd71;
-	mad.wide.s32 	%rd248, %r694, 4, %rd71;
-	mad.wide.s32 	%rd249, %r695, 4, %rd71;
-	mad.wide.s32 	%rd250, %r696, 4, %rd71;
-	mad.wide.s32 	%rd251, %r697, 4, %rd71;
-	mad.wide.s32 	%rd252, %r698, 4, %rd71;
-	mad.wide.s32 	%rd253, %r699, 4, %rd71;
-	mad.wide.s32 	%rd254, %r700, 4, %rd71;
-	mad.wide.s32 	%rd255, %r701, 4, %rd71;
-	mad.wide.s32 	%rd256, %r702, 4, %rd71;
-	mad.wide.s32 	%rd257, %r703, 4, %rd71;
-	mad.wide.s32 	%rd258, %r704, 4, %rd71;
-	mad.wide.s32 	%rd259, %r705, 4, %rd71;
-	mad.wide.s32 	%rd260, %r706, 4, %rd71;
-	mad.wide.s32 	%rd261, %r707, 4, %rd71;
-	mad.wide.s32 	%rd262, %r708, 4, %rd71;
-	mad.wide.s32 	%rd263, %r710, 4, %rd71;
-	mad.wide.s32 	%rd264, %r711, 4, %rd71;
-	mad.wide.s32 	%rd265, %r712, 4, %rd71;
-	mad.wide.s32 	%rd266, %r713, 4, %rd71;
-	mad.wide.s32 	%rd267, %r714, 4, %rd71;
-	mad.wide.s32 	%rd268, %r715, 4, %rd71;
-	mad.wide.s32 	%rd269, %r716, 4, %rd71;
-	mad.wide.s32 	%rd270, %r717, 4, %rd71;
-	mad.wide.s32 	%rd271, %r718, 4, %rd71;
-	mad.wide.s32 	%rd272, %r719, 4, %rd71;
-	mad.wide.s32 	%rd273, %r720, 4, %rd71;
-	mad.wide.s32 	%rd274, %r721, 4, %rd71;
-	mad.wide.s32 	%rd275, %r722, 4, %rd71;
-	mad.wide.s32 	%rd276, %r723, 4, %rd71;
-	mad.wide.s32 	%rd277, %r724, 4, %rd71;
-	mad.wide.s32 	%rd278, %r725, 4, %rd71;
-	mad.wide.s32 	%rd279, %r726, 4, %rd71;
-	mad.wide.s32 	%rd280, %r727, 4, %rd71;
-	mad.wide.s32 	%rd281, %r728, 4, %rd71;
-	mad.wide.s32 	%rd282, %r729, 4, %rd71;
-	mad.wide.s32 	%rd283, %r730, 4, %rd71;
-	mad.wide.s32 	%rd284, %r731, 4, %rd71;
-	mad.wide.s32 	%rd285, %r732, 4, %rd71;
-	mad.wide.s32 	%rd286, %r733, 4, %rd71;
-	mad.wide.s32 	%rd287, %r734, 4, %rd71;
-	mad.wide.s32 	%rd288, %r735, 4, %rd71;
-	mad.wide.s32 	%rd289, %r736, 4, %rd71;
-	mad.wide.s32 	%rd290, %r737, 4, %rd71;
-	mad.wide.s32 	%rd291, %r738, 4, %rd71;
-	mad.wide.s32 	%rd292, %r739, 4, %rd71;
-	mad.wide.s32 	%rd293, %r740, 4, %rd71;
-	mad.wide.s32 	%rd294, %r741, 4, %rd71;
-	.loc	1 152 69                        // fp8_linear.py:152:69
-	mul.lo.s32 	%r742, %r66, %r38;
-	.loc	1 152 51                        // fp8_linear.py:152:51
-	mul.wide.s32 	%rd295, %r742, 4;
+	and.b32 	%r526, %r812, 24;
+	and.b32 	%r527, %r2, 96;
+	add.s32 	%r528, %r745, %r526;
+	add.s32 	%r529, %r528, %r527;
+	.loc	1 156 39                        // fp8_linear.py:156:39
+	mul.lo.s32 	%r530, %r65, %r1;
+	shl.b32 	%r531, %r65, 1;
+	add.s32 	%r532, %r530, %r531;
+	mad.lo.s32 	%r533, %r65, 3, %r530;
+	shl.b32 	%r534, %r65, 2;
+	add.s32 	%r535, %r530, %r534;
+	mad.lo.s32 	%r536, %r65, 5, %r530;
+	mad.lo.s32 	%r537, %r65, 6, %r530;
+	mad.lo.s32 	%r538, %r65, 7, %r530;
+	shl.b32 	%r539, %r65, 3;
+	add.s32 	%r540, %r530, %r539;
+	mad.lo.s32 	%r541, %r65, 9, %r530;
+	mad.lo.s32 	%r542, %r65, 10, %r530;
+	mad.lo.s32 	%r543, %r65, 11, %r530;
+	mad.lo.s32 	%r544, %r65, 12, %r530;
+	mad.lo.s32 	%r545, %r65, 13, %r530;
+	mad.lo.s32 	%r546, %r65, 14, %r530;
+	mad.lo.s32 	%r547, %r65, 15, %r530;
+	shl.b32 	%r548, %r65, 4;
+	add.s32 	%r549, %r530, %r548;
+	mad.lo.s32 	%r550, %r65, 17, %r530;
+	mad.lo.s32 	%r551, %r65, 18, %r530;
+	mad.lo.s32 	%r552, %r65, 19, %r530;
+	mad.lo.s32 	%r553, %r65, 20, %r530;
+	mad.lo.s32 	%r554, %r65, 21, %r530;
+	mad.lo.s32 	%r555, %r65, 22, %r530;
+	mad.lo.s32 	%r556, %r65, 23, %r530;
+	mad.lo.s32 	%r557, %r65, 24, %r530;
+	mad.lo.s32 	%r558, %r65, 25, %r530;
+	mad.lo.s32 	%r559, %r65, 26, %r530;
+	mad.lo.s32 	%r560, %r65, 27, %r530;
+	mad.lo.s32 	%r561, %r65, 28, %r530;
+	mad.lo.s32 	%r562, %r65, 29, %r530;
+	mad.lo.s32 	%r563, %r65, 30, %r530;
+	mad.lo.s32 	%r564, %r65, 31, %r530;
+	shl.b32 	%r565, %r65, 5;
+	add.s32 	%r566, %r530, %r565;
+	mad.lo.s32 	%r567, %r65, 33, %r530;
+	mad.lo.s32 	%r568, %r65, 34, %r530;
+	mad.lo.s32 	%r569, %r65, 35, %r530;
+	mad.lo.s32 	%r570, %r65, 36, %r530;
+	mad.lo.s32 	%r571, %r65, 37, %r530;
+	mad.lo.s32 	%r572, %r65, 38, %r530;
+	mad.lo.s32 	%r573, %r65, 39, %r530;
+	mad.lo.s32 	%r574, %r65, 40, %r530;
+	mad.lo.s32 	%r575, %r65, 41, %r530;
+	mad.lo.s32 	%r576, %r65, 42, %r530;
+	mad.lo.s32 	%r577, %r65, 43, %r530;
+	mad.lo.s32 	%r578, %r65, 44, %r530;
+	mad.lo.s32 	%r579, %r65, 45, %r530;
+	mad.lo.s32 	%r580, %r65, 46, %r530;
+	mad.lo.s32 	%r581, %r65, 47, %r530;
+	mad.lo.s32 	%r582, %r65, 48, %r530;
+	mad.lo.s32 	%r583, %r65, 49, %r530;
+	mad.lo.s32 	%r584, %r65, 50, %r530;
+	mad.lo.s32 	%r585, %r65, 51, %r530;
+	mad.lo.s32 	%r586, %r65, 52, %r530;
+	mad.lo.s32 	%r587, %r65, 53, %r530;
+	mad.lo.s32 	%r588, %r65, 54, %r530;
+	mad.lo.s32 	%r589, %r65, 55, %r530;
+	mad.lo.s32 	%r590, %r65, 56, %r530;
+	mad.lo.s32 	%r591, %r65, 57, %r530;
+	mad.lo.s32 	%r592, %r65, 58, %r530;
+	mad.lo.s32 	%r593, %r65, 59, %r530;
+	mad.lo.s32 	%r594, %r65, 60, %r530;
+	mad.lo.s32 	%r595, %r65, 61, %r530;
+	mad.lo.s32 	%r596, %r65, 62, %r530;
+	mad.lo.s32 	%r597, %r65, 63, %r530;
+	.loc	1 156 21                        // fp8_linear.py:156:21
+	mad.wide.s32 	%rd232, %r530, 2, %rd71;
+	mad.wide.s32 	%rd233, %r532, 2, %rd71;
+	mad.wide.s32 	%rd234, %r533, 2, %rd71;
+	mad.wide.s32 	%rd235, %r535, 2, %rd71;
+	mad.wide.s32 	%rd236, %r536, 2, %rd71;
+	mad.wide.s32 	%rd237, %r537, 2, %rd71;
+	mad.wide.s32 	%rd238, %r538, 2, %rd71;
+	mad.wide.s32 	%rd239, %r540, 2, %rd71;
+	mad.wide.s32 	%rd240, %r541, 2, %rd71;
+	mad.wide.s32 	%rd241, %r542, 2, %rd71;
+	mad.wide.s32 	%rd242, %r543, 2, %rd71;
+	mad.wide.s32 	%rd243, %r544, 2, %rd71;
+	mad.wide.s32 	%rd244, %r545, 2, %rd71;
+	mad.wide.s32 	%rd245, %r546, 2, %rd71;
+	mad.wide.s32 	%rd246, %r547, 2, %rd71;
+	mad.wide.s32 	%rd247, %r549, 2, %rd71;
+	mad.wide.s32 	%rd248, %r550, 2, %rd71;
+	mad.wide.s32 	%rd249, %r551, 2, %rd71;
+	mad.wide.s32 	%rd250, %r552, 2, %rd71;
+	mad.wide.s32 	%rd251, %r553, 2, %rd71;
+	mad.wide.s32 	%rd252, %r554, 2, %rd71;
+	mad.wide.s32 	%rd253, %r555, 2, %rd71;
+	mad.wide.s32 	%rd254, %r556, 2, %rd71;
+	mad.wide.s32 	%rd255, %r557, 2, %rd71;
+	mad.wide.s32 	%rd256, %r558, 2, %rd71;
+	mad.wide.s32 	%rd257, %r559, 2, %rd71;
+	mad.wide.s32 	%rd258, %r560, 2, %rd71;
+	mad.wide.s32 	%rd259, %r561, 2, %rd71;
+	mad.wide.s32 	%rd260, %r562, 2, %rd71;
+	mad.wide.s32 	%rd261, %r563, 2, %rd71;
+	mad.wide.s32 	%rd262, %r564, 2, %rd71;
+	mad.wide.s32 	%rd263, %r566, 2, %rd71;
+	mad.wide.s32 	%rd264, %r567, 2, %rd71;
+	mad.wide.s32 	%rd265, %r568, 2, %rd71;
+	mad.wide.s32 	%rd266, %r569, 2, %rd71;
+	mad.wide.s32 	%rd267, %r570, 2, %rd71;
+	mad.wide.s32 	%rd268, %r571, 2, %rd71;
+	mad.wide.s32 	%rd269, %r572, 2, %rd71;
+	mad.wide.s32 	%rd270, %r573, 2, %rd71;
+	mad.wide.s32 	%rd271, %r574, 2, %rd71;
+	mad.wide.s32 	%rd272, %r575, 2, %rd71;
+	mad.wide.s32 	%rd273, %r576, 2, %rd71;
+	mad.wide.s32 	%rd274, %r577, 2, %rd71;
+	mad.wide.s32 	%rd275, %r578, 2, %rd71;
+	mad.wide.s32 	%rd276, %r579, 2, %rd71;
+	mad.wide.s32 	%rd277, %r580, 2, %rd71;
+	mad.wide.s32 	%rd278, %r581, 2, %rd71;
+	mad.wide.s32 	%rd279, %r582, 2, %rd71;
+	mad.wide.s32 	%rd280, %r583, 2, %rd71;
+	mad.wide.s32 	%rd281, %r584, 2, %rd71;
+	mad.wide.s32 	%rd282, %r585, 2, %rd71;
+	mad.wide.s32 	%rd283, %r586, 2, %rd71;
+	mad.wide.s32 	%rd284, %r587, 2, %rd71;
+	mad.wide.s32 	%rd285, %r588, 2, %rd71;
+	mad.wide.s32 	%rd286, %r589, 2, %rd71;
+	mad.wide.s32 	%rd287, %r590, 2, %rd71;
+	mad.wide.s32 	%rd288, %r591, 2, %rd71;
+	mad.wide.s32 	%rd289, %r592, 2, %rd71;
+	mad.wide.s32 	%rd290, %r593, 2, %rd71;
+	mad.wide.s32 	%rd291, %r594, 2, %rd71;
+	mad.wide.s32 	%rd292, %r595, 2, %rd71;
+	mad.wide.s32 	%rd293, %r596, 2, %rd71;
+	mad.wide.s32 	%rd294, %r597, 2, %rd71;
+	.loc	1 156 69                        // fp8_linear.py:156:69
+	mul.lo.s32 	%r598, %r66, %r38;
+	.loc	1 156 51                        // fp8_linear.py:156:51
+	mul.wide.s32 	%rd295, %r598, 2;
 	add.s64 	%rd168, %rd232, %rd295;
-	mad.wide.s32 	%rd169, %r65, 4, %rd168;
+	mad.wide.s32 	%rd169, %r65, 2, %rd168;
 	add.s64 	%rd170, %rd233, %rd295;
 	add.s64 	%rd171, %rd234, %rd295;
 	add.s64 	%rd172, %rd235, %rd295;
@@ -3145,7 +3079,7 @@ $L__BB0_4:                              // %._crit_edge
 	add.s64 	%rd229, %rd292, %rd295;
 	add.s64 	%rd230, %rd293, %rd295;
 	add.s64 	%rd231, %rd294, %rd295;
-	.loc	1 153 49                        // fp8_linear.py:153:49
+	.loc	1 160 31                        // fp8_linear.py:160:31
 	and.pred 	%p197, %p324, %p325;
 	and.pred 	%p198, %p323, %p325;
 	and.pred 	%p199, %p322, %p325;
@@ -3210,291 +3144,386 @@ $L__BB0_4:                              // %._crit_edge
 	and.pred 	%p258, %p263, %p325;
 	and.pred 	%p259, %p262, %p325;
 	and.pred 	%p260, %p261, %p325;
-	.loc	1 153 21                        // fp8_linear.py:153:21
+	.loc	1 155 16                        // fp8_linear.py:155:16
+	ld.shared.b64 	%rd296, [%r529];
+	mul.f32x2 	%rd297, %rd340, %rd296;
+	mov.b64 	{%r599, %r600}, %rd296;
+	mul.f32 	%r601, %r750, %r599;
+	mul.f32 	%r602, %r751, %r600;
+	mul.f32 	%r603, %r764, %r599;
+	mul.f32 	%r604, %r765, %r600;
+	mul.f32 	%r605, %r766, %r599;
+	mul.f32 	%r606, %r767, %r600;
+	mul.f32 	%r607, %r780, %r599;
+	mul.f32 	%r608, %r781, %r600;
+	mul.f32 	%r609, %r782, %r599;
+	mul.f32 	%r610, %r783, %r600;
+	mul.f32 	%r611, %r796, %r599;
+	mul.f32 	%r612, %r797, %r600;
+	mul.f32 	%r613, %r798, %r599;
+	mul.f32 	%r614, %r799, %r600;
+	.loc	1 159 15                        // fp8_linear.py:159:15
+	mov.b64 	{%r615, %r616}, %rd297;
+	cvt.rn.bf16x2.f32 	%r617, %r616, %r615;
+	.loc	1 155 16                        // fp8_linear.py:155:16
+	ld.shared.b64 	%rd298, [%r529+128];
+	mul.f32x2 	%rd299, %rd339, %rd298;
+	mov.b64 	{%r618, %r619}, %rd298;
+	mul.f32 	%r620, %r754, %r618;
+	mul.f32 	%r621, %r755, %r619;
+	mul.f32 	%r622, %r768, %r618;
+	mul.f32 	%r623, %r769, %r619;
+	mul.f32 	%r624, %r770, %r618;
+	mul.f32 	%r625, %r771, %r619;
+	mul.f32 	%r626, %r784, %r618;
+	mul.f32 	%r627, %r785, %r619;
+	mul.f32 	%r628, %r786, %r618;
+	mul.f32 	%r629, %r787, %r619;
+	mul.f32 	%r630, %r800, %r618;
+	mul.f32 	%r631, %r801, %r619;
+	mul.f32 	%r632, %r802, %r618;
+	mul.f32 	%r633, %r803, %r619;
+	.loc	1 159 15                        // fp8_linear.py:159:15
+	mov.b64 	{%r634, %r635}, %rd299;
+	cvt.rn.bf16x2.f32 	%r636, %r635, %r634;
+	.loc	1 155 16                        // fp8_linear.py:155:16
+	ld.shared.b64 	%rd300, [%r529+256];
+	mul.f32x2 	%rd301, %rd338, %rd300;
+	mov.b64 	{%r637, %r638}, %rd300;
+	mul.f32 	%r639, %r758, %r637;
+	mul.f32 	%r640, %r759, %r638;
+	mul.f32 	%r641, %r772, %r637;
+	mul.f32 	%r642, %r773, %r638;
+	mul.f32 	%r643, %r774, %r637;
+	mul.f32 	%r644, %r775, %r638;
+	mul.f32 	%r645, %r788, %r637;
+	mul.f32 	%r646, %r789, %r638;
+	mul.f32 	%r647, %r790, %r637;
+	mul.f32 	%r648, %r791, %r638;
+	mul.f32 	%r649, %r804, %r637;
+	mul.f32 	%r650, %r805, %r638;
+	mul.f32 	%r651, %r806, %r637;
+	mul.f32 	%r652, %r807, %r638;
+	.loc	1 159 15                        // fp8_linear.py:159:15
+	mov.b64 	{%r653, %r654}, %rd301;
+	cvt.rn.bf16x2.f32 	%r655, %r654, %r653;
+	.loc	1 155 16                        // fp8_linear.py:155:16
+	ld.shared.b64 	%rd302, [%r529+384];
+	mul.f32x2 	%rd303, %rd337, %rd302;
+	mov.b64 	{%r656, %r657}, %rd302;
+	mul.f32 	%r658, %r762, %r656;
+	mul.f32 	%r659, %r763, %r657;
+	mul.f32 	%r660, %r776, %r656;
+	mul.f32 	%r661, %r777, %r657;
+	mul.f32 	%r662, %r778, %r656;
+	mul.f32 	%r663, %r779, %r657;
+	mul.f32 	%r664, %r792, %r656;
+	mul.f32 	%r665, %r793, %r657;
+	mul.f32 	%r666, %r794, %r656;
+	mul.f32 	%r667, %r795, %r657;
+	mul.f32 	%r668, %r808, %r656;
+	mul.f32 	%r669, %r809, %r657;
+	mul.f32 	%r670, %r810, %r656;
+	mul.f32 	%r671, %r811, %r657;
+	.loc	1 159 15                        // fp8_linear.py:159:15
+	mov.b64 	{%r672, %r673}, %rd303;
+	cvt.rn.bf16x2.f32 	%r674, %r673, %r672;
+	.loc	1 159 8                         // fp8_linear.py:159:8
 	bar.sync 	0;
-	shl.b32 	%r743, %r825, 5;
-	and.b32 	%r744, %r2, 120;
-	shl.b32 	%r745, %r744, 4;
-	bfe.s32 	%r746, %r2, 2, 1;
-	and.b32 	%r747, %r746, 8208;
-	or.b32 	%r748, %r747, %r745;
-	or.b32 	%r749, %r748, %r743;
-	add.s32 	%r462, %r758, %r749;
-	// begin inline asm
-	st.shared.v4.b32 [ %r462 + 0 ], { %r463, %r464, %r465, %r466 };
-	// end inline asm
-	add.s32 	%r467, %r462, 2048;
-	// begin inline asm
-	st.shared.v4.b32 [ %r467 + 0 ], { %r468, %r469, %r470, %r471 };
-	// end inline asm
-	add.s32 	%r472, %r462, 4096;
-	// begin inline asm
-	st.shared.v4.b32 [ %r472 + 0 ], { %r473, %r474, %r475, %r476 };
-	// end inline asm
-	add.s32 	%r477, %r462, 6144;
-	// begin inline asm
-	st.shared.v4.b32 [ %r477 + 0 ], { %r478, %r479, %r480, %r481 };
-	// end inline asm
-	xor.b32 	%r750, %r749, 16;
-	add.s32 	%r482, %r758, %r750;
-	// begin inline asm
-	st.shared.v4.b32 [ %r482 + 0 ], { %r483, %r484, %r485, %r486 };
-	// end inline asm
-	add.s32 	%r487, %r482, 2048;
-	// begin inline asm
-	st.shared.v4.b32 [ %r487 + 0 ], { %r488, %r489, %r490, %r491 };
-	// end inline asm
-	add.s32 	%r492, %r482, 4096;
-	// begin inline asm
-	st.shared.v4.b32 [ %r492 + 0 ], { %r493, %r494, %r495, %r496 };
-	// end inline asm
-	add.s32 	%r497, %r482, 6144;
-	// begin inline asm
-	st.shared.v4.b32 [ %r497 + 0 ], { %r498, %r499, %r500, %r501 };
-	// end inline asm
+	shl.b32 	%r675, %r2, 6;
+	and.b32 	%r676, %r675, 1536;
+	shl.b32 	%r677, %r2, 4;
+	and.b32 	%r678, %r677, 112;
+	shl.b32 	%r679, %r527, 2;
+	add.s32 	%r680, %r745, %r676;
+	add.s32 	%r681, %r680, %r678;
+	add.s32 	%r682, %r681, %r679;
+	stmatrix.sync.aligned.m8n8.x4.trans.shared.b16 [%r682], {%r617, %r636, %r655, %r674};
 	bar.sync 	0;
-	shl.b32 	%r751, %r744, 6;
-	shl.b32 	%r752, %r2, 4;
-	and.b32 	%r753, %r752, 112;
-	or.b32 	%r754, %r751, %r753;
-	add.s32 	%r755, %r758, %r754;
-	ld.shared.v4.b32 	{%r534, %r542, %r550, %r558}, [%r755];
-	ld.shared.v4.b32 	{%r536, %r544, %r552, %r560}, [%r755+128];
-	ld.shared.v4.b32 	{%r538, %r546, %r554, %r562}, [%r755+256];
-	ld.shared.v4.b32 	{%r540, %r548, %r556, %r564}, [%r755+384];
-	xor.b32 	%r756, %r754, 16;
-	add.s32 	%r757, %r758, %r756;
-	ld.shared.v4.b32 	{%r535, %r543, %r551, %r559}, [%r757+8192];
-	ld.shared.v4.b32 	{%r537, %r545, %r553, %r561}, [%r757+8320];
-	ld.shared.v4.b32 	{%r539, %r547, %r555, %r563}, [%r757+8448];
-	ld.shared.v4.b32 	{%r541, %r549, %r557, %r565}, [%r757+8576];
+	shl.b32 	%r683, %r37, 4;
+	add.s32 	%r684, %r745, %r683;
+	ld.shared.v4.b32 	{%r685, %r686, %r687, %r688}, [%r684];
+	mov.b32 	{%rs296, %rs297}, %r688;
+	mov.b32 	{%rs294, %rs295}, %r687;
+	mov.b32 	{%rs292, %rs293}, %r686;
+	mov.b32 	{%rs290, %rs291}, %r685;
 	bar.sync 	0;
-	// begin inline asm
-	st.shared.v4.b32 [ %r462 + 0 ], { %r502, %r503, %r504, %r505 };
-	// end inline asm
-	// begin inline asm
-	st.shared.v4.b32 [ %r467 + 0 ], { %r506, %r507, %r508, %r509 };
-	// end inline asm
-	// begin inline asm
-	st.shared.v4.b32 [ %r472 + 0 ], { %r510, %r511, %r512, %r513 };
-	// end inline asm
-	// begin inline asm
-	st.shared.v4.b32 [ %r477 + 0 ], { %r514, %r515, %r516, %r517 };
-	// end inline asm
-	// begin inline asm
-	st.shared.v4.b32 [ %r482 + 0 ], { %r518, %r519, %r520, %r521 };
-	// end inline asm
-	// begin inline asm
-	st.shared.v4.b32 [ %r487 + 0 ], { %r522, %r523, %r524, %r525 };
-	// end inline asm
-	// begin inline asm
-	st.shared.v4.b32 [ %r492 + 0 ], { %r526, %r527, %r528, %r529 };
-	// end inline asm
-	// begin inline asm
-	st.shared.v4.b32 [ %r497 + 0 ], { %r530, %r531, %r532, %r533 };
-	// end inline asm
+	cvt.rn.bf16x2.f32 	%r689, %r602, %r601;
+	cvt.rn.bf16x2.f32 	%r690, %r621, %r620;
+	cvt.rn.bf16x2.f32 	%r691, %r640, %r639;
+	cvt.rn.bf16x2.f32 	%r692, %r659, %r658;
+	stmatrix.sync.aligned.m8n8.x4.trans.shared.b16 [%r682], {%r689, %r690, %r691, %r692};
 	bar.sync 	0;
-	ld.shared.v4.b32 	{%r566, %r574, %r582, %r590}, [%r755];
-	ld.shared.v4.b32 	{%r568, %r576, %r584, %r592}, [%r755+128];
-	ld.shared.v4.b32 	{%r570, %r578, %r586, %r594}, [%r755+256];
-	ld.shared.v4.b32 	{%r572, %r580, %r588, %r596}, [%r755+384];
-	ld.shared.v4.b32 	{%r567, %r575, %r583, %r591}, [%r757+8192];
-	ld.shared.v4.b32 	{%r569, %r577, %r585, %r593}, [%r757+8320];
-	ld.shared.v4.b32 	{%r571, %r579, %r587, %r595}, [%r757+8448];
-	ld.shared.v4.b32 	{%r573, %r581, %r589, %r597}, [%r757+8576];
+	ld.shared.v4.b32 	{%r693, %r694, %r695, %r696}, [%r684];
+	mov.b32 	{%rs304, %rs305}, %r696;
+	mov.b32 	{%rs302, %rs303}, %r695;
+	mov.b32 	{%rs300, %rs301}, %r694;
+	mov.b32 	{%rs298, %rs299}, %r693;
+	bar.sync 	0;
+	cvt.rn.bf16x2.f32 	%r697, %r604, %r603;
+	cvt.rn.bf16x2.f32 	%r698, %r623, %r622;
+	cvt.rn.bf16x2.f32 	%r699, %r642, %r641;
+	cvt.rn.bf16x2.f32 	%r700, %r661, %r660;
+	stmatrix.sync.aligned.m8n8.x4.trans.shared.b16 [%r682], {%r697, %r698, %r699, %r700};
+	bar.sync 	0;
+	ld.shared.v4.b32 	{%r701, %r702, %r703, %r704}, [%r684];
+	mov.b32 	{%rs312, %rs313}, %r704;
+	mov.b32 	{%rs310, %rs311}, %r703;
+	mov.b32 	{%rs308, %rs309}, %r702;
+	mov.b32 	{%rs306, %rs307}, %r701;
+	bar.sync 	0;
+	cvt.rn.bf16x2.f32 	%r705, %r606, %r605;
+	cvt.rn.bf16x2.f32 	%r706, %r625, %r624;
+	cvt.rn.bf16x2.f32 	%r707, %r644, %r643;
+	cvt.rn.bf16x2.f32 	%r708, %r663, %r662;
+	stmatrix.sync.aligned.m8n8.x4.trans.shared.b16 [%r682], {%r705, %r706, %r707, %r708};
+	bar.sync 	0;
+	ld.shared.v4.b32 	{%r709, %r710, %r711, %r712}, [%r684];
+	mov.b32 	{%rs320, %rs321}, %r712;
+	mov.b32 	{%rs318, %rs319}, %r711;
+	mov.b32 	{%rs316, %rs317}, %r710;
+	mov.b32 	{%rs314, %rs315}, %r709;
+	bar.sync 	0;
+	cvt.rn.bf16x2.f32 	%r713, %r608, %r607;
+	cvt.rn.bf16x2.f32 	%r714, %r627, %r626;
+	cvt.rn.bf16x2.f32 	%r715, %r646, %r645;
+	cvt.rn.bf16x2.f32 	%r716, %r665, %r664;
+	stmatrix.sync.aligned.m8n8.x4.trans.shared.b16 [%r682], {%r713, %r714, %r715, %r716};
+	bar.sync 	0;
+	ld.shared.v4.b32 	{%r717, %r718, %r719, %r720}, [%r684];
+	mov.b32 	{%rs328, %rs329}, %r720;
+	mov.b32 	{%rs326, %rs327}, %r719;
+	mov.b32 	{%rs324, %rs325}, %r718;
+	mov.b32 	{%rs322, %rs323}, %r717;
+	bar.sync 	0;
+	cvt.rn.bf16x2.f32 	%r721, %r610, %r609;
+	cvt.rn.bf16x2.f32 	%r722, %r629, %r628;
+	cvt.rn.bf16x2.f32 	%r723, %r648, %r647;
+	cvt.rn.bf16x2.f32 	%r724, %r667, %r666;
+	stmatrix.sync.aligned.m8n8.x4.trans.shared.b16 [%r682], {%r721, %r722, %r723, %r724};
+	bar.sync 	0;
+	ld.shared.v4.b32 	{%r725, %r726, %r727, %r728}, [%r684];
+	mov.b32 	{%rs336, %rs337}, %r728;
+	mov.b32 	{%rs334, %rs335}, %r727;
+	mov.b32 	{%rs332, %rs333}, %r726;
+	mov.b32 	{%rs330, %rs331}, %r725;
+	bar.sync 	0;
+	cvt.rn.bf16x2.f32 	%r729, %r612, %r611;
+	cvt.rn.bf16x2.f32 	%r730, %r631, %r630;
+	cvt.rn.bf16x2.f32 	%r731, %r650, %r649;
+	cvt.rn.bf16x2.f32 	%r732, %r669, %r668;
+	stmatrix.sync.aligned.m8n8.x4.trans.shared.b16 [%r682], {%r729, %r730, %r731, %r732};
+	bar.sync 	0;
+	ld.shared.v4.b32 	{%r733, %r734, %r735, %r736}, [%r684];
+	mov.b32 	{%rs344, %rs345}, %r736;
+	mov.b32 	{%rs342, %rs343}, %r735;
+	mov.b32 	{%rs340, %rs341}, %r734;
+	mov.b32 	{%rs338, %rs339}, %r733;
+	bar.sync 	0;
+	cvt.rn.bf16x2.f32 	%r737, %r614, %r613;
+	cvt.rn.bf16x2.f32 	%r738, %r633, %r632;
+	cvt.rn.bf16x2.f32 	%r739, %r652, %r651;
+	cvt.rn.bf16x2.f32 	%r740, %r671, %r670;
+	stmatrix.sync.aligned.m8n8.x4.trans.shared.b16 [%r682], {%r737, %r738, %r739, %r740};
+	bar.sync 	0;
+	ld.shared.v4.b32 	{%r741, %r742, %r743, %r744}, [%r684];
+	mov.b32 	{%rs352, %rs353}, %r744;
+	mov.b32 	{%rs350, %rs351}, %r743;
+	mov.b32 	{%rs348, %rs349}, %r742;
+	mov.b32 	{%rs346, %rs347}, %r741;
 	// begin inline asm
-	@%p197 st.global.b32 [ %rd168 + 0 ], { %r534 };
+	@%p197 st.global.b16 [ %rd168 + 0 ], { %rs290 };
 	// end inline asm
 	// begin inline asm
-	@%p198 st.global.b32 [ %rd169 + 0 ], { %r535 };
+	@%p198 st.global.b16 [ %rd169 + 0 ], { %rs291 };
 	// end inline asm
 	// begin inline asm
-	@%p199 st.global.b32 [ %rd170 + 0 ], { %r536 };
+	@%p199 st.global.b16 [ %rd170 + 0 ], { %rs292 };
 	// end inline asm
 	// begin inline asm
-	@%p200 st.global.b32 [ %rd171 + 0 ], { %r537 };
+	@%p200 st.global.b16 [ %rd171 + 0 ], { %rs293 };
 	// end inline asm
 	// begin inline asm
-	@%p201 st.global.b32 [ %rd172 + 0 ], { %r538 };
+	@%p201 st.global.b16 [ %rd172 + 0 ], { %rs294 };
 	// end inline asm
 	// begin inline asm
-	@%p202 st.global.b32 [ %rd173 + 0 ], { %r539 };
+	@%p202 st.global.b16 [ %rd173 + 0 ], { %rs295 };
 	// end inline asm
 	// begin inline asm
-	@%p203 st.global.b32 [ %rd174 + 0 ], { %r540 };
+	@%p203 st.global.b16 [ %rd174 + 0 ], { %rs296 };
 	// end inline asm
 	// begin inline asm
-	@%p204 st.global.b32 [ %rd175 + 0 ], { %r541 };
+	@%p204 st.global.b16 [ %rd175 + 0 ], { %rs297 };
 	// end inline asm
 	// begin inline asm
-	@%p205 st.global.b32 [ %rd176 + 0 ], { %r542 };
+	@%p205 st.global.b16 [ %rd176 + 0 ], { %rs298 };
 	// end inline asm
 	// begin inline asm
-	@%p206 st.global.b32 [ %rd177 + 0 ], { %r543 };
+	@%p206 st.global.b16 [ %rd177 + 0 ], { %rs299 };
 	// end inline asm
 	// begin inline asm
-	@%p207 st.global.b32 [ %rd178 + 0 ], { %r544 };
+	@%p207 st.global.b16 [ %rd178 + 0 ], { %rs300 };
 	// end inline asm
 	// begin inline asm
-	@%p208 st.global.b32 [ %rd179 + 0 ], { %r545 };
+	@%p208 st.global.b16 [ %rd179 + 0 ], { %rs301 };
 	// end inline asm
 	// begin inline asm
-	@%p209 st.global.b32 [ %rd180 + 0 ], { %r546 };
+	@%p209 st.global.b16 [ %rd180 + 0 ], { %rs302 };
 	// end inline asm
 	// begin inline asm
-	@%p210 st.global.b32 [ %rd181 + 0 ], { %r547 };
+	@%p210 st.global.b16 [ %rd181 + 0 ], { %rs303 };
 	// end inline asm
 	// begin inline asm
-	@%p211 st.global.b32 [ %rd182 + 0 ], { %r548 };
+	@%p211 st.global.b16 [ %rd182 + 0 ], { %rs304 };
 	// end inline asm
 	// begin inline asm
-	@%p212 st.global.b32 [ %rd183 + 0 ], { %r549 };
+	@%p212 st.global.b16 [ %rd183 + 0 ], { %rs305 };
 	// end inline asm
 	// begin inline asm
-	@%p213 st.global.b32 [ %rd184 + 0 ], { %r550 };
+	@%p213 st.global.b16 [ %rd184 + 0 ], { %rs306 };
 	// end inline asm
 	// begin inline asm
-	@%p214 st.global.b32 [ %rd185 + 0 ], { %r551 };
+	@%p214 st.global.b16 [ %rd185 + 0 ], { %rs307 };
 	// end inline asm
 	// begin inline asm
-	@%p215 st.global.b32 [ %rd186 + 0 ], { %r552 };
+	@%p215 st.global.b16 [ %rd186 + 0 ], { %rs308 };
 	// end inline asm
 	// begin inline asm
-	@%p216 st.global.b32 [ %rd187 + 0 ], { %r553 };
+	@%p216 st.global.b16 [ %rd187 + 0 ], { %rs309 };
 	// end inline asm
 	// begin inline asm
-	@%p217 st.global.b32 [ %rd188 + 0 ], { %r554 };
+	@%p217 st.global.b16 [ %rd188 + 0 ], { %rs310 };
 	// end inline asm
 	// begin inline asm
-	@%p218 st.global.b32 [ %rd189 + 0 ], { %r555 };
+	@%p218 st.global.b16 [ %rd189 + 0 ], { %rs311 };
 	// end inline asm
 	// begin inline asm
-	@%p219 st.global.b32 [ %rd190 + 0 ], { %r556 };
+	@%p219 st.global.b16 [ %rd190 + 0 ], { %rs312 };
 	// end inline asm
 	// begin inline asm
-	@%p220 st.global.b32 [ %rd191 + 0 ], { %r557 };
+	@%p220 st.global.b16 [ %rd191 + 0 ], { %rs313 };
 	// end inline asm
 	// begin inline asm
-	@%p221 st.global.b32 [ %rd192 + 0 ], { %r558 };
+	@%p221 st.global.b16 [ %rd192 + 0 ], { %rs314 };
 	// end inline asm
 	// begin inline asm
-	@%p222 st.global.b32 [ %rd193 + 0 ], { %r559 };
+	@%p222 st.global.b16 [ %rd193 + 0 ], { %rs315 };
 	// end inline asm
 	// begin inline asm
-	@%p223 st.global.b32 [ %rd194 + 0 ], { %r560 };
+	@%p223 st.global.b16 [ %rd194 + 0 ], { %rs316 };
 	// end inline asm
 	// begin inline asm
-	@%p224 st.global.b32 [ %rd195 + 0 ], { %r561 };
+	@%p224 st.global.b16 [ %rd195 + 0 ], { %rs317 };
 	// end inline asm
 	// begin inline asm
-	@%p225 st.global.b32 [ %rd196 + 0 ], { %r562 };
+	@%p225 st.global.b16 [ %rd196 + 0 ], { %rs318 };
 	// end inline asm
 	// begin inline asm
-	@%p226 st.global.b32 [ %rd197 + 0 ], { %r563 };
+	@%p226 st.global.b16 [ %rd197 + 0 ], { %rs319 };
 	// end inline asm
 	// begin inline asm
-	@%p227 st.global.b32 [ %rd198 + 0 ], { %r564 };
+	@%p227 st.global.b16 [ %rd198 + 0 ], { %rs320 };
 	// end inline asm
 	// begin inline asm
-	@%p228 st.global.b32 [ %rd199 + 0 ], { %r565 };
+	@%p228 st.global.b16 [ %rd199 + 0 ], { %rs321 };
 	// end inline asm
 	// begin inline asm
-	@%p229 st.global.b32 [ %rd200 + 0 ], { %r566 };
+	@%p229 st.global.b16 [ %rd200 + 0 ], { %rs322 };
 	// end inline asm
 	// begin inline asm
-	@%p230 st.global.b32 [ %rd201 + 0 ], { %r567 };
+	@%p230 st.global.b16 [ %rd201 + 0 ], { %rs323 };
 	// end inline asm
 	// begin inline asm
-	@%p231 st.global.b32 [ %rd202 + 0 ], { %r568 };
+	@%p231 st.global.b16 [ %rd202 + 0 ], { %rs324 };
 	// end inline asm
 	// begin inline asm
-	@%p232 st.global.b32 [ %rd203 + 0 ], { %r569 };
+	@%p232 st.global.b16 [ %rd203 + 0 ], { %rs325 };
 	// end inline asm
 	// begin inline asm
-	@%p233 st.global.b32 [ %rd204 + 0 ], { %r570 };
+	@%p233 st.global.b16 [ %rd204 + 0 ], { %rs326 };
 	// end inline asm
 	// begin inline asm
-	@%p234 st.global.b32 [ %rd205 + 0 ], { %r571 };
+	@%p234 st.global.b16 [ %rd205 + 0 ], { %rs327 };
 	// end inline asm
 	// begin inline asm
-	@%p235 st.global.b32 [ %rd206 + 0 ], { %r572 };
+	@%p235 st.global.b16 [ %rd206 + 0 ], { %rs328 };
 	// end inline asm
 	// begin inline asm
-	@%p236 st.global.b32 [ %rd207 + 0 ], { %r573 };
+	@%p236 st.global.b16 [ %rd207 + 0 ], { %rs329 };
 	// end inline asm
 	// begin inline asm
-	@%p237 st.global.b32 [ %rd208 + 0 ], { %r574 };
+	@%p237 st.global.b16 [ %rd208 + 0 ], { %rs330 };
 	// end inline asm
 	// begin inline asm
-	@%p238 st.global.b32 [ %rd209 + 0 ], { %r575 };
+	@%p238 st.global.b16 [ %rd209 + 0 ], { %rs331 };
 	// end inline asm
 	// begin inline asm
-	@%p239 st.global.b32 [ %rd210 + 0 ], { %r576 };
+	@%p239 st.global.b16 [ %rd210 + 0 ], { %rs332 };
 	// end inline asm
 	// begin inline asm
-	@%p240 st.global.b32 [ %rd211 + 0 ], { %r577 };
+	@%p240 st.global.b16 [ %rd211 + 0 ], { %rs333 };
 	// end inline asm
 	// begin inline asm
-	@%p241 st.global.b32 [ %rd212 + 0 ], { %r578 };
+	@%p241 st.global.b16 [ %rd212 + 0 ], { %rs334 };
 	// end inline asm
 	// begin inline asm
-	@%p242 st.global.b32 [ %rd213 + 0 ], { %r579 };
+	@%p242 st.global.b16 [ %rd213 + 0 ], { %rs335 };
 	// end inline asm
 	// begin inline asm
-	@%p243 st.global.b32 [ %rd214 + 0 ], { %r580 };
+	@%p243 st.global.b16 [ %rd214 + 0 ], { %rs336 };
 	// end inline asm
 	// begin inline asm
-	@%p244 st.global.b32 [ %rd215 + 0 ], { %r581 };
+	@%p244 st.global.b16 [ %rd215 + 0 ], { %rs337 };
 	// end inline asm
 	// begin inline asm
-	@%p245 st.global.b32 [ %rd216 + 0 ], { %r582 };
+	@%p245 st.global.b16 [ %rd216 + 0 ], { %rs338 };
 	// end inline asm
 	// begin inline asm
-	@%p246 st.global.b32 [ %rd217 + 0 ], { %r583 };
+	@%p246 st.global.b16 [ %rd217 + 0 ], { %rs339 };
 	// end inline asm
 	// begin inline asm
-	@%p247 st.global.b32 [ %rd218 + 0 ], { %r584 };
+	@%p247 st.global.b16 [ %rd218 + 0 ], { %rs340 };
 	// end inline asm
 	// begin inline asm
-	@%p248 st.global.b32 [ %rd219 + 0 ], { %r585 };
+	@%p248 st.global.b16 [ %rd219 + 0 ], { %rs341 };
 	// end inline asm
 	// begin inline asm
-	@%p249 st.global.b32 [ %rd220 + 0 ], { %r586 };
+	@%p249 st.global.b16 [ %rd220 + 0 ], { %rs342 };
 	// end inline asm
 	// begin inline asm
-	@%p250 st.global.b32 [ %rd221 + 0 ], { %r587 };
+	@%p250 st.global.b16 [ %rd221 + 0 ], { %rs343 };
 	// end inline asm
 	// begin inline asm
-	@%p251 st.global.b32 [ %rd222 + 0 ], { %r588 };
+	@%p251 st.global.b16 [ %rd222 + 0 ], { %rs344 };
 	// end inline asm
 	// begin inline asm
-	@%p252 st.global.b32 [ %rd223 + 0 ], { %r589 };
+	@%p252 st.global.b16 [ %rd223 + 0 ], { %rs345 };
 	// end inline asm
 	// begin inline asm
-	@%p253 st.global.b32 [ %rd224 + 0 ], { %r590 };
+	@%p253 st.global.b16 [ %rd224 + 0 ], { %rs346 };
 	// end inline asm
 	// begin inline asm
-	@%p254 st.global.b32 [ %rd225 + 0 ], { %r591 };
+	@%p254 st.global.b16 [ %rd225 + 0 ], { %rs347 };
 	// end inline asm
 	// begin inline asm
-	@%p255 st.global.b32 [ %rd226 + 0 ], { %r592 };
+	@%p255 st.global.b16 [ %rd226 + 0 ], { %rs348 };
 	// end inline asm
 	// begin inline asm
-	@%p256 st.global.b32 [ %rd227 + 0 ], { %r593 };
+	@%p256 st.global.b16 [ %rd227 + 0 ], { %rs349 };
 	// end inline asm
 	// begin inline asm
-	@%p257 st.global.b32 [ %rd228 + 0 ], { %r594 };
+	@%p257 st.global.b16 [ %rd228 + 0 ], { %rs350 };
 	// end inline asm
 	// begin inline asm
-	@%p258 st.global.b32 [ %rd229 + 0 ], { %r595 };
+	@%p258 st.global.b16 [ %rd229 + 0 ], { %rs351 };
 	// end inline asm
 	// begin inline asm
-	@%p259 st.global.b32 [ %rd230 + 0 ], { %r596 };
+	@%p259 st.global.b16 [ %rd230 + 0 ], { %rs352 };
 	// end inline asm
 	// begin inline asm
-	@%p260 st.global.b32 [ %rd231 + 0 ], { %r597 };
+	@%p260 st.global.b16 [ %rd231 + 0 ], { %rs353 };
 	// end inline asm
-	.loc	1 153 4                         // fp8_linear.py:153:4
+	.loc	1 157 4                         // fp8_linear.py:157:4
 	ret;
 $L__tmp3:
 $L__func_end0:
@@ -3674,7 +3703,7 @@ $L__func_end0:
 .b64 $L__tmp1                           // DW_AT_low_pc
 .b64 $L__tmp2                           // DW_AT_high_pc
 .b8 1                                   // DW_AT_call_file
-.b8 139                                 // DW_AT_call_line
+.b8 143                                 // DW_AT_call_line
 .b8 30                                  // DW_AT_call_column
 .b8 0                                   // End Of Children Mark
 .b8 0                                   // End Of Children Mark

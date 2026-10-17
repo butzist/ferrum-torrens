@@ -22,8 +22,9 @@
 .reqntid 64
 {
 	.reg .pred 	%p<7>;
+	.reg .b16 	%rs<5>;
 	.reg .b32 	%r<37>;
-	.reg .b64 	%rd<31>;
+	.reg .b64 	%rd<30>;
 	.loc	1 87 0                          // fp8_linear.py:87:0
 $L__func_begin0:
 	.loc	1 87 0                          // fp8_linear.py:87:0
@@ -47,14 +48,14 @@ $L__tmp0:
 	or.b32 	%r3, %r1, 128;
 	or.b32 	%r4, %r1, 192;
 	mov.b32 	%r13, 0f00000000;
-	mov.b64 	%rd29, {%r13, %r13};
+	mov.b64 	%rd28, {%r13, %r13};
 	.loc	1 105 19                        // fp8_linear.py:105:19
 	setp.lt.s32 	%p1, %r6, 1;
 	setp.lt.s32 	%p6, %r4, %r5;
 	setp.lt.s32 	%p5, %r3, %r5;
 	setp.lt.s32 	%p4, %r2, %r5;
 	setp.lt.s32 	%p3, %r1, %r5;
-	mov.b64 	%rd30, %rd29;
+	mov.b64 	%rd29, %rd28;
 	@%p1 bra 	$L__BB0_3;
 // %bb.1:                               // %.lr.ph
 	.loc	1 0 19                          // fp8_linear.py:0:19
@@ -70,16 +71,16 @@ $L__tmp0:
 	cvt.s64.s32 	%rd2, %r16;
 	cvt.s64.s32 	%rd3, %r15;
 	cvt.s64.s32 	%rd4, %r14;
-	mov.b64 	%rd29, {%r13, %r13};
+	mov.b64 	%rd28, {%r13, %r13};
 	.loc	1 105 19                        // fp8_linear.py:105:19
-	cvt.u64.u32 	%rd28, %r6;
+	cvt.u64.u32 	%rd27, %r6;
 	mov.b32 	%r19, 0;
 	shl.b64 	%rd13, %rd1, 2;
 	shl.b64 	%rd14, %rd2, 2;
 	shl.b64 	%rd15, %rd3, 2;
 	shl.b64 	%rd16, %rd4, 2;
 	mov.b32 	%r36, %r19;
-	mov.b64 	%rd30, %rd29;
+	mov.b64 	%rd29, %rd28;
 $L__BB0_2:                              // =>This Inner Loop Header: Depth=1
 	.loc	1 106 34                        // fp8_linear.py:106:34
 	mad.wide.s32 	%rd12, %r36, 4, %rd5;
@@ -108,17 +109,16 @@ $L__BB0_2:                              // =>This Inner Loop Header: Depth=1
 	mov.b64 	%rd17, {%r21, %r22};
 	mov.b64 	%rd18, {%r18, %r20};
 	.loc	1 106 15                        // fp8_linear.py:106:15
-	add.f32x2 	%rd29, %rd29, %rd18;
-	add.f32x2 	%rd30, %rd30, %rd17;
+	add.f32x2 	%rd28, %rd28, %rd18;
+	add.f32x2 	%rd29, %rd29, %rd17;
 	.loc	1 105 19                        // fp8_linear.py:105:19
-	add.s64 	%rd28, %rd28, -1;
+	add.s64 	%rd27, %rd27, -1;
 	add.s32 	%r36, %r36, %r7;
-	setp.ne.b64 	%p2, %rd28, 0;
+	setp.ne.b64 	%p2, %rd27, 0;
 	@%p2 bra 	$L__BB0_2;
 $L__BB0_3:                              // %._crit_edge
 	.loc	1 107 32                        // fp8_linear.py:107:32
-	mul.wide.s32 	%rd27, %r1, 4;
-	add.s64 	%rd19, %rd6, %rd27;
+	mad.wide.s32 	%rd19, %r1, 4, %rd6;
 	add.s64 	%rd20, %rd19, 256;
 	add.s64 	%rd21, %rd19, 512;
 	add.s64 	%rd22, %rd19, 768;
@@ -140,30 +140,35 @@ $L__BB0_3:                              // %._crit_edge
 	mov.u32 %r27, %r24;
 	@%p6 ld.global.b32 { %r27 }, [ %rd22 + 0 ];
 	// end inline asm
-	.loc	1 108 23                        // fp8_linear.py:108:23
-	add.s64 	%rd23, %rd7, %rd27;
-	add.s64 	%rd24, %rd23, 256;
-	add.s64 	%rd25, %rd23, 512;
-	add.s64 	%rd26, %rd23, 768;
-	.loc	1 108 35                        // fp8_linear.py:108:35
+	.loc	1 109 18                        // fp8_linear.py:109:18
+	mad.wide.s32 	%rd23, %r1, 2, %rd7;
+	add.s64 	%rd24, %rd23, 128;
+	add.s64 	%rd25, %rd23, 256;
+	add.s64 	%rd26, %rd23, 384;
+	.loc	1 110 15                        // fp8_linear.py:110:15
+	mov.b64 	{%r28, %r29}, %rd28;
+	mul.f32 	%r30, %r28, %r23;
+	mul.f32 	%r31, %r29, %r25;
 	mov.b64 	{%r32, %r33}, %rd29;
-	mul.f32 	%r28, %r32, %r23;
-	mul.f32 	%r29, %r33, %r25;
-	mov.b64 	{%r34, %r35}, %rd30;
-	mul.f32 	%r30, %r34, %r26;
-	mul.f32 	%r31, %r35, %r27;
-	.loc	1 108 29                        // fp8_linear.py:108:29
+	mul.f32 	%r34, %r32, %r26;
+	mul.f32 	%r35, %r33, %r27;
+	.loc	1 110 25                        // fp8_linear.py:110:25
+	cvt.rn.bf16.f32 	%rs1, %r30;
+	cvt.rn.bf16.f32 	%rs2, %r31;
+	cvt.rn.bf16.f32 	%rs3, %r34;
+	cvt.rn.bf16.f32 	%rs4, %r35;
+	.loc	1 110 8                         // fp8_linear.py:110:8
 	// begin inline asm
-	@%p3 st.global.b32 [ %rd23 + 0 ], { %r28 };
+	@%p3 st.global.b16 [ %rd23 + 0 ], { %rs1 };
 	// end inline asm
 	// begin inline asm
-	@%p4 st.global.b32 [ %rd24 + 0 ], { %r29 };
+	@%p4 st.global.b16 [ %rd24 + 0 ], { %rs2 };
 	// end inline asm
 	// begin inline asm
-	@%p5 st.global.b32 [ %rd25 + 0 ], { %r30 };
+	@%p5 st.global.b16 [ %rd25 + 0 ], { %rs3 };
 	// end inline asm
 	// begin inline asm
-	@%p6 st.global.b32 [ %rd26 + 0 ], { %r31 };
+	@%p6 st.global.b16 [ %rd26 + 0 ], { %rs4 };
 	// end inline asm
 	.loc	1 108 4                         // fp8_linear.py:108:4
 	ret;

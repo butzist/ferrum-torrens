@@ -129,7 +129,7 @@ def main() -> int:
         check(
             "paged_attention",
             _paged_attention_decode_kernel,
-            _paged_attention_sig(),
+            _paged_attention_sig(kv_dtype="fp32"),
             paged_attention_constexprs(),
         )
     except Exception as e:  # noqa: BLE001

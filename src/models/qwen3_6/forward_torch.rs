@@ -430,12 +430,13 @@ fn f32_(t: &Tensor) -> Tensor {
 }
 
 /// `rms_norm(x) * w` over the last dimension. The `1 + w` bake already happened
-/// at load. Kept in f32 even under bf16 storage: the mean square is where bf16
-/// loses the most, and this is one scalar per row.
+/// at load. The mean square is computed in f32 (where bf16 loses the most) and
+/// the result is stored bf16, the mixer's activation dtype (TODO.md item 19,
+/// matching FreeToken's `GemmaRMSNorm`).
 fn rms_norm(x: &Tensor, w: &Tensor, eps: f32) -> Tensor {
     let x = f32_(x);
     let var = x.pow_tensor_scalar(2.0).mean_dim(-1, true, Kind::Float);
-    x * (var.g_add_scalar(eps as f64).sqrt().reciprocal()) * f32_(w)
+    (x * (var.g_add_scalar(eps as f64).sqrt().reciprocal()) * f32_(w)).to_kind(Kind::BFloat16)
 }
 
 /// `x @ w.T * row_scale`, the shape every quantized projection takes.
@@ -456,10 +457,12 @@ fn linear(x: &Tensor, w: &Tensor, row_scale: Option<&Tensor>) -> Tensor {
     // (up to the 2 GB `lm_head`) to f32 on every step, which was the decode
     // bottleneck (decision 78).
     let y = f32_(&x.to_kind(Kind::BFloat16).matmul(&w.transpose(0, 1)));
-    match row_scale {
+    let y = match row_scale {
         Some(s) => y * s,
         None => y,
-    }
+    };
+    // The projection output joins the bf16 activation stream (TODO.md item 19).
+    y.to_kind(Kind::BFloat16)
 }
 
 /// A profiling aid: `FT_ABLATE=mixer,attn,gdn,moe,head` short-circuits that
@@ -553,7 +556,11 @@ fn apply_rope_cos_sin(
 
     let rot_lo = &lo * cos - &hi * sin;
     let rot_hi = &hi * cos + &lo * sin;
-    Tensor::cat(&[&rot_lo, &rot_hi, &tail], 2).reshape([t, heads * head_dim])
+    // The trig tables are f32; keep the activation in the input's own dtype so a
+    // bf16 mixer stream stays bf16 through rope (TODO.md item 19).
+    Tensor::cat(&[&rot_lo, &rot_hi, &tail], 2)
+        .reshape([t, heads * head_dim])
+        .to_kind(x.kind())
 }
 
 /// `positions` is a `[t]` device tensor rather than a host slice (decision 51):
@@ -664,6 +671,13 @@ fn causal_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Tensor {
 /// against the absolute positions, which is what keeps a multi-token chunk from
 /// reading the tokens after it inside the same chunk.
 fn attention_cached(q: &Tensor, k: &Tensor, v: &Tensor, q_offset: usize) -> Tensor {
+    // The mixer stream is bf16 and a pool gather is f32; SDPA wants one dtype,
+    // so the dense fallback runs f32 and the caller casts its result back (TODO.md
+    // item 19). The paged kernel path never reaches here on the device.
+    let q = f32_(q);
+    let k = f32_(k);
+    let v = f32_(v);
+    let (q, k, v) = (&q, &k, &v);
     // `[t, heads, head_dim]` in, `[t, qh * hd]` out.
     let [t, qh, hd] = [q.size()[0], q.size()[1], q.size()[2]];
     let n = k.size()[0];
@@ -710,6 +724,10 @@ fn attention_cached(q: &Tensor, k: &Tensor, v: &Tensor, q_offset: usize) -> Tens
 /// per row, so its position is the only value the mask needs and it must come
 /// off the device (decision 51).
 fn attention_cached_pos(q: &Tensor, k: &Tensor, v: &Tensor, positions: &Tensor) -> Tensor {
+    let q = f32_(q);
+    let k = f32_(k);
+    let v = f32_(v);
+    let (q, k, v) = (&q, &k, &v);
     let t = q.size()[0];
     let qh = q.size()[1];
     let hd = q.size()[2];
@@ -898,9 +916,11 @@ fn routed_via_port(
     let x = DevTensor(x_post.shallow_clone());
     let experts = DevTensor(ids.shallow_clone());
     let w = DevTensor(weights.shallow_clone());
+    // The routed sum joins the bf16 activation stream (TODO.md item 19); the
+    // port's reduce writes bf16, so this is exact.
     let mut out = DevTensor(Tensor::zeros(
         [tokens as i64, hidden as i64],
-        (Kind::Float, dev.to_tch()),
+        (Kind::BFloat16, dev.to_tch()),
     ));
     port.execute_device(
         &MoEDeviceRequest {
@@ -1011,7 +1031,9 @@ impl Dense {
             let cols = self.cols as i64;
             let m = (x.numel() / self.cols) as i64;
             let a = x.reshape([m, cols]).to_kind(Kind::BFloat16).contiguous();
-            let out = Tensor::zeros([m, self.rows as i64], (Kind::Float, x.device()));
+            // The vendored W8A16 kernels write the model dtype (bf16), matching
+            // the mixer's activation stream (TODO.md item 19).
+            let out = Tensor::zeros([m, self.rows as i64], (Kind::BFloat16, x.device()));
             let scale = self
                 .row_scale
                 .as_deref()
@@ -1506,7 +1528,9 @@ impl TorchQwen3_6 {
                 match (&self.attention, pool.dtype()) {
                     (Some(attn), KvDType::F32) | (Some(attn), KvDType::BFloat16) => {
                         let (qh, hd) = (q.size()[1], q.size()[2]);
-                        let out = Tensor::zeros([t, qh, hd], (Kind::Float, q.device()));
+                        // q/out are the bf16 activation dtype (TODO.md item 19);
+                        // the kernel reduces in f32 and casts on store.
+                        let out = Tensor::zeros([t, qh, hd], (Kind::BFloat16, q.device()));
                         let (k_ptr, v_ptr) = pool.kv_slab_ptrs(layer);
                         let kv_bf16 = pool.dtype() == KvDType::BFloat16;
                         // SAFETY: every address is a live device allocation in
@@ -1741,15 +1765,23 @@ impl TorchQwen3_6 {
         let qkvz = gdn.qkvz.apply(x);
         trace_tensor("gdn.qkvz", layer, &qkvz);
         let (conv_in, z) = two(qkvz, [conv_dim, value_dim], 1);
-        let ba = f32_(x).matmul(&f32_(&gdn.ba).transpose(0, 1));
+        // The gating projection is computed in f32 then narrowed to the kernel's
+        // bf16 `ba`: the bf16 matmul alone shifted the decode argmax past the
+        // device gate, so keep the f32 accumulation for this small projection.
+        let ba = f32_(x)
+            .matmul(&f32_(&gdn.ba).transpose(0, 1))
+            .to_kind(Kind::BFloat16);
 
         // Fused conv + silu (item 19): one launch for the depthwise conv, the
         // silu and the in-place state shift. `conv_state` is the gathered f32
         // `[n, conv_dim, k - 1]` row block, so the kernel mutates it and the
         // caller's `set_conv_state_rows` writes it back. The checkpoint stores
-        // the depthwise filter as `[conv_dim, 1, k]`, so drop the group axis.
-        let conv_w = f32_(&gdn.conv).reshape([conv_dim, p.linear_conv_kernel_dim as i64]);
-        let mixed = Tensor::empty([n, conv_dim], (Kind::Float, x.device()));
+        // the depthwise filter as `[conv_dim, 1, k]`, so drop the group axis; the
+        // filter is bf16, the bf16 activation stream's dtype.
+        let conv_w = gdn
+            .conv
+            .reshape([conv_dim, p.linear_conv_kernel_dim as i64]);
+        let mixed = Tensor::empty([n, conv_dim], (Kind::BFloat16, x.device()));
         // SAFETY: `conv_in`/`conv_w`/`conv_state`/`mixed` are live device
         // allocations and the shapes match the committed conv cubin.
         unsafe { kernel.conv_decode(&conv_in, &conv_w, conv_state, &mixed) }
@@ -1848,7 +1880,9 @@ impl TorchQwen3_6 {
         let p = &self.params;
         let dev = self.device;
 
-        // router: `[t, experts]`, softmax over experts, then top-k renormalized
+        // router: `[t, experts]`, softmax over experts, then top-k renormalized.
+        // Kept in f32: a bf16 router matmul shifted the decode argmax past the
+        // device gate, so the weight is upcast here (unlike the projections).
         let logits = f32_(x_post).matmul(&f32_(&layer.gate).transpose(0, 1));
         let probs = logits.softmax(-1, Kind::Float);
         let (ids, weights) = topk_renorm(&probs, p.top_k as i64);
@@ -1860,7 +1894,9 @@ impl TorchQwen3_6 {
         let si = p.shared_expert_intermediate_size as i64;
         let (gate_part, up_part) = two(ic1, [si, si], 1);
         let ic2 = gate_part.silu() * up_part;
-        let se = layer.shared.down.apply(&ic2) * se_gate.sigmoid();
+        // `apply` and the silu product are bf16 (the mixer stream); cast the f32
+        // gate to match before multiplying so the shared-expert term stays bf16.
+        let se = layer.shared.down.apply(&ic2) * se_gate.sigmoid().to_kind(Kind::BFloat16);
 
         // The routing decision is host-side either way: the port hands it to the
         // slot cache, and the inline path indexes the banks with it.
@@ -1902,7 +1938,8 @@ impl TorchQwen3_6 {
             }
             routed.push(acc);
         }
-        Ok(Tensor::cat(&routed, 0))
+        // The routed sum joins the bf16 activation stream (TODO.md item 19).
+        Ok(Tensor::cat(&routed, 0).to_kind(Kind::BFloat16))
     }
 
     /// One routed expert for one token: widen its two NVFP4 slabs, apply

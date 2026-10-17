@@ -58,20 +58,20 @@ def _conv_decode_kernel(
     s_row = state_ptr + i_n * stride_state
     o_row = out_ptr + i_n * stride_out
 
-    xv = tl.load(x_row + i_c, mask=mask, other=0.0)
+    xv = tl.load(x_row + i_c, mask=mask, other=0.0).to(tl.float32)
     # The old window, oldest first; the last column of the tile holds the new
     # token (or a masked tap for a width below K - 1).
     old = tl.load(
         s_row + i_c[:, None] * state_len + t[None, :],
         mask=(t < state_len)[None, :] & mask[:, None],
         other=0.0,
-    )
+    ).to(tl.float32)
     win = tl.where((t == state_len)[None, :], xv[:, None], old)
     w_tile = tl.load(
         w_ptr + i_c[:, None] * K + t[None, :],
         mask=(t <= state_len)[None, :] & mask[:, None],
         other=0.0,
-    )
+    ).to(tl.float32)
     acc = tl.sum(win * w_tile, axis=1)
 
     # Shift left and append x: new[c, j] = win[c, j + 1] for j < state_len.
@@ -87,10 +87,14 @@ def _conv_decode_kernel(
     )
     tl.store(
         s_row + i_c[:, None] * state_len + t[None, :],
-        shifted,
+        shifted.to(state_ptr.dtype.element_ty),
         mask=(t < state_len)[None, :] & mask[:, None],
     )
-    tl.store(o_row + i_c, acc / (1.0 + tl.exp(-acc)), mask=mask)
+    tl.store(
+        o_row + i_c,
+        (acc / (1.0 + tl.exp(-acc))).to(out_ptr.dtype.element_ty),
+        mask=mask,
+    )
 
 
 def conv_decode(

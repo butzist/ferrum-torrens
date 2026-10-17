@@ -434,12 +434,13 @@ Slices 1-2 and E4 are done. The ordered remainder, with what each step actually 
    `device_decode_matches_refeed` argmax-exact. **Throughput neutral**: the GDN
    block is ~10 ms/token before and after, so the conv was never the cost (decision
    77); it is kept for the dropped `w.repeat` allocation / op soup and as the ABI
-   pattern for slice 4. **OPEN: bf16 mixer activations.** Move the mixer activation
-   stream (rms_norm/conv/attention outputs) from f32 to bf16 so FreeToken's kernels
-   take signature-only edits; tower-wide numerics, so re-measure every logit gate
-   (the decision 80 bounds already allow for bf16) and give `conv_decode` a bf16
-   variant. Bounded by the ~10 ms GDN + ~30 ms "rest" shares (decision 81), so item
-   11 (batching) is the larger serving lever.
+   pattern for slice 4. **bf16 mixer activations DONE (2026-10-17), decision 87:**
+   rms_norm/linear/projection/conv/attention/MoE outputs are bf16, the state/
+   scales/router/softmax stay f32, and the vendored cubins take bf16 pointers
+   (store cast in-kernel). Correct (device gate 3/3 argmax-exact; `ftw_cross_check`
+   argmax 11751, 2.4%) and **throughput neutral** (tg 11.3 at 1536 slots, flat):
+   the activation stream is negligible against the weight read, matching decision
+   81 -- so item 11 (batching) is the larger serving lever. Slice 3 is complete.
 3. **Slice 4 (item 20): prefill chunk kernels** (`chunk_gated_delta_rule`,
    `causal_conv1d_varlen`). This is the **pp** lever (our prefill is still libtorch
    op soup), not tg.

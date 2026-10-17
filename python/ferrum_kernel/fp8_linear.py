@@ -105,7 +105,11 @@ def _fp8_splitk_reduce_kernel(
     for k in range(SPLIT_K):
         acc += tl.load(part_ptr + k * stride_pk + offs * stride_pn, mask=mask, other=0.0)
     scale = tl.load(scale_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-    tl.store(out_ptr + offs, acc * scale, mask=mask)
+    tl.store(
+        out_ptr + offs,
+        (acc * scale).to(out_ptr.dtype.element_ty),
+        mask=mask,
+    )
 
 
 @triton.jit
@@ -150,7 +154,11 @@ def _fp8_gemm_kernel(
     scale = tl.load(scale_ptr + offs_n, mask=n_mask, other=0.0).to(tl.float32)
     acc = acc * scale[None, :]
     c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
-    tl.store(c_ptrs, acc, mask=m_mask[:, None] & n_mask[None, :])
+    tl.store(
+        c_ptrs,
+        acc.to(c_ptr.dtype.element_ty),
+        mask=m_mask[:, None] & n_mask[None, :],
+    )
 
 
 def _split_k(n_tiles: int, n_kb: int) -> int:

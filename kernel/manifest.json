@@ -594,7 +594,7 @@
       ],
       "profile_scratch_size": 0,
       "scratch_params": 2,
-      "shared": 1024
+      "shared": 512
     },
     "fp8_gemm": {
       "constexprs": {
