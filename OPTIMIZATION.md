@@ -627,9 +627,33 @@ the parity lever this section promised.
 
 What remains sound is small: the routed copy for layer `l` can overlap that
 **same layer's shared-expert** compute (independent of the routed slots), worth
-~3.2 ms/token at 512 (~5%). It needs the MoE port split into prefetch/compute and
-cross-stream events inside the captured step; left as an optional R6 item rather
-than a milestone.
+~3.2 ms/token at 512 (~5%). The split landed (below), but the overlap is
+**neutral**, not a win.
+
+### R3b -- Decode copy/compute overlap via a prefetch/finish split -- SPLIT LANDED, OVERLAP NEUTRAL
+
+The MoE port is split into `prefetch_device` (issue `lru_ensure` + `index_copy`)
+and `finish_device` (wait for the copy, then the grouped GEMV), with
+`execute_device` the composite; the adapter runs the copy on a second
+(non-blocking) stream ordered by a per-layer `begun`/`ready` event pair, and the
+model computes the shared expert between the two calls. The split is correct and
+capture-safe (`a_captured_decode_step_replays_equal_to_an_uncaptured_step`
+exact, device-decode argmax-exact, 312 units) and is the scaffolding for a
+future speculative prefetch.
+
+**Measured neutral, and why.** rt/graph smoke tg `18.5 -> 18.3` (noise), and the
+uncaptured profile shows `moe_copy` `29.6 -> 0.03` while `shared` `2.3 -> 30.1`:
+the shared expert is not hidden, it *waits for the copy*. The `index_copy`
+kernel (`REG:72`, no shared memory) launches a `(6, BLOCK_K, splits)` grid and
+its resident CTAs sit on every SM slot while stalled on PCIe, so an independent
+compute kernel cannot co-schedule with two streams. The per-layer window is also
+only ~0.74 ms (the copy) against ~0.06 ms of router-independent work (the shared
+expert), so even a working overlap caps at ~2.3 ms/token at bs=1.
+
+To make the window pay, the fetch must leave SM headroom *and* there must be
+more independent work to fill it: a lower-occupancy copy kernel, or real
+lookahead (routing is persistent across tokens, so a one-token-ahead speculative
+prefetch is the candidate -- see the todo). Left as an optional R6 item.
 
 
 ### R4 -- MoE-first VRAM budget planner (item 12) -- DONE
@@ -673,8 +697,9 @@ Blocked, with the reason:
   so our W8A16 split-K GEMV stays.
 - `shared` 3.2 vs 1.7: the shared expert is NVFP4 in the checkpoint but our dense
   NVFP4 kernel is GEMV-only, so keeping it NVFP4 needs an M>1 (prefill) path.
-- the ~3 ms shared-expert/routed-copy overlap (R3 residue) needs the MoE port
-  split into prefetch/compute inside the captured step.
+- the shared-expert/routed-copy overlap (R3 residue): the prefetch/finish split
+  landed but the overlap is **neutral** because the copy kernel starves the SMs
+  (R3b). Real lookahead is the next candidate.
 - `router` 1.8 vs 0.8 stays f32 (decision 87).
 
 None is safe to add as polish; each is its own slice.

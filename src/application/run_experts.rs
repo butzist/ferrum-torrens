@@ -101,14 +101,27 @@ impl MoEExecutor for CachedExperts {
         self.steps()
     }
 
-    fn execute_device<'a>(
+    fn prefetch_device<'a>(&self, req: &MoEDeviceRequest<'a>) -> Result<(), MoEError> {
+        // Counted before the work, so a step the kernel refuses still shows up:
+        // the count is evidence that the port was reached, not that it succeeded.
+        self.steps.fetch_add(1, Ordering::Relaxed);
+        let tokens = check_device_step(req)?;
+        if tokens * req.top_k == 0 {
+            return Err(MoEError::Bad("device expert step: no routes".into()));
+        }
+        // The staged adapter issues the slot plan and the copy here, on its
+        // copy stream, so the caller can run the shared expert while it lands.
+        if self.staged {
+            return self.gemm.staged_prefetch(req);
+        }
+        Ok(())
+    }
+
+    fn finish_device<'a>(
         &self,
         req: &MoEDeviceRequest<'a>,
         out: &mut dyn MoETensor,
     ) -> Result<(), MoEError> {
-        // Counted before the work, so a step the kernel refuses still shows up:
-        // the count is evidence that the port was reached, not that it succeeded.
-        self.steps.fetch_add(1, Ordering::Relaxed);
         let tokens = check_device_step(req)?;
         if out.numel() < tokens * req.hidden {
             return Err(MoEError::Bad(format!(
@@ -117,18 +130,11 @@ impl MoEExecutor for CachedExperts {
                 req.hidden
             )));
         }
-        let routes = tokens * req.top_k;
-        if routes == 0 {
-            return Err(MoEError::Bad("device expert step: no routes".into()));
-        }
-
-        // The staged path owns the plan on the device, so a staged executor uses
-        // it for every step. A route list past the committed `lru_ensure` block
-        // is chunked inside the adapter (prefill), not sent to the host plan, so
-        // the router's ids and the misses never leave the device once staging is
-        // on. The host plan stays the whole path when there is no staging.
+        // A staged executor owns the plan on the device, so it uses the device
+        // path for every step; the adapter chunks a large route list internally
+        // (prefill), so the router's ids and the misses never leave the device.
         if self.staged {
-            return self.gemm.grouped_moe_staged(req, out);
+            return self.gemm.staged_finish(req, out);
         }
         run_experts_device(
             &mut self.locked(),
@@ -137,6 +143,15 @@ impl MoEExecutor for CachedExperts {
             req,
             out,
         )
+    }
+
+    fn execute_device<'a>(
+        &self,
+        req: &MoEDeviceRequest<'a>,
+        out: &mut dyn MoETensor,
+    ) -> Result<(), MoEError> {
+        self.prefetch_device(req)?;
+        self.finish_device(req, out)
     }
 }
 
@@ -483,7 +498,8 @@ mod tests {
     fn a_staged_step_keeps_the_router_ids_on_the_device() {
         let store = strict_store(4);
         let mut gemm = MockExpertGemm::new();
-        gemm.expect_grouped_moe_staged()
+        gemm.expect_staged_prefetch().times(1).returning(|_| Ok(()));
+        gemm.expect_staged_finish()
             .times(1)
             .returning(|_, out| out.set_host_f32(&vec![0.5f32; out.numel()]));
         let exec = CachedExperts::with_device_staging(Arc::new(store), Arc::new(gemm), 4, 8, 4);
@@ -496,6 +512,28 @@ mod tests {
         assert_eq!(out.vals, vec![0.5f32; 8]);
     }
 
+    /// The split the shared-expert overlap rides on: a staged `execute_device`
+    /// issues the copy in `staged_prefetch` and completes it in
+    /// `staged_finish`, in that order, so a caller can compute in between.
+    #[test]
+    fn a_staged_step_splits_into_prefetch_then_finish() {
+        let store = strict_store(4);
+        let mut gemm = MockExpertGemm::new();
+        let mut seq = mockall::Sequence::new();
+        gemm.expect_staged_prefetch()
+            .times(1)
+            .in_sequence(&mut seq)
+            .returning(|_| Ok(()));
+        gemm.expect_staged_finish()
+            .times(1)
+            .in_sequence(&mut seq)
+            .returning(|_, _| Ok(()));
+        let exec = CachedExperts::with_device_staging(Arc::new(store), Arc::new(gemm), 4, 8, 4);
+        let (x, experts, weights, mut out) = step_buffers();
+        exec.execute_device(&device_request(3, &x, &experts, &weights), &mut out)
+            .unwrap();
+    }
+
     /// A step larger than the cubin's route cap stays on the device too: the
     /// adapter chunks it internally (`grouped_moe_staged`), so prefill never
     /// falls back to the host plan and never reads the router's ids on the host.
@@ -504,7 +542,8 @@ mod tests {
     fn a_staged_step_past_the_cap_still_stages_on_the_device() {
         let store = strict_store(4);
         let mut gemm = MockExpertGemm::new();
-        gemm.expect_grouped_moe_staged()
+        gemm.expect_staged_prefetch().times(1).returning(|_| Ok(()));
+        gemm.expect_staged_finish()
             .times(1)
             .returning(|_, _| Ok(()));
         let exec = CachedExperts::with_device_staging(Arc::new(store), Arc::new(gemm), 4, 8, 4);

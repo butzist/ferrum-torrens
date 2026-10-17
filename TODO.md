@@ -763,11 +763,22 @@ next steps:
    `optimization.md` "R6 investigation": the GDN qkvz projection is at the read
    roofline (~220 GB/s), the FP8 GEMV config is already optimal, and the LRU
    clock is not the miss-rate cause (the copy is workload-bound). The rest is
-   blocked: `moe_lru` top-k needs `tl.topk` (the interpreter gate cannot run it);
-   GDN/attn projections need the W8A8 `torch._scaled_mm` `tch` does not expose
-   (decision 84), though batching routes the projections through the tensor-core
-   `fp8_gemm`; the shared expert needs an M>1 NVFP4 path to stay packed; the
-   copy/compute overlap needs the capture-path port split. Each is its own slice.
+   blocked or neutral: `moe_lru` top-k needs `tl.topk` (the interpreter gate
+   cannot run it); GDN/attn projections need the W8A8 `torch._scaled_mm` `tch`
+   does not expose (decision 84), though batching routes the projections through
+   the tensor-core `fp8_gemm`; the shared expert needs an M>1 NVFP4 path to stay
+   packed. The copy/compute split **landed** (`MoEExecutor::prefetch_device` /
+   `finish_device`, the adapter's second copy stream) but the overlap is
+   **neutral**: the `index_copy` kernel's resident CTAs hold every SM slot while
+   stalled on PCIe, so the shared expert waits for the copy instead of hiding
+   behind it (optimization.md R3b). Each remaining item is its own slice.
+7. **Speculative expert prefetch (idea, not started).** Routing is persistent
+   across decode tokens, so a one-token-ahead lookup could prefetch layer `l`'s
+   expected experts on the decode copy stream while the current token computes.
+   Open question: the copy is byte-bound at ~87% of PCIe peak, so a wrong guess
+   costs bytes directly; the misses are the *non*-persistent part, which the
+   previous token predicts worst. Measure routing persistence and miss
+   autocorrelation before building. Blocked on that measurement.
 
 Caveat (decision 89): the step is now ~33 ms copy (PCIe, miss-bound) + ~30 ms
 compute. FreeToken's 22.5 -> 30.3 tok/s at bs=1 is mostly its larger default

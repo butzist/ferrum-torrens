@@ -153,6 +153,12 @@ pub struct CudaMoE {
     /// has run (item 8 slice 2). Retained across prefill/decode transitions, so
     /// nothing is reallocated per prefill; `None` when overlap is off.
     prefill: Option<PrefillHarness>,
+    /// The decode copy's second stream and per-layer ordering events, present
+    /// once device staging is on. It lets a decode layer's miss copy run while
+    /// the caller computes the shared expert (optimization.md R6).
+    decode_copy: Option<DecodeOverlap>,
+    /// The staging in flight between `staged_prefetch` and `staged_finish`.
+    pending: Option<PendingStaged>,
     /// The live residency policy over the shared slot banks.
     residency: Residency,
 }
@@ -262,6 +268,25 @@ struct PrefillHarness {
     half_layer: [i64; 2],
 }
 
+/// The decode miss copy's second stream. One `begun`/`ready` event pair per
+/// layer, so a captured step records each event exactly once: the compute
+/// stream records `begun` after `lru_ensure`, the copy stream waits on it, runs
+/// `index_copy`, records `ready`, and the compute stream waits on `ready`
+/// before the GEMV reads the copied slots. The copy stream is otherwise idle.
+struct DecodeOverlap {
+    copy_stream: OwnedStream,
+    begun: Vec<OwnedEvent>,
+    ready: Vec<OwnedEvent>,
+}
+
+/// The staging a `staged_prefetch` left in flight: the rewritten slot routes
+/// the copy is filling and the layer whose plan they came from. Consumed by the
+/// matching `staged_finish`.
+struct PendingStaged {
+    layer: usize,
+    slots: Tensor,
+}
+
 impl CudaMoE {
     /// Open the driver, load the committed cubins and check they were built for
     /// `shapes`. Nothing is allocated yet: the banks come with the first miss,
@@ -322,6 +347,8 @@ impl CudaMoE {
             device_staging: None,
             pinned: None,
             prefill: None,
+            decode_copy: None,
+            pending: None,
             residency: Residency::Decode,
         })
     }
@@ -497,6 +524,21 @@ impl CudaMoE {
             src_ptrs,
         });
         self.pinned = Some(pinned);
+        // The decode overlap's copy stream and its per-layer events are created
+        // here, before any capture, so the graph bakes live handles.
+        let lib = self.kernels.driver();
+        let copy_stream = lib.owned_stream(STREAM_NON_BLOCKING).map_err(driver)?;
+        let mut begun = Vec::with_capacity(layers);
+        let mut ready = Vec::with_capacity(layers);
+        for _ in 0..layers {
+            begun.push(lib.owned_event().map_err(driver)?);
+            ready.push(lib.owned_event().map_err(driver)?);
+        }
+        self.decode_copy = Some(DecodeOverlap {
+            copy_stream,
+            begun,
+            ready,
+        });
         Ok(())
     }
 
@@ -686,8 +728,17 @@ impl CudaMoE {
 
     /// `index_copy`: copy the plan's missed rows from the layer's pinned host
     /// banks into the device slot banks. Reads the plan `ensure_experts` wrote on
-    /// the device, so it is data-independent.
+    /// the device, so it is data-independent. Runs on the compute stream; the
+    /// decode overlap uses `copy_missing_on` to put it on its copy stream
+    /// instead.
     pub fn copy_missing(&mut self, layer: usize) -> Result<(), MoEError> {
+        let stream = self.stream;
+        self.copy_missing_on(layer, stream)
+    }
+
+    /// As `copy_missing`, launched on `stream`: the decode overlap calls it with
+    /// the copy stream so the copy can run while the compute stream works.
+    fn copy_missing_on(&mut self, layer: usize, stream: CUstream) -> Result<(), MoEError> {
         let copy = self.staging_abi.kernel(INDEX_COPY).map_err(bad_abi)?;
         let st = self
             .device_staging
@@ -710,7 +761,7 @@ impl CudaMoE {
         let mut params = pack.kernel_params().map_err(bad_abi)?;
         // SAFETY: as `ensure_experts`: every pointer is a live allocation and
         // `params` matches this kernel's manifest entry.
-        unsafe { self.staging.launch(copy, &mut params, self.stream) }.map_err(driver)
+        unsafe { self.staging.launch(copy, &mut params, stream) }.map_err(driver)
     }
 
     /// Every check the launches need, before anything is allocated: the
@@ -1047,7 +1098,154 @@ impl CudaMoE {
     /// slots (`lru_ensure`), copy the misses (`index_copy`), then the same three
     /// pieces as the other hand-offs (decision 40 prerequisite 4). The ids never
     /// cross to the host, so a capture sees only data-independent launches.
+    ///
+    /// This is the composite: `staged_prefetch` issues the copy and
+    /// `staged_finish` completes it, so a caller can compute in between. A
+    /// caller that has nothing to overlap still uses this.
     pub fn grouped_moe_staged(
+        &mut self,
+        req: &MoEDeviceRequest<'_>,
+        out: &mut dyn MoETensor,
+    ) -> Result<(), MoEError> {
+        self.staged_prefetch(req)?;
+        self.staged_finish(req, out)
+    }
+
+    /// The first half of a decode step: rewrite the router's ids into slots on
+    /// the compute stream (`lru_ensure`), then launch the miss copy
+    /// (`index_copy`) on the second stream and return without waiting for it.
+    /// `staged_finish` makes the compute stream wait for the copy before the
+    /// GEMV, so a caller can run the shared expert while the copy lands.
+    ///
+    /// A no-op when there is nothing to split: no second stream, a
+    /// prefill-shaped step, or a multi-chunk route list. `staged_finish` then
+    /// runs the whole step.
+    pub fn staged_prefetch(&mut self, req: &MoEDeviceRequest<'_>) -> Result<(), MoEError> {
+        let tokens = self.check_batch(
+            req.top_k,
+            req.x.numel(),
+            req.experts.numel(),
+            req.weights.numel(),
+        )?;
+        let routes = tokens * req.top_k;
+        if self.decode_copy.is_none()
+            || self.is_prefill_step(routes)?
+            || routes > self.lru_block_k()?
+        {
+            return Ok(());
+        }
+        if self.residency == Residency::Prefill {
+            self.leave_prefill()?;
+        }
+        let experts = device_tensor(req.experts, "the expert ids")?;
+        // The kernel rewrites this copy in place; the cast makes a fresh buffer,
+        // so the router's own `[tokens, top_k]` ids are untouched.
+        let slots = experts
+            .reshape([routes as i64])
+            .to_kind(tch::Kind::Int)
+            .contiguous();
+        let sp = crate::infrastructure::profile::begin("moe_lru");
+        self.ensure_experts(req.layer, &slots)?;
+        crate::infrastructure::profile::end("moe_lru", sp);
+
+        let layer = req.layer;
+        // Fork: the copy stream waits until `lru_ensure` has written the plan,
+        // then copies the misses. The compute stream runs on past this call.
+        {
+            let dc = self.decode_copy.as_ref().expect("checked above");
+            let stream = self.stream;
+            // SAFETY: `stream` and the copy stream are live streams of the
+            // current context.
+            unsafe { dc.begun[layer].record(stream) }.map_err(driver)?;
+            unsafe { dc.begun[layer].wait_on(dc.copy_stream.raw()) }.map_err(driver)?;
+        }
+        let copy_stream = self
+            .decode_copy
+            .as_ref()
+            .expect("checked above")
+            .copy_stream
+            .raw();
+        let sp = crate::infrastructure::profile::begin("moe_copy");
+        self.copy_missing_on(layer, copy_stream)?;
+        crate::infrastructure::profile::end("moe_copy", sp);
+        {
+            let dc = self.decode_copy.as_ref().expect("checked above");
+            // SAFETY: the copy stream is this adapter's own live stream.
+            unsafe { dc.ready[layer].record(dc.copy_stream.raw()) }.map_err(driver)?;
+        }
+        self.pending = Some(PendingStaged { layer, slots });
+        Ok(())
+    }
+
+    /// The second half of a decode step: if `staged_prefetch` left a staging in
+    /// flight, wait for its copy on the compute stream, then run the GEMV over
+    /// the slots it filled. Otherwise run the whole step (`stage_whole`):
+    /// prefill-shaped steps and multi-chunk route lists are not split.
+    pub fn staged_finish(
+        &mut self,
+        req: &MoEDeviceRequest<'_>,
+        out: &mut dyn MoETensor,
+    ) -> Result<(), MoEError> {
+        let Some(pending) = self.pending.take() else {
+            return self.stage_whole(req, out);
+        };
+        let tokens = self.check_batch(
+            req.top_k,
+            req.x.numel(),
+            req.experts.numel(),
+            req.weights.numel(),
+        )?;
+        let top_k = req.top_k;
+        let out_t = out
+            .as_any_mut()
+            .downcast_mut::<DevTensor>()
+            .ok_or_else(|| {
+                MoEError::Bad(
+                    "the device MoE hand-off needs a device tensor for the routed sum".into(),
+                )
+            })?;
+        if out_t.0.size() != [tokens as i64, self.shapes.hidden as i64] {
+            return Err(MoEError::Bad(format!(
+                "grouped_moe_staged: the routed sum is {:?}, wanted [{tokens}, {}]",
+                out_t.0.size(),
+                self.shapes.hidden
+            )));
+        }
+        let x = device_tensor(req.x, "the activations")?;
+        let weights = device_tensor(req.weights, "the weights")?;
+        // Join: the compute stream waits for the copy before the GEMV reads the
+        // slots it filled.
+        {
+            let dc = self
+                .decode_copy
+                .as_ref()
+                .ok_or_else(|| MoEError::Bad("staged_finish without a copy stream".into()))?;
+            let stream = self.stream;
+            // SAFETY: `stream` is a live stream of the current context.
+            unsafe { dc.ready[pending.layer].wait_on(stream) }.map_err(driver)?;
+        }
+        let routes = tokens * top_k;
+        let dev = self.device.to_tch();
+        let token_t = Tensor::arange(tokens as i64, (tch::Kind::Int, dev))
+            .unsqueeze(1)
+            .expand([tokens as i64, top_k as i64], false)
+            .contiguous()
+            .reshape([routes as i64]);
+        let xd = DevTensor(x.shallow_clone());
+        let wd = DevTensor(weights.shallow_clone());
+        let sp = crate::infrastructure::profile::begin("moe_gemm");
+        let g = self.group_with_slots(&xd, &wd, pending.slots, token_t, tokens, top_k)?;
+        self.launch(&g)?;
+        let result = self.collect_dev(&g, out_t);
+        crate::infrastructure::profile::end("moe_gemm", sp);
+        result
+    }
+
+    /// The unsplit step: a prefill-shaped step takes the whole-layer path (one
+    /// streamed copy of the layer and one GEMV pass, no per-chunk `lru_ensure`),
+    /// and a route list past the `lru_ensure` cap is chunked by tokens. Anything
+    /// that fits one `lru_ensure` launch stays on the flat LRU.
+    fn stage_whole(
         &mut self,
         req: &MoEDeviceRequest<'_>,
         out: &mut dyn MoETensor,
@@ -1501,6 +1699,22 @@ impl ExpertGemm for Mutex<CudaMoE> {
         self.lock()
             .map_err(|_| MoEError::Bad("cuda slot cache poisoned".into()))?
             .grouped_moe_staged(req, out)
+    }
+
+    fn staged_prefetch<'a>(&self, req: &MoEDeviceRequest<'a>) -> Result<(), MoEError> {
+        self.lock()
+            .map_err(|_| MoEError::Bad("cuda slot cache poisoned".into()))?
+            .staged_prefetch(req)
+    }
+
+    fn staged_finish<'a>(
+        &self,
+        req: &MoEDeviceRequest<'a>,
+        out: &mut dyn MoETensor,
+    ) -> Result<(), MoEError> {
+        self.lock()
+            .map_err(|_| MoEError::Bad("cuda slot cache poisoned".into()))?
+            .staged_finish(req, out)
     }
 
     fn staged_route_cap(&self) -> usize {
