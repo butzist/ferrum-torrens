@@ -448,7 +448,10 @@ lever, ahead of cache growth.
    in bf16 like the reference; replace `conv1d_silu_step_batch` with their fused
    conv+silu (in-place slot state).
 4. **Prefill chunk kernels** (`chunk_gated_delta_rule`, `causal_conv1d_varlen`):
-   our prefill is still op soup and has no FLA chunk kernel at all.
+   our prefill is still op soup and has no FLA chunk kernel at all. A smaller
+   libtorch-level prefill win landed first (decision 101): a 256-token whole-layer
+   GEMV chunk plus a hoisted GDN recurrence, pp ~88 -> ~120 tok/s at 517 tokens
+   (1.36x) and ~76 -> ~122 at 2057 (1.60x), decode unchanged.
 
 ## Next steps (ordered, 2026-10-16)
 
@@ -488,8 +491,11 @@ Slices 1-2 and E4 are done. The ordered remainder, with what each step actually 
    the activation stream is negligible against the weight read, matching decision
    81 -- so item 11 (batching) is the larger serving lever. Slice 3 is complete.
 3. **Slice 4 (item 20): prefill chunk kernels** (`chunk_gated_delta_rule`,
-   `causal_conv1d_varlen`). This is the **pp** lever (our prefill is still libtorch
-   op soup), not tg.
+   `causal_conv1d_varlen`). This is the **pp** lever, not tg. **A libtorch-level
+   slice landed first (decision 101, 2026-10-18):** a 256-token whole-layer GEMV
+   chunk (`PREFILL_CHUNK_TOKENS`) and a GDN recurrence that hoists its per-token
+   work out of the loop; pp **88 -> 120 tok/s** at 517 tokens and **76 -> 122** at
+   2057, decode flat. The FLA chunk kernels remain open.
 4. **Item 11: server-side batching.** Not kernel work, but the largest *serving*
    lever -- the generation loop currently runs one `run_batch` per request, so
    decode never batches and `max_running_requests` is dead. At bs>1 the per-token
@@ -1078,7 +1084,18 @@ the fused reduction order shifts last-bit greedy chaos to 2.46e-1 of scale
 with the token sequence unchanged (oracles green) -- same class as decision
 80's cuBLAS-shape recalibration.
 
-Next levers, unchanged ranking: R8.3 attention (4.3 -> ~2.5, the largest
-single compute gap), the R8.1 fused router, `moe_lru` tuning, the gdn tail
-norm fusion (now the same `add_rmsnorm` shape), and slice 4 prefill kernels
-(pp). The copy (~13 ms, ~87% of pinned H2D peak) is the reference's cost too.
+Next levers after R9.1, re-ranked 2026-10-18:
+- **R8.3 attention is CLOSED** (see R8.3): the 4.3 ms was the eager libtorch
+  fallback, not the paged kernel; the captured kernel cost is ~0.1-0.25 ms.
+- **Prefill (pp): a libtorch-level win landed** (decision 101) -- a 256-token
+  whole-layer GEMV chunk plus a hoisted GDN recurrence, pp 88 -> 120 tok/s at 517
+  tokens (76 -> 122 at 2057); the FLA chunk kernels (slice 4) remain the larger
+  pp item.
+- Remaining bs=1 items, all sub-ms-to-~1 ms: `moe_lru` (2.35 vs 1.6), the R8.1
+  fused router (1.34), the gdn tail norm, R8.5 fp8 KV (frees VRAM for slots).
+- A stashed R9.2 attempt (fused q/k Gemma RMSNorm + fused GDN gated norm) was
+  correct and gate-green but measured a captured regression (~6% at the time;
+  each fusion alone neutral) with no proven win, so it is not shipped. Revisit
+  only with a per-kernel GPU timing under capture to explain the interaction.
+- The copy (~13 ms, ~87% of pinned H2D peak) and the FP8 projections (~220 GB/s,
+  read roofline) are at parity with the reference; not levers.

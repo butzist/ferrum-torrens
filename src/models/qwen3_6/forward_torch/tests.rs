@@ -999,9 +999,7 @@ fn a_carried_gdn_state_matches_the_stateless_recurrence_over_the_concatenation()
         &slice(&v, 0..t0, hv as i64 * dv as i64),
         &slice(&g, 0..t0, hv as i64),
         &slice(&beta, 0..t0, hv as i64),
-        hv as i64,
         dk as i64,
-        dv as i64,
         &zero,
     );
     let (second, _) = gdn_recurrence_cached(
@@ -1010,9 +1008,7 @@ fn a_carried_gdn_state_matches_the_stateless_recurrence_over_the_concatenation()
         &slice(&v, t0..t, hv as i64 * dv as i64),
         &slice(&g, t0..t, hv as i64),
         &slice(&beta, t0..t, hv as i64),
-        hv as i64,
         dk as i64,
-        dv as i64,
         &state,
     );
 
@@ -1083,9 +1079,7 @@ fn a_batched_recurrence_step_matches_each_single_row_step() {
             &vt.narrow(0, row, 1),
             &gt.narrow(0, row, 1),
             &bt.narrow(0, row, 1),
-            hv as i64,
             dk as i64,
-            dv as i64,
             &state.select(0, row),
         );
         close(

@@ -862,7 +862,7 @@ fn gdn_recurrence(
     dv: i64,
 ) -> Tensor {
     let zero = Tensor::zeros([hv, dk, dv], (Kind::Float, q.device()));
-    gdn_recurrence_cached(q, k, v, g, beta, hv, dk, dv, &zero).0
+    gdn_recurrence_cached(q, k, v, g, beta, dk, &zero).0
 }
 
 /// The same recurrence entering from `state` (`[hv, dk, dv]` fp32) instead of
@@ -876,9 +876,7 @@ fn gdn_recurrence_cached(
     v: &Tensor,
     g: &Tensor,
     beta: &Tensor,
-    hv: i64,
     dk: i64,
-    dv: i64,
     state: &Tensor,
 ) -> (Tensor, Tensor) {
     let t = q.size()[0];
@@ -886,25 +884,37 @@ fn gdn_recurrence_cached(
     // Build state as [hv, dk, dv] to match reference layout
     let mut state = state.shallow_clone();
     let scale = 1.0f64 / (dk as f64).sqrt();
+
+    // Everything the loop needs from `q`/`k`/`g`/`beta` is per-token, not
+    // state-dependent, so it is computed once over the whole chunk. The old
+    // form recomputed it inside the `t` loop, which is 517 tiny launches per
+    // layer at a 517-token prompt and made prefill launch-bound.
+    let qf = f32_(q);
+    let kf = f32_(k);
+    let vf = f32_(v);
+    let gf = f32_(g).exp();
+    let bf = f32_(beta);
+    let q2 = qf
+        .pow_tensor_scalar(2.0)
+        .sum_dim_intlist(-1, true, Kind::Float)
+        .g_add_scalar(1e-6);
+    let k2 = kf
+        .pow_tensor_scalar(2.0)
+        .sum_dim_intlist(-1, true, Kind::Float)
+        .g_add_scalar(1e-6);
+    let qinv = q2.sqrt().reciprocal() * scale;
+    let kinv = k2.sqrt().reciprocal();
+    let kiw_all = &kf * &kinv;
+
     for tt in 0..t {
-        let qi = f32_(&q.select(0, tt)).view([hv, dk]);
-        let ki = f32_(&k.select(0, tt)).view([hv, dk]);
-        let vi = f32_(&v.select(0, tt)).view([hv, dv]);
-        let g_t = f32_(&g.select(0, tt)).exp();
-        let beta_t = f32_(&beta.select(0, tt));
-        let q2 = qi
-            .pow_tensor_scalar(2.0)
-            .sum_dim_intlist(-1, true, Kind::Float)
-            .g_add_scalar(1e-6);
-        let k2 = ki
-            .pow_tensor_scalar(2.0)
-            .sum_dim_intlist(-1, true, Kind::Float)
-            .g_add_scalar(1e-6);
-        let qinv = q2.sqrt().reciprocal();
-        let kinv = k2.sqrt().reciprocal();
+        let qi = qf.select(0, tt);
+        let vi = vf.select(0, tt);
+        let g_t = gf.select(0, tt);
+        let beta_t = bf.select(0, tt);
+        let qinv_t = qinv.select(0, tt);
         // decay
         state = (&state) * &g_t.view([-1, 1, 1]);
-        let kiw = ki * kinv;
+        let kiw = kiw_all.select(0, tt);
         // kv_mem: sum_kk state[h,kk,d] * kiw[h,kk] -> [hv,dv]
         let kv_mem = ((&state) * kiw.unsqueeze(-1))
             .sum_dim_intlist(1, true, Kind::Float)
@@ -914,7 +924,7 @@ fn gdn_recurrence_cached(
         let out = ((&state) * qi.unsqueeze(-1))
             .sum_dim_intlist(1, true, Kind::Float)
             .squeeze_dim(1)
-            * (qinv * scale).view([-1, 1]);
+            * qinv_t;
         outs.push(out);
     }
     (Tensor::stack(&outs, 0), state)
@@ -1831,7 +1841,7 @@ impl TorchQwen3_6 {
         let beta = sigmoid(&b);
         let (core, rec) = {
             let sp = profile::begin("gdn_recur");
-            let o = gdn_recurrence_cached(&q, &k, &v, &g, &beta, vb, dk, dv, recurrent_state);
+            let o = gdn_recurrence_cached(&q, &k, &v, &g, &beta, dk, recurrent_state);
             profile::end("gdn_recur", sp);
             o
         };

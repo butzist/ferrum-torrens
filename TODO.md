@@ -71,8 +71,16 @@ OPTIMIZATION.md R9) put captured tg at 25.9 vs the reference's 30.3, found the
 residual gap to be **launch count, not bytes** (FreeToken's eager step equals
 its captured one), and landed the **fused add + RMSNorm** (`add_rmsnorm`,
 decision 100): eager norm stages 1.83 -> 0.47 ms, captured **tg 27.7**, eager
-22.9. Remaining levers: the R8.3 attention kernel, the R8.1 fused router,
-`moe_lru`, the gdn tail norm, and slice 4 (prefill). Instruments:
+22.9. Post-R9 (2026-10-18): the R8.3 attention "gap" was a measurement artifact (the
+eager profile's `attn` is the libtorch fallback; the paged kernel only runs in
+the captured path), so it is closed -- a fresh controlled baseline puts captured
+tg at **28.3 tok/s** vs the reference's 30.3, essentially parity. Prefill was the
+real remaining gap: a libtorch-level slice (decision 101) doubled pp at long
+prompts (76 -> 122 tok/s at 2057 tokens) via a 256-token whole-layer GEMV chunk
+and a hoisted GDN recurrence, decode unchanged. A stashed R9.2 attempt (fused q/k
+RMSNorm + GDN gated norm) was correct but did not measure a captured win, so it
+is parked. Remaining levers: the R8.1 fused router, `moe_lru`, the gdn tail norm,
+R8.5 fp8 KV, and the FLA prefill chunk kernels (slice 4). Instruments:
 `FT_PROFILE=1` and `scripts/freetoken_probe/`.
 Progress history and the full decision log (numbers 1..100) live in `DONE.md`;
 read that for the "why" behind any decision number referenced in code or tests.
@@ -688,9 +696,13 @@ performance work.
     `ftw_cross_check` argmax 11751, top-5 identical) and **throughput neutral**:
     tg 11.3 at 1536 slots, unchanged, because the activation stream is negligible
     against the per-token weight read (decision 81). Kept for reference parity.
-20. Prefill chunk kernels -- **OPEN (decision 82, slice 4).** Vendor FLA
-    `chunk_gated_delta_rule` + `causal_conv1d_varlen`; our prefill is still
-    libtorch op soup with no FLA chunk kernel.
+20. Prefill chunk kernels -- **PARTIAL (decision 82, slice 4; libtorch-level win
+    landed, decision 101).** A 256-token whole-layer GEMV chunk
+    (`PREFILL_CHUNK_TOKENS`) + a hoisted GDN recurrence (`gdn_recurrence_cached`
+    computes its per-token norms/`exp(g)`/`beta` once per chunk) took pp
+    **88 -> 120 tok/s** at 517 tokens and **76 -> 122** at 2057, decode flat
+    (2026-10-18). The FLA `chunk_gated_delta_rule` + `causal_conv1d_varlen`
+    kernels remain OPEN.
 21. Expert cache growth (E4) -- **DONE (2026-10-17), decision 85.** The staging
      `lru_ensure` `BLOCK_C` ceiling is raised 512 -> 2048 (decision 84), so a
      config may grow the cache into the VRAM the FP8 slice freed. Measured on the

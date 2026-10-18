@@ -1308,9 +1308,9 @@ impl CudaMoE {
         let hidden = self.shapes.hidden;
         let tokens = x.numel() / hidden;
         let routes = tokens * top_k;
-        let (experts_per_layer, layers, block_k) = {
+        let (experts_per_layer, layers) = {
             let st = self.device_staging.as_ref().expect("staging");
-            (st.experts, st.layers, self.lru_block_k()?)
+            (st.experts, st.layers)
         };
         let half = layer % 2;
 
@@ -1351,7 +1351,13 @@ impl CudaMoE {
             .expect("harness")
             .victims
             .index_select(0, &idx);
-        let chunk = staged_chunk_tokens(block_k, top_k);
+        // The whole-layer path never runs `lru_ensure`, so `block_k` does not
+        // bound it; the chunk only bounds the scratch and keeps the grouped
+        // GEMV's route list small. A large chunk is a large win: with 16-token
+        // chunks almost every route in a chunk names a distinct expert, so the
+        // per-route GEMV re-reads each expert from HBM, while a 256-token chunk
+        // gives each expert enough routes that its weight is reused from L2.
+        let chunk = PREFILL_CHUNK_TOKENS.min(tokens);
         let dev = self.device.to_tch();
         let mut start = 0usize;
         while start < tokens {
@@ -1445,6 +1451,19 @@ impl CudaMoE {
 fn staged_chunk_tokens(block_k: usize, top_k: usize) -> usize {
     (block_k / top_k).max(1)
 }
+
+/// Tokens one grouped GEMV launch of the whole-layer prefill path covers.
+///
+/// That path never runs `lru_ensure`, so the committed `BLOCK_K` (a route cap
+/// for the device LRU) does not apply; only the scratch and the route list are
+/// bounded. It wants to be large: the GEMV reads one expert's weight per route,
+/// so at the decode-shaped 16-token chunk nearly every route names a distinct
+/// expert and each weight is streamed from HBM once per route, while at 256
+/// tokens an expert's 8-ish routes share one resident read (L2 reuse). Measured
+/// on the RTX 5060 Laptop, 517-token prompt: 16 -> 512 tokens took the MoE GEMV
+/// 2.32 -> 1.50 s, and the returns flatten past ~256. Capped so a long
+/// `max_prefill_length` cannot balloon the per-layer scratch (~8 MiB at 256).
+const PREFILL_CHUNK_TOKENS: usize = 256;
 
 /// Packed plus scales plus globals for one expert's two slabs.
 fn per_expert(shapes: ExpertShapes) -> usize {

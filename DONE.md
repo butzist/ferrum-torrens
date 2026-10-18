@@ -2498,8 +2498,42 @@ settled.
       norm's different reduction order shifts last-bit greedy chaos from
       1.64e-1 to 2.46e-1 of scale (identical on both pools, argmax unchanged,
       all oracles green). Two `rms_norm` unit tests also failed pre-existing
-      under `--features cuda` (decision 87 made the store bf16 while they kept
-      an f32 1e-5 tolerance); raised to 8e-3 with the reason inline.
+       under `--features cuda` (decision 87 made the store bf16 while they kept
+       an f32 1e-5 tolerance); raised to 8e-3 with the reason inline.
+
+101. **Prefill: a bigger whole-layer GEMV chunk and a hoisted GDN recurrence**
+     (2026-10-18, implemented) -- OPTIMIZATION.md slice 4 (item 20) is the FLA
+     chunk kernels; this is a smaller libtorch-level prefill win landed first,
+     because prefill was the largest remaining gap once decode reached parity
+     (captured tg ~28.3 vs the reference's 30.3). Measured on the RTX 5060
+     Laptop, bs=1, bf16 KV, auto cache, controlled order-balanced A/B:
+     - **pp ~88 -> ~120 tok/s at a 517-token prompt (1.36x); ~76 -> ~122 at 2057
+       tokens (1.60x).** Prefill is now flat (~120 tok/s) instead of falling with
+       length, i.e. the change removes a per-token marginal cost. Decode is
+       unchanged (tg 24.7 -> 24.7 at 128 tokens; AIME-25 #0 tg 28.2), VRAM flat.
+     - **Two edits.** (a) `cuda_moe.rs`: the whole-layer prefill grouped GEMV now
+       covers `PREFILL_CHUNK_TOKENS = 256` tokens per launch, not the LRU route
+       cap `staged_chunk_tokens(BLOCK_K, top_k) = 16`. That path never calls
+       `lru_ensure`, so `BLOCK_K` never bounded it; with 16-token chunks almost
+       every route named a distinct expert and the GEMV re-streamed each weight
+       from HBM, while 256 tokens gives each expert's routes enough reuse to stay
+       in L2 (the prior agent's note: GEMV 2.32 -> 1.50 s at 517 tokens). The cap
+       keeps per-layer scratch ~8 MiB and leaves the LRU path's 16-token chunking
+       intact. (b) `forward_torch.rs::gdn_recurrence_cached`: the per-token q/k
+       l2 norm, `exp(g)` and `beta` are computed once over the whole chunk instead
+       of inside the `t` loop, which was 517 launches per layer at a 517-token
+       prompt -- prefill was launch-bound. The signature drops the unused `hv`/`dv`
+       params.
+     - **Gates.** `cargo fmt`/`clippy` (CPU and `--features cuda`) clean; 314
+       unit tests pass; `--interp` selftest and `check-kernels.sh` green (the
+       `add_rmsnorm.cubin` debug-path churn was resynced; see the build commit).
+       GPU: `engine_real_generate` 6/6 (oracle 11751, chat 8160, captured decode),
+       `kvcache_cross_request_reuse` (reused 7/10, argmax ok, 1.41e-1 of scale),
+       `device_decode_matches_refeed` 3/3 argmax exact, `ftw_cross_check` argmax
+       11751. The GDN hoist is the risky edit; the argmax-exact reuse/generate
+       oracles confirm no numeric drift.
+     - **Remaining prefill work:** the FLA chunk kernels (`chunk_gated_delta_rule`,
+       `causal_conv1d_varlen`) are still open (slice 4); this win is libtorch-level.
 
 ---
 
