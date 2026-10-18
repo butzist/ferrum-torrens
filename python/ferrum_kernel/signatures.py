@@ -52,7 +52,7 @@ def gemv(
     glob_dtype: str = "fp16",
     c_dtype: str | None = None,
 ) -> dict:
-    """The routed decode GEMV (optimization.md R1): the packed bank is int32
+    """The routed decode GEMV (OPTIMIZATION.md R1): the packed bank is int32
     `[S, N, K // 8]` (8 e2m1 codes per word) and the K reduction is deferred."""
     return {
         "a_ptr": f"*{a_dtype}",
@@ -347,7 +347,7 @@ def conv_decode_constexprs(
 
 
 def add_rmsnorm() -> dict:
-    """The fused residual-add + GemmaRMSNorm (optimization.md R6: the norm
+    """The fused residual-add + GemmaRMSNorm (OPTIMIZATION.md R6: the norm
     launch tax). `x`/`r`/`w`/`sum`/`out` are all the model dtype (bf16), `eps`
     is an fp32 scalar and the strides are the `x`/`r` row strides."""
     return {
@@ -370,7 +370,7 @@ def add_rmsnorm_constexprs(hidden: int = SERVING_HIDDEN, block: int = NORM_BLOCK
 
 def nvfp4_dense_gemv() -> dict:
     """The dense NVFP4 GEMV the lm_head runs (TODO.md section 8 item 18,
-    optimization.md R2): int32 wide loads, a deferred K reduction and the
+    OPTIMIZATION.md R2): int32 wide loads, a deferred K reduction and the
     fp16-bitcast dequant.
 
     `a` is bf16 activations `[M, K]`, the weight is NVFP4 (packed read as int32,

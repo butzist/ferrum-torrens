@@ -172,7 +172,7 @@ def main() -> int:
     except Exception as e:  # noqa: BLE001
         print(f"conv_decode FAILED: {type(e).__name__}: {str(e)[:200]}")
         failures += 1
-    # The fused add + RMSNorm (optimization.md R6: the norm launch tax).
+    # The fused add + RMSNorm (OPTIMIZATION.md R6: the norm launch tax).
     try:
         check(
             "add_rmsnorm",

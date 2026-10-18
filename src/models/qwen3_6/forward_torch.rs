@@ -79,7 +79,7 @@ struct Loader<'a> {
     fp8: Option<&'a std::sync::Arc<Fp8Linear>>,
     /// The dense NVFP4 GEMV launcher (the lm_head's). The shared expert is also
     /// NVFP4 in the checkpoint, so it keeps its packed banks for decode too
-    /// (TODO.md item 23, optimization.md R7.1).
+    /// (TODO.md item 23, OPTIMIZATION.md R7.1).
     gemv: Option<&'a std::sync::Arc<DenseGemv>>,
 }
 
@@ -391,7 +391,7 @@ impl<'a> Loader<'a> {
             .to_device(device.to_tch())))
     }
 
-    /// The lm_head's NVFP4 banks in the K-major resident layout (optimization.md
+    /// The lm_head's NVFP4 banks in the K-major resident layout (OPTIMIZATION.md
     /// R2): `packed [K // 8, N]` int32 and `scale [K // 16, N]` u8, so the dense
     /// GEMV's weight loads coalesce along N (the tile's wide axis) instead of
     /// along the 64-byte K strip. The checkpoint stores row-major `[N, K // 2]`;
@@ -2252,7 +2252,7 @@ impl TorchQwen3_6 {
     /// K/V and GDN state from (decision 51). Keeping it a single pass is what
     /// stops the two paths from drifting.
     /// The fused residual-add + RMSNorm, when the linear kernels are attached
-    /// and the row shape and dtype match what the cubin bakes (optimization.md
+    /// and the row shape and dtype match what the cubin bakes (OPTIMIZATION.md
     /// R6: the norm launch tax -- one launch replaces the `x + r` add and the
     /// ten-kernel `rms_norm`, and writes both the new residual and the
     /// normalized row). `None` means run the libtorch ops instead: a CPU

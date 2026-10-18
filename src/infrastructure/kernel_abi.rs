@@ -567,7 +567,7 @@ pub const FP8_GEMM: &str = "fp8_gemm";
 /// The fused single-token GDN causal conv + silu (TODO.md item 19).
 pub const CONV_DECODE: &str = "conv_decode";
 
-/// The fused residual-add + RMSNorm (optimization.md R6: the norm launch tax).
+/// The fused residual-add + RMSNorm (OPTIMIZATION.md R6: the norm launch tax).
 pub const ADD_RMSNORM: &str = "add_rmsnorm";
 
 const LINEAR_NAMES: [&str; 7] = [
@@ -973,7 +973,7 @@ pub fn gemv_gate_up_args(abi: &Abi, a: &MoEArgs) -> Result<ArgPack, MoEError> {
     p.u32(hidden as u32)?;
     p.u32(1)?;
     // The packed bank is read as int32 words (8 e2m1 codes each), so its row /
-    // slot strides are in words, not bytes (optimization.md R1).
+    // slot strides are in words, not bytes (OPTIMIZATION.md R1).
     p.u64((rows * (hidden / 8)) as u64)?;
     p.u32((hidden / 8) as u32)?;
     p.u32(1)?;
@@ -1291,7 +1291,7 @@ pub fn add_rmsnorm_grid(rows: usize) -> (u32, u32, u32) {
 /// `[M, K]` bf16 activations, `packed`/`scale`/`global` are the NVFP4 weight
 /// banks (`[N, K // 2]` u8 read as int32 words, `[N, K // 16]` e4m3 bytes,
 /// `[N]` f16 bytes) and `c` is the `[M, N]` fp32 output. The packed strides are
-/// in int32 words (optimization.md R2).
+/// in int32 words (OPTIMIZATION.md R2).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DenseGemvArgs {
     pub a: u64,
@@ -1672,7 +1672,7 @@ mod tests {
         let abi = abi();
         let gate_up = abi.kernel(GEMV_GATE_UP).unwrap();
         let routes = 3 * abi.top_k;
-        // The routed GEMV tiles 16 output columns per program (optimization.md
+        // The routed GEMV tiles 16 output columns per program (OPTIMIZATION.md
         // R1): gate_up N=1024, down N=2048. The silu tile is 256, the reduce 128.
         assert_eq!(gate_up.block, 16);
         assert_eq!(grid(routes, gate_up), (routes as u32, 64, 1));

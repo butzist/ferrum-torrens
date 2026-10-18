@@ -13,7 +13,7 @@ weight is streamed once per step, and each output element is a fixed K-order dot
 so (unlike a cuBLAS bf16 GEMM whose tiling moves with the batch) the result for a
 row does not depend on the batch shape.
 
-The decode GEMV is marlin-style (optimization.md R2): the packed bank is read as
+The decode GEMV is marlin-style (OPTIMIZATION.md R2): the packed bank is read as
 int32 `[N, K // 8]` (8 e2m1 codes per word) with a deferred `[BLOCK_KW, BLOCK_N]`
 partial, and the dequant is the fp16-bitcast trick (`_nvfp4_pair_f32`) instead of
 a 16-entry LUT gather, so the LSU is not the bottleneck of the streaming read.

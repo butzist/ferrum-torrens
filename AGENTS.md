@@ -19,6 +19,10 @@ Instructions for AI coding agents working in this repository.
 - `ARCHITECTURE.md` is the description of record: the high-level building
   blocks, the build process, and a static plus dynamic view of each subsystem,
   with mermaid diagrams.
+- `OPTIMIZATION.md` is the performance plan of record: the measured reference
+  (FreeToken) baseline and the ordered decode-optimization plan (the R-numbered
+  slices and levers). Look measured numbers up here before re-running a probe or
+  re-measuring the reference.
 - At the start of every session, re-read `TODO.md` in full. It may have been
   updated since your last session. Do not trust stale context.
 
@@ -64,9 +68,9 @@ Instructions for AI coding agents working in this repository.
   `[TODO]`), and describe only its boundary. Never draw a full design for a
   `[TODO]` piece.
 - When they disagree, `TODO.md` is the plan of record, `DONE.md` the history of
-  record, `ALGORITHM.md` the algorithm of record, and `ARCHITECTURE.md` the
-  description of record; fix the description to match reality rather than reality
-  to the description.
+  record, `ALGORITHM.md` the algorithm of record, `ARCHITECTURE.md` the
+  description of record, and `OPTIMIZATION.md` the performance plan of record;
+  fix the description to match reality rather than reality to the description.
 
 ## Testing (strict TDD)
 

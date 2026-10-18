@@ -17,7 +17,7 @@ K-loop, so a BF16 copy of the experts is never materialized. Layout per expert
 `W[N, K]` (decision 23): `packed [S, N, K // 2]` uint8 with the low nibble
 holding the even k, `scale [S, N, K // 16]` e4m3fn, `global [S, N]` f16.
 
-The decode GEMV is marlin-style (optimization.md R1, decision 88 verification):
+The decode GEMV is marlin-style (OPTIMIZATION.md R1, decision 88 verification):
 the packed bank is read as int32 `[S, N, K // 8]` (same bytes, 8 codes per word)
 and the K reduction is deferred, so the wide coalesced loads of successive
 iterations pipeline instead of serializing on a per-iteration cross-lane sum.

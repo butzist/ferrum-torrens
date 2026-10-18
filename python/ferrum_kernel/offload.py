@@ -155,7 +155,7 @@ def _index_copy_multi_kernel(
     # segment in a loop. n is on the device, so the grid is fixed and
     # capture-safe. The old grid launched one program per (bank, row, seg) --
     # BLOCK_K rows per bank, all but ~n of them no-op at decode -- and that CTA
-    # overhead was ~25 ms/token (optimization.md R8 Finding 5).
+    # overhead was ~25 ms/token (OPTIMIZATION.md R8 Finding 5).
     if base < feat_i32:
         off = base + tl.arange(0, SEG_I32)
         m = off < feat_i32

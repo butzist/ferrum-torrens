@@ -250,7 +250,7 @@ impl GdnDecode {
     /// Launch the fused residual-add + RMSNorm for `rows` rows: one kernel
     /// writes both the new residual (`sum_out = x + r`) and the normalized row
     /// (`out = rms_norm(sum_out) * w`), replacing the add plus the ten-kernel
-    /// `rms_norm` op soup (optimization.md R6).
+    /// `rms_norm` op soup (OPTIMIZATION.md R6).
     ///
     /// `x`/`r` are `[rows, hidden]` bf16 (either may be a strided row view),
     /// `w` is the `[hidden]` baked `1 + weight` norm vector, and `sum_out`/`out`

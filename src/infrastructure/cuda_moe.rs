@@ -1155,7 +1155,7 @@ impl CudaMoE {
     /// only the `2 * num_experts` buffer slots, and reset the half bookkeeping.
     ///
     /// Only the buffer range is touched; the decode LRU in the rest of the cache
-    /// is retained across the prefill (TODO.md item 24, optimization.md R7.2).
+    /// is retained across the prefill (TODO.md item 24, OPTIMIZATION.md R7.2).
     fn enter_prefill(&mut self) -> Result<(), MoEError> {
         self.select_buffer_slots()?;
         let copy_stream = {

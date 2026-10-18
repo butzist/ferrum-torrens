@@ -63,7 +63,7 @@ pub fn enabled() -> bool {
 /// `{"layer": L, "ids": [...]}` for every routed layer to that file. This is a
 /// device-to-host read per layer, so it forces a sync and must run eager
 /// (`FERRUM_SMOKE_NOGRAPH=1`); it exists to collect routing traces for the
-/// speculative-prefetch study (optimization.md R3b), never in serving.
+/// speculative-prefetch study (OPTIMIZATION.md R3b), never in serving.
 pub fn trace_routes(layer: usize, ids: &tch::Tensor) {
     static PATH: OnceLock<Option<std::ffi::OsString>> = OnceLock::new();
     let Some(path) = PATH

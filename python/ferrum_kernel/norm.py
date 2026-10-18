@@ -5,7 +5,7 @@ The decode tower ran every norm as a libtorch op soup: an `f32_` cast, a
 `to_kind`, plus the separate `x + r` residual add -- about ten tiny kernels per
 site and 80 sites per cached decode step (40 `norm_in` with a residual, 40
 `norm_post`). At bs=1 each extra kernel is a few microseconds of pure launch
-latency (optimization.md E5/R6: the norm block, not the bytes). This kernel
+latency (OPTIMIZATION.md E5/R6: the norm block, not the bytes). This kernel
 folds the add, the cast, the variance, the scale and both stores into one
 launch per site: it reads `x` and `r` once and writes the new residual and the
 normalized output together, so `x + r` and `rms_norm(x + r)` cost one kernel.

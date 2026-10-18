@@ -419,7 +419,7 @@ def random_norm_case(device: str, rows: int, hidden: int, seed: int):
 
 
 def check_norm(device: torch.device, tol: float, full: bool) -> int:
-    """Fused add + RMSNorm (optimization.md R6 norms): the kernel against the
+    """Fused add + RMSNorm (OPTIMIZATION.md R6 norms): the kernel against the
     torch reference mirroring `rms_norm`, for both the residual and the
     normalized row. `full` adds the serving hidden size and a multi-row case,
     and a strided `x` pins the row-stride argument the prefill chunk hands in."""

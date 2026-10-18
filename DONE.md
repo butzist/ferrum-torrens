@@ -1898,7 +1898,7 @@ settled.
 
 77. **Fused GDN decode kernel** (2026-10-16, implemented) -- the FreeToken-style
     fused workflow for the linear-attention mixer (TODO item 15, spec
-    `optimization.md`).
+    `OPTIMIZATION.md`).
     - **Why.** `gdn_core_batch` ran the recurrence as ~15 libtorch ops/layer
       (separate gating, q/k L2-norm, decay, `kv_mem` reduce, outer product, second
       reduce), each an allocation plus an `f32_` cast, 30x per decode step. The
@@ -1961,7 +1961,7 @@ settled.
       (`the_lm_head_block_split_is_exact`).
 
 79. **Dense NVFP4 GEMV for the lm_head** (2026-10-16, implemented) -- E2 of the
-    decode-gap review in `optimization.md`.
+    decode-gap review in `OPTIMIZATION.md`.
     - **Why.** The lm_head is the single largest per-token weight read (1.02 GiB
       bf16 at vocab 248320 x hidden 2048) and the checkpoint stores it NVFP4;
       widening it to bf16 at load tripled every step's read for zero information.
@@ -2006,7 +2006,7 @@ settled.
     the bf16-KV attention fallback (E3 / item 14) is the top remaining lever.
 
 82. **Vendor FreeToken's kernels; bf16 activations** (2026-10-16, plan) -- the
-    direction for the decode gap (TODO section 7, `optimization.md` "Plan"). It is a
+    direction for the decode gap (TODO section 7, `OPTIMIZATION.md` "Plan"). It is a
     substrate difference, not a missing trick: FreeToken authors the mixer as a
     handful of Triton kernels, we compose libtorch ops. Auditing `FreeToken/`
     shows the formats already match (same FTW weights, GDN state
@@ -2114,7 +2114,7 @@ settled.
       share (decision 81). The default config stays at 512; larger caches are
       opt-in, and this is the ceiling item 12's budget planner would spend.
 
-86. **Fused GDN causal conv + silu** (2026-10-17, implemented) -- optimization.md slice
+86. **Fused GDN causal conv + silu** (2026-10-17, implemented) -- OPTIMIZATION.md slice
     3 (the conv half), TODO item 19.
     - **Why.** The decode path built the GDN conv from libtorch ops per layer:
       `f32_`, `cat` with the `[rows, conv_dim, K-1]` state, a `w.repeat([rows, 1,
@@ -2147,7 +2147,7 @@ settled.
       shares (decision 81), which is why item 11 (batching) is the larger serving
       lever.
 
-87. **bf16 mixer activations** (2026-10-17, implemented) -- optimization.md slice 3, the
+87. **bf16 mixer activations** (2026-10-17, implemented) -- OPTIMIZATION.md slice 3, the
     dtype half, TODO item 19. The last piece of decision 82's plan.
     - **Why.** Decision 82 calls activation dtype "the one real divergence": our
       mixer ran f32 (rms_norm/conv/attention outputs) where FreeToken runs bf16,
@@ -2221,7 +2221,7 @@ settled.
       `FT_PROFILE=1` + `FERRUM_SMOKE_NOGRAPH=1 FERRUM_SMOKE_CACHE=<n>` on
       `single_request_throughput_smoke` (writes `/tmp/ft_profile.{txt,json}`).
       Both are dev-only; the probe never edits `FreeToken/`.
-    - **Verification addendum (same day; `optimization.md` "Decision 88
+    - **Verification addendum (same day; `OPTIMIZATION.md` "Decision 88
       verification").** Two of this decision's own claims were re-checked and
       corrected: (1) the reference's decode MoE GEMV at ~1900 slots is
       **3.8 ms p50**, not 8.8 -- that mean carried one 164 ms outlier step; at
@@ -2236,7 +2236,7 @@ settled.
       wide loads + deferred reduction + the fp16-bitcast dequant; 26 SMs make
       our 64-128-program grids under-occupied) are source-confirmed. The
       remediation plan that follows (R1-R6, including the decode copy/compute
-      overlap the reference lacks) lives in `optimization.md`.
+      overlap the reference lacks) lives in `OPTIMIZATION.md`.
 
 89. **R1/R2 applied: the two NVFP4 GEMVs are rewrites, and R3 is withdrawn**
     (2026-10-17, implemented).
@@ -2278,7 +2278,7 @@ settled.
       ~16 = 44.4 measured). The only sound overlap is the routed copy against the
       same layer's shared-expert compute (~3.2 ms/token, ~5%), which is not the
       promised parity lever; it is left as an optional R6 item. The corrected
-      plan is in `optimization.md`.
+      plan is in `OPTIMIZATION.md`.
 
 90. **R4 applied (auto expert-cache budget); R6 partial** (2026-10-17,
     implemented).
@@ -2331,7 +2331,7 @@ settled.
     (`extending_a_committed_prompt_adopts_and_matches_a_cold_refeed`) stays green.
 
 92. **Server-side batching** (2026-10-17, implemented) -- TODO.md item 11,
-    `optimization.md` R5. The engine already batched (`generate_batch` and one
+    `OPTIMIZATION.md` R5. The engine already batched (`generate_batch` and one
     captured decode step for every live row), but the HTTP handlers called
     `generate` once per request, so decode was batch 1 and, worse, two concurrent
     handlers drove the single CUDA stream, MoE slot cache and prefix tree at
@@ -2350,7 +2350,7 @@ settled.
     byte-identical for a lone request (same seed derivation).
 
 93. **Shared expert stays packed NVFP4** (2026-10-17, implemented) -- TODO.md
-    item 23, `optimization.md` R7.1. The checkpoint stores
+    item 23, `OPTIMIZATION.md` R7.1. The checkpoint stores
     `mlp.shared_expert.{gate_up,down}_proj` NVFP4; `Loader::dense` widened both to
     bf16 and the decode step read 240 MiB/token. `Dense` now carries
     `Nvfp4Dense { packed, scale, global, gemv }` (K-major banks built by
@@ -2366,7 +2366,7 @@ settled.
     within the 0.2 bound).
 
 94. **Prefill retains the decode expert cache** (2026-10-17, implemented) --
-    TODO.md item 24, `optimization.md` R7.2. The whole-layer prefill harness
+    TODO.md item 24, `OPTIMIZATION.md` R7.2. The whole-layer prefill harness
     borrowed the cache's first `2 * num_experts` slots for its double buffer, and
     `enter_prefill`/`leave_prefill` both called `reset_staging()`, so every
     prefill wiped the *entire* decode LRU. `enter_prefill` now frees only the
@@ -2419,7 +2419,7 @@ settled.
     `--interp` (a constexpr branch), or a two-pass bucket select.
 
 97. **The decode prefetch/finish MoE split was removed** (2026-10-17, reverted)
-    -- TODO.md item 6, optimization.md R3b. Decisions 93/95 split the staged MoE
+    -- TODO.md item 6, OPTIMIZATION.md R3b. Decisions 93/95 split the staged MoE
     step into `prefetch_device`/`finish_device` and ran the miss copy on a second
     stream so the shared expert could hide behind it. It was correct and
     capture-safe but **neutral**: the `index_copy` kernel's resident CTAs hold
@@ -2431,7 +2431,7 @@ settled.
     (`FT_ROUTE_TRACE`, decision 95) is kept.
 
 98. **The decode expert copy is grid-stride, not one program per row** (2026-10-17,
-    implemented) -- optimization.md R8.0, Finding 5. `_index_copy_multi_kernel`
+    implemented) -- OPTIMIZATION.md R8.0, Finding 5. `_index_copy_multi_kernel`
     launched one program per `(bank, row, seg)` = `(6, BLOCK_K=128, 64)` = 49152
     programs per layer, gated by `row < n`; at decode only ~8 rows are live, so
     ~94% were no-op CTAs, and `moe_copy` was `~25.6 ms/token fixed + 0.03
@@ -2446,7 +2446,7 @@ settled.
     ~10 GB/s vs the 14.4 pinned H2D, so the grid/segment split wants a sweep.
 
 99. **The router: precompute the f32 gate, keep the full softmax** (2026-10-17,
-    implemented/reverted) -- optimization.md R8.1. The router upcast the
+    implemented/reverted) -- OPTIMIZATION.md R8.1. The router upcast the
     `[experts, hidden]` bf16 gate to f32 inside `moe()`, i.e. a fresh 2 MiB
     alloc+copy per layer per token; decision 87 keeps the router matmul in f32,
     but the upcast only has to happen once, so `TorchLayer` now holds `gate_f32`
@@ -2461,7 +2461,7 @@ settled.
     without changing the arithmetic, and is the remaining option.
 
 100. **Like-for-like re-measure and the fused add + RMSNorm** (2026-10-18,
-    implemented) -- optimization.md R9.
+    implemented) -- OPTIMIZATION.md R9.
     - **The comparison.** Fresh head-to-head on this box, same FTW, bs=1,
       AIME-25 #0 prompt, auto cache, `FERRUM_SMOKE_PROMPT` on our side and
       `bench_decode_moe.py --aime --cache 0` (plus `scripts/freetoken_probe/`)
