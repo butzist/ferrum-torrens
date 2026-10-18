@@ -1018,6 +1018,46 @@ fn a_carried_gdn_state_matches_the_stateless_recurrence_over_the_concatenation()
 }
 
 #[test]
+fn a_chunked_prefill_recurrence_matches_the_token_loop() {
+    // The parallel prefill form must produce the same state and outputs as the
+    // sequential recurrence it replaces, including across a chunk boundary and
+    // with a non-zero starting state. `t` is deliberately not a multiple of the
+    // chunk size, so the last chunk is short.
+    let (t, hv, dk, dv) = (130, 3, 8, 4);
+    let q = data(t * hv * dk, 91);
+    let k = data(t * hv * dk, 92);
+    let v = data(t * hv * dv, 93);
+    // Serving decay is `g <= 0`; keep the factors in the range the model sees.
+    let g = data(t * hv, 94)
+        .iter()
+        .map(|x| -x.abs() * 0.5)
+        .collect::<Vec<_>>();
+    let beta = data(t * hv, 95).iter().map(|x| x.abs()).collect::<Vec<_>>();
+    let state = data(hv * dk * dv, 96);
+    let qt = up(&q, &[t as i64, hv as i64, dk as i64]);
+    let kt = up(&k, &[t as i64, hv as i64, dk as i64]);
+    let vt = up(&v, &[t as i64, hv as i64, dv as i64]);
+    let gt = up(&g, &[t as i64, hv as i64]);
+    let bt = up(&beta, &[t as i64, hv as i64]);
+    let st = up(&state, &[hv as i64, dk as i64, dv as i64]);
+
+    let (want, want_state) = gdn_recurrence_cached(&qt, &kt, &vt, &gt, &bt, dk as i64, &st);
+    let (got, got_state) = gdn_recurrence_chunked(&qt, &kt, &vt, &gt, &bt, dk as i64, &st);
+    close(
+        &to_f32_vec(&got),
+        &to_f32_vec(&want),
+        2e-4,
+        "chunked recurrence out",
+    );
+    close(
+        &to_f32_vec(&got_state),
+        &to_f32_vec(&want_state),
+        2e-4,
+        "chunked recurrence state",
+    );
+}
+
+#[test]
 fn a_batched_conv_step_matches_each_single_row_step() {
     // `n` independent one-step convs in one depthwise op must equal `n` calls
     // of the host conv, or a batched decode would drift from a single row.

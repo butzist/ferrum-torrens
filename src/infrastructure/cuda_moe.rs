@@ -1317,26 +1317,33 @@ impl CudaMoE {
         // (1) This layer's half. Layer 0 has no lookahead, so it starts here; for
         // every later layer the previous step already prefetched it.
         if self.half_missing(half, layer) {
+            let sp = crate::infrastructure::profile::begin("pf_prefetch");
             self.prefetch_half(layer, half)?;
+            crate::infrastructure::profile::end("pf_prefetch", sp);
             self.prefill.as_mut().expect("harness").half_layer[half] = layer as i64;
         }
         // (2) Next layer's copy, which overlaps everything below.
         if layer + 1 < layers {
             let nh = (layer + 1) % 2;
             if self.half_missing(nh, layer + 1) {
+                let sp = crate::infrastructure::profile::begin("pf_prefetch");
                 self.prefetch_half(layer + 1, nh)?;
+                crate::infrastructure::profile::end("pf_prefetch", sp);
                 self.prefill.as_mut().expect("harness").half_layer[nh] = (layer + 1) as i64;
             }
         }
         // (3) Wait for this half (the copy stream's ready event), then run the
         // GEMV over the materialized layer, chunked only to bound the scratch.
         {
+            let sp = crate::infrastructure::profile::begin("pf_wait");
             let pf = self.prefill.as_ref().expect("harness");
             if pf.ready_armed[half] {
                 // SAFETY: `self.stream` is the adapter's live compute stream.
                 unsafe { pf.ready[half].wait_on(self.stream) }.map_err(driver)?;
             }
+            crate::infrastructure::profile::end("pf_wait", sp);
         }
+        let sp = crate::infrastructure::profile::begin("pf_gemm");
         let offset = (half * experts_per_layer) as i64;
         // The buffer's slot for `(half, expert_id)` is the selected victim, not
         // the fixed `half * E + id` range (decision 94 follow-up).
@@ -1376,6 +1383,7 @@ impl CudaMoE {
             self.collect_dev(&g, &mut oc)?;
             start += n;
         }
+        crate::infrastructure::profile::end("pf_gemm", sp);
         // (4) Release the half so a future layer's prefetch may reuse it.
         let pf = self.prefill.as_mut().expect("harness");
         // SAFETY: `self.stream` is the adapter's live compute stream.

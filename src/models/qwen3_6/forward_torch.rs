@@ -930,6 +930,134 @@ fn gdn_recurrence_cached(
     (Tensor::stack(&outs, 0), state)
 }
 
+/// Tokens per chunk in the parallel prefill recurrence. Chunks stay sequential
+/// (each starts from the previous chunk's state), but inside a chunk the token
+/// loop becomes one triangular solve plus batched matmuls.
+const GDN_PREFILL_CHUNK: i64 = 64;
+
+/// The shortest prefill chunk that takes the parallel recurrence. A tiny chunk
+/// (a warm-up prompt, a short chat turn) does not need the throughput, and
+/// leaving it token-at-a-time keeps its prefill numerics bit-identical to HEAD:
+/// the parallel form's different state-update order shifts routing by a
+/// near-tie, which changes which experts a decode graph is captured against and
+/// moved captured tg by ~6% on the AIME prompt until this floor was added.
+const GDN_PREFILL_MIN: i64 = 128;
+
+/// `gdn_recurrence_cached` computed a chunk at a time instead of a token at a
+/// time. Prefill is launch-bound (OPTIMIZATION.md R9), and the sequential op
+/// stack costs ~10 launches per token per layer: this is the same math with the
+/// within-chunk token dependencies moved into a batched lower-triangular solve.
+///
+/// With `P_i = exp(sum_{l<=i} g_l)`, `khat` the L2-normalized `k` and `qhat`
+/// the L2-normalized, `scale`-folded `q`, the state after token `i` of a chunk
+/// starting at `S` is
+/// `P_i S + sum_{j<=i} (P_i/P_j) khat_j delta_j^T`.
+/// Substituting into `delta_i = beta_i (v_i - S_i^T khat_i)` gives
+/// `(I + diag(beta) M) delta = diag(beta) (v - P_i S^T khat_i)` with
+/// `M[i,j] = (P_i/P_j) (khat_i . khat_j)` strictly lower triangular, and the
+/// outputs are `P_i S^T qhat_i + sum_{j<=i} (P_i/P_j)(khat_j . qhat_i) delta_j`.
+/// All the `P_i/P_j` factors are <= 1 in serving (`g <= 0`), and the ratio is
+/// zeroed above the diagonal before `exp` so it cannot overflow.
+#[allow(clippy::too_many_arguments)]
+fn gdn_recurrence_chunked(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+    dk: i64,
+    state: &Tensor,
+) -> (Tensor, Tensor) {
+    let t = q.size()[0];
+    let hv = q.size()[1];
+    let dv = v.size()[2];
+    let device = q.device();
+    let scale = 1.0f64 / (dk as f64).sqrt();
+
+    let qf = f32_(q);
+    let kf = f32_(k);
+    let vf = f32_(v);
+    let q2 = qf
+        .pow_tensor_scalar(2.0)
+        .sum_dim_intlist(-1, true, Kind::Float)
+        .g_add_scalar(1e-6);
+    let k2 = kf
+        .pow_tensor_scalar(2.0)
+        .sum_dim_intlist(-1, true, Kind::Float)
+        .g_add_scalar(1e-6);
+    let qhat = &qf * (q2.sqrt().reciprocal() * scale);
+    let khat = &kf * k2.sqrt().reciprocal();
+    let gg = f32_(g);
+    let bf = f32_(beta);
+
+    let idx = Tensor::arange(t, (Kind::Int64, device));
+    let lower = idx
+        .unsqueeze(1)
+        .gt_tensor(&idx.unsqueeze(0))
+        .to_kind(Kind::Float);
+    let lower_eq = idx
+        .unsqueeze(1)
+        .ge_tensor(&idx.unsqueeze(0))
+        .to_kind(Kind::Float);
+
+    let mut state = f32_(state);
+    let mut out_chunks: Vec<Tensor> =
+        Vec::with_capacity((t as usize).div_ceil(GDN_PREFILL_CHUNK as usize));
+    let mut start = 0i64;
+    while start < t {
+        let n = GDN_PREFILL_CHUNK.min(t - start);
+        let qc = qhat.narrow(0, start, n);
+        let kc = khat.narrow(0, start, n);
+        let vc = vf.narrow(0, start, n);
+        let bc = bf.narrow(0, start, n);
+        let gcum = gg.narrow(0, start, n).cumsum(0, None);
+        let p = gcum.exp();
+        let lo = lower.narrow(0, 0, n).narrow(1, 0, n);
+        let loeq = lower_eq.narrow(0, 0, n).narrow(1, 0, n);
+        let mut diff = gcum.unsqueeze(1) - gcum.unsqueeze(0);
+        diff = diff.masked_fill(&loeq.unsqueeze(-1).logical_not(), 0.0);
+        let ratio_h = diff.exp().permute([2, 0, 1]);
+
+        let kt = kc.transpose(0, 1);
+        let kdot = kt.bmm(&kt.transpose(1, 2));
+        let m = kdot * &ratio_h * lo.unsqueeze(0);
+        let a = m * bc.transpose(0, 1).unsqueeze(-1);
+        let base = kt.bmm(&state) * p.transpose(0, 1).unsqueeze(-1);
+        let rhs = (vc.transpose(0, 1) - base) * bc.transpose(0, 1).unsqueeze(-1);
+        // Forward substitution for the unit-lower-triangular system. Kept as
+        // row updates of `[hv, 1, dv]` rather than `linalg_solve_triangular`:
+        // the CUDA solve loads libcusolver, which does not resolve against the
+        // libtorch/cuBLAS this repo runs with, and the rows are tiny next to
+        // the state matmuls anyway.
+        let delta = Tensor::zeros([hv, n, dv], (Kind::Float, device));
+        let sp_solve = crate::infrastructure::profile::begin("gdn_solve");
+        for i in 0..n {
+            let rhs_i = rhs.narrow(1, i, 1);
+            let d_i = if i == 0 {
+                rhs_i
+            } else {
+                let a_i = a.narrow(1, i, 1).narrow(2, 0, i);
+                rhs_i - a_i.bmm(&delta.narrow(1, 0, i))
+            };
+            delta.narrow(1, i, 1).copy_(&d_i);
+        }
+        crate::infrastructure::profile::end("gdn_solve", sp_solve);
+
+        let qt = qc.transpose(0, 1);
+        let obase = qt.bmm(&state) * p.transpose(0, 1).unsqueeze(-1);
+        let qmat = qt.bmm(&kt.transpose(1, 2)) * &ratio_h * loeq.unsqueeze(0);
+        out_chunks.push((obase + qmat.bmm(&delta)).transpose(0, 1));
+
+        let plast = p.select(0, n - 1);
+        let w = (gcum.select(0, n - 1).unsqueeze(0) - &gcum).exp();
+        let kw = kc * w.unsqueeze(-1);
+        let update = kw.transpose(0, 1).transpose(1, 2).bmm(&delta);
+        state = state * plast.unsqueeze(-1).unsqueeze(-1) + update;
+        start += n;
+    }
+    (Tensor::cat(&out_chunks, 0), state)
+}
+
 /// `gdn_recurrence_cached` for a batched single step: `q`/`k` are
 /// `[n, hv, dk]`, `v` is `[n, hv, dv]`, `g`/`beta` are `[n, hv]`, and the state
 /// is `[n, hv, dk, dv]`. One step per row, so the whole recurrence is one pass
@@ -1841,7 +1969,14 @@ impl TorchQwen3_6 {
         let beta = sigmoid(&b);
         let (core, rec) = {
             let sp = profile::begin("gdn_recur");
-            let o = gdn_recurrence_cached(&q, &k, &v, &g, &beta, dk, recurrent_state);
+            // One token stays token-at-a-time (the decode/refeed shape); a
+            // prefill chunk takes the parallel formulation, which is the same
+            // math without the per-token launch chain.
+            let o = if t >= GDN_PREFILL_MIN {
+                gdn_recurrence_chunked(&q, &k, &v, &g, &beta, dk, recurrent_state)
+            } else {
+                gdn_recurrence_cached(&q, &k, &v, &g, &beta, dk, recurrent_state)
+            };
             profile::end("gdn_recur", sp);
             o
         };
@@ -2308,7 +2443,7 @@ impl TorchQwen3_6 {
         let p = &self.params;
         let t = ids.size()[0];
         let slab = self.cache.as_ref().expect("no kv cache attached");
-        profile::begin_step(t == 1);
+        profile::begin_step(t);
 
         let sp = profile::begin("embed");
         let mut x = self.embed.gather_dev(ids);

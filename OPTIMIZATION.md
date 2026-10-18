@@ -1089,8 +1089,18 @@ Next levers after R9.1, re-ranked 2026-10-18:
   fallback, not the paged kernel; the captured kernel cost is ~0.1-0.25 ms.
 - **Prefill (pp): a libtorch-level win landed** (decision 101) -- a 256-token
   whole-layer GEMV chunk plus a hoisted GDN recurrence, pp 88 -> 120 tok/s at 517
-  tokens (76 -> 122 at 2057); the FLA chunk kernels (slice 4) remain the larger
-  pp item.
+  tokens (76 -> 122 at 2057).
+- **R9.3 Prefill attribution + a chunked parallel GDN recurrence** (decision
+  102) -- `FT_PROFILE` now keeps a second `FT-PREFILL` table and the whole-layer
+  MoE has `pf_*` sub-labels. A 451-token chunk split 9.54 ms/token as GDN 5.11
+  (recurrence 4.26, 45% of all prefill), prefill MoE 3.43 (at the streaming
+  floor), attention 0.77 (`attn_mem` 0.15). `gdn_recurrence_chunked` replaces
+  the per-token recurrence with FLA's chunk formulation (triangular solve +
+  batched matmuls) for `t >= 128`: pp **120 -> 143** at 517 and **122 -> 150** at
+  2057, decode within noise. The solve's per-row launches are still ~1.8
+  ms/token; the FLA `chunk_gated_delta_rule` + `causal_conv1d_varlen` kernels
+  (slice 4) remain the larger pp item, with a smaller `gdn_tri_solve` kernel as
+  the next step.
 - Remaining bs=1 items, all sub-ms-to-~1 ms: `moe_lru` (2.35 vs 1.6), the R8.1
   fused router (1.34), the gdn tail norm, R8.5 fp8 KV (frees VRAM for slots).
 - A stashed R9.2 attempt (fused q/k Gemma RMSNorm + fused GDN gated norm) was

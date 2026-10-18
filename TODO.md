@@ -75,13 +75,19 @@ decision 100): eager norm stages 1.83 -> 0.47 ms, captured **tg 27.7**, eager
 eager profile's `attn` is the libtorch fallback; the paged kernel only runs in
 the captured path), so it is closed -- a fresh controlled baseline puts captured
 tg at **28.3 tok/s** vs the reference's 30.3, essentially parity. Prefill was the
-real remaining gap: a libtorch-level slice (decision 101) doubled pp at long
-prompts (76 -> 122 tok/s at 2057 tokens) via a 256-token whole-layer GEMV chunk
-and a hoisted GDN recurrence, decode unchanged. A stashed R9.2 attempt (fused q/k
-RMSNorm + GDN gated norm) was correct but did not measure a captured win, so it
-is parked. Remaining levers: the R8.1 fused router, `moe_lru`, the gdn tail norm,
-R8.5 fp8 KV, and the FLA prefill chunk kernels (slice 4). Instruments:
-`FT_PROFILE=1` and `scripts/freetoken_probe/`.
+real remaining gap: two libtorch-level slices landed. Decision 101 doubled pp at
+long prompts (76 -> 122 tok/s at 2057 tokens) via a 256-token whole-layer GEMV
+chunk and a hoisted GDN recurrence. Decision 102 then added a prefill split to
+`FT_PROFILE` and attributed the remaining ~8 ms/token: the GDN recurrence is
+~45% (the Host attention fallback only ~8%), so `gdn_recurrence_chunked`
+replaces the per-token loop with a chunked triangular solve + batched matmuls:
+pp **120 -> 143 tok/s** at 517 tokens and **122 -> 150** at 2057, decode within
+noise. A stashed R9.2 attempt (fused q/k RMSNorm + GDN gated norm) was correct
+but did not measure a captured win, so it is parked. Remaining levers: the
+tri-solve Triton kernel (the chunked recurrence's per-row solve launches), the
+R8.1 fused router, `moe_lru`, the gdn tail norm, R8.5 fp8 KV, and the FLA
+prefill chunk kernels (slice 4). Instruments: `FT_PROFILE=1`,
+`scripts/freetoken_probe/`.
 Progress history and the full decision log (numbers 1..100) live in `DONE.md`;
 read that for the "why" behind any decision number referenced in code or tests.
 
@@ -696,13 +702,18 @@ performance work.
     `ftw_cross_check` argmax 11751, top-5 identical) and **throughput neutral**:
     tg 11.3 at 1536 slots, unchanged, because the activation stream is negligible
     against the per-token weight read (decision 81). Kept for reference parity.
-20. Prefill chunk kernels -- **PARTIAL (decision 82, slice 4; libtorch-level win
-    landed, decision 101).** A 256-token whole-layer GEMV chunk
+20. Prefill chunk kernels -- **PARTIAL (decision 82, slice 4; two libtorch-level
+    wins landed, decisions 101, 102).** A 256-token whole-layer GEMV chunk
     (`PREFILL_CHUNK_TOKENS`) + a hoisted GDN recurrence (`gdn_recurrence_cached`
     computes its per-token norms/`exp(g)`/`beta` once per chunk) took pp
-    **88 -> 120 tok/s** at 517 tokens and **76 -> 122** at 2057, decode flat
-    (2026-10-18). The FLA `chunk_gated_delta_rule` + `causal_conv1d_varlen`
-    kernels remain OPEN.
+    **88 -> 120 tok/s** at 517 tokens and **76 -> 122** at 2057 (decision 101).
+    A prefill profile (extended `FT_PROFILE`, decision 102) then attributed the
+    ~8 ms/token as GDN recurrence ~45% (not attention: the Host fallback is ~8%,
+    `attn_mem` <2%), so `gdn_recurrence_chunked` replaces the per-token loop with
+    a chunked FLA-style triangular solve + batched matmuls: pp **120 -> 143** at
+    517 and **122 -> 150** at 2057, decode within noise (decisions 102). The FLA
+    `chunk_gated_delta_rule` + `causal_conv1d_varlen` kernels remain OPEN; the
+    solve's per-row launches are the next lever (a small tri-solve Triton kernel).
 21. Expert cache growth (E4) -- **DONE (2026-10-17), decision 85.** The staging
      `lru_ensure` `BLOCK_C` ceiling is raised 512 -> 2048 (decision 84), so a
      config may grow the cache into the VRAM the FP8 slice freed. Measured on the

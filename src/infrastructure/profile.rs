@@ -23,6 +23,7 @@ use crate::infrastructure::cuda_driver::{CUstream, Driver, OwnedEvent};
 struct Rec {
     step: u64,
     decode: bool,
+    tokens: i64,
     label: &'static str,
     start: OwnedEvent,
     end: OwnedEvent,
@@ -34,6 +35,7 @@ struct Inner {
     stream: CUstream,
     step: u64,
     decode: bool,
+    tokens: i64,
     open: bool,
     decoded_seen: u64,
     step_start: Option<OwnedEvent>,
@@ -112,6 +114,7 @@ pub fn init(device: usize) -> bool {
         stream,
         step: 0,
         decode: false,
+        tokens: 0,
         open: false,
         decoded_seen: 0,
         step_start: None,
@@ -165,19 +168,21 @@ pub fn end(label: &'static str, start: Option<OwnedEvent>) {
     if unsafe { ev.record(g.stream) }.is_err() {
         return;
     }
-    let (step, decode) = (g.step, g.decode);
+    let (step, decode, tokens) = (g.step, g.decode, g.tokens);
     g.records.push(Rec {
         step,
         decode,
+        tokens,
         label,
         start,
         end: ev,
     });
 }
 
-/// Open one forward's step. `decode` is `tokens == 1`: the decode step is the
-/// one the profile is about, prefill is kept so the split is visible.
-pub fn begin_step(decode: bool) {
+/// Open one forward's step. A step is a decode step when it processes one
+/// token; prefill steps are kept with their token count so their split is
+/// visible too (a chunked prefill is several steps of different sizes).
+pub fn begin_step(tokens: i64) {
     let Some(mutex) = P.get() else {
         return;
     };
@@ -188,7 +193,8 @@ pub fn begin_step(decode: bool) {
         return;
     }
     g.step += 1;
-    g.decode = decode;
+    g.tokens = tokens;
+    g.decode = tokens == 1;
     g.open = true;
     // A server forward can run on a worker thread whose primary context is not
     // current; make it current before recording (cheap, once per step).
@@ -219,10 +225,11 @@ pub fn end_step() {
         if let Ok(ev) = driver.owned_timing_event() {
             // SAFETY: as `begin`.
             if unsafe { ev.record(g.stream) }.is_ok() {
-                let (step, decode) = (g.step, g.decode);
+                let (step, decode, tokens) = (g.step, g.decode, g.tokens);
                 g.records.push(Rec {
                     step,
                     decode,
+                    tokens,
                     label: "total",
                     start,
                     end: ev,
@@ -318,6 +325,38 @@ fn dump(g: &mut Inner) {
         .sum();
     let unaccounted = (total - labeled).max(0.0);
 
+    // Prefill is not part of the decode aggregate above: it is a different
+    // shape (many tokens per launch), and a chunked prefill is several steps of
+    // different sizes. Keep one row per step so the measured prompt's chunks are
+    // distinguishable from the warm-up (the token count is in the row).
+    let mut prefill_steps: Vec<(u64, i64)> = g
+        .records
+        .iter()
+        .filter(|r| !r.decode)
+        .map(|r| (r.step, r.tokens))
+        .collect();
+    prefill_steps.sort_unstable();
+    prefill_steps.dedup();
+    type PrefillRow = (u64, i64, f64, Vec<(&'static str, f64)>);
+    let mut prefill: Vec<PrefillRow> = Vec::with_capacity(prefill_steps.len());
+    for (step, tokens) in prefill_steps {
+        let mut labels: HashMap<&'static str, f64> = HashMap::new();
+        let mut total = 0.0;
+        for r in g.records.iter().filter(|r| r.step == step && !r.decode) {
+            let Ok(ms) = r.start.elapsed(&r.end) else {
+                continue;
+            };
+            if r.label == "total" {
+                total = ms as f64;
+            } else {
+                *labels.entry(r.label).or_insert(0.0) += ms as f64;
+            }
+        }
+        let mut labels: Vec<(&'static str, f64)> = labels.into_iter().collect();
+        labels.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        prefill.push((step, tokens, total, labels));
+    }
+
     let mut text = String::new();
     text.push_str(&format!(
         "FT-PROFILE (rust) decode_steps={} (CUDA-event, ms/token)\n",
@@ -332,6 +371,24 @@ fn dump(g: &mut Inner) {
         "  {:<14} {labeled:8.3}  (unaccounted/launch gaps {unaccounted:.3})\n",
         "labeled sum"
     ));
+    if !prefill.is_empty() {
+        text.push_str(&format!(
+            "\nFT-PREFILL (rust) steps={} (CUDA-event, ms/step)\n",
+            prefill.len()
+        ));
+        for (step, tokens, total, labels) in &prefill {
+            let per_token = *total / (*tokens).max(1) as f64;
+            text.push_str(&format!(
+                "  step {step} tokens={tokens} total={total:8.3} ms ({per_token:.3} ms/token)\n"
+            ));
+            for (label, ms) in labels {
+                text.push_str(&format!(
+                    "    {label:<14} {ms:8.3} ms ({:.3} ms/token)\n",
+                    ms / (*tokens).max(1) as f64
+                ));
+            }
+        }
+    }
 
     eprintln!("{text}");
     let out = std::env::var("FT_PROFILE_OUT").unwrap_or_else(|_| "/tmp/ft_profile".into());
@@ -347,6 +404,17 @@ fn dump(g: &mut Inner) {
         })).collect::<Vec<_>>(),
         "labeled_sum_ms_per_token": labeled,
         "unaccounted_ms_per_token": unaccounted,
+        "prefill_steps": prefill.iter().map(|(step, tokens, total, labels)| serde_json::json!({
+            "step": step,
+            "tokens": tokens,
+            "total_ms": total,
+            "ms_per_token": total / (*tokens).max(1) as f64,
+            "stages": labels.iter().map(|(label, ms)| serde_json::json!({
+                "label": label,
+                "ms": ms,
+                "ms_per_token": ms / (*tokens).max(1) as f64,
+            })).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
     });
     let _ = std::fs::write(format!("{out}.json"), json.to_string());
     eprintln!("[ft-profile] wrote {out}.txt and {out}.json");

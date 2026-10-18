@@ -2535,6 +2535,61 @@ settled.
      - **Remaining prefill work:** the FLA chunk kernels (`chunk_gated_delta_rule`,
        `causal_conv1d_varlen`) are still open (slice 4); this win is libtorch-level.
 
+102. **Prefill attribution + a chunked parallel GDN recurrence** (2026-10-18,
+     implemented) -- decision 101 left prefill at ~122 tok/s (~8.2 ms/token at
+     2057) versus a ~0.7 ms/token streaming floor, and `FT_PROFILE` could not see
+     it (it filtered on `r.decode`). This change adds the attribution and lands
+     the biggest item it named.
+     - **Attribution.** `profile.rs` now keeps the token count on every step and
+       dumps a second `FT-PREFILL` table, one row per prefill step with its
+       per-label split (ms/step and ms/token); `cuda_moe.rs::prefill_layer` and
+       `gdn_recurrence_chunked` gained `pf_prefetch`/`pf_wait`/`pf_gemm` and
+       `gdn_solve` sub-labels so the previously-unaccounted whole-layer MoE is
+       visible. Measured (RTX 5060, `FERRUM_SMOKE_NOGRAPH=1 FT_PROFILE=1
+       FERRUM_SMOKE_TOKENS=8`, so the profile dumps at the first measured decode
+       step), 451-token chunk of the 517 prompt, ms/token: total 9.54 = GDN
+       5.11 (53.6%; recurrence **4.26**, qkvz 0.60, tail 0.16, conv 0.065) +
+       prefill MoE 3.43 (36%; `pf_gemm` 3.36, `pf_wait` 0.08) + attention 0.77
+       (8%; `attn_mem` **0.15**) + norms/post/router/head ~0.24. So the prime
+       suspect was confirmed -- the recurrence, not the Host attention fallback
+       (`attn_mem` is <2%, `attn_proj`/`attn_out` are real but ~0.5 combined).
+     - **Fix.** `gdn_recurrence_chunked` (forward_torch.rs) computes the same
+       recurrence chunk-at-a-time. With `P_i = exp(sum_{l<=i} g_l)` and
+       normalized `khat`/`qhat`, the state is
+       `P_i S + sum_{j<=i} (P_i/P_j) khat_j delta_j^T`, so the deltas solve the
+       unit-lower-triangular system `(I + diag(beta) M) delta =
+       diag(beta)(v - P_i S^T khat_i)`, `M[i,j] = (P_i/P_j)(khat_i . khat_j)`,
+       and outputs/state are two more batched matmuls. Chunk size 64; the solve
+       is an explicit forward substitution (row updates of `[hv,1,dv]`) because
+       `linalg_solve_triangular` on CUDA loads libcusolver, which fails to
+       resolve against this repo's libtorch/cuBLAS. The parallel-inverse
+       (Neumann/squaring) form was measured numerically unstable (60% error on
+       the unit test's well-scaled system) and rejected. The recurrence is
+       dispatched only for `t >= GDN_PREFILL_MIN = 128`: tiny prefills stay
+       bit-identical to HEAD, which matters because the parallel form's
+       different state-update order flips near-tie routing, changing the expert
+       set a decode graph is captured against (measured ~6% captured tg on the
+       AIME prompt at the default auto cache before the floor; gone after).
+     - **Measured** (bs=1, bf16 KV, auto cache, controlled order-balanced A/B,
+       2 runs each; RTX 5060 Laptop): pp **119.7 -> 143.5 tok/s** at 517 tokens
+       (**+19.8%**) and **122.2 -> 150.5** at 2057 (**+23.2%**); VRAM flat at
+       7190 MiB. Decode (128 tokens, order-balanced): AIME tg 27.8 -> 27.8/27.9
+       (unchanged), 517-prompt 24.4/24.8 -> 24.4/24.3, 2057-prompt 23.2/23.1 ->
+       23.3/21.2 (one outlier); the decode code path is untouched and eager
+       decode is equal or faster, with identical decode miss counts.
+     - **Gates.** `cargo fmt --check`, `cargo clippy --all-targets` and
+       `--features cuda` clean; CPU `cargo test` 314 pass; the new cuda unit test
+       (`a_chunked_prefill_recurrence_matches_the_token_loop`, chunk crossing +
+       non-zero state, tol 2e-4) passes; `--interp` selftest `PASS` and
+       `check-kernels.sh` green with no artifact churn (no kernel edit).
+       GPU: `engine_real_generate` 6/6, `kvcache_cross_request_reuse` (reused
+       7/10, argmax ok, 1.41e-1), `device_decode_matches_refeed` 3/3 argmax
+       exact, `ftw_cross_check` argmax 11751 top-5 identical.
+     - **Remaining:** the chunked solve still spends ~1.8 ms/token on ~`t`
+       per-row launches; a small `gdn_tri_solve` Triton kernel (one launch per
+       chunk per layer) is the next lever, then the FLA `chunk_gated_delta_rule`
+       + `causal_conv1d_varlen`.
+
 ---
 
 ## Progress log (narrative, pre-2026-10-15 compaction)
