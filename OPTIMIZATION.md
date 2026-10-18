@@ -1101,6 +1101,13 @@ Next levers after R9.1, re-ranked 2026-10-18:
   ms/token; the FLA `chunk_gated_delta_rule` + `causal_conv1d_varlen` kernels
   (slice 4) remain the larger pp item, with a smaller `gdn_tri_solve` kernel as
   the next step.
+- **R9.3b `gdn_tri_solve` landed (decision 103):** one Triton program per
+  `(value head, value tile)` walks the `n <= 64` rows in registers, replacing
+  the `n` batched-matmul launches. The solve drops 1.98 -> 0.037 ms/token
+  (profile `gdn_solve`, 451-token chunk); pp 142 -> 150 at 517 and 151 -> 156 at
+  2057, decode unchanged. The wall-clock win is smaller than the solve saving
+  because that time was already overlapped with the prefill MoE copy, so prefill
+  is now MoE-bound (`pf_gemm` ~3.5 ms/token).
 - Remaining bs=1 items, all sub-ms-to-~1 ms: `moe_lru` (2.35 vs 1.6), the R8.1
   fused router (1.34), the gdn tail norm, R8.5 fp8 KV (frees VRAM for slots).
 - A stashed R9.2 attempt (fused q/k Gemma RMSNorm + fused GDN gated norm) was

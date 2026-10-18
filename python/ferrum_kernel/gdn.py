@@ -162,6 +162,111 @@ def gdn_decode(
     )
 
 
+# The prefill triangular-solve tiles. `N` is the largest chunk
+# (`GDN_PREFILL_CHUNK` in forward_torch.rs); `BV` splits the value dim so one
+# program holds a `[N, BV]` f32 delta tile in registers. Both are constexpr, so
+# the committed cubin is shape-specialized like the other serving kernels.
+GDN_SOLVE_N = 64
+GDN_SOLVE_BV = 32
+
+
+@triton.jit
+def _gdn_tri_solve_kernel(
+    a_ptr,
+    rhs_ptr,
+    out_ptr,
+    n,
+    stride_a_h,
+    stride_a_r,
+    stride_rhs_h,
+    stride_rhs_r,
+    stride_out_h,
+    stride_out_r,
+    N: tl.constexpr,
+    BV: tl.constexpr,
+    DV: tl.constexpr,
+):
+    """Forward substitution for `(I + a) delta = rhs`, unit lower triangular.
+
+    `a` is `[hv, n, n]`, strictly lower; `rhs`/`out` are `[hv, n, dv]` f32. One
+    program owns a `(value head, value tile)`: it keeps `delta` as an `[N, BV]`
+    tile and walks the rows, so a chunk costs one launch instead of `n` tiny
+    batched matmuls. `a` is entirely in L2 at this size, so the row re-reads
+    across value tiles are cheaper than a cross-program reduction.
+    """
+    i_hv = tl.program_id(0)
+    i_v = tl.program_id(1)
+    rows = tl.arange(0, N)
+    cols = tl.arange(0, N)
+    o_v = i_v * BV + tl.arange(0, BV)
+    mask_r = rows < n
+    mask_v = o_v < DV
+
+    a_h = a_ptr + i_hv * stride_a_h
+    rhs_h = rhs_ptr + i_hv * stride_rhs_h
+    out_h = out_ptr + i_hv * stride_out_h
+
+    delta = tl.zeros([N, BV], dtype=tl.float32)
+    for i in range(0, n):
+        a_row = tl.load(a_h + i * stride_a_r + cols, mask=cols < i, other=0.0)
+        contrib = tl.sum(a_row[:, None] * delta, axis=0)
+        rhs_i = tl.load(rhs_h + i * stride_rhs_r + o_v, mask=mask_v, other=0.0)
+        d_i = rhs_i - contrib
+        delta = tl.where(rows[:, None] == i, d_i[None, :], delta)
+    tl.store(
+        out_h + rows[:, None] * stride_out_r + o_v[None, :],
+        delta,
+        mask=mask_r[:, None] & mask_v[None, :],
+    )
+
+
+def gdn_tri_solve(
+    a: torch.Tensor,
+    rhs: torch.Tensor,
+    out: torch.Tensor,
+    n_tile: int = GDN_SOLVE_N,
+    bv: int = GDN_SOLVE_BV,
+) -> None:
+    """Launch the blocked prefill triangular solve.
+
+    `a` is `[hv, n, n]` f32 strictly lower, `rhs` and `out` are `[hv, n, dv]`
+    f32 contiguous. `n_tile` must cover `n`; `BV` tiles the value dim.
+    """
+    hv, n, _ = a.shape
+    dv = rhs.shape[2]
+    grid = (hv, triton.cdiv(dv, bv))
+    _gdn_tri_solve_kernel[grid](
+        a,
+        rhs,
+        out,
+        n,
+        a.stride(0),
+        a.stride(1),
+        rhs.stride(0),
+        rhs.stride(1),
+        out.stride(0),
+        out.stride(1),
+        N=n_tile,
+        BV=bv,
+        DV=dv,
+        num_warps=4,
+    )
+
+
+def gdn_tri_solve_reference(a: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+    """Plain-torch forward substitution for the same unit-lower system."""
+    hv, n, _ = a.shape
+    dv = rhs.shape[2]
+    delta = torch.zeros((hv, n, dv), dtype=torch.float32, device=rhs.device)
+    for i in range(n):
+        if i == 0:
+            d_i = rhs[:, i : i + 1]
+        else:
+            d_i = rhs[:, i : i + 1] - a[:, i : i + 1, :i].bmm(delta[:, :i])
+        delta[:, i : i + 1] = d_i
+    return delta
+
+
 def gdn_decode_reference(
     ba: torch.Tensor,
     a_log: torch.Tensor,
@@ -203,4 +308,12 @@ def gdn_decode_reference(
     return out, new_state
 
 
-__all__ = ["GDN_BV", "gdn_decode", "gdn_decode_reference"]
+__all__ = [
+    "GDN_BV",
+    "GDN_SOLVE_BV",
+    "GDN_SOLVE_N",
+    "gdn_decode",
+    "gdn_decode_reference",
+    "gdn_tri_solve",
+    "gdn_tri_solve_reference",
+]

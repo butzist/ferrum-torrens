@@ -943,6 +943,32 @@ const GDN_PREFILL_CHUNK: i64 = 64;
 /// moved captured tg by ~6% on the AIME prompt until this floor was added.
 const GDN_PREFILL_MIN: i64 = 128;
 
+/// Row-by-row forward substitution for `(I + a) delta = rhs`, the fallback when
+/// the Triton solve is unavailable. Kept as `[hv, 1, dv]` row updates rather
+/// than `linalg_solve_triangular`: the CUDA solve loads libcusolver, which does
+/// not resolve against the libtorch/cuBLAS this repo runs with.
+fn triangular_solve(
+    a: &Tensor,
+    rhs: &Tensor,
+    hv: i64,
+    n: i64,
+    dv: i64,
+    device: tch::Device,
+) -> Tensor {
+    let delta = Tensor::zeros([hv, n, dv], (Kind::Float, device));
+    for i in 0..n {
+        let rhs_i = rhs.narrow(1, i, 1);
+        let d_i = if i == 0 {
+            rhs_i
+        } else {
+            let a_i = a.narrow(1, i, 1).narrow(2, 0, i);
+            rhs_i - a_i.bmm(&delta.narrow(1, 0, i))
+        };
+        delta.narrow(1, i, 1).copy_(&d_i);
+    }
+    delta
+}
+
 /// `gdn_recurrence_cached` computed a chunk at a time instead of a token at a
 /// time. Prefill is launch-bound (OPTIMIZATION.md R9), and the sequential op
 /// stack costs ~10 launches per token per layer: this is the same math with the
@@ -967,6 +993,7 @@ fn gdn_recurrence_chunked(
     beta: &Tensor,
     dk: i64,
     state: &Tensor,
+    solve: Option<&GdnDecode>,
 ) -> (Tensor, Tensor) {
     let t = q.size()[0];
     let hv = q.size()[1];
@@ -1024,23 +1051,23 @@ fn gdn_recurrence_chunked(
         let a = m * bc.transpose(0, 1).unsqueeze(-1);
         let base = kt.bmm(&state) * p.transpose(0, 1).unsqueeze(-1);
         let rhs = (vc.transpose(0, 1) - base) * bc.transpose(0, 1).unsqueeze(-1);
-        // Forward substitution for the unit-lower-triangular system. Kept as
-        // row updates of `[hv, 1, dv]` rather than `linalg_solve_triangular`:
-        // the CUDA solve loads libcusolver, which does not resolve against the
-        // libtorch/cuBLAS this repo runs with, and the rows are tiny next to
-        // the state matmuls anyway.
-        let delta = Tensor::zeros([hv, n, dv], (Kind::Float, device));
+        // Forward substitution for the unit-lower-triangular system. The
+        // committed Triton kernel folds the `n` row updates into one launch
+        // (OPTIMIZATION.md R9.3); the libtorch loop stays the fallback for a CPU
+        // device or a shape the cubin was not built for.
         let sp_solve = crate::infrastructure::profile::begin("gdn_solve");
-        for i in 0..n {
-            let rhs_i = rhs.narrow(1, i, 1);
-            let d_i = if i == 0 {
-                rhs_i
-            } else {
-                let a_i = a.narrow(1, i, 1).narrow(2, 0, i);
-                rhs_i - a_i.bmm(&delta.narrow(1, 0, i))
-            };
-            delta.narrow(1, i, 1).copy_(&d_i);
-        }
+        let delta = match solve {
+            Some(kernel) => {
+                let a = a.contiguous();
+                let rhs = rhs.contiguous();
+                let d = Tensor::zeros([hv, n, dv], (Kind::Float, device));
+                match unsafe { kernel.tri_solve(&a, &rhs, &d) } {
+                    Ok(()) => d,
+                    Err(_) => triangular_solve(&a, &rhs, hv, n, dv, device),
+                }
+            }
+            None => triangular_solve(&a, &rhs, hv, n, dv, device),
+        };
         crate::infrastructure::profile::end("gdn_solve", sp_solve);
 
         let qt = qc.transpose(0, 1);
@@ -1973,7 +2000,16 @@ impl TorchQwen3_6 {
             // prefill chunk takes the parallel formulation, which is the same
             // math without the per-token launch chain.
             let o = if t >= GDN_PREFILL_MIN {
-                gdn_recurrence_chunked(&q, &k, &v, &g, &beta, dk, recurrent_state)
+                gdn_recurrence_chunked(
+                    &q,
+                    &k,
+                    &v,
+                    &g,
+                    &beta,
+                    dk,
+                    recurrent_state,
+                    self.gdn.as_deref(),
+                )
             } else {
                 gdn_recurrence_cached(&q, &k, &v, &g, &beta, dk, recurrent_state)
             };

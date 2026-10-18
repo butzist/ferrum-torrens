@@ -570,10 +570,14 @@ pub const CONV_DECODE: &str = "conv_decode";
 /// The fused residual-add + RMSNorm (OPTIMIZATION.md R6: the norm launch tax).
 pub const ADD_RMSNORM: &str = "add_rmsnorm";
 
-const LINEAR_NAMES: [&str; 7] = [
+/// The prefill chunk triangular solve (OPTIMIZATION.md R9.3).
+pub const GDN_TRI_SOLVE: &str = "gdn_tri_solve";
+
+const LINEAR_NAMES: [&str; 8] = [
     GDN_DECODE,
     CONV_DECODE,
     ADD_RMSNORM,
+    GDN_TRI_SOLVE,
     NVFP4_DENSE_GEMV,
     FP8_GEMV,
     FP8_SPLITK_REDUCE,
@@ -704,6 +708,7 @@ pub fn linear_cubin(name: &str) -> Result<&'static [u8], MoEError> {
         GDN_DECODE => include_bytes!("../../kernel/gdn_decode.cubin"),
         CONV_DECODE => include_bytes!("../../kernel/conv_decode.cubin"),
         ADD_RMSNORM => include_bytes!("../../kernel/add_rmsnorm.cubin"),
+        GDN_TRI_SOLVE => include_bytes!("../../kernel/gdn_tri_solve.cubin"),
         NVFP4_DENSE_GEMV => include_bytes!("../../kernel/nvfp4_dense_gemv.cubin"),
         FP8_GEMV => include_bytes!("../../kernel/fp8_gemv.cubin"),
         FP8_SPLITK_REDUCE => include_bytes!("../../kernel/fp8_splitk_reduce.cubin"),
@@ -719,6 +724,7 @@ fn linear_ptx(name: &str) -> &'static str {
         GDN_DECODE => include_str!("../../kernel/gdn_decode.ptx"),
         CONV_DECODE => include_str!("../../kernel/conv_decode.ptx"),
         ADD_RMSNORM => include_str!("../../kernel/add_rmsnorm.ptx"),
+        GDN_TRI_SOLVE => include_str!("../../kernel/gdn_tri_solve.ptx"),
         NVFP4_DENSE_GEMV => include_str!("../../kernel/nvfp4_dense_gemv.ptx"),
         FP8_GEMV => include_str!("../../kernel/fp8_gemv.ptx"),
         FP8_SPLITK_REDUCE => include_str!("../../kernel/fp8_splitk_reduce.ptx"),
@@ -1285,6 +1291,52 @@ pub fn add_rmsnorm_args(abi: &LinearAbi, a: &AddRmsnormArgs) -> Result<ArgPack, 
 /// row is one baked tile.
 pub fn add_rmsnorm_grid(rows: usize) -> (u32, u32, u32) {
     (rows as u32, 1, 1)
+}
+
+/// Device addresses and shapes for one prefill triangular-solve launch. `a` is
+/// `[hv, n, n]` f32 strictly lower, `rhs`/`out` are `[hv, n, dv]` f32 contiguous;
+/// the strides are the caller's (the forward passes contiguous tensors). `n` is
+/// the chunk length, at most the baked tile `N`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GdnTriSolveArgs {
+    pub a: u64,
+    pub rhs: u64,
+    pub out: u64,
+    pub n: u32,
+    pub stride_a_h: u32,
+    pub stride_a_r: u32,
+    pub stride_rhs_h: u32,
+    pub stride_rhs_r: u32,
+    pub stride_out_h: u32,
+    pub stride_out_r: u32,
+}
+
+/// The prefill triangular-solve launch argument pack, in the cubin's order.
+pub fn gdn_tri_solve_args(abi: &LinearAbi, a: &GdnTriSolveArgs) -> Result<ArgPack, MoEError> {
+    let kernel = abi.kernel(GDN_TRI_SOLVE)?;
+    let mut p = ArgPack::for_linear(kernel);
+    p.ptr(a.a)?;
+    p.ptr(a.rhs)?;
+    p.ptr(a.out)?;
+    p.u32(a.n)?;
+    p.u32(a.stride_a_h)?;
+    p.u32(a.stride_a_r)?;
+    p.u32(a.stride_rhs_h)?;
+    p.u32(a.stride_rhs_r)?;
+    p.u32(a.stride_out_h)?;
+    p.u32(a.stride_out_r)?;
+    Ok(p)
+}
+
+/// The prefill triangular-solve grid: one program per `(value head, value tile)`.
+/// The value tile is the baked `BV`.
+pub fn gdn_tri_solve_grid(
+    value_heads: usize,
+    dv: usize,
+    kernel: &LinearKernel,
+) -> Result<(u32, u32, u32), MoEError> {
+    let bv = kernel.constexpr("BV")?;
+    Ok((value_heads as u32, (dv as u64).div_ceil(bv) as u32, 1))
 }
 
 /// Device addresses and shapes for one dense NVFP4 GEMV launch. `a` is
@@ -2072,6 +2124,68 @@ mod tests {
     #[test]
     fn the_add_rmsnorm_grid_is_one_program_per_row() {
         assert_eq!(add_rmsnorm_grid(3), (3, 1, 1));
+    }
+
+    #[test]
+    fn the_tri_solve_manifest_records_the_tiles() {
+        let abi = LinearAbi::committed().unwrap();
+        let kernel = abi.kernel(GDN_TRI_SOLVE).unwrap();
+        assert_eq!(kernel.constexpr("N").unwrap(), 64);
+        assert_eq!(kernel.constexpr("BV").unwrap(), 32);
+        assert_eq!(kernel.constexpr("DV").unwrap(), 128);
+        assert_eq!(kernel.num_warps, 4);
+        // 128 value dims / BV 32 = 4 tiles in y, 32 value heads in x.
+        assert_eq!(gdn_tri_solve_grid(32, 128, kernel).unwrap(), (32, 4, 1));
+        // A value dim that is not a multiple of the tile rounds up.
+        assert_eq!(gdn_tri_solve_grid(2, 5, kernel).unwrap(), (2, 1, 1));
+    }
+
+    #[test]
+    fn the_tri_solve_argument_builder_matches_its_kernel_signature() {
+        let abi = LinearAbi::committed().unwrap();
+        let args = GdnTriSolveArgs {
+            a: 0x1000,
+            rhs: 0x2000,
+            out: 0x3000,
+            n: 64,
+            stride_a_h: 4096,
+            stride_a_r: 64,
+            stride_rhs_h: 8192,
+            stride_rhs_r: 128,
+            stride_out_h: 8192,
+            stride_out_r: 128,
+        };
+        let pack = gdn_tri_solve_args(&abi, &args).unwrap();
+        let kernel = abi.kernel(GDN_TRI_SOLVE).unwrap();
+        assert_eq!(
+            kernel.args,
+            vec![
+                ArgKind::Ptr,
+                ArgKind::Ptr,
+                ArgKind::Ptr,
+                ArgKind::U32,
+                ArgKind::U32,
+                ArgKind::U32,
+                ArgKind::U32,
+                ArgKind::U32,
+                ArgKind::U32,
+                ArgKind::U32,
+            ]
+        );
+        assert_eq!(pack.slots()[3], u64::from(64u32));
+        let params = pack.kernel_params().unwrap();
+        assert_eq!(params.len(), kernel.args.len() + kernel.scratch_params);
+        for slot in &pack.slots()[kernel.args.len()..] {
+            assert_eq!(*slot, 0, "scratch slot is not null");
+        }
+    }
+
+    #[test]
+    fn a_manifest_missing_the_tri_solve_kernel_is_rejected() {
+        let mut v: serde_json::Value = serde_json::from_str(MANIFEST_JSON).unwrap();
+        v["linear"].as_object_mut().unwrap().remove(GDN_TRI_SOLVE);
+        let err = LinearAbi::parse(&v.to_string()).unwrap_err().to_string();
+        assert!(err.contains("missing linear kernel gdn_tri_solve"), "{err}");
     }
 
     #[test]

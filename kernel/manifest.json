@@ -975,6 +975,81 @@
       "scratch_params": 2,
       "shared": 512
     },
+    "gdn_tri_solve": {
+      "constexprs": {
+        "BV": 32,
+        "DV": 128,
+        "N": 64
+      },
+      "declared_args": [
+        "a_ptr",
+        "rhs_ptr",
+        "out_ptr",
+        "n",
+        "stride_a_h",
+        "stride_a_r",
+        "stride_rhs_h",
+        "stride_rhs_r",
+        "stride_out_h",
+        "stride_out_r"
+      ],
+      "entry": "_gdn_tri_solve_kernel",
+      "global_scratch_size": 0,
+      "num_warps": 4,
+      "params": [
+        {
+          "index": 0,
+          "kind": "ptr"
+        },
+        {
+          "index": 1,
+          "kind": "ptr"
+        },
+        {
+          "index": 2,
+          "kind": "ptr"
+        },
+        {
+          "index": 3,
+          "kind": "u32"
+        },
+        {
+          "index": 4,
+          "kind": "u32"
+        },
+        {
+          "index": 5,
+          "kind": "u32"
+        },
+        {
+          "index": 6,
+          "kind": "u32"
+        },
+        {
+          "index": 7,
+          "kind": "u32"
+        },
+        {
+          "index": 8,
+          "kind": "u32"
+        },
+        {
+          "index": 9,
+          "kind": "u32"
+        },
+        {
+          "index": 10,
+          "kind": "ptr"
+        },
+        {
+          "index": 11,
+          "kind": "ptr"
+        }
+      ],
+      "profile_scratch_size": 0,
+      "scratch_params": 2,
+      "shared": 512
+    },
     "nvfp4_dense_gemv": {
       "constexprs": {
         "BLOCK_KW": 16,

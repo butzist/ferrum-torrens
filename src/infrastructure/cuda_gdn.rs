@@ -19,8 +19,9 @@ use crate::domain::expert_kernel::MoEError;
 use crate::domain::model::ModelParams;
 use crate::infrastructure::cuda_driver::{CUstream, CudaError, Driver, GdnKernels};
 use crate::infrastructure::kernel_abi::{
-    ADD_RMSNORM, AddRmsnormArgs, CONV_DECODE, ConvArgs, GDN_DECODE, GdnArgs, LinearAbi,
-    add_rmsnorm_args, add_rmsnorm_grid, conv_decode_args, conv_grid, gdn_decode_args, gdn_grid,
+    ADD_RMSNORM, AddRmsnormArgs, CONV_DECODE, ConvArgs, GDN_DECODE, GDN_TRI_SOLVE, GdnArgs,
+    GdnTriSolveArgs, LinearAbi, add_rmsnorm_args, add_rmsnorm_grid, conv_decode_args, conv_grid,
+    gdn_decode_args, gdn_grid, gdn_tri_solve_args, gdn_tri_solve_grid,
 };
 use crate::infrastructure::torch::Device;
 
@@ -192,6 +193,67 @@ impl GdnDecode {
         unsafe { self.kernels.launch(kernel, grid, &mut params, self.stream) }.map_err(driver)
     }
 
+    /// Launch the prefill chunk triangular solve for one chunk: the committed
+    /// cubin solves `(I + a) delta = rhs` for the strictly-lower `a`.
+    ///
+    /// `a` is `[v_heads, n, n]` f32 strictly lower, `rhs`/`out` are
+    /// `[v_heads, n, v_dim]` f32 contiguous. `n` must not exceed the cubin's
+    /// baked row tile; a longer or mismatched shape falls back to the libtorch
+    /// loop at the call site.
+    ///
+    /// # Safety
+    /// Every tensor must be a live device allocation in this launcher's context.
+    pub unsafe fn tri_solve(&self, a: &Tensor, rhs: &Tensor, out: &Tensor) -> Result<(), MoEError> {
+        let kernel = self.abi.kernel(GDN_TRI_SOLVE).map_err(bad_abi)?;
+        let bad = |what: &str| {
+            MoEError::Bad(format!(
+                "the tri-solve kernel was built for {what}, not the shapes handed in"
+            ))
+        };
+        let a_size = a.size();
+        if a_size.len() != 3 || a_size[0] != self.v_heads || a_size[1] != a_size[2] {
+            return Err(bad("a = [v_heads, n, n]"));
+        }
+        let n = a_size[1];
+        if n > kernel.constexpr("N").map_err(bad_abi)? as i64 {
+            return Err(bad("n within the baked row tile"));
+        }
+        if self.vdim != kernel.constexpr("DV").map_err(bad_abi)? as i64 {
+            return Err(bad("DV matching the value dim"));
+        }
+        if rhs.size() != [self.v_heads, n, self.vdim] || out.size() != rhs.size() {
+            return Err(bad("rhs = out = [v_heads, n, v_dim]"));
+        }
+        let f32_contiguous = |t: &Tensor| t.kind() == tch::Kind::Float && t.is_contiguous();
+        if !f32_contiguous(a) || !f32_contiguous(rhs) || !f32_contiguous(out) {
+            return Err(MoEError::Bad(format!(
+                "the tri-solve kernel needs contiguous f32 tensors (a={} rhs={} out={})",
+                f32_contiguous(a),
+                f32_contiguous(rhs),
+                f32_contiguous(out)
+            )));
+        }
+        let (a_strides, rhs_strides, out_strides) = (a.stride(), rhs.stride(), out.stride());
+        let args = GdnTriSolveArgs {
+            a: a.data_ptr() as u64,
+            rhs: rhs.data_ptr() as u64,
+            out: out.data_ptr() as u64,
+            n: n as u32,
+            stride_a_h: a_strides[0] as u32,
+            stride_a_r: a_strides[1] as u32,
+            stride_rhs_h: rhs_strides[0] as u32,
+            stride_rhs_r: rhs_strides[1] as u32,
+            stride_out_h: out_strides[0] as u32,
+            stride_out_r: out_strides[1] as u32,
+        };
+        let pack = gdn_tri_solve_args(&self.abi, &args).map_err(bad_abi)?;
+        let mut params = pack.kernel_params().map_err(bad_abi)?;
+        let grid = gdn_tri_solve_grid(self.v_heads as usize, self.vdim as usize, kernel)
+            .map_err(bad_abi)?;
+        // SAFETY: as above; the outputs are fully overwritten by the kernel.
+        unsafe { self.kernels.launch(kernel, grid, &mut params, self.stream) }.map_err(driver)
+    }
+
     /// Launch one fused conv + silu decode step for `rows` rows.
     ///
     /// `x` is `[rows, conv_dim]` f32, `w` `[conv_dim, K]` f32, `state`
@@ -349,6 +411,14 @@ fn check_geometry(params: &ModelParams, abi: &LinearAbi) -> Result<(), MoEError>
         return Err(MoEError::Bad(format!(
             "the norm kernel was built with HIDDEN = {built}, but the model has {}",
             params.hidden_size
+        )));
+    }
+    let solve = abi.kernel(GDN_TRI_SOLVE).map_err(bad_abi)?;
+    let built = solve.constexpr("DV").map_err(bad_abi)?;
+    if built != params.linear_value_head_dim as u64 {
+        return Err(MoEError::Bad(format!(
+            "the tri-solve kernel was built with DV = {built}, but the model has {}",
+            params.linear_value_head_dim
         )));
     }
     Ok(())

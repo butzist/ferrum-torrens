@@ -83,12 +83,14 @@ chunk and a hoisted GDN recurrence. Decision 102 then added a prefill split to
 replaces the per-token loop with a chunked triangular solve + batched matmuls:
 pp **120 -> 143 tok/s** at 517 tokens and **122 -> 150** at 2057, decode within
 noise. A stashed R9.2 attempt (fused q/k RMSNorm + GDN gated norm) was correct
-but did not measure a captured win, so it is parked. Remaining levers: the
-tri-solve Triton kernel (the chunked recurrence's per-row solve launches), the
-R8.1 fused router, `moe_lru`, the gdn tail norm, R8.5 fp8 KV, and the FLA
-prefill chunk kernels (slice 4). Instruments: `FT_PROFILE=1`,
-`scripts/freetoken_probe/`.
-Progress history and the full decision log (numbers 1..100) live in `DONE.md`;
+but did not measure a captured win, so it is parked. Decision 103 replaced the
+chunked solve's per-row launches with one `gdn_tri_solve` Triton kernel (solve
+1.98 -> 0.04 ms/token; pp 142 -> 150 at 517 and 151 -> 156 at 2057, with the
+freed time now hidden under the prefill MoE overlap), decode unchanged.
+Remaining levers: the R8.1 fused router, `moe_lru`, the gdn tail norm, R8.5
+fp8 KV, and the FLA prefill chunk kernels (slice 4). Instruments:
+`FT_PROFILE=1`, `scripts/freetoken_probe/`.
+Progress history and the full decision log (numbers 1..103) live in `DONE.md`;
 read that for the "why" behind any decision number referenced in code or tests.
 
 Goal: a **minimal, fast, single-GPU** Rust serving engine for **one model** --
@@ -711,9 +713,10 @@ performance work.
     ~8 ms/token as GDN recurrence ~45% (not attention: the Host fallback is ~8%,
     `attn_mem` <2%), so `gdn_recurrence_chunked` replaces the per-token loop with
     a chunked FLA-style triangular solve + batched matmuls: pp **120 -> 143** at
-    517 and **122 -> 150** at 2057, decode within noise (decisions 102). The FLA
-    `chunk_gated_delta_rule` + `causal_conv1d_varlen` kernels remain OPEN; the
-    solve's per-row launches are the next lever (a small tri-solve Triton kernel).
+    517 and **122 -> 150** at 2057, decode within noise (decisions 102). The
+    per-row solve is now one `gdn_tri_solve` Triton kernel (decision 103), so
+    prefill is MoE-bound. The FLA `chunk_gated_delta_rule` +
+    `causal_conv1d_varlen` kernels remain OPEN.
 21. Expert cache growth (E4) -- **DONE (2026-10-17), decision 85.** The staging
      `lru_ensure` `BLOCK_C` ceiling is raised 512 -> 2048 (decision 84), so a
      config may grow the cache into the VRAM the FP8 slice freed. Measured on the

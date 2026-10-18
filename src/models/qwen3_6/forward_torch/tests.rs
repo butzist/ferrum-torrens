@@ -270,9 +270,9 @@ fn gdn_recurrence_matches_the_reference() {
     let beta = data(t * hv, 21).iter().map(|x| x.abs()).collect::<Vec<_>>();
     let want = super::super::forward::gdn_recurrence(t, hv, dk, dv, &q, &k, &v, &g, &beta);
     let got = to_f32_vec(&gdn_recurrence(
-        &up(&q, &[t as i64, hv as i64 * dk as i64]),
-        &up(&k, &[t as i64, hv as i64 * dk as i64]),
-        &up(&v, &[t as i64, hv as i64 * dv as i64]),
+        &up(&q, &[t as i64, hv as i64, dk as i64]),
+        &up(&k, &[t as i64, hv as i64, dk as i64]),
+        &up(&v, &[t as i64, hv as i64, dv as i64]),
         &up(&g, &[t as i64, hv as i64]),
         &up(&beta, &[t as i64, hv as i64]),
         hv as i64,
@@ -309,9 +309,9 @@ fn gdn_state_starts_at_zero_so_the_first_step_is_exact() {
     let g = vec![0.0f32; t * hv];
     let beta = vec![0.5f32; t * hv];
     let got = to_f32_vec(&gdn_recurrence(
-        &up(&zero, &[t as i64, hv as i64 * dk as i64]),
-        &up(&zero, &[t as i64, hv as i64 * dk as i64]),
-        &up(&v, &[t as i64, hv as i64 * dv as i64]),
+        &up(&zero, &[t as i64, hv as i64, dk as i64]),
+        &up(&zero, &[t as i64, hv as i64, dk as i64]),
+        &up(&v, &[t as i64, hv as i64, dv as i64]),
         &up(&g, &[t as i64, hv as i64]),
         &up(&beta, &[t as i64, hv as i64]),
         hv as i64,
@@ -989,23 +989,33 @@ fn a_carried_gdn_state_matches_the_stateless_recurrence_over_the_concatenation()
             .collect();
         up(&rows, &[(rows.len() / cols as usize) as i64, cols])
     };
+    let slice3 = |d: &[f32], rows: std::ops::Range<usize>, h: i64, w: i64| {
+        let cols = h * w;
+        let rows: Vec<f32> = d
+            .iter()
+            .skip(rows.start * cols as usize)
+            .take((rows.end - rows.start) * cols as usize)
+            .copied()
+            .collect();
+        up(&rows, &[(rows.len() / cols as usize) as i64, h, w])
+    };
     let zero = Tensor::zeros(
         [hv as i64, dk as i64, dv as i64],
         (Kind::Float, dev().to_tch()),
     );
     let (first, state) = gdn_recurrence_cached(
-        &slice(&q, 0..t0, hv as i64 * dk as i64),
-        &slice(&k, 0..t0, hv as i64 * dk as i64),
-        &slice(&v, 0..t0, hv as i64 * dv as i64),
+        &slice3(&q, 0..t0, hv as i64, dk as i64),
+        &slice3(&k, 0..t0, hv as i64, dk as i64),
+        &slice3(&v, 0..t0, hv as i64, dv as i64),
         &slice(&g, 0..t0, hv as i64),
         &slice(&beta, 0..t0, hv as i64),
         dk as i64,
         &zero,
     );
     let (second, _) = gdn_recurrence_cached(
-        &slice(&q, t0..t, hv as i64 * dk as i64),
-        &slice(&k, t0..t, hv as i64 * dk as i64),
-        &slice(&v, t0..t, hv as i64 * dv as i64),
+        &slice3(&q, t0..t, hv as i64, dk as i64),
+        &slice3(&k, t0..t, hv as i64, dk as i64),
+        &slice3(&v, t0..t, hv as i64, dv as i64),
         &slice(&g, t0..t, hv as i64),
         &slice(&beta, t0..t, hv as i64),
         dk as i64,
@@ -1042,7 +1052,7 @@ fn a_chunked_prefill_recurrence_matches_the_token_loop() {
     let st = up(&state, &[hv as i64, dk as i64, dv as i64]);
 
     let (want, want_state) = gdn_recurrence_cached(&qt, &kt, &vt, &gt, &bt, dk as i64, &st);
-    let (got, got_state) = gdn_recurrence_chunked(&qt, &kt, &vt, &gt, &bt, dk as i64, &st);
+    let (got, got_state) = gdn_recurrence_chunked(&qt, &kt, &vt, &gt, &bt, dk as i64, &st, None);
     close(
         &to_f32_vec(&got),
         &to_f32_vec(&want),

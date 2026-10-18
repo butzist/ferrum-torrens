@@ -35,7 +35,7 @@ from triton.backends.nvidia.compiler import CUDAOptions
 from triton.compiler import ASTSource, compile as triton_compile
 
 from .conv import _conv_decode_kernel
-from .gdn import _gdn_decode_kernel
+from .gdn import _gdn_decode_kernel, _gdn_tri_solve_kernel
 from .norm import _add_rmsnorm_kernel
 from .fp8_linear import (
     _fp8_gemm_kernel,
@@ -69,6 +69,8 @@ from .signatures import (
     gate_up_constexprs,
     gdn_decode,
     gdn_decode_constexprs,
+    gdn_tri_solve,
+    gdn_tri_solve_constexprs,
     add_rmsnorm,
     add_rmsnorm_constexprs,
     gemv,
@@ -187,6 +189,12 @@ LINEAR_KERNELS: dict[str, dict] = {
         "fn": _conv_decode_kernel,
         "signature": conv_decode(),
         "constexprs": conv_decode_constexprs(),
+        "num_warps": 4,
+    },
+    "gdn_tri_solve": {
+        "fn": _gdn_tri_solve_kernel,
+        "signature": gdn_tri_solve(),
+        "constexprs": gdn_tri_solve_constexprs(),
         "num_warps": 4,
     },
     "nvfp4_dense_gemv": {

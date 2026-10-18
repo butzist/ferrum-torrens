@@ -36,7 +36,7 @@ from .nvfp4_moe import (
 from .offload import _ensure_experts_kernel, _index_copy_multi_kernel
 from .attention import _paged_attention_decode_kernel
 from .conv import _conv_decode_kernel
-from .gdn import _gdn_decode_kernel
+from .gdn import _gdn_decode_kernel, _gdn_tri_solve_kernel
 from .norm import _add_rmsnorm_kernel
 from .fp8_linear import (
     _fp8_gemm_kernel,
@@ -53,6 +53,8 @@ from .signatures import fp8_gemv_constexprs, fp8_splitk_reduce_constexprs
 from .signatures import fp8_splitk_reduce as _fp8_splitk_reduce_sig
 from .signatures import gdn_decode as _gdn_decode_sig
 from .signatures import gdn_decode_constexprs
+from .signatures import gdn_tri_solve as _gdn_tri_solve_sig
+from .signatures import gdn_tri_solve_constexprs
 from .signatures import add_rmsnorm as _add_rmsnorm_sig
 from .signatures import add_rmsnorm_constexprs
 from .signatures import gemv as _gemv_sig
@@ -172,6 +174,17 @@ def main() -> int:
     except Exception as e:  # noqa: BLE001
         print(f"conv_decode FAILED: {type(e).__name__}: {str(e)[:200]}")
         failures += 1
+    # The prefill chunk triangular solve (OPTIMIZATION.md R9.3).
+    try:
+        check(
+            "gdn_tri_solve",
+            _gdn_tri_solve_kernel,
+            _gdn_tri_solve_sig(),
+            gdn_tri_solve_constexprs(),
+        )
+    except Exception as e:  # noqa: BLE001
+        failures += 1
+        print(f"gdn_tri_solve FAILED: {type(e).__name__}: {str(e)[:200]}")
     # The fused add + RMSNorm (OPTIMIZATION.md R6: the norm launch tax).
     try:
         check(

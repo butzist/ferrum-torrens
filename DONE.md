@@ -2585,12 +2585,54 @@ settled.
        GPU: `engine_real_generate` 6/6, `kvcache_cross_request_reuse` (reused
        7/10, argmax ok, 1.41e-1), `device_decode_matches_refeed` 3/3 argmax
        exact, `ftw_cross_check` argmax 11751 top-5 identical.
-     - **Remaining:** the chunked solve still spends ~1.8 ms/token on ~`t`
-       per-row launches; a small `gdn_tri_solve` Triton kernel (one launch per
-       chunk per layer) is the next lever, then the FLA `chunk_gated_delta_rule`
-       + `causal_conv1d_varlen`.
+      - **Remaining:** the chunked solve still spends ~1.8 ms/token on ~`t`
+        per-row launches; a small `gdn_tri_solve` Triton kernel (one launch per
+        chunk per layer) is the next lever, then the FLA `chunk_gated_delta_rule`
+        + `causal_conv1d_varlen`.
+
+103. **Prefill: one Triton kernel for the chunked recurrence's triangular solve**
+     (2026-10-18, implemented) -- decision 102 left `gdn_recurrence_chunked`'s
+     solve as `n` tiny `a[:, i, :i] @ delta[:, :i]` batched matmuls per chunk per
+     layer (~1.8 ms/token at the 451-token chunk). This replaces that loop with
+     a single committed kernel, the last named lever of slice 4 before the FLA
+     chunk kernels.
+     - **Kernel.** `python/ferrum_kernel/gdn.py::_gdn_tri_solve_kernel`: a
+       blocked forward substitution of `(I + a) delta = rhs` with one program per
+       `(value head, value tile)`. `a` is `[hv, n, n]` strictly lower, `rhs` and
+       `out` are `[hv, n, dv]` f32; the program keeps `delta` as an `[N=64, BV=32]`
+       register tile and walks `n` rows, masking the strictly-lower `a` row and
+       selecting the computed row into the tile with `tl.where`, so a chunk costs
+       one launch instead of `n`. Registered in the `linear` manifest section
+       (`gdn_tri_solve`, 4 warps, `N=64`/`BV=32`/`DV=128`) and launched from
+       `GdnDecode::tri_solve`; `gdn_recurrence_chunked` takes an
+       `Option<&GdnDecode>` and keeps the libtorch row loop as the fallback for a
+       CPU device or a shape the cubin was not built for. `a`/`rhs` are made
+       contiguous at the call site (they come out of broadcast multiplies with a
+       non-contiguous `transpose`/`permute` operand).
+     - **Measured** (RTX 5060 Laptop, bs=1, bf16 KV, auto cache, controlled
+       order-balanced A/B, 2 runs each, `FERRUM_SMOKE_TOKENS=8`): pp **141.9 ->
+       150.3 tok/s** at 517 tokens (+5.9%) and **151.2 -> 156.5** at 2057
+       (+3.5%); VRAM flat at 7190 MiB. The profile (`FERRUM_SMOKE_NOGRAPH=1
+       FT_PROFILE=1`, 451-token chunk) shows `gdn_solve` **1.98 -> 0.037
+       ms/token** (53x) and `gdn_recur` 2.61 -> 0.19; the wall-clock win is
+       smaller than the solve saving because that time was already overlapped
+       with the whole-layer prefill MoE copy, so prefill is now MoE-bound
+       (`pf_gemm` ~3.5 ms/token). Decode unchanged: AIME prompt tg 27.9/27.8 ->
+       28.0/27.8 at 64 generated tokens; the code path is prefill-only and the
+       `t < GDN_PREFILL_MIN` branch is untouched.
+     - **Gates.** `cargo fmt --check`, `cargo clippy --all-targets` and
+       `--features cuda` clean; CPU `cargo test` 317 pass (3 new ABI tests);
+       `--interp` selftest `PASS` (new `check_gdn_solve`, exact-tile and ragged
+       cases, max rel ~3e-7); `check-kernels.sh` green with 16 cubins and only
+       the new `gdn_tri_solve.{cubin,ptx}` + manifest added (no other artifact
+       churn). GPU: `engine_real_generate` 6/6, `kvcache_cross_request_reuse`
+       (reused 7/10, argmax 248046 ok, 1.412e-1), `device_decode_matches_refeed`
+       3/3 argmax exact, `ftw_cross_check` argmax 11751 top-5 identical.
+     - **Remaining:** the FLA `chunk_gated_delta_rule` + `causal_conv1d_varlen`
+       prefill kernels (slice 4); prefill is now gated by the MoE `pf_gemm`.
 
 ---
+
 
 ## Progress log (narrative, pre-2026-10-15 compaction)
 

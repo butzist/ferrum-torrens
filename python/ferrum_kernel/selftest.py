@@ -356,6 +356,44 @@ def check_gdn(device: torch.device, tol: float, full: bool) -> int:
     return failures
 
 
+def random_solve_case(device: str, hv: int, n: int, dv: int, seed: int):
+    """A unit-lower system: strictly-lower `a [hv, n, n]` and `rhs [hv, n, dv]`."""
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    dev = torch.device(device)
+    a = (torch.randn((hv, n, n), generator=g, dtype=torch.float32) * 0.3).to(dev)
+    a = torch.tril(a, diagonal=-1).contiguous()
+    rhs = torch.randn((hv, n, dv), generator=g, dtype=torch.float32).to(dev)
+    return a, rhs
+
+
+def check_gdn_solve(device: torch.device, tol: float, full: bool) -> int:
+    """Prefill chunk triangular solve (OPTIMIZATION.md R9.3): the kernel against
+    the plain-torch forward substitution, including a ragged chunk shorter than
+    the tile. `full` adds the serving geometry."""
+    cases = [
+        ("small", {"hv": 2, "n": 5, "dv": 8}),
+        ("ragged", {"hv": 3, "n": 11, "dv": 16}),
+        ("exact-tile", {"hv": 2, "n": 64, "dv": 16}),
+    ]
+    if full:
+        cases.append(("qwen-shape", {"hv": 32, "n": 64, "dv": 128}))
+    failures = 0
+    for label, shape in cases:
+        for seed in range(2):
+            a, rhs = random_solve_case(str(device), seed=seed, **shape)
+            want = gdn_mod.gdn_tri_solve_reference(a, rhs)
+            got = torch.empty_like(rhs)
+            gdn_mod.gdn_tri_solve(a, rhs, got, n_tile=gdn_mod.GDN_SOLVE_N)
+            rel = (
+                (got - want).abs().max() / want.abs().max().clamp(min=1e-6)
+            ).item()
+            print(f"solve {label} seed {seed}: rel {rel:.3e}")
+            if rel > tol:
+                failures += 1
+                print(f"solve {label} seed {seed}: FAIL", file=sys.stderr)
+    return failures
+
+
 def random_conv_case(device: str, rows: int, conv_dim: int, k: int, seed: int):
     g = torch.Generator(device="cpu").manual_seed(seed)
     dev = torch.device(device)
@@ -608,6 +646,12 @@ def main(argv: list[str] | None = None) -> int:
         torch.device(args.device), args.tol, full=args.device != "cpu"
     )
     if gdn_failures:
+        print("FAIL", file=sys.stderr)
+        return 1
+    solve_failures = check_gdn_solve(
+        torch.device(args.device), args.tol, full=args.device != "cpu"
+    )
+    if solve_failures:
         print("FAIL", file=sys.stderr)
         return 1
     conv_failures = check_conv(

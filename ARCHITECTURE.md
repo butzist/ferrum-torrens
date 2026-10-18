@@ -220,7 +220,8 @@ flowchart LR
   `staging` (`lru_ensure`, `index_copy`), `attention` (`paged_attention` f32 and
   `paged_attention_bf16`, the pool-dtype variants) and
   `linear` (`gdn_decode`, the fused GDN decode, `conv_decode`, the fused GDN
-  causal conv + silu, `nvfp4_dense_gemv`, the lm_head tail, and
+  causal conv + silu, `gdn_tri_solve`, the prefill chunk triangular solve,
+  `nvfp4_dense_gemv`, the lm_head tail, and
   `fp8_gemv`/`fp8_splitk_reduce`/`fp8_gemm`, the vendored W8A16 FP8 projections).
   The devshell aliases
   `kernel-aot`, `kernel-selftest` (CPU interpreter gate) and
@@ -738,7 +739,9 @@ decode kernel through `infrastructure/cuda_gdn.rs` (`GdnDecode`): it loads the
 stream, folding the gating, the q/k L2-norm and the delta-rule update into one
 launch per layer and reading/writing the row's `LinearStateSlabs` recurrent state
 in place; when the launcher is absent (CPU, decision 21) the arm keeps the
-op-by-op `gdn_core_batch` (decision 77). The forward's tail is
+op-by-op `gdn_core_batch` (decision 77). The same launcher's `tri_solve` runs the
+prefill chunked recurrence's triangular solve (`gdn_tri_solve`, decision 103),
+with the libtorch row loop as the fallback. The forward's tail is
 device-local: `TorchQwen3_6::forward_cached_into` writes the `lm_head` block pass
 straight into a caller-owned `[rows, vocab]` device logits buffer with no host
 round-trip, and `forward_decode_into` addresses the same forward entirely from a

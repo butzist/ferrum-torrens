@@ -13,7 +13,7 @@ baked into the cubin rather than passed at launch.
 from __future__ import annotations
 
 from .conv import CONV_BLOCK_N
-from .gdn import GDN_BV
+from .gdn import GDN_BV, GDN_SOLVE_BV, GDN_SOLVE_N
 from .fp8_linear import (
     GEMM_BLOCK_K as FP8_GEMM_BLOCK_K,
     GEMM_BLOCK_M as FP8_GEMM_BLOCK_M,
@@ -309,6 +309,34 @@ def gdn_decode_constexprs(
         "BK": 1 << (k - 1).bit_length(),
         "BV": bv,
     }
+
+
+def gdn_tri_solve() -> dict:
+    """The prefill chunk triangular solve (OPTIMIZATION.md R9.3): `a` is
+    `[hv, n, n]` strictly lower, `rhs`/`out` are `[hv, n, dv]` f32."""
+    return {
+        "a_ptr": "*fp32",
+        "rhs_ptr": "*fp32",
+        "out_ptr": "*fp32",
+        "n": "i32",
+        "stride_a_h": "i32",
+        "stride_a_r": "i32",
+        "stride_rhs_h": "i32",
+        "stride_rhs_r": "i32",
+        "stride_out_h": "i32",
+        "stride_out_r": "i32",
+        "N": "constexpr",
+        "BV": "constexpr",
+        "DV": "constexpr",
+    }
+
+
+def gdn_tri_solve_constexprs(
+    n: int = GDN_SOLVE_N,
+    bv: int = GDN_SOLVE_BV,
+    dv: int = SERVING_GDN_V,
+) -> dict:
+    return {"N": n, "BV": bv, "DV": dv}
 
 
 def conv_decode() -> dict:
