@@ -81,7 +81,9 @@ fn rms_norm_matches_the_reference() {
         &up(&w, &[h as i64]),
         1e-6,
     ));
-    close(&got, &want, 1e-5, "rms_norm");
+    // The store is bf16 by decision 87 (the mixer activation stream), so the
+    // agreement floor is a bf16 ulp, not the f32 reference's precision.
+    close(&got, &want, 8e-3, "rms_norm");
 }
 
 #[test]
@@ -99,7 +101,7 @@ fn rms_norm_applies_the_baked_weight_not_one_plus_it() {
     close(
         &got,
         &super::super::forward::rms_norm(&x, &baked, 1e-6, h),
-        1e-5,
+        8e-3,
         "rms_norm",
     );
 }

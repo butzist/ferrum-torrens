@@ -31,6 +31,9 @@ pub enum ArgKind {
     Ptr,
     U32,
     U64,
+    /// A 4-byte float scalar (the driver reads the raw bits from the slot, the
+    /// same way it reads a `u32`).
+    F32,
 }
 
 impl ArgKind {
@@ -39,6 +42,7 @@ impl ArgKind {
             "ptr" => Some(Self::Ptr),
             "u32" => Some(Self::U32),
             "u64" => Some(Self::U64),
+            "f32" => Some(Self::F32),
             _ => None,
         }
     }
@@ -563,9 +567,13 @@ pub const FP8_GEMM: &str = "fp8_gemm";
 /// The fused single-token GDN causal conv + silu (TODO.md item 19).
 pub const CONV_DECODE: &str = "conv_decode";
 
-const LINEAR_NAMES: [&str; 6] = [
+/// The fused residual-add + RMSNorm (optimization.md R6: the norm launch tax).
+pub const ADD_RMSNORM: &str = "add_rmsnorm";
+
+const LINEAR_NAMES: [&str; 7] = [
     GDN_DECODE,
     CONV_DECODE,
+    ADD_RMSNORM,
     NVFP4_DENSE_GEMV,
     FP8_GEMV,
     FP8_SPLITK_REDUCE,
@@ -695,6 +703,7 @@ pub fn linear_cubin(name: &str) -> Result<&'static [u8], MoEError> {
     Ok(match name {
         GDN_DECODE => include_bytes!("../../kernel/gdn_decode.cubin"),
         CONV_DECODE => include_bytes!("../../kernel/conv_decode.cubin"),
+        ADD_RMSNORM => include_bytes!("../../kernel/add_rmsnorm.cubin"),
         NVFP4_DENSE_GEMV => include_bytes!("../../kernel/nvfp4_dense_gemv.cubin"),
         FP8_GEMV => include_bytes!("../../kernel/fp8_gemv.cubin"),
         FP8_SPLITK_REDUCE => include_bytes!("../../kernel/fp8_splitk_reduce.cubin"),
@@ -709,6 +718,7 @@ fn linear_ptx(name: &str) -> &'static str {
     match name {
         GDN_DECODE => include_str!("../../kernel/gdn_decode.ptx"),
         CONV_DECODE => include_str!("../../kernel/conv_decode.ptx"),
+        ADD_RMSNORM => include_str!("../../kernel/add_rmsnorm.ptx"),
         NVFP4_DENSE_GEMV => include_str!("../../kernel/nvfp4_dense_gemv.ptx"),
         FP8_GEMV => include_str!("../../kernel/fp8_gemv.ptx"),
         FP8_SPLITK_REDUCE => include_str!("../../kernel/fp8_splitk_reduce.ptx"),
@@ -750,10 +760,14 @@ fn ptx_entry_args(src: &str) -> Vec<ArgKind> {
                 continue;
             }
             let fields: Vec<&str> = raw.split_whitespace().collect();
-            let width = fields
+            let (width, is_float) = fields
                 .iter()
-                .find_map(|f| f.strip_prefix(".u"))
-                .and_then(|w| w.parse::<u32>().ok())
+                .find_map(|f| {
+                    f.strip_prefix(".u")
+                        .map(|w| (w, false))
+                        .or_else(|| f.strip_prefix(".f").map(|w| (w, true)))
+                })
+                .and_then(|(w, f)| w.parse::<u32>().ok().map(|v| (v, f)))
                 .unwrap_or_else(|| panic!("PTX param without a width: {raw}"));
             let index: usize = fields
                 .last()
@@ -762,6 +776,8 @@ fn ptx_entry_args(src: &str) -> Vec<ArgKind> {
                 .unwrap_or_else(|| panic!("PTX param without an index: {raw}"));
             let kind = if fields.contains(&".ptr") {
                 ArgKind::Ptr
+            } else if is_float {
+                ArgKind::F32
             } else if width == 32 {
                 ArgKind::U32
             } else {
@@ -781,6 +797,8 @@ pub enum Arg {
     Ptr(u64),
     U32(u32),
     U64(u64),
+    /// An f32 scalar carried as its raw bit pattern.
+    F32(u32),
 }
 
 /// The value buffer handed to `cuLaunchKernel`.
@@ -837,7 +855,10 @@ impl ArgPack {
         let want = self.kinds[self.next];
         let ok = matches!(
             (want, arg),
-            (ArgKind::Ptr, Arg::Ptr(_)) | (ArgKind::U32, Arg::U32(_)) | (ArgKind::U64, Arg::U64(_))
+            (ArgKind::Ptr, Arg::Ptr(_))
+                | (ArgKind::U32, Arg::U32(_))
+                | (ArgKind::U64, Arg::U64(_))
+                | (ArgKind::F32, Arg::F32(_))
         );
         if !ok {
             let (index, want) = (self.next, want);
@@ -847,7 +868,7 @@ impl ArgPack {
         }
         self.slots[self.next] = match arg {
             Arg::Ptr(a) | Arg::U64(a) => a,
-            Arg::U32(v) => u64::from(v),
+            Arg::U32(v) | Arg::F32(v) => u64::from(v),
         };
         self.next += 1;
         Ok(())
@@ -863,6 +884,10 @@ impl ArgPack {
 
     pub fn u64(&mut self, v: u64) -> Result<(), MoEError> {
         self.push(Arg::U64(v))
+    }
+
+    pub fn f32(&mut self, v: f32) -> Result<(), MoEError> {
+        self.push(Arg::F32(v.to_bits()))
     }
 
     fn finish(&self) -> Result<(), MoEError> {
@@ -1223,6 +1248,43 @@ pub fn conv_grid(rows: usize, kernel: &LinearKernel) -> Result<(u32, u32, u32), 
         (conv_dim as usize).div_ceil(block_n as usize) as u32,
         1,
     ))
+}
+
+/// Device addresses for one fused add + RMSNorm launch. `x`/`r` are
+/// `[rows, hidden]` model dtype (either may be strided), `w` is `[hidden]`, and
+/// `sum`/`out` are the contiguous `[rows, hidden]` outputs: the new residual
+/// and the normalized row. `eps` is the f32 rms-norm epsilon.
+#[derive(Debug, Clone, Copy)]
+pub struct AddRmsnormArgs {
+    pub x: u64,
+    pub r: u64,
+    pub w: u64,
+    pub sum: u64,
+    pub out: u64,
+    pub eps: f32,
+    pub stride_x: u32,
+    pub stride_r: u32,
+}
+
+/// The fused add + RMSNorm launch argument pack, in the cubin's declared order.
+pub fn add_rmsnorm_args(abi: &LinearAbi, a: &AddRmsnormArgs) -> Result<ArgPack, MoEError> {
+    let kernel = abi.kernel(ADD_RMSNORM)?;
+    let mut p = ArgPack::for_linear(kernel);
+    p.ptr(a.x)?;
+    p.ptr(a.r)?;
+    p.ptr(a.w)?;
+    p.ptr(a.sum)?;
+    p.ptr(a.out)?;
+    p.f32(a.eps)?;
+    p.u32(a.stride_x)?;
+    p.u32(a.stride_r)?;
+    Ok(p)
+}
+
+/// The fused add + RMSNorm launch grid: one program per row; the whole hidden
+/// row is one baked tile.
+pub fn add_rmsnorm_grid(rows: usize) -> (u32, u32, u32) {
+    (rows as u32, 1, 1)
 }
 
 /// Device addresses and shapes for one dense NVFP4 GEMV launch. `a` is
@@ -1967,6 +2029,61 @@ mod tests {
         v["linear"].as_object_mut().unwrap().remove(CONV_DECODE);
         let err = LinearAbi::parse(&v.to_string()).unwrap_err().to_string();
         assert!(err.contains("missing linear kernel conv_decode"), "{err}");
+    }
+
+    #[test]
+    fn the_add_rmsnorm_argument_builder_matches_its_kernel_signature() {
+        let abi = LinearAbi::committed().unwrap();
+        let args = AddRmsnormArgs {
+            x: 0x1000,
+            r: 0x2000,
+            w: 0x3000,
+            sum: 0x4000,
+            out: 0x5000,
+            eps: 1e-6,
+            stride_x: 2048,
+            stride_r: 2048,
+        };
+        let pack = add_rmsnorm_args(&abi, &args).unwrap();
+        let kernel = abi.kernel(ADD_RMSNORM).unwrap();
+        assert_eq!(
+            kernel.args,
+            vec![
+                ArgKind::Ptr,
+                ArgKind::Ptr,
+                ArgKind::Ptr,
+                ArgKind::Ptr,
+                ArgKind::Ptr,
+                ArgKind::F32,
+                ArgKind::U32,
+                ArgKind::U32,
+            ]
+        );
+        let params = pack.kernel_params().unwrap();
+        assert_eq!(params.len(), kernel.args.len() + kernel.scratch_params);
+        // The f32 slot carries the raw bit pattern, so a mistyped arg pack
+        // would change the bits the driver reads, not just the width check.
+        assert_eq!(pack.slots()[5], u64::from(1e-6f32.to_bits()));
+        for slot in &pack.slots()[kernel.args.len()..] {
+            assert_eq!(*slot, 0, "scratch slot is not null");
+        }
+    }
+
+    #[test]
+    fn the_add_rmsnorm_grid_is_one_program_per_row() {
+        assert_eq!(add_rmsnorm_grid(3), (3, 1, 1));
+    }
+
+    #[test]
+    fn a_mistyped_argpack_slot_is_rejected() {
+        let abi = LinearAbi::committed().unwrap();
+        let kernel = abi.kernel(ADD_RMSNORM).unwrap();
+        let mut p = ArgPack::for_linear(kernel);
+        for _ in 0..5 {
+            p.ptr(0x1000).unwrap();
+        }
+        // The sixth declared parameter is the f32 eps; a u32 must not pass.
+        assert!(p.u32(1).is_err());
     }
 
     #[test]

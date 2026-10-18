@@ -1,6 +1,6 @@
 # FerrumTorrens -- FreeToken MVP port to Rust: TODO
 
-Status (2026-10-16): M2 (API) current, late M3 in practice. The heavy M3
+Status (2026-10-18): M2 (API) current, late M3 in practice. The heavy M3
 infrastructure is landed and gated on the real checkpoint: driver-API kernels
 (NVFP4 MoE + paged GQA decode), device-staged offload, engine-owned per-batch-size
 decode graphs, and bf16 KV by default so a default config fits the 8 GiB target.
@@ -66,10 +66,15 @@ other R6 items have hard blockers (see `optimization.md`). **R5 landed
 `run_batch`; K=4 aggregate decode **16.6 -> 26.2 tok/s (1.58x)**. **Shared expert
 stays NVFP4** (decision 93, `shared` 3.12 -> 2.26) and **a prefill no longer
 wipes the decode expert cache** (decision 94: only the `2*E` buffer slots are
-freed). Remaining levers: the PCIe copy (miss-bound) and the spread compute
-(GDN/attn/shared/LRU); the R6 slices. Instruments: `FT_PROFILE=1` and
-`scripts/freetoken_probe/`.
-Progress history and the full decision log (numbers 1..94) live in `DONE.md`;
+freed). A like-for-like re-measure on the same AIME prompt (decision 100,
+optimization.md R9) put captured tg at 25.9 vs the reference's 30.3, found the
+residual gap to be **launch count, not bytes** (FreeToken's eager step equals
+its captured one), and landed the **fused add + RMSNorm** (`add_rmsnorm`,
+decision 100): eager norm stages 1.83 -> 0.47 ms, captured **tg 27.7**, eager
+22.9. Remaining levers: the R8.3 attention kernel, the R8.1 fused router,
+`moe_lru`, the gdn tail norm, and slice 4 (prefill). Instruments:
+`FT_PROFILE=1` and `scripts/freetoken_probe/`.
+Progress history and the full decision log (numbers 1..100) live in `DONE.md`;
 read that for the "why" behind any decision number referenced in code or tests.
 
 Goal: a **minimal, fast, single-GPU** Rust serving engine for **one model** --
@@ -734,9 +739,11 @@ Measured on the RTX 5060 Laptop, bs=1, bf16 KV, `tests/throughput_smoke.rs`
 | + packed NVFP4 lm_head (decision 79) | 8.2 | 7.1 | `8eeee85` |
 | + bf16 paged attention (83, slice 1) | 10.3 | 6.05 | `61021e8` |
 | + vendored W8A16 FP8 projections (84, slice 2) | 10.9 | 4.83 | `fea0281` |
+| + marlin GEMVs (89), auto cache (90), grid-stride copy (98), fused add+RMSNorm (100), AIME prompt | **27.7** | 7.05 | this decision |
 
 FreeToken `offload` on the same GPU/FTW does **22.5 tok/s** (512 slots) / **30.3**
-(1900 slots), so the gap is now **~2.1-2.8x** (was ~3.7x). The plan and its
+(1900 slots), so the bs=1 gap is now **1.1x** (was ~3.7x); the like-for-like
+re-measure and the remaining levers are in `optimization.md` R9. The plan and its
 FreeToken facts live in `optimization.md` "Plan"; slices 1-2 are landed. Ordered
 next steps:
 
@@ -838,8 +845,15 @@ prompt override before comparing miss rates.
   fp8 to `tl.dot` directly instead of the fp8->bf16 upcast.
 - [ ] **R8.5 fp8 KV cache** (checkpoint declares it; we run bf16): frees VRAM for
   expert slots.
-- [ ] **R8.6 Like-for-like miss measurement** (AIME both sides) to confirm the
-  miss-rate parity in optimization.md R8 Finding 1 before any eviction change.
+- [x] **R8.6 Like-for-like miss measurement** (AIME both sides) -- DONE
+  (decision 100): same AIME-25 #0 prompt, auto cache, both engines; Finding 1
+  confirmed (copy 13.7 vs their 15.7 p50 -- we are now at/below their staging
+  cost; the residual gap is launches and attention, see optimization.md R9).
+- [x] **R9.1 Fused add + RMSNorm** (launch tax) -- DONE (decision 100):
+  `add_rmsnorm` Triton kernel + `ArgKind::F32` ABI; eager norms 1.83 -> 0.47 ms,
+  captured AIME tg 25.9 -> 27.7, eager 18.7 -> 22.9.
+- [ ] **R9.2 Fused gdn tail / gated norm** with the same `add_rmsnorm` shape
+  (`gdn_tail` 1.39 ms still an op soup; the q/k norms inside attention too).
 
 ### State of play
 

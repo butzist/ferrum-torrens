@@ -2460,6 +2460,47 @@ settled.
     failure decision 87 hit. A fused Triton router kernel would cut the launches
     without changing the arithmetic, and is the remaining option.
 
+100. **Like-for-like re-measure and the fused add + RMSNorm** (2026-10-18,
+    implemented) -- optimization.md R9.
+    - **The comparison.** Fresh head-to-head on this box, same FTW, bs=1,
+      AIME-25 #0 prompt, auto cache, `FERRUM_SMOKE_PROMPT` on our side and
+      `bench_decode_moe.py --aime --cache 0` (plus `scripts/freetoken_probe/`)
+      on theirs: **captured tg 25.9 -> 27.7 tok/s (this decision) vs the
+      reference's 30.3**, eager 22.9 vs 30.2 (was 18.7). FreeToken's captured
+      and eager steps are the same speed (~33 ms) -- it has no launch tax to
+      remove -- which pinned the remaining gap on our per-step *launch* count,
+      not bytes: our `rms_norm` was a nine-kernel libtorch chain plus a
+      separate residual add at 81 sites per step (~700 tiny kernels), against
+      their one fused `forward_add_residual` per site.
+    - **The kernel.** `python/ferrum_kernel/norm.py::_add_rmsnorm_kernel`:
+      one program per row, bf16 in/out, `s = round_bf16(f32(x)+f32(r))` fed
+      through the f32 variance and scale, writing both the new residual and
+      the normalized row. Registered in the `linear` manifest section
+      (`add_rmsnorm`, 8 warps, `HIDDEN`/`BLOCK` constexpr 2048) and launched
+      from `GdnDecode::add_rmsnorm`; `run_tower` calls it via
+      `add_rms_norm`, which returns `None` (libtorch ops) on a CPU device or a
+      dtype/shape the cubin was not built for. This required the first **f32
+      runtime scalar** through the ABI: `ArgKind::F32`/`ArgPack::f32` (bits in
+      the 4-byte slot) and a `.param .f32` case in the `aot.py`/PTX parsers.
+    - **Measured.** eager stage `norm_in` 0.90 -> 0.27, `norm_post` 0.93 ->
+      0.20 ms/token; captured bs=1 tg **25.9 -> 27.7** on the AIME prompt
+      (38.6 -> 36.1 ms/token), eager tg 18.7 -> 22.9 (+22%, the launch tax the
+      graph used to hide). VRAM flat.
+    - **Gates.** `--interp` selftest (`check_norm`, bf16 ulp), `kernel-aot` +
+      `check-kernels.sh` green (the rebuild also refreshed ten cubins whose
+      debug-info had drifted against the old toolchain -- content-identical
+      modulo store paths, `--check` was red at HEAD before this and is green
+      now). Device gates green: `device_decode_matches_refeed` 3/3 argmax-exact,
+      `decode_graph_capture`, `kvcache_cross_request_reuse`,
+      `dispatcher_batching`, `ftw_cross_check` (argmax 11751, 0.7%),
+      `engine_real_generate` 6/6. Two calibrations moved: the f32-pool
+      safety-net bound 0.2 -> 0.3 and the bf16 0.25 -> 0.35 -- the fused
+      norm's different reduction order shifts last-bit greedy chaos from
+      1.64e-1 to 2.46e-1 of scale (identical on both pools, argmax unchanged,
+      all oracles green). Two `rms_norm` unit tests also failed pre-existing
+      under `--features cuda` (decision 87 made the store bf16 while they kept
+      an f32 1e-5 tolerance); raised to 8e-3 with the reason inline.
+
 ---
 
 ## Progress log (narrative, pre-2026-10-15 compaction)

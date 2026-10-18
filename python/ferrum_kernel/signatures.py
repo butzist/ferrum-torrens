@@ -23,6 +23,7 @@ from .fp8_linear import (
     GEMV_REDUCE_BLOCK as FP8_GEMV_REDUCE_BLOCK,
 )
 from .linear import DENSE_BLOCK_KW, DENSE_BLOCK_N
+from .norm import NORM_BLOCK_H
 from .nvfp4_moe import GEMV_BLOCK_KW, GEMV_BLOCK_N, REDUCE_BLOCK_N
 from .offload import COPY_SEG_I32, USAGE_MAX, copy_splits
 
@@ -343,6 +344,28 @@ def conv_decode_constexprs(
         "TAPS": 1 << (k - 1).bit_length(),
         "BLOCK_N": block_n,
     }
+
+
+def add_rmsnorm() -> dict:
+    """The fused residual-add + GemmaRMSNorm (optimization.md R6: the norm
+    launch tax). `x`/`r`/`w`/`sum`/`out` are all the model dtype (bf16), `eps`
+    is an fp32 scalar and the strides are the `x`/`r` row strides."""
+    return {
+        "x_ptr": f"*{SERVING_DTYPE}",
+        "r_ptr": f"*{SERVING_DTYPE}",
+        "w_ptr": f"*{SERVING_DTYPE}",
+        "sum_ptr": f"*{SERVING_DTYPE}",
+        "out_ptr": f"*{SERVING_DTYPE}",
+        "eps": "fp32",
+        "stride_x": "i32",
+        "stride_r": "i32",
+        "HIDDEN": "constexpr",
+        "BLOCK": "constexpr",
+    }
+
+
+def add_rmsnorm_constexprs(hidden: int = SERVING_HIDDEN, block: int = NORM_BLOCK_H) -> dict:
+    return {"HIDDEN": hidden, "BLOCK": block}
 
 
 def nvfp4_dense_gemv() -> dict:

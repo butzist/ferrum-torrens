@@ -19,8 +19,8 @@ use crate::domain::expert_kernel::MoEError;
 use crate::domain::model::ModelParams;
 use crate::infrastructure::cuda_driver::{CUstream, CudaError, Driver, GdnKernels};
 use crate::infrastructure::kernel_abi::{
-    CONV_DECODE, ConvArgs, GDN_DECODE, GdnArgs, LinearAbi, conv_decode_args, conv_grid,
-    gdn_decode_args, gdn_grid,
+    ADD_RMSNORM, AddRmsnormArgs, CONV_DECODE, ConvArgs, GDN_DECODE, GdnArgs, LinearAbi,
+    add_rmsnorm_args, add_rmsnorm_grid, conv_decode_args, conv_grid, gdn_decode_args, gdn_grid,
 };
 use crate::infrastructure::torch::Device;
 
@@ -50,6 +50,8 @@ pub struct GdnDecode {
     conv_dim: i64,
     /// The conv kernel width (`linear_conv_kernel_dim`).
     conv_k: i64,
+    /// `hidden_size`, the width the fused add + RMSNorm kernel tiles.
+    hidden: i64,
     stream: CUstream,
 }
 
@@ -96,6 +98,7 @@ impl GdnDecode {
             vdim,
             conv_dim: 2 * k_heads * kd + v_heads * vdim,
             conv_k: params.linear_conv_kernel_dim as i64,
+            hidden: params.hidden_size as i64,
             stream,
         })
     }
@@ -243,6 +246,66 @@ impl GdnDecode {
         // belongs to the context made current at construction.
         unsafe { self.kernels.launch(kernel, grid, &mut params, self.stream) }.map_err(driver)
     }
+
+    /// Launch the fused residual-add + RMSNorm for `rows` rows: one kernel
+    /// writes both the new residual (`sum_out = x + r`) and the normalized row
+    /// (`out = rms_norm(sum_out) * w`), replacing the add plus the ten-kernel
+    /// `rms_norm` op soup (optimization.md R6).
+    ///
+    /// `x`/`r` are `[rows, hidden]` bf16 (either may be a strided row view),
+    /// `w` is the `[hidden]` baked `1 + weight` norm vector, and `sum_out`/`out`
+    /// are the contiguous `[rows, hidden]` outputs.
+    ///
+    /// # Safety
+    /// Every tensor must be a live device allocation in this launcher's context.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn add_rmsnorm(
+        &self,
+        x: &Tensor,
+        r: &Tensor,
+        w: &Tensor,
+        sum_out: &Tensor,
+        out: &Tensor,
+        eps: f32,
+    ) -> Result<(), MoEError> {
+        let kernel = self.abi.kernel(ADD_RMSNORM).map_err(bad_abi)?;
+        let bad = |what: &str| {
+            MoEError::Bad(format!(
+                "the norm kernel was built for {what}, not the shapes handed in"
+            ))
+        };
+        let x_size = x.size();
+        if x_size.len() != 2 || x_size[1] != self.hidden || x.stride()[1] != 1 {
+            return Err(bad("x = [rows, hidden] with a unit inner stride"));
+        }
+        let rows = x_size[0];
+        if r.size() != x_size || r.stride()[1] != 1 {
+            return Err(bad("r = x"));
+        }
+        if w.numel() as i64 != self.hidden {
+            return Err(bad("w = [hidden]"));
+        }
+        for t in [sum_out, out] {
+            if t.size() != x_size || t.stride()[0] != self.hidden || t.stride()[1] != 1 {
+                return Err(bad("contiguous [rows, hidden] outputs"));
+            }
+        }
+        let args = AddRmsnormArgs {
+            x: x.data_ptr() as u64,
+            r: r.data_ptr() as u64,
+            w: w.data_ptr() as u64,
+            sum: sum_out.data_ptr() as u64,
+            out: out.data_ptr() as u64,
+            eps,
+            stride_x: x.stride()[0] as u32,
+            stride_r: r.stride()[0] as u32,
+        };
+        let pack = add_rmsnorm_args(&self.abi, &args).map_err(bad_abi)?;
+        let mut params = pack.kernel_params().map_err(bad_abi)?;
+        let grid = add_rmsnorm_grid(rows as usize);
+        // SAFETY: as above; the outputs are fully overwritten by the kernel.
+        unsafe { self.kernels.launch(kernel, grid, &mut params, self.stream) }.map_err(driver)
+    }
 }
 
 /// The cubin bakes the GDN geometry, so a checkpoint whose head shape differs
@@ -279,6 +342,14 @@ fn check_geometry(params: &ModelParams, abi: &LinearAbi) -> Result<(), MoEError>
                 "the conv kernel was built with {name} = {built}, but the model has {value}"
             )));
         }
+    }
+    let norm = abi.kernel(ADD_RMSNORM).map_err(bad_abi)?;
+    let built = norm.constexpr("HIDDEN").map_err(bad_abi)?;
+    if built != params.hidden_size as u64 {
+        return Err(MoEError::Bad(format!(
+            "the norm kernel was built with HIDDEN = {built}, but the model has {}",
+            params.hidden_size
+        )));
     }
     Ok(())
 }

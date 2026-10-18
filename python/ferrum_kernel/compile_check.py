@@ -37,6 +37,7 @@ from .offload import _ensure_experts_kernel, _index_copy_multi_kernel
 from .attention import _paged_attention_decode_kernel
 from .conv import _conv_decode_kernel
 from .gdn import _gdn_decode_kernel
+from .norm import _add_rmsnorm_kernel
 from .fp8_linear import (
     _fp8_gemm_kernel,
     _fp8_gemv_splitk_kernel,
@@ -52,6 +53,8 @@ from .signatures import fp8_gemv_constexprs, fp8_splitk_reduce_constexprs
 from .signatures import fp8_splitk_reduce as _fp8_splitk_reduce_sig
 from .signatures import gdn_decode as _gdn_decode_sig
 from .signatures import gdn_decode_constexprs
+from .signatures import add_rmsnorm as _add_rmsnorm_sig
+from .signatures import add_rmsnorm_constexprs
 from .signatures import gemv as _gemv_sig
 from .signatures import index_copy as _index_copy_sig
 from .signatures import index_copy_constexprs, lru_constexprs
@@ -167,8 +170,19 @@ def main() -> int:
             conv_decode_constexprs(),
         )
     except Exception as e:  # noqa: BLE001
-        failures += 1
         print(f"conv_decode FAILED: {type(e).__name__}: {str(e)[:200]}")
+        failures += 1
+    # The fused add + RMSNorm (optimization.md R6: the norm launch tax).
+    try:
+        check(
+            "add_rmsnorm",
+            _add_rmsnorm_kernel,
+            _add_rmsnorm_sig(),
+            add_rmsnorm_constexprs(),
+        )
+    except Exception as e:  # noqa: BLE001
+        failures += 1
+        print(f"add_rmsnorm FAILED: {type(e).__name__}: {str(e)[:200]}")
     # The dense NVFP4 GEMV the lm_head runs (TODO.md section 8 item 18).
     try:
         check(

@@ -170,10 +170,15 @@ fn assert_close(dev: &[f32], whole: &[f32], at: usize) {
     // The device step gathers a fixed-length window rather than exactly
     // `filled()`, and the dense projections now run bf16 tensor-core GEMMs
     // (decision 78), whose tiling moves with the batch shape; the argmax above
-    // is the exact check and this bound is the bf16 headroom (measured ~1e-1 for
-    // a 7-row prefix, stable across runs).
+    // is the exact check and this bound is the bf16 headroom. The fused
+    // add + RMSNorm (decision 100) reorders the variance reduction relative
+    // to the libtorch op chain and moved the measured last-step drift from
+    // ~1.6e-1 to ~2.5e-1 of scale (greedy argmax unchanged; `ftw_cross_check`
+    // and every `engine_real_generate` oracle green), so the headroom sits at
+    // 0.3 -- it stays a safety net against an addressing regression, not a
+    // precision contract.
     assert!(
-        diff < 0.2,
+        diff < 0.3,
         "device step drifted from the re-fed forward at {at}: {diff:.3e} of scale"
     );
     eprintln!(
@@ -271,7 +276,7 @@ fn a_bf16_pool_device_decode_matches_refeeding_the_whole_prefix() {
             .fold(0.0f32, f32::max)
             / scale;
         assert!(
-            diff < 2.5e-1,
+            diff < 0.35,
             "bf16 pool drifted from the re-fed forward at {}: {diff:.3e} of scale",
             tokens.len() - 1
         );

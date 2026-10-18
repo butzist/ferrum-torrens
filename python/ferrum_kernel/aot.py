@@ -36,6 +36,7 @@ from triton.compiler import ASTSource, compile as triton_compile
 
 from .conv import _conv_decode_kernel
 from .gdn import _gdn_decode_kernel
+from .norm import _add_rmsnorm_kernel
 from .fp8_linear import (
     _fp8_gemm_kernel,
     _fp8_gemv_splitk_kernel,
@@ -68,6 +69,8 @@ from .signatures import (
     gate_up_constexprs,
     gdn_decode,
     gdn_decode_constexprs,
+    add_rmsnorm,
+    add_rmsnorm_constexprs,
     gemv,
     index_copy,
     index_copy_constexprs,
@@ -210,6 +213,12 @@ LINEAR_KERNELS: dict[str, dict] = {
         "constexprs": fp8_gemm_constexprs(),
         "num_warps": 4,
     },
+    "add_rmsnorm": {
+        "fn": _add_rmsnorm_kernel,
+        "signature": add_rmsnorm(),
+        "constexprs": add_rmsnorm_constexprs(),
+        "num_warps": 8,
+    },
 }
 
 # Triton bakes absolute source paths into the PTX `.file` directives and the
@@ -227,14 +236,17 @@ def _norm(blob: bytes) -> bytes:
 
 # `.param .u64 .ptr .global .align 1 f_param_0`: the arg kind is the type, the
 # pointer-ness is the address space, and the name is triton positional. Only the
-# kind matters to a launcher, so record that.
+# kind matters to a launcher, so record that. Scalars come in `.u32`/`.f32`
+# widths; both are 4-byte slots, the driver reads the raw bits.
 _PTX_PARAM = re.compile(
-    r"\.param\s+\.u(?P<width>\d+)(?P<rest>[^,]*?)\s+\w+_param_(?P<index>\d+)"
+    r"\.param\s+\.(?P<ty>[uf]32|u64)(?P<rest>[^,]*?)\s+\w+_param_(?P<index>\d+)"
 )
 
 
-def _kind(width: str, rest: str) -> str:
-    return "ptr" if ".ptr" in rest else f"u{width}"
+def _kind(ty: str, rest: str) -> str:
+    if ".ptr" in rest:
+        return "ptr"
+    return ty
 
 
 def _entry_params(ptx: str) -> list[dict]:
@@ -249,7 +261,7 @@ def _entry_params(ptx: str) -> list[dict]:
         m = _PTX_PARAM.search(raw)
         if m is None:
             raise SystemExit(f"unparsed PTX param: {raw!r}")
-        params.append({"index": int(m.group("index")), "kind": _kind(m.group("width"), m.group("rest"))})
+        params.append({"index": int(m.group("index")), "kind": _kind(m.group("ty"), m.group("rest"))})
     return sorted(params, key=lambda p: p["index"])
 
 

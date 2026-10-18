@@ -24,6 +24,7 @@ from . import conv as conv_mod
 from . import fp8_linear as fp8_mod
 from . import gdn as gdn_mod
 from . import linear as linear_mod
+from . import norm as norm_mod
 from . import offload as off
 from .nvfp4_moe import _check_constexprs, grouped_moe, require_native_e4m3
 
@@ -408,6 +409,65 @@ def check_conv(device: torch.device, tol: float, full: bool) -> int:
     return failures
 
 
+def random_norm_case(device: str, rows: int, hidden: int, seed: int):
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    dev = torch.device(device)
+    x = (torch.randn((rows, hidden), generator=g, dtype=torch.float32) * 0.5).to(dev).to(torch.bfloat16)
+    r = (torch.randn((rows, hidden), generator=g, dtype=torch.float32) * 0.5).to(dev).to(torch.bfloat16)
+    w = (torch.rand((hidden,), generator=g, dtype=torch.float32) * 0.5 + 0.75).to(dev).to(torch.bfloat16)
+    return x, r, w
+
+
+def check_norm(device: torch.device, tol: float, full: bool) -> int:
+    """Fused add + RMSNorm (optimization.md R6 norms): the kernel against the
+    torch reference mirroring `rms_norm`, for both the residual and the
+    normalized row. `full` adds the serving hidden size and a multi-row case,
+    and a strided `x` pins the row-stride argument the prefill chunk hands in."""
+    cases = [("small", {"rows": 2, "hidden": 32})]
+    if full:
+        cases.append(("qwen-shape", {"rows": 3, "hidden": 2048}))
+    failures = 0
+    for label, shape in cases:
+        for seed in range(2):
+            x, r, w = random_norm_case(str(device), seed=seed, **shape)
+            want_sum, want_out = norm_mod.add_rmsnorm_reference(x, r, w, 1e-6)
+            rows, hidden = x.shape
+            got_sum = torch.empty((rows, hidden), dtype=torch.bfloat16, device=device)
+            got_out = torch.empty((rows, hidden), dtype=torch.bfloat16, device=device)
+            norm_mod.add_rmsnorm(x, r, w, got_sum, got_out, 1e-6)
+            rel_sum = (got_sum.to(torch.float32) - want_sum.to(torch.float32)).abs().max().item()
+            rel_out = (
+                (got_out.to(torch.float32) - want_out.to(torch.float32))
+                .abs()
+                .max()
+                / want_out.to(torch.float32).abs().max().clamp(min=1e-6)
+            ).item()
+            print(f"norm {label} seed {seed}: sum max|d| {rel_sum:.3e}, out rel {rel_out:.3e}")
+            if rel_sum > 2.0 or rel_out > tol:
+                failures += 1
+                print(f"norm {label} seed {seed}: FAIL", file=sys.stderr)
+    # Strided x: the forward's `mixer_out + xsum` can hand a padded row slice.
+    x, r, w = random_norm_case(str(device), seed=7, rows=2, hidden=64)
+    want_sum, want_out = norm_mod.add_rmsnorm_reference(x, r, w, 1e-6)
+    padded = torch.cat([x, torch.zeros((2, 8), dtype=torch.bfloat16, device=device)], dim=1)
+    xs = padded[:, :64]
+    assert xs.stride(0) == 72, "the strided case must not be contiguous"
+    got_sum = torch.empty((2, 64), dtype=torch.bfloat16, device=device)
+    got_out = torch.empty((2, 64), dtype=torch.bfloat16, device=device)
+    norm_mod.add_rmsnorm(xs, r, w, got_sum, got_out, 1e-6)
+    rel = (
+        (got_out.to(torch.float32) - want_out.to(torch.float32))
+        .abs()
+        .max()
+        / want_out.to(torch.float32).abs().max().clamp(min=1e-6)
+    ).item()
+    print(f"norm strided: out rel {rel:.3e}")
+    if rel > tol:
+        failures += 1
+        print("norm strided: FAIL", file=sys.stderr)
+    return failures
+
+
 def random_dense_case(device: str, m: int = 2, n: int = 128, k: int = 256, seed: int = 0):
     """A dense NVFP4 GEMV case: `[n, k//2]` packed nibbles, `[n, k//16]` e4m3
     block scales, `[n]` f16 globals, and a bf16 activation row."""
@@ -554,6 +614,12 @@ def main(argv: list[str] | None = None) -> int:
         torch.device(args.device), args.tol, full=args.device != "cpu"
     )
     if conv_failures:
+        print("FAIL", file=sys.stderr)
+        return 1
+    norm_failures = check_norm(
+        torch.device(args.device), args.tol, full=args.device != "cpu"
+    )
+    if norm_failures:
         print("FAIL", file=sys.stderr)
         return 1
     dense_failures = check_nvfp4_dense(torch.device(args.device), args.tol)

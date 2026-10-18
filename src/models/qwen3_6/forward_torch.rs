@@ -2251,6 +2251,42 @@ impl TorchQwen3_6 {
     /// same ops over the same weights, differing only in where `access` reads
     /// K/V and GDN state from (decision 51). Keeping it a single pass is what
     /// stops the two paths from drifting.
+    /// The fused residual-add + RMSNorm, when the linear kernels are attached
+    /// and the row shape and dtype match what the cubin bakes (optimization.md
+    /// R6: the norm launch tax -- one launch replaces the `x + r` add and the
+    /// ten-kernel `rms_norm`, and writes both the new residual and the
+    /// normalized row). `None` means run the libtorch ops instead: a CPU
+    /// device, the legacy re-fed forward, or a dtype the cubin was not built
+    /// for.
+    fn add_rms_norm(
+        &self,
+        x: &Tensor,
+        r: &Tensor,
+        w: &Tensor,
+        eps: f32,
+    ) -> Result<Option<(Tensor, Tensor)>> {
+        let Some(kernel) = self.gdn.as_ref() else {
+            return Ok(None);
+        };
+        if x.kind() != Kind::BFloat16
+            || r.kind() != Kind::BFloat16
+            || w.kind() != Kind::BFloat16
+            || x.dim() != 2
+            || x.size()[1] != self.params.hidden_size as i64
+            || r.size() != x.size()
+        {
+            return Ok(None);
+        }
+        let opts = (Kind::BFloat16, x.device());
+        let sum = Tensor::empty([x.size()[0], x.size()[1]], opts);
+        let out = Tensor::empty([x.size()[0], x.size()[1]], opts);
+        // SAFETY: all five tensors are live allocations on this model's device
+        // and the shapes are the ones the launcher was built for; the kernel
+        // fully overwrites both outputs.
+        unsafe { kernel.add_rmsnorm(x, r, w, &sum, &out, eps) }?;
+        Ok(Some((sum, out)))
+    }
+
     fn run_tower(
         &self,
         ids: &Tensor,
@@ -2270,12 +2306,21 @@ impl TorchQwen3_6 {
         let mut residual: Option<Tensor> = None;
 
         for (li, layer) in self.layers.iter().enumerate() {
-            let xsum = match residual.take() {
-                None => x.shallow_clone(),
-                Some(r) => &x + &r,
-            };
             let sp = profile::begin("norm_in");
-            let h1 = rms_norm(&xsum, &layer.input_norm, p.rms_norm_eps);
+            let (xsum, h1) = match residual.take() {
+                None => {
+                    let xsum = x.shallow_clone();
+                    let h1 = rms_norm(&xsum, &layer.input_norm, p.rms_norm_eps);
+                    (xsum, h1)
+                }
+                Some(r) => self
+                    .add_rms_norm(&x, &r, &layer.input_norm, p.rms_norm_eps)?
+                    .unwrap_or_else(|| {
+                        let xsum = &x + &r;
+                        let h1 = rms_norm(&xsum, &layer.input_norm, p.rms_norm_eps);
+                        (xsum, h1)
+                    }),
+            };
             profile::end("norm_in", sp);
             let mixer_out = if ablated("mixer") {
                 Tensor::zeros_like(&h1)
@@ -2297,9 +2342,14 @@ impl TorchQwen3_6 {
                     _ => Tensor::zeros_like(&h1),
                 }
             };
-            let sum2 = &mixer_out + &xsum;
             let sp = profile::begin("norm_post");
-            let h2 = rms_norm(&sum2, &layer.post_norm, p.rms_norm_eps);
+            let (sum2, h2) = self
+                .add_rms_norm(&mixer_out, &xsum, &layer.post_norm, p.rms_norm_eps)?
+                .unwrap_or_else(|| {
+                    let sum2 = &mixer_out + &xsum;
+                    let h2 = rms_norm(&sum2, &layer.post_norm, p.rms_norm_eps);
+                    (sum2, h2)
+                });
             profile::end("norm_post", sp);
             x = if ablated("moe") {
                 h2.shallow_clone()

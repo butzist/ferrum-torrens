@@ -975,3 +975,57 @@ copy to ~PCIe time (~7-10 ms at 2048), i.e. **~20 ms/token off the step -> tg
 - **R8.5 fp8 KV cache** (type): frees VRAM for more expert slots.
 - **R8.6 Like-for-like miss measurement** (AIME both sides) to confirm Finding 1
   before any eviction change.
+
+## R9 -- 2026-10-18 like-for-like re-measure, and the fused add + RMSNorm
+
+Fresh head-to-head with the reference, same box/FTW, bs=1, bf16 KV, auto cache,
+and -- this time -- the **same prompt** on both sides (`FERRUM_SMOKE_PROMPT` /
+`bench_decode_moe.py --aime` with AIME-25 #0), greedy:
+
+| metric | ours (before R9) | FreeToken |
+|---|---|---|
+| captured tg | 25.9 tok/s (38.6 ms/token) | **30.3 tok/s (33.0 ms)** |
+| eager tg | 18.7 tok/s (53.5 ms) | 30.25 tok/s (33.1 ms) |
+| VRAM after load | 7190 MiB | ~7.1 GiB |
+| stage p50 copy / gdn / attn / gemm / shared / lru / router / norms / head | 13.7 / 10.1 / 4.3 / 3.8 / 2.25 / 2.35 / 1.34 / 1.83 / 1.06 | 15.7 / 9.0+0.6 / 3.0 / 4.2(+glue) / 3.6 / 1.6 / 1.6 / 1.0 / 0.85 |
+
+(Their probe numbers carry a ~1.5-3 ms event tax per labelled stage -- their
+instrumented total is 46.6 vs their real 33 -- so compare the shape, not the sum.)
+
+**Where the time is lost, as of now.** The old blockers (GEMVs, copy grid
+overhead, cache size) are fixed; the remaining ~5.6 ms/token gap at captured
+bs=1 is *launches*, not bytes: FreeToken's eager step equals its captured step
+(33 ms -- nothing left to hide), while ours gains 38.6 -> 53.5 ms when the
+graph is off. The largest per-step launch count left in the forward is the
+norm block: `rms_norm` is nine libtorch kernels (`f32_`, `pow`, `mean_dim`,
+`sqrt`, `reciprocal`, two `mul`, `to_kind`) plus a separate `x + r` add, at 81
+sites per step, against their single fused `forward_add_residual` per site.
+Secondary: attn 4.3 vs 3.0 (R8.3, flashinfer), moe_lru 2.35 vs 1.6, router
+1.34 + the R8.1 fused kernel, and the gdn tail norm.
+
+### R9.1 Fused add + RMSNorm -- DONE (decision 100)
+
+`python/ferrum_kernel/norm.py` `_add_rmsnorm_kernel`: one program per row,
+bf16 in/out, the residual add rounded to bf16 exactly like the libtorch op
+chain it replaces, the variance and scale in f32, and both outputs (new
+residual + normalized row) written by the same launch. Registered in the
+`linear` manifest section and launched from `GdnDecode::add_rmsnorm`;
+`run_tower::add_rms_norm` dispatches it at the `norm_in`-with-residual and
+`norm_post` sites (79 of 81 per step; layer 0 and the final head norm stay
+libtorch), falling back to the ops on a CPU device or a non-bf16 stream.
+First f32 runtime scalar through the ABI (`ArgKind::F32`, `.param .f32`
+handled in `aot.py` and the PTX test parser).
+
+Measured (AIME prompt, auto cache): eager `norm_in` 0.90 -> 0.27, `norm_post`
+0.93 -> 0.20 ms/token; captured **tg 25.9 -> 27.7** (38.6 -> 36.1 ms); eager tg
+18.7 -> 22.9. Gates: `--interp` + `check-kernels` green; device
+refeed/capture/reuse/batching/cross-check/generate all green with argmax exact.
+The refeed safety-net bounds moved 0.2 -> 0.3 (f32) and 0.25 -> 0.35 (bf16):
+the fused reduction order shifts last-bit greedy chaos to 2.46e-1 of scale
+with the token sequence unchanged (oracles green) -- same class as decision
+80's cuBLAS-shape recalibration.
+
+Next levers, unchanged ranking: R8.3 attention (4.3 -> ~2.5, the largest
+single compute gap), the R8.1 fused router, `moe_lru` tuning, the gdn tail
+norm fusion (now the same `add_rmsnorm` shape), and slice 4 prefill kernels
+(pp). The copy (~13 ms, ~87% of pinned H2D peak) is the reference's cost too.
