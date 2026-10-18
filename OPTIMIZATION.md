@@ -1002,9 +1002,19 @@ copy to ~PCIe time (~7-10 ms at 2048), i.e. **~20 ms/token off the step -> tg
   argmax unchanged.
 - **R8.2 Fused GDN decode** (adopt the FLA kernel). 9.8 -> ~7. Medium risk
   (state layout `[K,V]`, in-kernel l2norm, GQA); gate on the GDN oracle.
-- **R8.3 Attention kernel** (largest compute gap, most effort): lift our Triton
-  paged kernel (larger tiles, varlen packing, split-K over KV); vendor flashinfer
-  only if still short.
+- **R8.3 Attention kernel** -- CLOSED (2026-10-18). The "largest compute gap"
+  premise was a measurement artifact: the eager `FT_PROFILE` `attn_mem` 1.9 ms is
+  the libtorch gather + SDPA fallback, not the paged kernel. `run_sequence_cached_into`
+  (the eager/uncaptured path) builds `CacheAccess::Host`; the paged Triton kernel
+  runs only in the captured `Device` path (`forward_decode_into`). On the real GPU
+  the paged kernel is ~0.10 ms/token at ctx 76 and ~0.25 ms at ctx 279 across the
+  10 full layers (microbench: ~3.5 us fixed + 0.085 us/KV-token, BLOCK_N=64,
+  8 warps), and ablating it in the captured graph is within noise. `num_warps=4`
+  measured ~30% faster in the microbench but regressed the captured step ~1.5
+  tok/s (a graph interaction), so the committed 8-warp config stays. The captured
+  attention cost is the FP8 QKV/O projections (~2.4-2.5 ms/token), already at the
+  ~220 GB/s read roofline (R6). No kernel change kept; remaining bs=1 levers are
+  `moe_lru` and the router, not attention.
 - **R8.4 W8A8 Triton `tl.dot` GEMM** for M>1 projections (batching win).
 - **R8.5 fp8 KV cache** (type): frees VRAM for more expert slots.
 - **R8.6 Like-for-like miss measurement** (AIME both sides) to confirm Finding 1
@@ -1034,8 +1044,17 @@ graph is off. The largest per-step launch count left in the forward is the
 norm block: `rms_norm` is nine libtorch kernels (`f32_`, `pow`, `mean_dim`,
 `sqrt`, `reciprocal`, two `mul`, `to_kind`) plus a separate `x + r` add, at 81
 sites per step, against their single fused `forward_add_residual` per site.
-Secondary: attn 4.3 vs 3.0 (R8.3, flashinfer), moe_lru 2.35 vs 1.6, router
-1.34 + the R8.1 fused kernel, and the gdn tail norm.
+Secondary: moe_lru 2.35 vs 1.6, router 1.34 + the R8.1 fused kernel, and the gdn
+tail norm.
+
+**Correction (2026-10-18).** The `attn 4.3` row above is the **eager libtorch
+fallback**, not the paged kernel: the eager path (`CacheAccess::Host`) runs a
+gather + SDPA fallback, and the Triton paged kernel only runs in the captured
+`Device` path. The captured attention cost is the FP8 QKV/O projections, not the
+kernel, so attention is not the lever it looked like (see R8.3, now closed). A
+fresh controlled baseline on this box measures the committed HEAD at **captured
+tg ~28.3 tok/s** (5 runs 27.8-28.7) rather than 27.7; treat absolute single runs
+as +/-5% and use within-session interleaved A/B for any decision.
 
 ### R9.1 Fused add + RMSNorm -- DONE (decision 100)
 
