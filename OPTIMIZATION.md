@@ -50,6 +50,40 @@ Dtypes (`gdn_kernels.py::gdn_decode_fla` docstring):
 - GDN projections: FP8 (`in_proj_qkv`, `in_proj_z`, `out_proj`); the recurrence
   still runs bf16 in / fp32 state.
 
+### Measured reference baseline (recorded 2026-10-16..18; do not re-measure)
+
+Every number here is the read-only reference on the same box (RTX 5060 Laptop,
+26 SMs, 8 GiB), same FTW, bs=1, bf16 KV, `ft serve --moe-backend offload` via
+`benchmarks/bench_decode_moe.py --aime` (AIME-25 #0), greedy. Run recipe in
+`DONE.md` decision 76; per-stage via `scripts/freetoken_probe/` (`FT_PROBE_OUT`).
+Persisted here so a comparison never needs a fresh probe run.
+
+| metric | value |
+|---|---|
+| captured decode, 512 slots | 22.5 tok/s, 44.4 ms/token, 7.05 GiB |
+| captured decode, ~1900 (auto) | 30.3 tok/s, 33.0 ms/token, 6.85 GiB |
+| eager decode, auto | 30.25 tok/s, 33.1 ms/token (== captured: no launch tax to hide) |
+| MoE miss rate, AIME, 512 / ~1900 | 0.66 / 0.34 |
+| H2D staging, 512 / auto | 28.5 / 15.1 ms, miss-proportional at ~12.5-13.1 GB/s |
+
+Per-stage p50, ms/token (auto cache, event instrumented; ~+1.5-3 ms/stage tax,
+instrumented total 46.6 vs the real 33.0): `copy` 15.7, `gdn` 9.0+0.6, `attn`
+3.0, `gemm` 4.2 (+glue), `shared` 3.6, `lru` 1.6, `router` 1.6, `norms` 1.0,
+`head` 0.85. At 512 slots (decision 88): staging 28.5, GEMV 3.5 (p50 3.6;
+torch-profiler self-CUDA 2.95), GDN 6.6, attn 2.1, head 0.82 (min 0.80 / max 0.85,
+~350 GB/s, at the read roofline), shared 1.7, router 0.8, LRU 0.6-1.5. Kernel
+self-CUDA at 512: `fast_index_copy_multi` 67%, `_scaled_mm` 16%, routed GEMV 7.4%.
+
+Routing trace (156 decode steps x 40 layers, AIME, decision 95): consecutive-token
+expert-set overlap 0.33 (p50 0.38); exact-LRU replay miss 0.59 / 0.32 / 0.31 at
+512 / 1900 / 2048 slots; 0% of misses were routed by the previous token. The
+reference uses the same global LRU over `layer*E+expert` as ours, so the earlier
+miss-rate "gap" was the prompt, not the policy (0.32 vs 0.34 on AIME).
+
+Auto-run VRAM layout (decision 76): free-before 7.35 GiB, weights+fixed ~4.6 GiB,
+slots 1900 x 1.13 MiB ~2.1 GiB, KV (8274 tokens) 0.16 GiB, graphs ~0.01 GiB,
+free-after 0.44 GiB.
+
 ## Model constants (Qwen3.6-35B-A3B-NVFP4)
 
 | name | value |
