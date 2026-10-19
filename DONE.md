@@ -2710,6 +2710,22 @@ settled.
      PASS; `cargo test`/clippy green; no committed artifact churned (the check
      still keys on code and line mapping, so a real kernel change is caught).
 
+107. **The agentic tool-call anchor is already provided by hybrid_radix**
+     (2026-10-19, measured; TODO item 13) -- FreeToken freezes the GDN state (and
+     retains the SWA window) at the tool-call token so a tool loop resumes from
+     there. Ours needs no explicit anchor: the end-of-turn `commit(finished=true)`
+     (decision 69) donates the whole generated sequence, so the follow-up turn's
+     rendered prompt -- system + user + assistant tool_call + `role:"tool"`
+     result -- shares the entire committed prefix and `adopt_prefix` resumes from
+     the finish snapshot. `tests/tool_call_anchor.rs` pins it on the real
+     checkpoint through the real tokenizer and chat template: turn 1 is 276
+     prompt + 100 generated tokens ending in a `<tool_call>`; the follow-up is
+     405 tokens, its rendered prefix equals all 376 committed tokens,
+     `adopt_prefix` returns 375, so only the 30-token tool result is prefilled,
+     and the adopted step matches a cold re-feed (argmax 760, 8.5e-2 of scale).
+     No mid-decode commit was added: it would only add risk to the two-boundary
+     discipline (decisions 69/71) for a prefix the finish commit already keeps.
+
 ---
 
 

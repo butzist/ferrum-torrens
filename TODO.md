@@ -92,10 +92,12 @@ The R8.1 fused router and `moe_lru` were then implemented, gate-green and 44%
 faster in the kernel, but measured **captured-neutral** (the captured step is
 bound by the PCIe copy / memory, not these sub-ms stages), so they are closed as
 levers. Decode is at parity; prefill is MoE-bound (`pf_gemm` ~3.5 ms/token).
-Remaining: the gdn tail norm, R8.5 fp8 KV (VRAM), the FLA prefill chunk kernels
-(slice 4, low value now), tool calling (decision 74), and `[opt] /v1/responses`.
+Tool calling landed (decision 105) and the agentic tool-call prefix reuse is
+covered by hybrid_radix (decision 107), so a multi-turn tool loop only prefills
+the tool result. Remaining: the gdn tail norm, R8.5 fp8 KV (VRAM), the FLA
+prefill chunk kernels (slice 4, low value now), and `[opt] /v1/responses`.
 Instruments: `FT_PROFILE=1`, `scripts/freetoken_probe/`.
-Progress history and the full decision log (numbers 1..106) live in `DONE.md`;
+Progress history and the full decision log (numbers 1..107) live in `DONE.md`;
 read that for the "why" behind any decision number referenced in code or tests.
 
 Goal: a **minimal, fast, single-GPU** Rust serving engine for **one model** --
@@ -662,11 +664,15 @@ performance work.
     the MoE port for the duration), subtracts a 1 GiB reserve and divides by
     `cuda_moe::expert_slot_bytes`, clamped to `[256, BLOCK_C 2048]`. ~1900 slots
     on the 8 GiB target, captured tg 18.7 tok/s. MoE-priority by construction.
-13. Tool-call anchor (agentic) -- **OPEN, pairs with tool calling (decision 74).**
-    FreeToken freezes the hybrid GDN state and retains the SWA window at the
-    tool-call token, so a multi-turn loop (tool call -> result -> continue) reuses
-    the pre-call prefix instead of re-prefilling. Add the analogous snapshot point
-    when the tool-call feature lands; it is the agentic-session cache.
+13. Tool-call anchor (agentic) -- **DONE (2026-10-19), decision 107, no new
+    machinery.** FreeToken freezes the hybrid GDN state at the tool-call token;
+    our existing hybrid_radix already does the equivalent: the end-of-turn
+    `commit(finished=true)` (decision 69) donates the whole generated sequence,
+    so the follow-up turn (assistant tool_call + `role:"tool"` result) shares the
+    entire committed prefix and `adopt_prefix` resumes from the finish snapshot.
+    Gated by `tests/tool_call_anchor.rs`: a 376-token turn ending in a tool call
+    is fully reused by the 405-token follow-up (only the 30-token tool result is
+    prefilled) and the adopted step matches a cold re-feed.
 14. bf16 paged attention -- **DONE (decision 83, decision 82 slice 1).** A second
     AOT signature `paged_attention_bf16` on the same `_paged_attention_decode_kernel`
     (q/out f32, K/V bf16) plus `PagedAttention::decode(..., kv_bf16)` and a
