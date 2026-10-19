@@ -2723,8 +2723,26 @@ settled.
      405 tokens, its rendered prefix equals all 376 committed tokens,
      `adopt_prefix` returns 375, so only the 30-token tool result is prefilled,
      and the adopted step matches a cold re-feed (argmax 760, 8.5e-2 of scale).
-     No mid-decode commit was added: it would only add risk to the two-boundary
-     discipline (decisions 69/71) for a prefix the finish commit already keeps.
+      No mid-decode commit was added: it would only add risk to the two-boundary
+      discipline (decisions 69/71) for a prefix the finish commit already keeps.
+
+108. **W8A8 `tl.dot` (R8.4) is rejected: the activation quant breaks a gate**
+     (2026-10-19, measured, not shipped). `_fp8_gemm_kernel` (M>1) upcasts the
+     fp8 weight to bf16; R8.4 fed e4m3 to `tl.dot` on both sides instead, via a
+     new `_fp8_quant_kernel` (bf16 activation -> e4m3 under one per-tensor scale,
+     on device) and `_fp8_gemm_a8_kernel`. It is a real kernel win -- a model-free
+     microbench measured 1.04-1.25x across N/K and M in {4,66,451,1024}, and the
+     K=4 batched aggregate decode rose **29.7 -> 32.1 tok/s (+8.1%)**; but the
+     per-tensor activation scale is computed over the batch, so M=1 and M=4
+     quantize differently and the batched rows drift ~2-3%. That flips
+     `device_decode_matches_refeed::a_batched_decode_step_matches_n_single_row_steps`
+     (row 2 argmax; HEAD is exact), an existing correctness gate.
+     `engine_real_generate`'s single-token oracle stayed exact and pp was flat
+     (+0.4%, within noise); M=1 (W8A16) is untouched. A modest batching win does
+     not justify breaking an exact-argmax gate, so the change was reverted; the
+     patch is archived at `/tmp/opencode/r84_tracked.patch` (+ `r84_untracked/`)
+     for a revisit if that gate is deliberately re-based or the precision class
+     changes.
 
 ---
 

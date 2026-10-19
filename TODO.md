@@ -97,7 +97,7 @@ covered by hybrid_radix (decision 107), so a multi-turn tool loop only prefills
 the tool result. Remaining: the gdn tail norm, R8.5 fp8 KV (VRAM), the FLA
 prefill chunk kernels (slice 4, low value now), and `[opt] /v1/responses`.
 Instruments: `FT_PROFILE=1`, `scripts/freetoken_probe/`.
-Progress history and the full decision log (numbers 1..107) live in `DONE.md`;
+Progress history and the full decision log (numbers 1..108) live in `DONE.md`;
 read that for the "why" behind any decision number referenced in code or tests.
 
 Goal: a **minimal, fast, single-GPU** Rust serving engine for **one model** --
@@ -368,7 +368,7 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 
 ## 7. Decisions
 
-The full log of confirmed decisions (numbers 1..106, stable -- code, tests and
+The full log of confirmed decisions (numbers 1..108, stable -- code, tests and
 `ARCHITECTURE.md` reference them by number) lives in `DONE.md`. This section
 lists only the decisions that still bind open work; everything else there is
 history.
@@ -879,8 +879,10 @@ prompt override before comparing miss rates.
 - [ ] **R8.3 Attention kernel** (largest compute gap, 4.4 vs 2.1-2.8). FreeToken
   uses flashinfer on sm_120; lift our Triton paged kernel (larger tiles, varlen,
   split-K over KV) first, vendor flashinfer only if still short.
-- [ ] **R8.4 W8A8 Triton `tl.dot` GEMM** for M>1 projections (batching/R5): feed
-  fp8 to `tl.dot` directly instead of the fp8->bf16 upcast.
+- [x] **R8.4 W8A8 Triton `tl.dot` GEMM** -- REJECTED (2026-10-19, decision 108).
+  A W8A8 variant wins +8.1% on the K=4 batched aggregate but the per-tensor
+  activation quant breaks `device_decode_matches_refeed`'s batched-vs-single exact
+  argmax (inherent ~2-3% error); pp flat, M=1 unchanged. Archived, not shipped.
 - [ ] **R8.5 fp8 KV cache** (checkpoint declares it; we run bf16): frees VRAM for
   expert slots.
 - [x] **R8.6 Like-for-like miss measurement** (AIME both sides) -- DONE

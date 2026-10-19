@@ -1021,7 +1021,14 @@ copy to ~PCIe time (~7-10 ms at 2048), i.e. **~20 ms/token off the step -> tg
   attention cost is the FP8 QKV/O projections (~2.4-2.5 ms/token), already at the
   ~220 GB/s read roofline (R6). No kernel change kept; remaining bs=1 levers are
   `moe_lru` and the router, not attention.
-- **R8.4 W8A8 Triton `tl.dot` GEMM** for M>1 projections (batching win).
+- **R8.4 W8A8 Triton `tl.dot` GEMM** -- REJECTED (2026-10-19, measured). A W8A8
+  variant (on-device per-tensor activation quant + e4m3 x e4m3 `tl.dot`) is a real
+  kernel win -- 1.04-1.25x in a model-free microbench and **+8.1%** on the K=4
+  batched aggregate (29.7 -> 32.1 tok/s) -- but the per-tensor activation scale
+  perturbs the batched rows ~2-3% and flips
+  `device_decode_matches_refeed`'s batched-vs-single exact argmax (HEAD is exact),
+  while pp gains were noise (+0.4%) and M=1 was unchanged. Not shippable while
+  that gate is exact; the patch is archived at `/tmp/opencode/r84_tracked.patch`.
 - **R8.5 fp8 KV cache** (type): frees VRAM for more expert slots.
 - **R8.6 Like-for-like miss measurement** (AIME both sides) to confirm Finding 1
   before any eviction change.
