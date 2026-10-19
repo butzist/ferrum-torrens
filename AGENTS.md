@@ -245,6 +245,15 @@ context lean; do the writing in the workers.
   unmeasured win is not a win; park it in a stash and note how to revisit.
 - **Record negative results.** A measured "no win" (and the reason) belongs in
   `OPTIMIZATION.md`/`DONE.md` so the next agent does not re-chase it.
+- **Resource limits -- never OOM the host.** A model load pins ~17 GiB of host
+  expert banks and holds the 8 GiB GPU, on a ~32 GiB box. Therefore: run **one
+  model-loading process at a time**, always under `prlimit --as=68719476736`;
+  run gated tests **one test by name** with `--test-threads=1` (never `--ignored`
+  across a whole binary -- several tests would load the model at once); and do
+  not build/test concurrently with a model load. Check `MemAvailable` in
+  `/proc/meminfo` before loading and stop and report if it is below ~24 GiB.
+  Keep `CARGO_BUILD_JOBS` modest (e.g. 4) so a build cannot spike alongside a
+  load. An OOM-killed session loses all uncommitted work in that agent.
 
 ## Commits
 
