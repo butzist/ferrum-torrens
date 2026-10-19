@@ -414,6 +414,17 @@ fn resolve_cache_slots(
         .map_err(|e| build_err(e.to_string()))? as usize;
     let budget = free.saturating_sub(AUTO_CACHE_RESERVE_BYTES);
     let slots = (budget / slot_bytes.max(1)).clamp(crate::config::MIN_CACHE_SIZE_SLOTS, ceiling);
+    if std::env::var_os("FT_SLOTS_REPORT").is_some() {
+        eprintln!(
+            "[slots] kv_tokens={} free={} MiB reserve={} MiB slot_bytes={} ceiling={} resolved={}",
+            config.kv_tokens(),
+            free >> 20,
+            AUTO_CACHE_RESERVE_BYTES >> 20,
+            slot_bytes,
+            ceiling,
+            slots / 128 * 128,
+        );
+    }
     Ok(slots / 128 * 128)
 }
 

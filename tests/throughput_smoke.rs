@@ -204,6 +204,7 @@ fn config() -> Config {
         "true"
     };
     let kv = std::env::var("FERRUM_SMOKE_KV").unwrap_or_else(|_| "bf16".into());
+    let kv_tokens = std::env::var("FERRUM_SMOKE_KVTOK").unwrap_or_else(|_| "4096".into());
     // The config default is `auto` (item 12); `FERRUM_SMOKE_CACHE` pins a slot
     // count for a cache-size sweep, or `auto` for the planner.
     let slots = std::env::var("FERRUM_SMOKE_CACHE").unwrap_or_else(|_| "auto".into());
@@ -217,7 +218,7 @@ fn config() -> Config {
         "[model]\npath = \"{FTW_DIR}\"\ndevice = \"cuda\"\nmax_seq_len = 4096\n\
          max_output_tokens = {}\nmax_prefill_length = 1024\n\
          max_running_requests = 4\ncuda_graph = {graph}\n\n\
-         [kv]\nnum_tokens = 4096\ndtype = \"{kv}\"\n\n\
+         [kv]\nnum_tokens = {kv_tokens}\ndtype = \"{kv}\"\n\n\
          [moe]\ncache_size_slots = {slots}\nprefill_overlap = true\n\n\
          [kernel]\ntriton = true\n",
         decode_tokens()

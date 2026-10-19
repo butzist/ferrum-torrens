@@ -99,7 +99,7 @@ covered by hybrid_radix (decision 107), so a multi-turn tool loop only prefills
 the tool result. Remaining: the gdn tail norm, R8.5 fp8 KV (VRAM), the FLA
 prefill chunk kernels (slice 4, low value now).
 Instruments: `FT_PROFILE=1`, `scripts/freetoken_probe/`.
-Progress history and the full decision log (numbers 1..109) live in `DONE.md`;
+Progress history and the full decision log (numbers 1..110) live in `DONE.md`;
 read that for the "why" behind any decision number referenced in code or tests.
 
 Goal: a **minimal, fast, single-GPU** Rust serving engine for **one model** --
@@ -369,7 +369,7 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 
 ## 7. Decisions
 
-The full log of confirmed decisions (numbers 1..109, stable -- code, tests and
+The full log of confirmed decisions (numbers 1..110, stable -- code, tests and
 `ARCHITECTURE.md` reference them by number) lives in `DONE.md`. This section
 lists only the decisions that still bind open work; everything else there is
 history.
@@ -885,11 +885,15 @@ prompt override before comparing miss rates.
   A W8A8 variant wins +8.1% on the K=4 batched aggregate but the per-tensor
   activation quant breaks `device_decode_matches_refeed`'s batched-vs-single exact
   argmax (inherent ~2-3% error); pp flat, M=1 unchanged. Archived, not shipped.
-- [x] **R8.5 fp8 KV cache** -- NOT PURSUED (2026-10-19): the checkpoint declares
-  `kv_cache_quant_algo=FP8`, but FreeToken's only fp8-KV path is the DSv4 pool (a
-  different model) and its pool docs call fp8 an in-place round-trip; the Qwen
-  path keeps KV bf16. An unscaled e4m3 pool would be a local approximation with
-  clipping risk, not reference parity. Revisit only if a scaled path is wanted.
+- [x] **R8.5 fp8 KV cache** -- REJECTED (2026-10-19, decision 110); the real lever
+  is right-sizing the pool. Measured with `FT_SLOTS_REPORT` on bf16: kv 4096 /
+  16384 / 32768 / 65536 tokens resolve **1664 / 1536 / 1280 / 896** slots (~1.2 GB
+  of KV buys ~768 slots), and 1664 -> 896 slots costs ~10% tg (25.6 -> 22.9).
+  The default `num_pages = 131072` is 2x `max_seq_len = 65536`, so the stock pool
+  extrapolates to the 256-slot floor on 8 GB; sizing it to the actual context x
+  concurrency is numerically free and recovers the same VRAM fp8 would. fp8 needs
+  a scale, is not FreeToken's Qwen behavior (it keeps KV bf16), and is lossy, so
+  it would break the exact gates. Size the pool; do not quantize.
 - [x] **R8.6 Like-for-like miss measurement** (AIME both sides) -- DONE
   (decision 100): same AIME-25 #0 prompt, auto cache, both engines; Finding 1
   confirmed (copy 13.7 vs their 15.7 p50 -- we are now at/below their staging
@@ -897,10 +901,12 @@ prompt override before comparing miss rates.
 - [x] **R9.1 Fused add + RMSNorm** (launch tax) -- DONE (decision 100):
   `add_rmsnorm` Triton kernel + `ArgKind::F32` ABI; eager norms 1.83 -> 0.47 ms,
   captured AIME tg 25.9 -> 27.7, eager 18.7 -> 22.9.
-- [~] **R9.2 Fused gdn tail / gated norm** -- PARKED (stash). Implemented as fused
-  q/k Gemma RMSNorm + fused GDN gated norm: correct and gate-green but measured a
-  captured regression (~6%; each fusion alone neutral), so not shipped. `git stash`
-  holds it; revisit only with per-kernel GPU timing under capture.
+- [x] **R9.2 Fused gdn tail / gated norm** -- REJECTED (2026-10-19, re-evaluated
+  under the ship-if-neutral policy). Re-applied on the current base, oracle-exact
+  and VRAM-flat, all gates green, but captured decode is reproducibly **-6.4%**
+  (HEAD 27.69 +/- 0.30 vs 25.93 +/- 0.67, n=12+12, interleaved); each fusion alone
+  and eager are neutral, only the combination regresses. Not shipped; the attempt
+  stays in `git stash`.
 
 ### State of play
 

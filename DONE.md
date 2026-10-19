@@ -2778,12 +2778,30 @@ settled.
        Codex replays output items (`id`, `status`, `annotations`) verbatim.
      - **Not ported.** Reasoning items (`response.reasoning_text.*`), built-in
        tools, images, and `GET /v1/responses/{id}`/cancel (no store).
-     - **Tests.** HTTP integration tests over the fake and scripted tokenizers:
-       text input with `instructions`, a multi-turn `function_call_output`
-       input, a tool call, the streamed text and tool-call event sequences, and
-       the ignored stateful fields plus empty/zero-token rejection. CPU gates
-       green (`cargo test`, `cargo clippy --all-targets [--features cuda]`,
-       `cargo test --features cuda --lib`, `cargo fmt --check`).
+      - **Tests.** HTTP integration tests over the fake and scripted tokenizers:
+        text input with `instructions`, a multi-turn `function_call_output`
+        input, a tool call, the streamed text and tool-call event sequences, and
+        the ignored stateful fields plus empty/zero-token rejection. CPU gates
+        green (`cargo test`, `cargo clippy --all-targets [--features cuda]`,
+        `cargo test --features cuda --lib`, `cargo fmt --check`).
+
+110. **fp8 KV (R8.5) is rejected; the real lever is right-sizing the KV pool**
+     (2026-10-19, measured). FreeToken's Qwen path keeps KV bf16 (its only fp8
+     pool is the DSv4 model), so fp8 would be a local, lossy approximation, not
+     parity. The claimed benefit (freed VRAM -> more expert slots) was measured
+     directly instead, with two small diagnostic knobs added: `FT_SLOTS_REPORT=1`
+     prints the auto planner's resolved slot count/free bytes, and
+     `FERRUM_SMOKE_KVTOK` sets the smoke's KV token count. On bf16, kv 4096 /
+     16384 / 32768 / 65536 tokens resolve **1664 / 1536 / 1280 / 896** slots
+     (~1.2 GB of KV per ~768 slots; slot = 1,775,616 B), and the drawn-down cache
+     costs real decode: tg 25.6 -> 22.9 over a short decode. So:
+     - `[kv] num_pages = 131072` (the default) is **2x** `max_seq_len = 65536`
+       and bf16, which extrapolates to the 256-slot floor on 8 GB. Sizing the
+       pool to the actual context x concurrency is numerically free and recovers
+       exactly the VRAM fp8 would, with no accuracy change.
+     - fp8 would halve the bytes but needs a scale, is not the reference
+       behavior, and is lossy -> it would break the exact argmax/token gates.
+       Not shipped. Recommend sizing the pool (documented), not quantizing KV.
 
 ---
 
