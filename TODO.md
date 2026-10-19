@@ -862,29 +862,33 @@ prompt override before comparing miss rates.
   (decision 98). One program per `(bank, segment)` + a `tl.range(0, n)` loop
   replaced one per `(bank, row, seg)`. `moe_copy` 27.4 -> 9.0 ms; bs=1 captured
   tg 18.4 -> 23.4 (~27%). Headroom: copy still ~10 GB/s vs 14.4 pinned H2D.
-- [ ] **R8.0b Retry the LRU bitonic top-k** (decision 96 was reverted: it breaks
-  the `--interp` gate -- triton 3.7.1's interpreter mis-types `tl.topk` on the
-  packed key). Options: a formulation the interpreter accepts, a device-only path
-  with a `--interp` sort fallback behind a constexpr branch, or a two-pass bucket
-  select. Worth ~1.1 ms/token (`moe_lru` 2.54 -> 1.42).
-- [~] **R8.1 Fused Triton router** -- PARTIAL. Done: precompute the f32 gate at
-  load (decision 99), `router` 2.20 -> 1.50 ms; captured bs=1 tg ~23.4 -> 24.0.
-  Reverted: topk-the-logits-then-softmax-the-k (same math, fewer ops, `router`
-  ~1.26) breaks the exact-token oracle (float rounding flips a near-tie routing
-  decision). Remaining: a fused kernel keeping the full-softmax arithmetic.
+- [x] **R8.0b Retry the LRU bitonic top-k** -- CLOSED (2026-10-19, decision 104).
+  The bitonic `tl.topk` runs (the decision-96 interpreter note was wrong; the real
+  blockers were a `tl.constexpr` subtraction into `tl.topk` and a `k=1` interpreter
+  bug). Kernel 2.52 -> 1.41 ms (-44%) but the captured step is memory-bound and
+  measured **-2%**: not a captured lever. Archived, not shipped.
+- [x] **R8.1 Fused Triton router** -- CLOSED (2026-10-19, decision 104). Precompute
+  the f32 gate at load (decision 99) is kept. A fused full-softmax + top-k + renorm
+  kernel (keeping the exact arithmetic, oracle green) was 1.26 -> 0.70 ms but
+  measured **captured-neutral-to--6%**: the captured step is memory-bound, not
+  router-bound. Archived, not shipped.
 - [ ] **R8.2 Fused GDN decode** (adopt the vendored FLA
   `fused_sigmoid_gating_delta_rule_update`). One Triton kernel for gating +
   l2norm + recurrence + state I/O, replacing `gdn_conv/gdn_ba/gdn_recur/gdn_tail`.
   gdn 9.8 -> ~7. Gate: GDN oracle.
-- [ ] **R8.3 Attention kernel** (largest compute gap, 4.4 vs 2.1-2.8). FreeToken
-  uses flashinfer on sm_120; lift our Triton paged kernel (larger tiles, varlen,
-  split-K over KV) first, vendor flashinfer only if still short.
+- [x] **R8.3 Attention kernel** -- CLOSED (2026-10-19): the "4.4 vs 2.1-2.8" was a
+  measurement artifact (the eager profile's `attn` is the libtorch fallback; the
+  paged kernel runs only in the captured path and costs ~0.1-0.25 ms). See
+  OPTIMIZATION.md R8.3.
 - [x] **R8.4 W8A8 Triton `tl.dot` GEMM** -- REJECTED (2026-10-19, decision 108).
   A W8A8 variant wins +8.1% on the K=4 batched aggregate but the per-tensor
   activation quant breaks `device_decode_matches_refeed`'s batched-vs-single exact
   argmax (inherent ~2-3% error); pp flat, M=1 unchanged. Archived, not shipped.
-- [ ] **R8.5 fp8 KV cache** (checkpoint declares it; we run bf16): frees VRAM for
-  expert slots.
+- [x] **R8.5 fp8 KV cache** -- NOT PURSUED (2026-10-19): the checkpoint declares
+  `kv_cache_quant_algo=FP8`, but FreeToken's only fp8-KV path is the DSv4 pool (a
+  different model) and its pool docs call fp8 an in-place round-trip; the Qwen
+  path keeps KV bf16. An unscaled e4m3 pool would be a local approximation with
+  clipping risk, not reference parity. Revisit only if a scaled path is wanted.
 - [x] **R8.6 Like-for-like miss measurement** (AIME both sides) -- DONE
   (decision 100): same AIME-25 #0 prompt, auto cache, both engines; Finding 1
   confirmed (copy 13.7 vs their 15.7 p50 -- we are now at/below their staging
@@ -892,8 +896,10 @@ prompt override before comparing miss rates.
 - [x] **R9.1 Fused add + RMSNorm** (launch tax) -- DONE (decision 100):
   `add_rmsnorm` Triton kernel + `ArgKind::F32` ABI; eager norms 1.83 -> 0.47 ms,
   captured AIME tg 25.9 -> 27.7, eager 18.7 -> 22.9.
-- [ ] **R9.2 Fused gdn tail / gated norm** with the same `add_rmsnorm` shape
-  (`gdn_tail` 1.39 ms still an op soup; the q/k norms inside attention too).
+- [~] **R9.2 Fused gdn tail / gated norm** -- PARKED (stash). Implemented as fused
+  q/k Gemma RMSNorm + fused GDN gated norm: correct and gate-green but measured a
+  captured regression (~6%; each fusion alone neutral), so not shipped. `git stash`
+  holds it; revisit only with per-kernel GPU timing under capture.
 
 ### State of play
 
