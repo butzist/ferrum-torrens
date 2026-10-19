@@ -95,7 +95,7 @@ levers. Decode is at parity; prefill is MoE-bound (`pf_gemm` ~3.5 ms/token).
 Remaining: the gdn tail norm, R8.5 fp8 KV (VRAM), the FLA prefill chunk kernels
 (slice 4, low value now), tool calling (decision 74), and `[opt] /v1/responses`.
 Instruments: `FT_PROFILE=1`, `scripts/freetoken_probe/`.
-Progress history and the full decision log (numbers 1..105) live in `DONE.md`;
+Progress history and the full decision log (numbers 1..106) live in `DONE.md`;
 read that for the "why" behind any decision number referenced in code or tests.
 
 Goal: a **minimal, fast, single-GPU** Rust serving engine for **one model** --
@@ -366,7 +366,7 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 
 ## 7. Decisions
 
-The full log of confirmed decisions (numbers 1..105, stable -- code, tests and
+The full log of confirmed decisions (numbers 1..106, stable -- code, tests and
 `ARCHITECTURE.md` reference them by number) lives in `DONE.md`. This section
 lists only the decisions that still bind open work; everything else there is
 history.

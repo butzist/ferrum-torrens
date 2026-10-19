@@ -2685,10 +2685,30 @@ settled.
        malformed block. Content before the call streams as before.
      - **Tests.** Parser unit tests; adapter rendering tests (incl. the real
        checkpoint template with tools); HTTP non-stream and stream tool-call
-       integration tests over a scripted tokenizer, plus the stream state
-       machine's partial/malformed cases. All CPU gates green
-       (`cargo test`, `cargo clippy --all-targets [--features cuda]`,
-       `cargo fmt --check`).
+        integration tests over a scripted tokenizer, plus the stream state
+        machine's partial/malformed cases. All CPU gates green
+        (`cargo test`, `cargo clippy --all-targets [--features cuda]`,
+        `cargo fmt --check`).
+
+106. **`aot.py --check` is deterministic across toolchains and caches**
+     (2026-10-19, implemented) -- the fix for the recurring `check-kernels.sh`
+     staleness. Decision 45 normalizes the python-env `/nix/store/...` path out
+     of the cubin debug info before comparing, but ptxas also bakes each source
+     file's **size and mtime** into the DWARF `.debug_line` file table, and those
+     are not reproducible (a `git checkout` re-stamps mtime). A cold build and a
+     cache-seeded one therefore disagreed by ~10 debug bytes; the visible
+     `:standard.py` token was an mtime ULEB leaking into the next file name,
+     misread as a kernel edit. `aot.py::_norm` now canonicalizes the line-program
+     file table (zeroes mtime/size, keeps names and directory indices) in every
+     `.debug_line` section of an ELF64 cubin before comparing, and `emit()`
+     compiles into a fresh temp `TRITON_CACHE_DIR` unless the caller pinned one,
+     so a build reflects the current toolchain, not an arbitrary earlier cache
+     entry. Evidence: with store-path normalization alone, `gdn_decode`,
+     `index_copy` and `lru_ensure` cubins still differ from a fresh build; with
+     store+DWARF they compare equal. `check-kernels.sh` passes with the normal, a
+     cleared, a foreign, and a fresh `TRITON_CACHE_DIR`; `--interp` selftest
+     PASS; `cargo test`/clippy green; no committed artifact churned (the check
+     still keys on code and line mapping, so a real kernel change is caught).
 
 ---
 

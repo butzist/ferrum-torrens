@@ -189,7 +189,10 @@ Instructions for AI coding agents working in this repository.
   `aot.py --check`) before committing: it lowers every kernel for sm_120 and
   recompiles each committed `kernel/*.cubin`/`.ptx` in memory, so a kernel edit
   without a matching `kernel-aot` fails instead of shipping stale artifacts.
-  Run it in the devShell; it needs no GPU.
+  Run it in the devShell; it needs no GPU. The comparison canonicalizes the
+  debug-info store paths, source mtimes and sizes (and `aot.py` compiles into a
+  fresh temp `TRITON_CACHE_DIR`), so it is stable across toolchains and caches
+  (DONE.md decision 106) -- a stale report now means a real kernel change.
 - Kernel work has a CPU inner loop, no GPU needed (DONE.md decision 31), and it
   is **hermetic in the devShell**. The flake's `pythonEnv` is torch + triton +
   numpy, and its `shellHook` wires triton to the cudatoolkit's `ptxas`

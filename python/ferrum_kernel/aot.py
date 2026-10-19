@@ -25,9 +25,12 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import os
 import pathlib
 import re
+import struct
 import sys
+import tempfile
 
 import triton
 from triton.backends.compiler import GPUTarget
@@ -237,9 +240,142 @@ LINEAR_KERNELS: dict[str, dict] = {
 # set stale on any box whose toolchain closure was rebuilt (DONE.md decision 45).
 _STORE_PATH = re.compile(rb"/nix/store/[a-z0-9]{32}-[^/\x00]+")
 
+# ptxas also bakes each source file's size and mtime into the DWARF
+# `.debug_line` file table. Neither is reproducible: a `git checkout` stamps
+# mtime with the checkout time, so a cold build and a cached one disagree even
+# though the code is identical, and a `strings`-visible residual (`:standard.py`
+# is an mtime ULEB leaking into the next name) looked like a kernel edit.
+# Canonicalize the table -- names and directory indices stay, size and mtime go
+# to zero -- so the comparison keys on code and line mapping, not on where or
+# when the sources were checked out (DONE.md decision 45, extended).
+
+
+def _uleb(blob: bytes, pos: int) -> tuple[int, int]:
+    value = shift = 0
+    while True:
+        byte = blob[pos]
+        pos += 1
+        value |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return value, pos
+        shift += 7
+
+
+def _uleb_bytes(value: int) -> bytes:
+    out = bytearray()
+    while True:
+        byte = value & 0x7F
+        value >>= 7
+        if value:
+            out.append(byte | 0x80)
+        else:
+            out.append(byte)
+            return bytes(out)
+
+
+def _canon_line_unit(unit: bytes) -> bytes:
+    """Zero the size/mtime fields in one DWARF v2-v4 line-program unit.
+
+    The file table sits between `header_start` (after the standard opcodes) and
+    `header_end` (`header_length` counts from the header-length field). Rebuild
+    it in place, padded back to the original header length so the section and
+    every later section keep their offsets.
+    """
+    (unit_length,) = struct.unpack_from("<I", unit, 0)
+    if unit_length < 10 or unit_length + 4 > len(unit):
+        return unit
+    body, tail = unit[: 4 + unit_length], unit[4 + unit_length :]
+    (version,) = struct.unpack_from("<H", body, 4)
+    if version not in (2, 3, 4):
+        return unit
+    (header_length,) = struct.unpack_from("<I", body, 6)
+    if version == 4:
+        opcode_base = body[15]
+        header_start = 10 + 6 + (opcode_base - 1)
+    else:
+        opcode_base = body[14]
+        header_start = 10 + 5 + (opcode_base - 1)
+    header_end = 10 + header_length
+    if not header_start <= header_end <= len(body):
+        return unit
+    region = body[header_start:header_end]
+    pos = 0
+    dirs = []
+    while pos < len(region) and region[pos] != 0:
+        end = region.index(b"\x00", pos)
+        dirs.append(region[pos:end])
+        pos = end + 1
+    if pos >= len(region):
+        return unit
+    pos += 1
+    files = []
+    while pos < len(region) and region[pos] != 0:
+        end = region.index(b"\x00", pos)
+        name = region[pos:end]
+        pos = end + 1
+        directory, pos = _uleb(region, pos)
+        _mtime, pos = _uleb(region, pos)
+        _size, pos = _uleb(region, pos)
+        files.append((name, directory))
+    if pos >= len(region):
+        return unit
+    table = bytearray()
+    for directory in dirs:
+        table += directory + b"\x00"
+    table += b"\x00"
+    for name, directory in files:
+        table += name + b"\x00" + _uleb_bytes(directory) + _uleb_bytes(0) + _uleb_bytes(0)
+    table += b"\x00"
+    if len(table) > len(region):
+        return unit
+    table += b"\x00" * (len(region) - len(table))
+    return body[:header_start] + bytes(table) + body[header_end:] + tail
+
+
+def _canon_line_section(section: bytes) -> bytes:
+    out = bytearray()
+    pos = 0
+    while pos + 4 <= len(section):
+        (unit_length,) = struct.unpack_from("<I", section, pos)
+        end = 4 + unit_length
+        if unit_length < 10 or pos + end > len(section):
+            break
+        out += _canon_line_unit(section[pos : pos + end])
+        pos += end
+    out += section[pos:]
+    return bytes(out)
+
+
+def _canon_debug_lines(blob: bytes) -> bytes:
+    """Rewrite every `.debug_line` section of an ELF64 cubin, leaving the rest."""
+    if len(blob) < 64 or blob[:4] != b"\x7fELF" or blob[4] != 2 or blob[5] != 1:
+        return blob
+    (shoff,) = struct.unpack_from("<Q", blob, 0x28)
+    shentsize, shnum, shstrndx = struct.unpack_from("<HHH", blob, 0x3A)
+    if shoff == 0 or shnum == 0 or shstrndx >= shnum:
+        return blob
+
+    def header(index: int) -> tuple[int, int, int, int]:
+        name, typ, _flags, _addr, offset, size, *_ = struct.unpack_from(
+            "<IIQQQQIIQQ", blob, shoff + index * shentsize
+        )
+        return name, typ, offset, size
+
+    _name, _typ, str_off, _size = header(shstrndx)
+    out = bytearray(blob)
+    for index in range(shnum):
+        name, typ, offset, size = header(index)
+        end = blob.index(b"\x00", str_off + name)
+        section_name = blob[str_off + name : end]
+        if typ != 1 or size == 0 or not section_name.endswith(b"debug_line"):
+            continue
+        section = bytes(blob[offset : offset + size])
+        out[offset : offset + size] = _canon_line_section(section)
+    return bytes(out)
+
 
 def _norm(blob: bytes) -> bytes:
-    return _STORE_PATH.sub(b"/nix/store/<store>", blob)
+    return _STORE_PATH.sub(b"/nix/store/<store>", _canon_debug_lines(blob))
 
 
 # `.param .u64 .ptr .global .align 1 f_param_0`: the arg kind is the type, the
@@ -324,7 +460,26 @@ class Artifacts:
 
 def emit() -> Artifacts:
     """Compile every kernel. Pure: nothing is written, so `--check` can compare
-    a fresh build against the committed files without disturbing them."""
+    a fresh build against the committed files without disturbing them.
+
+    `triton.compile` keys its `~/.triton/cache` on the source and options, not on
+    the environment that seeded the entry, so a hit from a rebuilt closure
+    returns that closure's debug bytes verbatim. Compile into a fresh cache
+    unless the caller pinned `TRITON_CACHE_DIR`, so a build always reflects this
+    toolchain rather than an arbitrary earlier one."""
+    cache = None
+    if not os.environ.get("TRITON_CACHE_DIR"):
+        cache = tempfile.TemporaryDirectory(prefix="ferrum-aot-cache-")
+        os.environ["TRITON_CACHE_DIR"] = cache.name
+    try:
+        return _emit()
+    finally:
+        if cache is not None:
+            os.environ.pop("TRITON_CACHE_DIR", None)
+            cache.cleanup()
+
+
+def _emit() -> Artifacts:
     manifest = {
         "target": {"arch": "sm_120", "warp_size": 32},
         "triton": triton.__version__,
