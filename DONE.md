@@ -2799,9 +2799,21 @@ settled.
        and bf16, which extrapolates to the 256-slot floor on 8 GB. Sizing the
        pool to the actual context x concurrency is numerically free and recovers
        exactly the VRAM fp8 would, with no accuracy change.
-     - fp8 would halve the bytes but needs a scale, is not the reference
-       behavior, and is lossy -> it would break the exact argmax/token gates.
-       Not shipped. Recommend sizing the pool (documented), not quantizing KV.
+      - fp8 would halve the bytes but needs a scale, is not the reference
+        behavior, and is lossy -> it would break the exact argmax/token gates.
+        Not shipped. Recommend sizing the pool (documented), not quantizing KV.
+
+111. **Slice 4's FLA prefill kernels are closed as not worth it** (2026-10-19,
+     measured). After decisions 101-103 the GDN recurrence is no longer the
+     prefill bound. A fresh `FT_PROFILE` of a 451-token prefill chunk attributes
+     the 7.72 ms/token as: `pf_gemm` 3.53 (46%, the MoE grouped GEMV/PCIe stream),
+     `norm_in` 0.87, host `attn` fallback 0.77, `attn_out` 0.43, `attn_mem` 0.16,
+     `attn_proj` 0.18, and **`gdn_recur` 0.19 (2.5%)**. A vendored
+     `chunk_gated_delta_rule` could save only a fraction of that 0.19 ms/token,
+     so it cannot move pp; the FLA `causal_conv1d_varlen` is similarly moot (the
+     conv is already a single kernel). The remaining prefill levers are the host
+     attention fallback (`CacheAccess::Host` gathers + SDPA for prefill, ~1.2
+     ms/token across `attn`/`attn_out`/`attn_mem`) and `norm_in`, not GDN.
 
 ---
 

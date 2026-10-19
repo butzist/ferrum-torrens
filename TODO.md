@@ -49,9 +49,10 @@ cache can grow to 2048 slots: tg 10.6 -> 11.5 at 1536 slots (plateau), VRAM up t
 7.4 GiB. Slice 3 landed (item 19, decisions 86, 87): the fused `conv_decode`
 kernel replaces the grouped-conv op soup and the mixer activation stream is now
 bf16, both correct and throughput neutral (the substrate matches FreeToken; the
-cost is elsewhere). Remaining: the prefill chunk kernels (slice 4) and item 11
-(server-side batching) as the largest serving lever; libtorch stays the
-generic/CPU fallback.
+cost is elsewhere). Slice 4's FLA kernels are now closed as not worth it
+(decision 111: the GDN recurrence is 0.19 ms/token; the prefill bound is the MoE
+stream and the host attention fallback). Remaining serving lever: item 11
+(server-side batching); libtorch stays the generic/CPU fallback.
 **The two NVFP4 GEMVs were rewritten marlin-style (decision 89, OPTIMIZATION.md
 R1/R2):** int32 wide loads + a deferred K reduction + the fp16-bitcast dequant
 (`_split8` register activation split), and the lm_head is now resident K-major.
@@ -96,10 +97,13 @@ bound by the PCIe copy / memory, not these sub-ms stages), so they are closed as
 levers. Decode is at parity; prefill is MoE-bound (`pf_gemm` ~3.5 ms/token).
 Tool calling landed (decision 105) and the agentic tool-call prefix reuse is
 covered by hybrid_radix (decision 107), so a multi-turn tool loop only prefills
-the tool result. Remaining: the gdn tail norm, R8.5 fp8 KV (VRAM), the FLA
-prefill chunk kernels (slice 4, low value now).
-Instruments: `FT_PROFILE=1`, `scripts/freetoken_probe/`.
-Progress history and the full decision log (numbers 1..110) live in `DONE.md`;
+the tool result. The open perf/eval items are now resolved: R9.2 rejected
+(-6.4% captured, reproducible), R8.5 rejected (size the KV pool instead of fp8),
+and slice 4 closed (GDN is 0.19 ms/token of prefill). The remaining prefill lever
+is the host attention fallback (~1.2 ms/token) and `norm_in` (0.87); the only
+open serving lever is item 11 (server-side batching).
+Instruments: `FT_PROFILE=1`, `FT_SLOTS_REPORT=1`, `scripts/freetoken_probe/`.
+Progress history and the full decision log (numbers 1..111) live in `DONE.md`;
 read that for the "why" behind any decision number referenced in code or tests.
 
 Goal: a **minimal, fast, single-GPU** Rust serving engine for **one model** --
@@ -369,7 +373,7 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 
 ## 7. Decisions
 
-The full log of confirmed decisions (numbers 1..110, stable -- code, tests and
+The full log of confirmed decisions (numbers 1..111, stable -- code, tests and
 `ARCHITECTURE.md` reference them by number) lives in `DONE.md`. This section
 lists only the decisions that still bind open work; everything else there is
 history.
@@ -728,8 +732,13 @@ performance work.
     a chunked FLA-style triangular solve + batched matmuls: pp **120 -> 143** at
     517 and **122 -> 150** at 2057, decode within noise (decisions 102). The
     per-row solve is now one `gdn_tri_solve` Triton kernel (decision 103), so
-    prefill is MoE-bound. The FLA `chunk_gated_delta_rule` +
-    `causal_conv1d_varlen` kernels remain OPEN.
+    prefill is MoE-bound. **Slice 4's FLA kernels are CLOSED as not worth it
+    (decision 111, 2026-10-19):** a fresh prefill profile of a 451-token chunk is
+    now `pf_gemm` 3.53 ms/token (46%, the MoE/PCIe stream), `norm_in` 0.87, host
+    `attn` fallback 0.77 + `attn_out` 0.43 + `attn_mem` 0.16, and **`gdn_recur`
+    0.19 ms/token (2.5%)** -- so a `chunk_gated_delta_rule` port cannot move pp.
+    The remaining prefill levers are a device prefill attention (instead of the
+    Host SDPA fallback) and `norm_in`, not GDN.
 21. Expert cache growth (E4) -- **DONE (2026-10-17), decision 85.** The staging
      `lru_ensure` `BLOCK_C` ceiling is raised 512 -> 2048 (decision 84), so a
      config may grow the cache into the VRAM the FP8 slice freed. Measured on the
