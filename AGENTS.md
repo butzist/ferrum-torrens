@@ -212,6 +212,37 @@ Instructions for AI coding agents working in this repository.
   `tests/cuda_moe_matches_reference.rs`, which is the real-hardware gate for the
   same kernels.
 
+## Sub-agent workflow
+
+Larger sessions run as an **orchestrator** that dispatches one bounded task per
+**sub-agent**, then judges the result and owns git. Keep the orchestrator's
+context lean; do the writing in the workers.
+
+- **One writer at a time.** Every agent shares this working tree, so never run
+  two agents that edit files concurrently. Serialize implementation tasks; only
+  read-only exploration may run in parallel.
+- **Task prompt must state:** the repo and current HEAD, the dirty-file and
+  `git stash` state (and "do not touch the stash"), the exact task with its
+  `TODO.md`/`OPTIMIZATION.md`/`DONE.md` decision references, the acceptance
+  gates, the environment recipes (below), and the required deliverable format.
+- **Required deliverable:** a **summary** (what changed, final `git status`);
+  a **timing report** (before/after with sample counts from a controlled,
+  order-balanced A/B -- single runs vary ~5%, so never trust one); **correctness**
+  (every gate's exact result); a **justification** (win size, artifact churn,
+  calibration changes, risk, whether it touches decode or prefill); and the
+  **commands + log paths**. No fabricated numbers; "no safe win" is an acceptable
+  and valuable result.
+- **Agent rules:** do **not** commit or stash; never touch a pre-existing stash;
+  leave the tree with only the final gated change (or clean if nothing won); run
+  the verify line and any affected gated GPU tests before reporting.
+- **Orchestrator duties:** independently confirm the tree (`git status`,
+  `git diff`), spot-check at least the cheap gates, and judge keep vs
+  stash/revert. Commit accepted work per the Commits section and update
+  `TODO.md`/`DONE.md`/`OPTIMIZATION.md` in the same change. A correct but
+  unmeasured win is not a win; park it in a stash and note how to revisit.
+- **Record negative results.** A measured "no win" (and the reason) belongs in
+  `OPTIMIZATION.md`/`DONE.md` so the next agent does not re-chase it.
+
 ## Commits
 
 - Commit after each sprint or feature implementation, when its `TODO.md`
