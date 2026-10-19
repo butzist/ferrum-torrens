@@ -2628,8 +2628,34 @@ settled.
        churn). GPU: `engine_real_generate` 6/6, `kvcache_cross_request_reuse`
        (reused 7/10, argmax 248046 ok, 1.412e-1), `device_decode_matches_refeed`
        3/3 argmax exact, `ftw_cross_check` argmax 11751 top-5 identical.
-     - **Remaining:** the FLA `chunk_gated_delta_rule` + `causal_conv1d_varlen`
-       prefill kernels (slice 4); prefill is now gated by the MoE `pf_gemm`.
+      - **Remaining:** the FLA `chunk_gated_delta_rule` + `causal_conv1d_varlen`
+        prefill kernels (slice 4); prefill is now gated by the MoE `pf_gemm`.
+
+104. **`moe_lru` and the fused router are captured-neutral** (2026-10-18,
+     measured, not shipped) -- the last two bs=1 decode levers. Both were
+     implemented and gate-green (`engine_real_generate` 6/6 with the exact token,
+     `device_decode_matches_refeed` argmax exact, `ftw_cross_check` 11751), and
+     both were large kernel wins in isolation and on the eager path:
+     - `moe_lru` bitonic `tl.topk` (device path): kernel 2.52 -> 1.41 ms p50
+       (-44%), eager tg 24.00 -> 24.37 (+1.5%).
+     - fused router (full-softmax + top-k + renorm in one kernel, reproducing the
+       current arithmetic to ~1e-7, oracle exact): stage 1.26 -> 0.70 ms p50
+       (-44%), eager tg 23.8 -> 24.15 (+1.5%).
+     Neither moved captured tg in an order-balanced A/B at the serving default:
+     `moe_lru` **-2.0%** (auto, 128 tokens; -2.4% at a pinned 1664-slot cache),
+     router **-5.9% at `num_warps=4`**, neutral at `num_warps=1` (the fused
+     kernel's long per-row dependency chain is exposed under capture). Both were
+     reverted. The captured step is bound by the PCIe copy / memory, not these
+     sub-ms stages -- the same lesson as decision 100, where only a ~700-launch
+     reduction moved captured tg. Corrects decision 96: `tl.topk` *does* run in
+     the triton 3.7.1 interpreter; the real blockers were a `tl.constexpr`
+     subtraction into `tl.topk` and a `k=1` interpreter bug (`bk = max(2, ..)`
+     with the extra victim masked works). Candidate patches archived at
+     `/tmp/opencode/{topk_files,router_files}/`.
+
+     This closes the bs=1 decode optimization campaign: captured tg ~28.3 vs the
+     reference's 30.3, with the residual split over copy (PCIe, miss-bound),
+     GDN/attention projections (read roofline), and MoE GEMV (near parity).
 
 ---
 

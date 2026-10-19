@@ -1108,8 +1108,20 @@ Next levers after R9.1, re-ranked 2026-10-18:
   2057, decode unchanged. The wall-clock win is smaller than the solve saving
   because that time was already overlapped with the prefill MoE copy, so prefill
   is now MoE-bound (`pf_gemm` ~3.5 ms/token).
-- Remaining bs=1 items, all sub-ms-to-~1 ms: `moe_lru` (2.35 vs 1.6), the R8.1
-  fused router (1.34), the gdn tail norm, R8.5 fp8 KV (frees VRAM for slots).
+- **`moe_lru` and the fused router are CLOSED as captured levers (2026-10-18,
+  measured).** Both were implemented, gate-green and 44% faster in the kernel
+  (`moe_lru` 2.52 -> 1.41 ms p50 with a bitonic `tl.topk`; a fused full-softmax
+  router 1.26 -> 0.70 ms p50, exact-token oracle intact), and both moved the
+  *eager* tg (+1.5%) -- but neither moved captured tg (LRU -2%, router
+  neutral-to--6%). The captured graph is not bound by these sub-ms stages: it is
+  bound by the PCIe copy / memory, so only a large launch-count change (decision
+  100's 700-launch norm block) moves it. Decision 96's "interpreter cannot run
+  `tl.topk`" note was also wrong: the real blockers were a `tl.constexpr`
+  subtraction into `tl.topk` and a `k=1` interpreter bug. The candidate patches
+  are archived under `/tmp/opencode/{topk_files,router_files}/`; do not re-chase
+  them without a captured-tg reason.
+- Remaining bs=1 items: the gdn tail norm (a `t>=128`-style prefill win, not
+  captured), R8.5 fp8 KV (frees VRAM for slots). Decode is otherwise at parity.
 - A stashed R9.2 attempt (fused q/k Gemma RMSNorm + fused GDN gated norm) was
   correct and gate-green but measured a captured regression (~6% at the time;
   each fusion alone neutral) with no proven win, so it is not shipped. Revisit

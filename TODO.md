@@ -87,9 +87,13 @@ but did not measure a captured win, so it is parked. Decision 103 replaced the
 chunked solve's per-row launches with one `gdn_tri_solve` Triton kernel (solve
 1.98 -> 0.04 ms/token; pp 142 -> 150 at 517 and 151 -> 156 at 2057, with the
 freed time now hidden under the prefill MoE overlap), decode unchanged.
-Remaining levers: the R8.1 fused router, `moe_lru`, the gdn tail norm, R8.5
-fp8 KV, and the FLA prefill chunk kernels (slice 4). Instruments:
-`FT_PROFILE=1`, `scripts/freetoken_probe/`.
+The R8.1 fused router and `moe_lru` were then implemented, gate-green and 44%
+faster in the kernel, but measured **captured-neutral** (the captured step is
+bound by the PCIe copy / memory, not these sub-ms stages), so they are closed as
+levers. Decode is at parity; prefill is MoE-bound (`pf_gemm` ~3.5 ms/token).
+Remaining: the gdn tail norm, R8.5 fp8 KV (VRAM), the FLA prefill chunk kernels
+(slice 4, low value now), tool calling (decision 74), and `[opt] /v1/responses`.
+Instruments: `FT_PROFILE=1`, `scripts/freetoken_probe/`.
 Progress history and the full decision log (numbers 1..103) live in `DONE.md`;
 read that for the "why" behind any decision number referenced in code or tests.
 
@@ -734,12 +738,12 @@ performance work.
      `stride_pkw` and `kernel_abi.rs` passes word strides; `nvfp4_dense_gemv()`
      drops the LUT and takes K-major strides. Gates green (see DONE.md 89).
      Remaining decode work is R4/R5/R6, not this item.
-23. Shared expert stays NVFP4 -- **IN PROGRESS (operator request, 2026-10-17).**
-     The checkpoint stores `mlp.shared_expert.{gate_up,down}_proj` NVFP4; we widen
-     both to bf16 at load (240 MiB) and read them every token. Keep the packed
-     banks and run the dense NVFP4 GEMV for decode (like the lm_head), bf16 for
-     prefill (M>1). Saves ~2 ms/token and ~180 MiB. Design in `OPTIMIZATION.md`
-     R7.
+23. Shared expert stays NVFP4 -- **DONE (2026-10-17), decision 93.** `Dense`
+     carries the packed K-major NVFP4 banks (`Nvfp4Dense`) alongside the bf16
+     weight and runs the dense NVFP4 GEMV for `m <= 8` (decode), bf16 cuBLAS
+     above (prefill); `shared` 3.12 -> 2.26 ms/token. The cubin's `K_WORDS` is a
+     runtime arg so one kernel serves the head and the shared `down`. The TODO
+     text here was stale; see `DONE.md` decision 93 for the detail.
 24. Prefill/cache residency -- **DONE (2026-10-17), decision 94.** Audit found
      the whole-layer prefill called `reset_staging()` on enter *and* leave,
      wiping the entire decode LRU around every prefill. Now `enter_prefill` picks
