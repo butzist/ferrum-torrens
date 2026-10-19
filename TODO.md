@@ -36,8 +36,10 @@ Tool calling on `/v1/chat/completions` landed (decision 74 scope, decision 105
 implementation): `tools`/`tool_choice` are rendered through the checkpoint's own
 chat template, the `<tool_call>` dialect is parsed into a `tool_calls` message
 (non-stream) or `tool_calls` deltas (stream), and `role: "tool"` results are
-accepted. Open work: the `[opt] /v1/responses` surface, server-side batching, the
-bf16-attention/remaining decode gap (items 14, 17), and the section 8 experiments.
+accepted. The `[opt] /v1/responses` surface now serves the stateless Responses
+subset (decision 109), so Codex-style clients can drive the model too. Open work:
+server-side batching, the bf16-attention/remaining decode gap (items 14, 17), and
+the section 8 experiments.
 The decode gap is now pursued by **vendoring FreeToken's own Triton kernels**
 (decision 82, plan in `OPTIMIZATION.md`). Slices 1-2 landed: bf16 paged attention
 (decision 83) and the W8A16 FP8 projections (decision 84), which with the packed
@@ -95,9 +97,9 @@ levers. Decode is at parity; prefill is MoE-bound (`pf_gemm` ~3.5 ms/token).
 Tool calling landed (decision 105) and the agentic tool-call prefix reuse is
 covered by hybrid_radix (decision 107), so a multi-turn tool loop only prefills
 the tool result. Remaining: the gdn tail norm, R8.5 fp8 KV (VRAM), the FLA
-prefill chunk kernels (slice 4, low value now), and `[opt] /v1/responses`.
+prefill chunk kernels (slice 4, low value now).
 Instruments: `FT_PROFILE=1`, `scripts/freetoken_probe/`.
-Progress history and the full decision log (numbers 1..108) live in `DONE.md`;
+Progress history and the full decision log (numbers 1..109) live in `DONE.md`;
 read that for the "why" behind any decision number referenced in code or tests.
 
 Goal: a **minimal, fast, single-GPU** Rust serving engine for **one model** --
@@ -163,7 +165,6 @@ with `--text-model-only`). Known-good bf16/Fp8 siblings: `Qwen/Qwen3.6-35B-A3B`,
 - DSV4 / SWA / DSA / MLA / QSA / BSA attention families (full-attention GQA only).
 - Reasoning parsers (reasoning is optional for opencode; tool calling is in scope, decision 74).
 - Daemon, proxy, shell/TUI, `ft ctl`, accounting, log ring.
-- `/v1/responses` API (optional, in decisions).
 
 ## 3. Repo/crate layout (target, clean architecture / hexagonal / DDD)
 
@@ -316,7 +317,7 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 ### Server (axum recommended)
 
 - [x] P0 **tool calling on `/v1/chat/completions` -- DONE (2026-10-19), decisions 74, 105.** Accepts `tools`/`tool_choice`/`parallel_tool_calls`, renders them through the checkpoint's chat template (minijinja `json` feature), parses the `<tool_call>` dialect (`infrastructure/tool_call.rs`), returns a `tool_calls` message or streams `tool_calls` deltas with `finish_reason: "tool_calls"`, and accepts `role: "tool"` result turns.
-- [ ] [opt] `/v1/responses` (needed only for Codex; opencode talks chat-completions, decision 74).
+- [x] [opt] **`/v1/responses` -- DONE (2026-10-19), decision 109.** Stateless subset for Codex: `input` string/items (`message`, `function_call`, `function_call_output`), `instructions`, flattened `tools`, `tool_choice`, `max_output_tokens`; renders through the same chat template and `parse_tool_calls`, answers `message`/`function_call` output items and streams `response.created`/`output_text.delta`/`function_call_arguments.delta`/`response.completed`. `store`/`previous_response_id`/`text`/`reasoning`/`metadata` accepted and ignored (no state, reasoning out of scope).
 - Anthropic `/v1/messages` is out of the MVP (decision 38).
 
 ### Hygiene
@@ -350,12 +351,12 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
   without GDN snapshot donation (decision 65).
 - **M4 offload**: LRU slot cache + fused copy + chunked staged prefill + whole
   layer prefill overlap (DONE, decisions 42-48, 66, 67); batch concurrency.
-- **M5**: optional `/v1/responses`, hybrid_radix GDN snapshot donation (which is
+- **M5**: `/v1/responses` DONE (decision 109); hybrid_radix GDN snapshot donation (which is
   what makes the radix prefix cache real, decision 65) -- domain core, device
   primitive, generation-loop wiring, chunked prefill with mid-prefill snapshots,
   and the gated cross-request oracle DONE (decisions 68, 69, 70, 71); startup
   load tuning DONE (decision 72); throughput smoke DONE (decision 73);
-  `[opt] /v1/responses` remains, plus the section 8 experiments.
+  plus the section 8 experiments.
 - **M6 (CURRENT): agentic serving.** Tool calling on `/v1/chat/completions` is
   DONE (decisions 74, 105), so opencode/agentic clients can drive the model. The
   decode gap is
@@ -368,7 +369,7 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 
 ## 7. Decisions
 
-The full log of confirmed decisions (numbers 1..108, stable -- code, tests and
+The full log of confirmed decisions (numbers 1..109, stable -- code, tests and
 `ARCHITECTURE.md` reference them by number) lives in `DONE.md`. This section
 lists only the decisions that still bind open work; everything else there is
 history.

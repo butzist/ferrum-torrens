@@ -625,15 +625,28 @@ EOS/stop-string over max-tokens.
 ### 3.8 HTTP serving and generation `[core]`
 
 **Static.** `infrastructure/http.rs` (axum) exposes `/v1/completions`,
-`/v1/chat/completions`, `/v1/models`, `/health`; `application/generation.rs`
-owns the loop; `application/dispatcher.rs` owns the single model worker;
-`tokenizers_hf.rs` encodes/decodes and renders the chat template. The chat
-endpoint carries OpenAI tool calling (decision 74): `ChatMessage`/`ChatTool`
-(domain `tokenizer.rs`) are rendered with `tools`, and `tool_call.rs` parses the
-checkpoint's `<tool_call>` dialect out of the answer. Non-stream turns the whole
-answer into a `tool_calls` message; the chat stream buffers once a `<tool_call>`
-opener appears and emits `tool_calls` deltas, finishing with
-`finish_reason: "tool_calls"`.
+`/v1/chat/completions`, `/v1/responses`, `/v1/models`, `/health`;
+`application/generation.rs` owns the loop; `application/dispatcher.rs` owns the
+single model worker; `tokenizers_hf.rs` encodes/decodes and renders the chat
+template. The chat endpoint carries OpenAI tool calling (decision 74):
+`ChatMessage`/`ChatTool` (domain `tokenizer.rs`) are rendered with `tools`, and
+`tool_call.rs` parses the checkpoint's `<tool_call>` dialect out of the answer.
+Non-stream turns the whole answer into a `tool_calls` message; the chat stream
+buffers once a `<tool_call>` opener appears and emits `tool_calls` deltas,
+finishing with `finish_reason: "tool_calls"`.
+
+`/v1/responses` (decision 109) is the stateless Responses subset for Codex. Its
+`input` (string or items), `instructions` and flattened `tools` are mapped onto
+the same `ChatMessage`/`ChatTool` and rendered by the same `render_chat`, so
+tool calling is identical; `function_call`/`function_call_output` items become
+the assistant/tool turns the chat template already understands. The answer is
+re-parsed with `parse_tool_calls` and emitted as Responses output items
+(`message` with `output_text`, `function_call`) or, on `stream: true`, as
+`response.created` / `output_text.delta` / `function_call_arguments.delta` /
+`response.completed` events over the same per-token `ChatStream` and bounded
+sink. `store`, `previous_response_id`, `text`, `reasoning` and `metadata` are
+accepted and ignored: the server keeps no response state and reasoning is out of
+scope.
 
 **Dynamic -- a streaming request.** Handlers never call the model directly: they
 tokenize, submit a `Job` to the `Dispatcher`, and await its reply. The dispatcher
@@ -651,7 +664,7 @@ sequenceDiagram
   participant G as generation::run_batch
   participant E as Engine
   participant Sink as SSE sink (per uid)
-  C->>H: POST /v1/{chat,}completions (stream)
+  C->>H: POST /v1/{chat/completions,responses} (stream)
   H->>T: encode prompt (or render chat template then encode)
   H->>D: submit Job{request, sink, reply}
   D->>G: drain queue (<= max_running) -> run_batch

@@ -1,5 +1,6 @@
 // OpenAI-compatible HTTP surface: `POST /v1/completions` (buffered and
 // `stream: true`), `POST /v1/chat/completions` (chat template + tool calls),
+// `POST /v1/responses` (the Responses wire over the same chat path),
 // `GET /v1/models`, `GET /health`. Axum types stay here; the handlers call the
 // application layer, which never sees an HTTP type.
 
@@ -27,7 +28,7 @@ use crate::domain::sampling::SamplingParams;
 use crate::domain::scheduler::FinishReason;
 use crate::domain::{ChatMessage, ChatTool, ChatToolCall};
 
-use super::tool_call::parse_tool_calls;
+use super::tool_call::{ParsedToolCall, parse_tool_calls};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServeError {
@@ -70,6 +71,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/v1/completions", post(completions))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/responses", post(responses))
         .route("/v1/models", get(models))
         .route("/health", get(health))
         .with_state(Arc::new(state))
@@ -444,6 +446,888 @@ pub struct DeltaFunction {
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub arguments: Option<String>,
+}
+
+/// `POST /v1/responses` (the OpenAI Responses wire, used by Codex). The
+/// stateless subset: `input` and `instructions` are rendered through the same
+/// chat template as `/v1/chat/completions`, so tool calling behaves identically.
+/// `store`/`previous_response_id` are accepted and ignored because this server
+/// keeps no conversation state; Codex resends full context in `input`.
+#[derive(Debug, Deserialize)]
+pub struct ResponsesRequest {
+    #[serde(default)]
+    pub model: String,
+    pub input: ResponsesInput,
+    #[serde(default)]
+    pub instructions: Option<String>,
+    /// Flattened Responses tools: `{"type":"function","name",...}`.
+    #[serde(default)]
+    pub tools: Vec<ResponsesTool>,
+    #[serde(default)]
+    pub tool_choice: Option<serde_json::Value>,
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    #[serde(default)]
+    pub stream: Option<bool>,
+    // Accepted for wire compatibility and ignored: reasoning is out of scope
+    // (decision 74), there is no response store, and the server has no
+    // background job queue.
+    #[serde(default)]
+    pub store: Option<bool>,
+    #[serde(default)]
+    pub previous_response_id: Option<String>,
+    #[serde(default)]
+    pub text: Option<serde_json::Value>,
+    #[serde(default)]
+    pub reasoning: Option<serde_json::Value>,
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
+    #[serde(default)]
+    pub parallel_tool_calls: Option<bool>,
+    #[serde(default)]
+    pub background: Option<bool>,
+    #[serde(default)]
+    pub include: Option<Vec<String>>,
+    #[serde(default)]
+    pub prompt_cache_key: Option<String>,
+    #[serde(default)]
+    pub truncation: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum ResponsesInput {
+    Text(String),
+    Items(Vec<ResponsesItem>),
+}
+
+/// One Responses input item. Unknown fields are allowed because Codex replays
+/// output items verbatim (`id`, `status`, `annotations`, ...) and sends fields
+/// this subset does not read.
+#[derive(Debug, Deserialize)]
+pub struct ResponsesItem {
+    #[serde(rename = "type", default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub content: Option<ResponsesContent>,
+    #[serde(default)]
+    pub call_id: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub arguments: Option<serde_json::Value>,
+    #[serde(default)]
+    pub output: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum ResponsesContent {
+    Text(String),
+    Parts(Vec<ResponsesContentPart>),
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ResponsesContentPart {
+    #[serde(rename = "type", default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub text: Option<String>,
+}
+
+impl ResponsesContent {
+    fn text(&self) -> String {
+        match self {
+            ResponsesContent::Text(text) => text.clone(),
+            ResponsesContent::Parts(parts) => parts
+                .iter()
+                .filter_map(|part| part.text.as_deref())
+                .collect::<String>(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ResponsesTool {
+    #[serde(rename = "type", default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub parameters: Option<serde_json::Value>,
+    /// Accepted as well as the flattened shape; Responses itself sends flat.
+    #[serde(default)]
+    pub function: Option<ResponsesFunction>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ResponsesFunction {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub parameters: Option<serde_json::Value>,
+}
+
+impl ResponsesTool {
+    fn to_domain(&self) -> Option<ChatTool> {
+        if self.kind.as_deref().is_some_and(|kind| kind != "function") {
+            return None;
+        }
+        let (name, description, parameters) = match &self.function {
+            Some(function) => (
+                function.name.clone(),
+                function.description.clone(),
+                function.parameters.clone(),
+            ),
+            None => (
+                self.name.clone().unwrap_or_default(),
+                self.description.clone(),
+                self.parameters.clone(),
+            ),
+        };
+        (!name.is_empty()).then(|| ChatTool {
+            name,
+            description,
+            parameters: parameters.map(|p| p.to_string()),
+        })
+    }
+}
+
+impl ResponsesRequest {
+    fn sampling_params(&self) -> SamplingParams {
+        CompletionRequest::params_of(
+            self.max_output_tokens,
+            self.temperature,
+            self.top_p,
+            None,
+            None,
+            None,
+        )
+    }
+
+    fn chat_tools(&self) -> Vec<ChatTool> {
+        let all: Vec<ChatTool> = self
+            .tools
+            .iter()
+            .filter_map(ResponsesTool::to_domain)
+            .collect();
+        match &self.tool_choice {
+            Some(serde_json::Value::String(choice)) if choice == "none" => Vec::new(),
+            Some(serde_json::Value::Object(choice))
+                if choice.get("type").and_then(|v| v.as_str()) == Some("function") =>
+            {
+                let name = choice.get("name").and_then(|v| v.as_str()).or_else(|| {
+                    choice
+                        .get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(|v| v.as_str())
+                });
+                match name {
+                    Some(name) => all.into_iter().filter(|tool| tool.name == name).collect(),
+                    None => all,
+                }
+            }
+            _ => all,
+        }
+    }
+
+    fn chat_messages(&self) -> Result<Vec<ChatMessage>, ApiError> {
+        let mut system = Vec::new();
+        if let Some(instructions) = &self.instructions
+            && !instructions.is_empty()
+        {
+            system.push(instructions.clone());
+        }
+        let mut turns: Vec<ChatMessage> = Vec::new();
+        match &self.input {
+            ResponsesInput::Text(text) => {
+                if text.is_empty() {
+                    return Err(ApiError::bad_request("input must not be empty"));
+                }
+                turns.push(ChatMessage::new("user", text));
+            }
+            ResponsesInput::Items(items) => {
+                for item in items {
+                    match item.kind.as_deref().unwrap_or("message") {
+                        "message" => {
+                            let role = item.role.as_deref().unwrap_or("user");
+                            let role = if role == "developer" { "system" } else { role };
+                            let content = item
+                                .content
+                                .as_ref()
+                                .map(ResponsesContent::text)
+                                .unwrap_or_default();
+                            if role == "system" {
+                                if !content.is_empty() {
+                                    system.push(content);
+                                }
+                            } else if role == "assistant" {
+                                merge_assistant_content(&mut turns, content);
+                            } else {
+                                turns.push(ChatMessage {
+                                    role: role.to_string(),
+                                    content: Some(content),
+                                    tool_calls: Vec::new(),
+                                    tool_call_id: None,
+                                });
+                            }
+                        }
+                        "function_call" => {
+                            let call = ChatToolCall {
+                                id: item
+                                    .call_id
+                                    .clone()
+                                    .or_else(|| item.id.clone())
+                                    .unwrap_or_default(),
+                                name: item.name.clone().unwrap_or_default(),
+                                arguments: arguments_text(item.arguments.as_ref()),
+                            };
+                            merge_assistant_call(&mut turns, call);
+                        }
+                        "function_call_output" => {
+                            turns.push(ChatMessage {
+                                role: "tool".to_string(),
+                                content: Some(stringify(item.output.as_ref())),
+                                tool_calls: Vec::new(),
+                                tool_call_id: item.call_id.clone(),
+                            });
+                        }
+                        // Reasoning items are out of scope (decision 74); Codex
+                        // replays them, but the model sees only text and calls.
+                        "reasoning" => {}
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if !system.is_empty() {
+            turns.insert(0, ChatMessage::new("system", &system.join("\n\n")));
+        }
+        if turns.is_empty() {
+            return Err(ApiError::bad_request("input must not be empty"));
+        }
+        Ok(turns)
+    }
+}
+
+fn merge_assistant_content(turns: &mut Vec<ChatMessage>, content: String) {
+    if let Some(last) = turns.last_mut()
+        && last.role == "assistant"
+        && last.content.is_none()
+        && last.tool_calls.is_empty()
+    {
+        last.content = Some(content);
+        return;
+    }
+    turns.push(ChatMessage {
+        role: "assistant".to_string(),
+        content: Some(content),
+        tool_calls: Vec::new(),
+        tool_call_id: None,
+    });
+}
+
+fn merge_assistant_call(turns: &mut Vec<ChatMessage>, call: ChatToolCall) {
+    if let Some(last) = turns.last_mut()
+        && last.role == "assistant"
+    {
+        last.tool_calls.push(call);
+        return;
+    }
+    turns.push(ChatMessage {
+        role: "assistant".to_string(),
+        content: None,
+        tool_calls: vec![call],
+        tool_call_id: None,
+    });
+}
+
+fn stringify(value: Option<&serde_json::Value>) -> String {
+    match value {
+        None | Some(serde_json::Value::Null) => String::new(),
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(parts)) => {
+            let texts: Vec<&str> = parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(|text| text.as_str()))
+                .collect();
+            if texts.len() == parts.len() {
+                texts.concat()
+            } else {
+                serde_json::Value::Array(parts.clone()).to_string()
+            }
+        }
+        Some(other) => other.to_string(),
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResponsesResponse {
+    pub id: String,
+    pub object: &'static str,
+    pub created_at: u64,
+    pub model: String,
+    pub status: &'static str,
+    pub output: Vec<ResponsesOutputItem>,
+    pub usage: Option<ResponsesUsage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<ResponsesError>,
+    pub parallel_tool_calls: bool,
+    pub tool_choice: serde_json::Value,
+    pub tools: Vec<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResponsesError {
+    pub code: &'static str,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum ResponsesOutputItem {
+    Message(ResponsesOutputMessage),
+    FunctionCall(ResponsesFunctionCall),
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResponsesOutputMessage {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub role: &'static str,
+    pub status: &'static str,
+    pub content: Vec<ResponsesOutputText>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResponsesOutputText {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub text: String,
+    pub annotations: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResponsesFunctionCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub call_id: String,
+    pub name: String,
+    pub arguments: String,
+    pub status: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResponsesUsage {
+    pub input_tokens: usize,
+    pub output_tokens: usize,
+    pub total_tokens: usize,
+    pub input_tokens_details: ResponsesInputTokens,
+    pub output_tokens_details: ResponsesOutputTokens,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResponsesInputTokens {
+    pub cached_tokens: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResponsesOutputTokens {
+    pub reasoning_tokens: usize,
+}
+
+fn responses_usage(g: &generation::Generation) -> ResponsesUsage {
+    ResponsesUsage {
+        input_tokens: g.prompt_tokens,
+        output_tokens: g.tokens.len(),
+        total_tokens: g.prompt_tokens + g.tokens.len(),
+        input_tokens_details: ResponsesInputTokens { cached_tokens: 0 },
+        output_tokens_details: ResponsesOutputTokens {
+            reasoning_tokens: 0,
+        },
+    }
+}
+
+fn responses_output(text: &str, calls: Vec<ParsedToolCall>, uid: u64) -> Vec<ResponsesOutputItem> {
+    let mut output = Vec::new();
+    if !text.is_empty() {
+        output.push(ResponsesOutputItem::Message(ResponsesOutputMessage {
+            id: format!("msg_{uid:08x}"),
+            kind: "message",
+            role: "assistant",
+            status: "completed",
+            content: vec![ResponsesOutputText {
+                kind: "output_text",
+                text: text.to_string(),
+                annotations: Vec::new(),
+            }],
+        }));
+    }
+    for (index, call) in calls.into_iter().enumerate() {
+        output.push(ResponsesOutputItem::FunctionCall(ResponsesFunctionCall {
+            id: format!("fc_{uid:08x}_{index}"),
+            kind: "function_call",
+            call_id: call.id,
+            name: call.name,
+            arguments: call.arguments,
+            status: "completed",
+        }));
+    }
+    output
+}
+
+/// The fields every Responses snapshot repeats. Owned so a stream sink can be
+/// `'static`; the non-stream handler builds one too.
+#[derive(Debug, Clone)]
+struct ResponsesBase {
+    id: String,
+    model: String,
+    created_at: u64,
+    parallel_tool_calls: bool,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    instructions: Option<String>,
+    metadata: Option<serde_json::Value>,
+}
+
+impl ResponsesBase {
+    fn new(state: &AppState, req: &ResponsesRequest, uid: u64) -> Self {
+        Self {
+            id: format!("resp_{uid:08x}"),
+            model: state.served_model_name.clone(),
+            created_at: unix_now(),
+            parallel_tool_calls: req.parallel_tool_calls.unwrap_or(true),
+            temperature: req.temperature,
+            top_p: req.top_p,
+            instructions: req.instructions.clone(),
+            metadata: req.metadata.clone(),
+        }
+    }
+
+    fn response(
+        &self,
+        status: &'static str,
+        output: Vec<ResponsesOutputItem>,
+        usage: Option<ResponsesUsage>,
+        error: Option<ResponsesError>,
+    ) -> ResponsesResponse {
+        ResponsesResponse {
+            id: self.id.clone(),
+            object: "response",
+            created_at: self.created_at,
+            model: self.model.clone(),
+            status,
+            output,
+            usage,
+            error,
+            parallel_tool_calls: self.parallel_tool_calls,
+            tool_choice: serde_json::Value::String("auto".to_string()),
+            tools: Vec::new(),
+            temperature: self.temperature,
+            top_p: self.top_p,
+            instructions: self.instructions.clone(),
+            metadata: self.metadata.clone(),
+        }
+    }
+}
+
+/// The Responses event stream over the same per-token `ChatStream` the chat
+/// endpoint uses. It turns parsed content into `output_text` deltas and a
+/// parsed call into one `function_call` item, then closes with a snapshot.
+struct ResponsesStream {
+    base: ResponsesBase,
+    uid: u64,
+    seq: u64,
+    chat: ChatStream,
+    message: Option<(String, String)>,
+    output: Vec<ResponsesOutputItem>,
+}
+
+impl ResponsesStream {
+    fn new(base: ResponsesBase, uid: u64) -> Self {
+        Self {
+            base,
+            uid,
+            seq: 0,
+            chat: ChatStream::new(),
+            message: None,
+            output: Vec::new(),
+        }
+    }
+
+    fn event(&mut self, kind: &str, body: serde_json::Value) -> String {
+        let mut body = match body {
+            serde_json::Value::Object(map) => map,
+            _ => serde_json::Map::new(),
+        };
+        body.insert("type".into(), serde_json::Value::String(kind.to_string()));
+        body.insert("sequence_number".into(), serde_json::json!(self.seq));
+        self.seq += 1;
+        let payload = serde_json::Value::Object(body).to_string();
+        format!("event: {kind}\ndata: {payload}\n\n")
+    }
+
+    fn opened(&mut self) -> Vec<String> {
+        let response = self.base.response("in_progress", Vec::new(), None, None);
+        let body = serde_json::json!({ "response": response });
+        vec![self.event("response.created", body)]
+    }
+
+    fn token(&mut self, text: &str) -> Vec<String> {
+        let actions = self.chat.feed(text);
+        self.actions(actions)
+    }
+
+    fn end_of_text(&mut self) -> Vec<String> {
+        let (_emitted, flush) = self.chat.finish();
+        match flush {
+            Some(text) => self.actions(vec![ChatAction::Content(text)]),
+            None => Vec::new(),
+        }
+    }
+
+    fn actions(&mut self, actions: Vec<ChatAction>) -> Vec<String> {
+        let mut frames = Vec::new();
+        for action in actions {
+            match action {
+                ChatAction::Content(text) => {
+                    if text.is_empty() {
+                        continue;
+                    }
+                    let index = self.output.len();
+                    if self.message.is_none() {
+                        let id = format!("msg_{:08x}_{index}", self.uid);
+                        frames.push(self.event(
+                            "response.output_item.added",
+                            serde_json::json!({
+                                "output_index": index,
+                                "item": {
+                                    "id": id,
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "status": "in_progress",
+                                    "content": [],
+                                },
+                            }),
+                        ));
+                        frames.push(self.event(
+                            "response.content_part.added",
+                            serde_json::json!({
+                                "item_id": id,
+                                "output_index": index,
+                                "content_index": 0,
+                                "part": {
+                                    "type": "output_text",
+                                    "text": "",
+                                    "annotations": [],
+                                },
+                            }),
+                        ));
+                        self.message = Some((id, String::new()));
+                    }
+                    let id = {
+                        let (id, full) = self.message.as_mut().expect("a message is open");
+                        full.push_str(&text);
+                        id.clone()
+                    };
+                    frames.push(self.event(
+                        "response.output_text.delta",
+                        serde_json::json!({
+                            "item_id": id,
+                            "output_index": index,
+                            "content_index": 0,
+                            "delta": text,
+                            "logprobs": [],
+                        }),
+                    ));
+                }
+                ChatAction::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                    ..
+                } => {
+                    self.close_message(&mut frames);
+                    let index = self.output.len();
+                    let item_id = format!("fc_{:08x}_{index}", self.uid);
+                    frames.push(self.event(
+                        "response.output_item.added",
+                        serde_json::json!({
+                            "output_index": index,
+                            "item": {
+                                "id": item_id,
+                                "type": "function_call",
+                                "call_id": id,
+                                "name": name,
+                                "arguments": "",
+                                "status": "in_progress",
+                            },
+                        }),
+                    ));
+                    frames.push(self.event(
+                        "response.function_call_arguments.delta",
+                        serde_json::json!({
+                            "item_id": item_id,
+                            "output_index": index,
+                            "delta": arguments,
+                        }),
+                    ));
+                    frames.push(self.event(
+                        "response.function_call_arguments.done",
+                        serde_json::json!({
+                            "item_id": item_id,
+                            "output_index": index,
+                            "name": name,
+                            "arguments": arguments,
+                        }),
+                    ));
+                    let item = ResponsesFunctionCall {
+                        id: item_id,
+                        kind: "function_call",
+                        call_id: id,
+                        name,
+                        arguments,
+                        status: "completed",
+                    };
+                    frames.push(self.event(
+                        "response.output_item.done",
+                        serde_json::json!({ "output_index": index, "item": item }),
+                    ));
+                    self.output.push(ResponsesOutputItem::FunctionCall(item));
+                }
+            }
+        }
+        frames
+    }
+
+    fn close_message(&mut self, frames: &mut Vec<String>) {
+        let Some((id, text)) = self.message.take() else {
+            return;
+        };
+        let index = self.output.len();
+        frames.push(self.event(
+            "response.output_text.done",
+            serde_json::json!({
+                "item_id": id,
+                "output_index": index,
+                "content_index": 0,
+                "text": text,
+                "logprobs": [],
+            }),
+        ));
+        frames.push(self.event(
+            "response.content_part.done",
+            serde_json::json!({
+                "item_id": id,
+                "output_index": index,
+                "content_index": 0,
+                "part": {
+                    "type": "output_text",
+                    "text": text,
+                    "annotations": [],
+                },
+            }),
+        ));
+        let item = ResponsesOutputMessage {
+            id,
+            kind: "message",
+            role: "assistant",
+            status: "completed",
+            content: vec![ResponsesOutputText {
+                kind: "output_text",
+                text,
+                annotations: Vec::new(),
+            }],
+        };
+        frames.push(self.event(
+            "response.output_item.done",
+            serde_json::json!({ "output_index": index, "item": item }),
+        ));
+        self.output.push(ResponsesOutputItem::Message(item));
+    }
+
+    fn finish(&mut self, g: &generation::Generation) -> Vec<String> {
+        let mut frames = self.end_of_text();
+        self.close_message(&mut frames);
+        let response = self.base.response(
+            "completed",
+            self.output.clone(),
+            Some(responses_usage(g)),
+            None,
+        );
+        frames.push(self.event(
+            "response.completed",
+            serde_json::json!({ "response": response }),
+        ));
+        frames
+    }
+
+    fn failed(&mut self, message: &str) -> String {
+        let response = self.base.response(
+            "failed",
+            self.output.clone(),
+            None,
+            Some(ResponsesError {
+                code: "server_error",
+                message: message.to_string(),
+            }),
+        );
+        self.event(
+            "response.failed",
+            serde_json::json!({ "response": response }),
+        )
+    }
+}
+
+/// `stream: true` for `/v1/responses`: the same dispatcher job and per-token
+/// sink as the chat stream, formatted as Responses events. Frames ride a
+/// bounded channel, so a slow client drops its own stream instead of stalling
+/// the batch it rides in.
+fn responses_stream_body(
+    state: &Arc<AppState>,
+    request: generation::Request,
+    req: &ResponsesRequest,
+) -> Response {
+    let (tx, rx) = mpsc::channel::<String>(32);
+    let base = ResponsesBase::new(state, req, request.uid);
+    let stream = Arc::new(Mutex::new(ResponsesStream::new(base, request.uid)));
+    for frame in stream.lock().expect("responses stream lock").opened() {
+        let _ = tx.try_send(frame);
+    }
+
+    let sink_tx = tx.clone();
+    let sink_stream = Arc::clone(&stream);
+    let sink: crate::application::dispatcher::Sink = Box::new(move |_uid, text, _id, _index| {
+        let mut stream = sink_stream.lock().expect("responses stream lock");
+        for frame in stream.token(text) {
+            if sink_tx.try_send(frame).is_err() {
+                return false;
+            }
+        }
+        true
+    });
+
+    let (reply, rx_reply) = tokio::sync::oneshot::channel();
+    if state
+        .dispatcher
+        .submit(Job {
+            request,
+            sink: Some(sink),
+            reply,
+        })
+        .is_err()
+    {
+        let frame = stream
+            .lock()
+            .expect("responses stream lock")
+            .failed("the engine worker is not running");
+        let _ = tx.try_send(frame);
+        let _ = tx.try_send(sse_data("[DONE]"));
+        drop(tx);
+        return sse_response(rx);
+    }
+
+    let final_tx = tx.clone();
+    let final_stream = Arc::clone(&stream);
+    tokio::spawn(async move {
+        let reply = rx_reply.await;
+        let frames = {
+            let mut stream = final_stream.lock().expect("responses stream lock");
+            match reply {
+                Ok(Ok(g)) if g.finish_reason == FinishReason::Abort => {
+                    vec![stream.failed("the generation was aborted")]
+                }
+                Ok(Ok(g)) => stream.finish(&g),
+                Ok(Err(msg)) => vec![stream.failed(&msg)],
+                Err(_) => vec![stream.failed("the engine worker dropped the request")],
+            }
+        };
+        for frame in frames {
+            let _ = final_tx.try_send(frame);
+        }
+        let _ = final_tx.try_send(sse_data("[DONE]"));
+        drop(final_tx);
+    });
+    drop(tx);
+    sse_response(rx)
+}
+
+async fn responses(
+    State(state): State<Arc<AppState>>,
+    payload: Result<Json<ResponsesRequest>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    let Json(req) =
+        payload.map_err(|e| ApiError::bad_request(format!("invalid json body: {e}")))?;
+
+    if !req.model.is_empty() && req.model != state.served_model_name {
+        return Err(ApiError::not_found(format!(
+            "model {} not found, this server serves {}",
+            req.model, state.served_model_name
+        )));
+    }
+    if req.max_output_tokens == Some(0) {
+        return Err(ApiError::bad_request(
+            "max_output_tokens must be a positive integer",
+        ));
+    }
+    if req.background == Some(true) {
+        return Err(ApiError::bad_request("background mode is not supported"));
+    }
+
+    let messages = req.chat_messages()?;
+    let tools = req.chat_tools();
+    let uid = state.next_uid();
+    let engine = Arc::clone(&state.engine);
+    let params = req.sampling_params();
+    let streaming = req.stream.unwrap_or(false);
+
+    let worker = Arc::clone(&engine);
+    let prepared =
+        tokio::task::spawn_blocking(move || -> Result<generation::Request, EngineError> {
+            let prompt = worker.render_chat(&messages, &tools)?;
+            let ids = worker.encode(&prompt)?;
+            make_request(&worker, uid, ids, params, uid)
+        })
+        .await
+        .expect("preparation task is not cancellable");
+    let request = match prepared {
+        Ok(r) => r,
+        Err(e) => return Err(ApiError::from(e)),
+    };
+
+    if streaming {
+        return Ok(responses_stream_body(&state, request, &req));
+    }
+
+    let generated = dispatch(&state, request, None).await?;
+    let (content, calls) = parse_tool_calls(&generated.text);
+    let output = responses_output(&content, calls, uid);
+    let base = ResponsesBase::new(&state, &req, uid);
+    Ok(
+        Json(base.response("completed", output, Some(responses_usage(&generated)), None))
+            .into_response(),
+    )
 }
 
 #[derive(Debug, Serialize)]
@@ -1270,6 +2154,286 @@ mod tests {
 
     fn chunk_of(frame: &str) -> serde_json::Value {
         serde_json::from_str(&frame[6..]).expect("a data frame holds one json")
+    }
+
+    async fn post_responses_with(
+        router: Router,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = router
+            .oneshot(
+                Request::post("/v1/responses")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    async fn post_responses(body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+        post_responses_with(test_router(), body).await
+    }
+
+    /// Responses SSE frames pair an `event:` line with a `data:` line, so they
+    /// are split whole; `[DONE]` is a bare data frame.
+    async fn post_responses_sse_with(router: Router, body: serde_json::Value) -> Vec<String> {
+        let response = router
+            .oneshot(
+                Request::post("/v1/responses")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec())
+            .unwrap()
+            .split("\n\n")
+            .filter(|f| !f.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn responses_event(frame: &str) -> (String, serde_json::Value) {
+        let mut kind = String::new();
+        let mut data = String::new();
+        for line in frame.split('\n') {
+            if let Some(rest) = line.strip_prefix("event: ") {
+                kind = rest.to_string();
+            } else if let Some(rest) = line.strip_prefix("data: ") {
+                data = rest.to_string();
+            }
+        }
+        let value = serde_json::from_str(&data).expect("a data line holds one json");
+        (kind, value)
+    }
+
+    #[tokio::test]
+    async fn responses_text_input_answers_a_message_item() {
+        let (router, rec) = test_router_with_rec();
+        let (status, body) = post_responses_with(
+            router,
+            serde_json::json!({
+                "model": "test-model",
+                "instructions": "be brief",
+                "input": "ab",
+                "max_output_tokens": 3,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["object"], "response");
+        assert!(body["id"].as_str().unwrap().starts_with("resp_"));
+        assert_eq!(body["status"], "completed");
+        assert_eq!(body["output"][0]["type"], "message");
+        assert_eq!(body["output"][0]["role"], "assistant");
+        assert_eq!(body["output"][0]["content"][0]["type"], "output_text");
+        assert_eq!(
+            body["output"][0]["content"][0]["text"],
+            fake_text(&fake_tokens(&rendered("be brief", "ab"), 3))
+        );
+        assert_eq!(
+            body["usage"]["input_tokens"],
+            rendered("be brief", "ab").len()
+        );
+        assert_eq!(body["usage"]["output_tokens"], 3);
+        assert_eq!(
+            body["usage"]["total_tokens"],
+            rendered("be brief", "ab").len() + 3
+        );
+
+        let prompt: Vec<u32> = rendered("be brief", "ab").bytes().map(u32::from).collect();
+        assert_eq!(rec.calls()[0].input_ids, prompt);
+    }
+
+    #[tokio::test]
+    async fn responses_function_call_output_renders_the_tool_turn() {
+        let (router, rec) = test_router_with_rec();
+        let (status, _) = post_responses_with(
+            router,
+            serde_json::json!({
+                "input": [
+                    { "role": "user", "content": "weather?" },
+                    {
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "get_weather",
+                        "arguments": "{\"city\":\"Paris\"}"
+                    },
+                    { "type": "function_call_output", "call_id": "call_1", "output": "sunny" }
+                ],
+                "max_output_tokens": 1,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let prompt = "user\nweather?\nassistant\n\ntool\nsunny\nassistant\n";
+        assert_eq!(
+            rec.calls()[0].input_ids,
+            prompt.bytes().map(u32::from).collect::<Vec<u32>>(),
+            "the function call and its output become assistant/tool turns"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_tool_call_returns_a_function_call_item() {
+        let (status, body) = post_responses_with(
+            tool_router(),
+            serde_json::json!({
+                "model": "test-model",
+                "input": "weather in Paris?",
+                "tools": [{
+                    "type": "function",
+                    "name": "get_weather",
+                    "description": "look up weather",
+                    "parameters": { "type": "object" }
+                }],
+                "max_output_tokens": TOOL_SCRIPT.len(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "completed");
+        let output = body["output"].as_array().expect("output array");
+        assert_eq!(output.len(), 1, "no text, one call: {output:?}");
+        assert_eq!(output[0]["type"], "function_call");
+        assert_eq!(output[0]["name"], "get_weather");
+        assert_eq!(output[0]["status"], "completed");
+        assert!(output[0]["call_id"].as_str().unwrap().starts_with("call_"));
+        let args: serde_json::Value =
+            serde_json::from_str(output[0]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["city"], "Paris");
+    }
+
+    #[tokio::test]
+    async fn responses_streams_text_deltas_and_completes() {
+        let frames = post_responses_sse_with(
+            test_router(),
+            serde_json::json!({
+                "input": "ab",
+                "instructions": "be brief",
+                "max_output_tokens": 3,
+                "stream": true,
+            }),
+        )
+        .await;
+        let events: Vec<(String, serde_json::Value)> = frames
+            .iter()
+            .filter(|f| *f != "data: [DONE]")
+            .map(|f| responses_event(f))
+            .collect();
+        assert_eq!(events[0].0, "response.created");
+        assert_eq!(events[0].1["response"]["status"], "in_progress");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|(kind, _)| kind == "response.output_text.delta")
+                .count(),
+            3
+        );
+        let text: String = events
+            .iter()
+            .filter(|(kind, _)| kind == "response.output_text.delta")
+            .map(|(_, data)| data["delta"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            text,
+            fake_text(&fake_tokens(&rendered("be brief", "ab"), 3))
+        );
+        let done = events
+            .iter()
+            .find(|(kind, _)| kind == "response.output_text.done")
+            .expect("a text done event");
+        assert_eq!(done.1["text"], text);
+        let completed = events
+            .iter()
+            .find(|(kind, _)| kind == "response.completed")
+            .expect("a completed event");
+        assert_eq!(completed.1["response"]["status"], "completed");
+        assert_eq!(
+            completed.1["response"]["output"][0]["content"][0]["text"],
+            text
+        );
+        assert_eq!(completed.1["response"]["usage"]["output_tokens"], 3);
+        assert_eq!(frames.last().unwrap(), "data: [DONE]");
+    }
+
+    #[tokio::test]
+    async fn responses_streams_function_call_arguments() {
+        let frames = post_responses_sse_with(
+            tool_router(),
+            serde_json::json!({
+                "input": "weather in Paris?",
+                "tools": [{
+                    "type": "function",
+                    "name": "get_weather",
+                    "parameters": { "type": "object" }
+                }],
+                "max_output_tokens": TOOL_SCRIPT.len(),
+                "stream": true,
+            }),
+        )
+        .await;
+        let events: Vec<(String, serde_json::Value)> = frames
+            .iter()
+            .filter(|f| *f != "data: [DONE]")
+            .map(|f| responses_event(f))
+            .collect();
+        let added = events
+            .iter()
+            .find(|(kind, _)| kind == "response.output_item.added")
+            .expect("a call item added");
+        assert_eq!(added.1["item"]["type"], "function_call");
+        assert_eq!(added.1["item"]["name"], "get_weather");
+        let args_done = events
+            .iter()
+            .find(|(kind, _)| kind == "response.function_call_arguments.done")
+            .expect("arguments done");
+        let args: serde_json::Value =
+            serde_json::from_str(args_done.1["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["city"], "Paris");
+        let completed = events
+            .iter()
+            .find(|(kind, _)| kind == "response.completed")
+            .expect("a completed event");
+        assert_eq!(
+            completed.1["response"]["output"][0]["type"],
+            "function_call"
+        );
+        assert_eq!(frames.last().unwrap(), "data: [DONE]");
+    }
+
+    #[tokio::test]
+    async fn responses_ignores_stateful_fields_and_rejects_an_empty_input() {
+        let (status, _) = post_responses(serde_json::json!({
+            "input": "hi",
+            "store": true,
+            "previous_response_id": "resp_other",
+            "metadata": { "k": "v" },
+            "text": { "format": { "type": "text" } },
+            "reasoning": { "effort": "low" },
+            "max_output_tokens": 1,
+        }))
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = post_responses(serde_json::json!({ "input": [] })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"]["message"].as_str().unwrap().contains("input"));
+
+        let (status, _) =
+            post_responses(serde_json::json!({ "input": "hi", "max_output_tokens": 0 })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

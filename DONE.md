@@ -2744,6 +2744,47 @@ settled.
      for a revisit if that gate is deliberately re-based or the precision class
      changes.
 
+109. **The stateless OpenAI Responses subset is served at `POST /v1/responses`**
+     (2026-10-19, implemented) -- the `[opt]` item of decision 74, so Codex-style
+     clients can drive the server without a second generation path.
+     - **Mapping.** `ResponsesRequest` takes `input` as a plain string or an item
+       array, `instructions`, flattened `tools` (`{"type":"function","name",...}`,
+       the nested `function` shape also accepted), `tool_choice`,
+       `max_output_tokens`, `temperature`, `top_p` and `stream`. Items map onto
+       the existing domain `ChatMessage`: `message` (a `developer` role folds to
+       `system`, consecutive assistant content and `function_call` items merge
+       into one turn), `function_call` -> assistant `tool_calls`,
+       `function_call_output` -> a `role: "tool"` turn with its `call_id`, and
+       `reasoning` is dropped. All system text (top-level `instructions` plus
+       `system`/`developer` items) is joined into one leading system turn, which
+       strict chat templates require. The prompt goes through the same
+       `render_chat` + `encode` + `make_request` and the answer through the same
+       `parse_tool_calls`, so tool calling is identical to chat-completions.
+     - **Wire.** Non-stream returns `resp_<uid>` with `object: "response"`,
+       `status: "completed"`, `output` items (`message`/`output_text` and
+       `function_call` with `call_id`/`name`/`arguments`) and Responses `usage`
+       (`input_tokens`/`output_tokens`/`total_tokens` plus the details objects).
+       Stream reuses the chat `ChatStream` state machine over a bounded channel:
+       `response.created`, `output_item.added`, `content_part.added`,
+       `output_text.delta`/`.done`, `function_call_arguments.delta`/`.done`,
+       `output_item.done`, then `response.completed` carrying the full response;
+       a mid-run failure emits `response.failed`. `data: [DONE]` closes it.
+     - **Ignored, with reason.** `store` and `previous_response_id` are accepted
+       and ignored because the server is stateless and Codex resends the full
+       context in `input`; `text`, `reasoning` and `metadata` are accepted and
+       ignored because reasoning is out of scope (decision 74) and there is no
+       response store to carry metadata. `background: true` is rejected, and so
+       is `max_output_tokens: 0`; the input items tolerate unknown fields because
+       Codex replays output items (`id`, `status`, `annotations`) verbatim.
+     - **Not ported.** Reasoning items (`response.reasoning_text.*`), built-in
+       tools, images, and `GET /v1/responses/{id}`/cancel (no store).
+     - **Tests.** HTTP integration tests over the fake and scripted tokenizers:
+       text input with `instructions`, a multi-turn `function_call_output`
+       input, a tool call, the streamed text and tool-call event sequences, and
+       the ignored stateful fields plus empty/zero-token rejection. CPU gates
+       green (`cargo test`, `cargo clippy --all-targets [--features cuda]`,
+       `cargo test --features cuda --lib`, `cargo fmt --check`).
+
 ---
 
 
