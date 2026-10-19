@@ -2657,6 +2657,39 @@ settled.
      reference's 30.3, with the residual split over copy (PCIe, miss-bound),
      GDN/attention projections (read roofline), and MoE GEMV (near parity).
 
+105. **Tool calling is implemented on `/v1/chat/completions`** (2026-10-19,
+     implemented) -- the feature decision 74 brought into scope. The checkpoint
+     emits tool calls as plain text (`<tool_call><function=NAME><parameter=K>V
+     </parameter></function></tool_call>`); the server now renders `tools` into
+     the prompt, parses the answer, and speaks OpenAI's `tool_calls` wire.
+     - **Domain.** `ChatMessage` gains `content: Option<String>`, `tool_calls`
+       and `tool_call_id`; new `ChatTool`/`ChatToolCall`; `Tokenizer::render_chat`
+       takes a `&[ChatTool]`. The domain stays serde_json-free.
+     - **Adapter.** `tokenizers_hf::ChatTemplate::render` builds the jinja
+       context: a message's `tool_calls[].function.arguments` is the wire JSON
+       string parsed to a mapping (the template does `arguments|items`; parse
+       failure -> `{}`), and `tools` is `null` when empty else the OpenAI function
+       list. minijinja gains the `json` feature for the template's `tojson`.
+     - **Parser.** New `infrastructure/tool_call.rs`: `parse_tool_calls` returns
+       the leading content and calls; a `<parameter=K>V` value that reads as JSON
+       stays JSON, else a JSON string; ids are `call_<counter>`. Unterminated or
+       function-less blocks are content, no call.
+     - **HTTP.** `ChatCompletionRequest` accepts `tools`/`tool_choice`/
+       `parallel_tool_calls`; `ChatTurn` accepts `content: Option`, `tool_calls`
+       and `tool_call_id` (the last two also let a `role: "tool"` result round-
+       trip). Non-stream sets `message.tool_calls` and
+       `finish_reason: "tool_calls"`; the chat stream buffers from a `<tool_call>`
+       opener (holding a partial opener across token boundaries),
+       emits `tool_calls` deltas (open: index/id/type/name; then arguments) and
+       finishes with `finish_reason: "tool_calls"`, falling back to content for a
+       malformed block. Content before the call streams as before.
+     - **Tests.** Parser unit tests; adapter rendering tests (incl. the real
+       checkpoint template with tools); HTTP non-stream and stream tool-call
+       integration tests over a scripted tokenizer, plus the stream state
+       machine's partial/malformed cases. All CPU gates green
+       (`cargo test`, `cargo clippy --all-targets [--features cuda]`,
+       `cargo fmt --check`).
+
 ---
 
 

@@ -105,7 +105,7 @@ fn a_chat_request_answers_from_the_rendered_template() {
         ChatMessage::new("system", "be brief"),
         ChatMessage::new("user", PROMPT),
     ];
-    let prompt = engine.render_chat(&conversation).unwrap();
+    let prompt = engine.render_chat(&conversation, &[]).unwrap();
     let ids = engine.encode(&prompt).unwrap();
     assert_eq!(
         ids, CHAT_TEMPLATE_ORACLE_IDS,

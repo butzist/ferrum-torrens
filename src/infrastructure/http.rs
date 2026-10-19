@@ -1,11 +1,11 @@
 // OpenAI-compatible HTTP surface: `POST /v1/completions` (buffered and
-// `stream: true`), `GET /v1/models`, `GET /health`. Axum types stay here; the
-// handlers call the application layer, which never sees an HTTP type.
-// `/v1/chat/completions` lands later (TODO.md section "Server").
+// `stream: true`), `POST /v1/chat/completions` (chat template + tool calls),
+// `GET /v1/models`, `GET /health`. Axum types stay here; the handlers call the
+// application layer, which never sees an HTTP type.
 
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use axum::Json;
@@ -23,9 +23,11 @@ use tokio::sync::mpsc;
 use crate::application::dispatcher::{Dispatcher, Job};
 use crate::application::engine::{Engine, EngineError};
 use crate::application::generation::{self, Request, make_request};
-use crate::domain::ChatMessage;
 use crate::domain::sampling::SamplingParams;
 use crate::domain::scheduler::FinishReason;
+use crate::domain::{ChatMessage, ChatTool, ChatToolCall};
+
+use super::tool_call::parse_tool_calls;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServeError {
@@ -227,6 +229,15 @@ pub struct ChatCompletionRequest {
     pub stream: Option<bool>,
     #[serde(default)]
     pub n: Option<u32>,
+    /// Callable functions the model may call; rendered into the system turn.
+    #[serde(default)]
+    pub tools: Vec<ChatToolSpec>,
+    /// `auto`/`none`/`required` or a named function; accepted and ignored (the
+    /// model decides from the prompt the template builds).
+    #[serde(default)]
+    pub tool_choice: Option<serde_json::Value>,
+    #[serde(default)]
+    pub parallel_tool_calls: Option<bool>,
     // Accepted and ignored; see `CompletionRequest`.
     #[serde(default)]
     pub presence_penalty: Option<f32>,
@@ -238,11 +249,98 @@ pub struct ChatCompletionRequest {
     pub user: Option<String>,
 }
 
+/// One OpenAI function tool: `{"type":"function","function":{...}}`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatToolSpec {
+    #[serde(rename = "type", default)]
+    pub kind: Option<String>,
+    pub function: FunctionDef,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FunctionDef {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub parameters: Option<serde_json::Value>,
+}
+
+impl ChatToolSpec {
+    fn to_domain(&self) -> ChatTool {
+        ChatTool {
+            name: self.function.name.clone(),
+            description: self.function.description.clone(),
+            parameters: self.function.parameters.as_ref().map(|v| v.to_string()),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChatTurn {
     pub role: String,
-    pub content: String,
+    #[serde(default)]
+    pub content: Option<String>,
+    /// Assistant tool calls answered later by a `role: "tool"` turn.
+    #[serde(default)]
+    pub tool_calls: Option<Vec<TurnToolCall>>,
+    /// On a `role: "tool"` turn, the id of the call this result answers.
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TurnToolCall {
+    pub id: String,
+    #[serde(rename = "type", default)]
+    pub kind: Option<String>,
+    pub function: TurnFunction,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TurnFunction {
+    pub name: String,
+    #[serde(default)]
+    pub arguments: Option<serde_json::Value>,
+}
+
+impl ChatTurn {
+    fn to_domain(&self) -> ChatMessage {
+        ChatMessage {
+            role: self.role.clone(),
+            content: self.content.clone(),
+            tool_calls: self
+                .tool_calls
+                .as_ref()
+                .map(|calls| {
+                    calls
+                        .iter()
+                        .map(|c| ChatToolCall {
+                            id: c.id.clone(),
+                            name: c.function.name.clone(),
+                            arguments: arguments_text(c.function.arguments.as_ref()),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            tool_call_id: self.tool_call_id.clone(),
+        }
+    }
+}
+
+/// A client sends `arguments` as a JSON string (OpenAI's shape); accept an
+/// object too. The domain wants the wire JSON string either way.
+fn arguments_text(value: Option<&serde_json::Value>) -> String {
+    match value {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(other) => other.to_string(),
+        None => "{}".to_string(),
+    }
 }
 
 impl ChatCompletionRequest {
@@ -280,6 +378,22 @@ pub struct ChatChoice {
 pub struct ChatMessageOut {
     pub role: &'static str,
     pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<OutToolCall>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OutToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub function: OutFunction,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OutFunction {
+    pub name: String,
+    pub arguments: String,
 }
 
 /// One streamed chat chunk: `delta` carries the role on the opening frame and
@@ -307,6 +421,29 @@ pub struct ChatDelta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<&'static str>,
     pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<DeltaToolCall>>,
+}
+
+/// A `tool_calls` stream delta: the opening frame names `index`/`id`/`type`/
+/// `function.name`, later frames carry `function.arguments` in pieces.
+#[derive(Debug, Serialize)]
+pub struct DeltaToolCall {
+    pub index: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub kind: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function: Option<DeltaFunction>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeltaFunction {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -604,6 +741,7 @@ impl Frames {
                     delta: ChatDelta {
                         role: (finish.is_none() && text.is_empty()).then_some("assistant"),
                         content: text.to_string(),
+                        tool_calls: None,
                     },
                     finish_reason: finish,
                 }],
@@ -615,6 +753,49 @@ impl Frames {
 
     /// The opening chat frame: names the role before any content arrives.
     fn role(&self) -> String {
+        self.chat_frame(ChatDelta {
+            role: Some("assistant"),
+            content: String::new(),
+            tool_calls: None,
+        })
+    }
+
+    /// The first frame of a tool call: names `index`, `id`, `type` and the
+    /// function, with empty arguments.
+    fn tool_open(&self, index: usize, id: &str, name: &str) -> String {
+        self.chat_frame(ChatDelta {
+            role: None,
+            content: String::new(),
+            tool_calls: Some(vec![DeltaToolCall {
+                index,
+                id: Some(id.to_string()),
+                kind: Some("function"),
+                function: Some(DeltaFunction {
+                    name: Some(name.to_string()),
+                    arguments: None,
+                }),
+            }]),
+        })
+    }
+
+    /// A follow-up frame carrying the call's `arguments` JSON.
+    fn tool_args(&self, index: usize, arguments: &str) -> String {
+        self.chat_frame(ChatDelta {
+            role: None,
+            content: String::new(),
+            tool_calls: Some(vec![DeltaToolCall {
+                index,
+                id: None,
+                kind: None,
+                function: Some(DeltaFunction {
+                    name: None,
+                    arguments: Some(arguments.to_string()),
+                }),
+            }]),
+        })
+    }
+
+    fn chat_frame(&self, delta: ChatDelta) -> String {
         let payload = serde_json::to_string(&ChatChunk {
             id: self.id.clone(),
             object: "chat.completion.chunk",
@@ -622,10 +803,7 @@ impl Frames {
             model: self.model.clone(),
             choices: vec![ChatChunkChoice {
                 index: 0,
-                delta: ChatDelta {
-                    role: Some("assistant"),
-                    content: String::new(),
-                },
+                delta,
                 finish_reason: None,
             }],
             usage: None,
@@ -651,6 +829,112 @@ fn sse_response(rx: mpsc::Receiver<String>) -> Response {
         .expect("a static response builder succeeds")
 }
 
+/// One thing a chat stream should emit as tokens arrive: either assistant
+/// content, or a fully-parsed tool call.
+enum ChatAction {
+    Content(String),
+    ToolCall {
+        index: usize,
+        id: String,
+        name: String,
+        arguments: String,
+    },
+}
+
+/// Turns the per-token chat stream into content up to the first `<tool_call>`
+/// and tool-call events after it. Text that could still grow into the opener
+/// (`<`, `<tool`, ...) is held back so a token boundary cannot leak a partial
+/// tag as content. An unterminated block at the end is flushed as content, so a
+/// malformed answer is not silently dropped.
+struct ChatStream {
+    buffer: String,
+    in_tool: bool,
+    emitted: usize,
+}
+
+impl ChatStream {
+    fn new() -> Self {
+        Self {
+            buffer: String::new(),
+            in_tool: false,
+            emitted: 0,
+        }
+    }
+
+    fn feed(&mut self, piece: &str) -> Vec<ChatAction> {
+        const OPEN: &str = "<tool_call>";
+        const CLOSE: &str = "</tool_call>";
+        let mut actions = Vec::new();
+        self.buffer.push_str(piece);
+        loop {
+            if !self.in_tool {
+                match self.buffer.find(OPEN) {
+                    Some(pos) => {
+                        if pos > 0 {
+                            actions.push(ChatAction::Content(self.buffer[..pos].to_string()));
+                        }
+                        self.buffer.drain(..pos + OPEN.len());
+                        self.in_tool = true;
+                    }
+                    None => {
+                        let keep = partial_opener(&self.buffer, OPEN);
+                        let emit = self.buffer.len() - keep;
+                        if emit > 0 {
+                            actions.push(ChatAction::Content(self.buffer.drain(..emit).collect()));
+                        }
+                        break;
+                    }
+                }
+            } else if let Some(pos) = self.buffer.find(CLOSE) {
+                let inner = self.buffer[..pos].to_string();
+                self.buffer.drain(..pos + CLOSE.len());
+                self.in_tool = false;
+                match super::tool_call::parse_block(&inner) {
+                    Some(call) => {
+                        self.emitted += 1;
+                        actions.push(ChatAction::ToolCall {
+                            index: self.emitted - 1,
+                            id: call.id,
+                            name: call.name,
+                            arguments: call.arguments,
+                        });
+                    }
+                    None => actions.push(ChatAction::Content(format!("{OPEN}{inner}{CLOSE}"))),
+                }
+            } else {
+                break;
+            }
+        }
+        actions
+    }
+
+    /// The run is over: any still-open block or held-back suffix becomes
+    /// content, but only when no complete call was emitted.
+    fn finish(&mut self) -> (usize, Option<String>) {
+        let pending = if self.in_tool {
+            format!("<tool_call>{}", self.buffer)
+        } else {
+            std::mem::take(&mut self.buffer)
+        };
+        self.buffer.clear();
+        let flush = (self.emitted == 0 && !pending.is_empty()).then_some(pending);
+        (self.emitted, flush)
+    }
+}
+
+/// Longest suffix of `buffer` that is a proper prefix of `open`, so it might
+/// still complete into the opener on a later token.
+fn partial_opener(buffer: &str, open: &str) -> usize {
+    let max = open.len().saturating_sub(1).min(buffer.len());
+    for keep in (1..=max).rev() {
+        let start = buffer.len() - keep;
+        if buffer.is_char_boundary(start) && open.starts_with(&buffer[start..]) {
+            return keep;
+        }
+    }
+    0
+}
+
 /// `stream: true`: one `data: {...}` frame per token as it is sampled, a frame
 /// carrying the finish reason plus the usage, then `data: [DONE]`.
 ///
@@ -668,17 +952,53 @@ fn stream_body(state: &Arc<AppState>, request: generation::Request, wire: Wire) 
         created: unix_now(),
         model: state.served_model_name.clone(),
     };
+    let tool_stream = Arc::new(Mutex::new(ChatStream::new()));
     if let Wire::Chat = wire {
         let _ = tx.try_send(frames.role());
     }
 
-    let sink_tx = tx.clone();
-    let sink_frames = frames.clone();
-    let sink: crate::application::dispatcher::Sink = Box::new(move |_uid, text, _id, _index| {
-        sink_tx
-            .try_send(sink_frames.chunk(text, None, None))
-            .is_ok()
-    });
+    let sink: crate::application::dispatcher::Sink = match wire {
+        Wire::Text => {
+            let sink_tx = tx.clone();
+            let sink_frames = frames.clone();
+            Box::new(move |_uid, text, _id, _index| {
+                sink_tx
+                    .try_send(sink_frames.chunk(text, None, None))
+                    .is_ok()
+            })
+        }
+        Wire::Chat => {
+            let sink_tx = tx.clone();
+            let sink_frames = frames.clone();
+            let stream = Arc::clone(&tool_stream);
+            Box::new(move |_uid, text, _id, _index| {
+                let actions = stream.lock().expect("tool stream lock").feed(text);
+                for action in actions {
+                    let frame = match action {
+                        ChatAction::Content(content) => sink_frames.chunk(&content, None, None),
+                        ChatAction::ToolCall {
+                            index,
+                            id,
+                            name,
+                            arguments,
+                        } => {
+                            if sink_tx
+                                .try_send(sink_frames.tool_open(index, &id, &name))
+                                .is_err()
+                            {
+                                return false;
+                            }
+                            sink_frames.tool_args(index, &arguments)
+                        }
+                    };
+                    if sink_tx.try_send(frame).is_err() {
+                        return false;
+                    }
+                }
+                true
+            })
+        }
+    };
 
     let (reply, rx_reply) = tokio::sync::oneshot::channel();
     if state
@@ -698,12 +1018,23 @@ fn stream_body(state: &Arc<AppState>, request: generation::Request, wire: Wire) 
 
     let final_tx = tx.clone();
     let final_frames = frames.clone();
+    let final_tools = Arc::clone(&tool_stream);
     tokio::spawn(async move {
         match rx_reply.await {
             Ok(Ok(g)) => {
                 if g.finish_reason != FinishReason::Abort {
                     let usage = usage_of(&g);
-                    let reason = finish_reason_str(g.finish_reason);
+                    let mut reason = finish_reason_str(g.finish_reason);
+                    if let Wire::Chat = final_frames.wire {
+                        let (emitted, leftover) =
+                            final_tools.lock().expect("tool stream lock").finish();
+                        if let Some(text) = leftover {
+                            let _ = final_tx.try_send(final_frames.chunk(&text, None, None));
+                        }
+                        if emitted > 0 {
+                            reason = "tool_calls";
+                        }
+                    }
                     let _ = final_tx.try_send(final_frames.chunk("", Some(reason), Some(usage)));
                     let _ = final_tx.try_send(sse_data("[DONE]"));
                 }
@@ -749,18 +1080,15 @@ async fn chat_completions(
     let params = req.sampling_params();
     let seed = req.seed.unwrap_or(uid);
     let streaming = req.stream.unwrap_or(false);
-    let messages: Vec<ChatMessage> = req
-        .messages
-        .iter()
-        .map(|t| ChatMessage::new(&t.role, &t.content))
-        .collect();
+    let messages: Vec<ChatMessage> = req.messages.iter().map(ChatTurn::to_domain).collect();
+    let tools: Vec<ChatTool> = req.tools.iter().map(ChatToolSpec::to_domain).collect();
 
     // Rendering the template and tokenizing it both run off the runtime, and both
     // still have to answer with a status code rather than a frame.
     let worker = Arc::clone(&engine);
     let prepared =
         tokio::task::spawn_blocking(move || -> Result<generation::Request, EngineError> {
-            let prompt = worker.render_chat(&messages)?;
+            let prompt = worker.render_chat(&messages, &tools)?;
             let ids = worker.encode(&prompt)?;
             make_request(&worker, uid, ids, params, seed)
         })
@@ -777,6 +1105,38 @@ async fn chat_completions(
 
     let generated = dispatch(&state, request, None).await?;
     let usage = usage_of(&generated);
+    let (content, calls) = parse_tool_calls(&generated.text);
+    let (message, finish_reason) = if calls.is_empty() {
+        (
+            ChatMessageOut {
+                role: "assistant",
+                content: generated.text,
+                tool_calls: None,
+            },
+            finish_reason_str(generated.finish_reason),
+        )
+    } else {
+        (
+            ChatMessageOut {
+                role: "assistant",
+                content,
+                tool_calls: Some(
+                    calls
+                        .into_iter()
+                        .map(|c| OutToolCall {
+                            id: c.id,
+                            kind: "function",
+                            function: OutFunction {
+                                name: c.name,
+                                arguments: c.arguments,
+                            },
+                        })
+                        .collect(),
+                ),
+            },
+            "tool_calls",
+        )
+    };
     Ok(Json(ChatCompletionResponse {
         id: format!("chatcmpl-{}", generated.uid),
         object: "chat.completion",
@@ -784,11 +1144,8 @@ async fn chat_completions(
         model: state.served_model_name.clone(),
         choices: vec![ChatChoice {
             index: 0,
-            message: ChatMessageOut {
-                role: "assistant",
-                content: generated.text,
-            },
-            finish_reason: Some(finish_reason_str(generated.finish_reason)),
+            message,
+            finish_reason: Some(finish_reason),
         }],
         usage: Some(usage),
     })
@@ -886,7 +1243,11 @@ mod tests {
     }
 
     async fn post_chat_sse(body: serde_json::Value) -> Vec<String> {
-        let response = test_router()
+        post_chat_sse_with(test_router(), body).await
+    }
+
+    async fn post_chat_sse_with(router: Router, body: serde_json::Value) -> Vec<String> {
+        let response = router
             .oneshot(
                 Request::post("/v1/chat/completions")
                     .header("content-type", "application/json")
@@ -1309,5 +1670,252 @@ mod tests {
         assert_eq!(p.max_tokens, 3);
         assert_eq!(p.stop_strs, vec!["X".to_string(), "Y".to_string()]);
         assert!(p.ignore_eos);
+    }
+
+    /// The tool-call text the scripted model below emits verbatim (its byte ids
+    /// start at `SCRIPT_BASE`). Kept under `FAKE_VOCAB - SCRIPT_BASE` bytes so a
+    /// run of consecutive ids never wraps.
+    const TOOL_SCRIPT: &str = "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>";
+    const REASONED_TOOL_SCRIPT: &str = "Checking it.\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>";
+    const SCRIPT_BASE: u32 = 400;
+
+    /// Encodes every prompt to one id, so the counter model then walks the ids
+    /// that decode to `script` byte by byte. A deterministic model output for
+    /// the tool-call path, which the plain fake (consecutive printable bytes)
+    /// cannot produce.
+    struct ScriptTokenizer(&'static str);
+
+    impl crate::domain::Tokenizer for ScriptTokenizer {
+        fn encode(&self, _text: &str) -> Result<Vec<u32>, crate::domain::TokenizerError> {
+            Ok(vec![SCRIPT_BASE - 1])
+        }
+
+        fn decode(&self, ids: &[u32]) -> Result<String, crate::domain::TokenizerError> {
+            Ok(ids
+                .iter()
+                .map(|&id| {
+                    let i = id.wrapping_sub(SCRIPT_BASE) as usize;
+                    if id >= SCRIPT_BASE && i < self.0.len() {
+                        char::from(self.0.as_bytes()[i])
+                    } else {
+                        char::from(id as u8)
+                    }
+                })
+                .collect())
+        }
+
+        fn render_chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[ChatTool],
+        ) -> Result<String, crate::domain::TokenizerError> {
+            Ok(String::new())
+        }
+    }
+
+    fn script_router(script: &'static str) -> Router {
+        use crate::application::engine::EngineLimits;
+        use crate::infrastructure::torch::Device;
+        let (model, _rec) = FakeModel::new();
+        let limits = EngineLimits {
+            max_seq_len: 4096,
+            max_output_tokens: 256,
+            max_running_requests: 4,
+            max_prefill_length: 16,
+        };
+        let engine = Engine::new(
+            Arc::new(model),
+            Arc::new(ScriptTokenizer(script)),
+            vec![FAKE_EOS],
+            limits,
+            Device::Cpu,
+        );
+        router(AppState::new(Arc::new(engine), "test-model".to_string()))
+    }
+
+    fn tool_router() -> Router {
+        script_router(TOOL_SCRIPT)
+    }
+
+    fn tool_request(script: &'static str, stream: bool) -> serde_json::Value {
+        serde_json::json!({
+            "model": "test-model",
+            "messages": [{ "role": "user", "content": "weather in Paris?" }],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "look up weather",
+                    "parameters": { "type": "object" }
+                }
+            }],
+            "max_tokens": script.len(),
+            "stream": stream,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_tool_call_answer_returns_a_tool_calls_message() {
+        let (status, body) = post_chat(tool_router(), tool_request(TOOL_SCRIPT, false)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+        let message = &body["choices"][0]["message"];
+        assert_eq!(message["role"], "assistant");
+        assert_eq!(message["content"], "");
+        assert!(
+            message.get("content").is_some(),
+            "the message still carries a content field"
+        );
+        let calls = message["tool_calls"].as_array().expect("tool_calls array");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["type"], "function");
+        assert!(calls[0]["id"].as_str().unwrap().starts_with("call_"));
+        assert_eq!(calls[0]["function"]["name"], "get_weather");
+        let args: serde_json::Value =
+            serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["city"], "Paris");
+    }
+
+    #[tokio::test]
+    async fn a_content_only_answer_still_has_no_tool_calls() {
+        let (router, _rec) = test_router_with_rec();
+        let (status, body) = post_chat(
+            router,
+            serde_json::json!({
+                "messages": [{ "role": "user", "content": "ab" }],
+                "max_tokens": 3,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["choices"][0]["message"].get("tool_calls").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_tool_call_stream_emits_tool_calls_deltas() {
+        let frames = post_chat_sse_with(tool_router(), tool_request(TOOL_SCRIPT, true)).await;
+        assert_eq!(
+            frames.len(),
+            5,
+            "role, open, args, final, [DONE]: {frames:?}"
+        );
+        assert_eq!(
+            chunk_of(&frames[0])["choices"][0]["delta"]["role"],
+            "assistant"
+        );
+
+        let open = chunk_of(&frames[1]);
+        let call = &open["choices"][0]["delta"]["tool_calls"][0];
+        assert_eq!(call["index"], 0);
+        assert_eq!(call["type"], "function");
+        assert!(call["id"].as_str().unwrap().starts_with("call_"));
+        assert_eq!(call["function"]["name"], "get_weather");
+
+        let args_frame = chunk_of(&frames[2]);
+        let call = &args_frame["choices"][0]["delta"]["tool_calls"][0];
+        assert_eq!(call["index"], 0);
+        let args: serde_json::Value =
+            serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["city"], "Paris");
+
+        let last = chunk_of(&frames[3]);
+        assert_eq!(last["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(last["usage"]["completion_tokens"], TOOL_SCRIPT.len());
+        assert_eq!(frames[4], "data: [DONE]");
+    }
+
+    #[tokio::test]
+    async fn reasoning_before_a_tool_call_streams_as_content() {
+        let frames = post_chat_sse_with(
+            script_router(REASONED_TOOL_SCRIPT),
+            tool_request(REASONED_TOOL_SCRIPT, true),
+        )
+        .await;
+        let content: String = frames
+            .iter()
+            .filter(|f| *f != "data: [DONE]")
+            .map(|f| chunk_of(f))
+            .map(|chunk| {
+                let delta = &chunk["choices"][0]["delta"];
+                match delta.get("tool_calls") {
+                    Some(_) => String::new(),
+                    None => delta["content"].as_str().unwrap_or("").to_string(),
+                }
+            })
+            .collect();
+        assert!(
+            content.contains("Checking it."),
+            "the reasoning before the call must stream, got {content:?}"
+        );
+        assert_eq!(frames.last().unwrap(), "data: [DONE]");
+        let last = chunk_of(&frames[frames.len() - 2]);
+        assert_eq!(last["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    #[tokio::test]
+    async fn tool_choice_and_a_tool_result_turn_deserialize() {
+        let (status, _) = post_chat(
+            test_router(),
+            serde_json::json!({
+                "messages": [
+                    { "role": "user", "content": "weather?" },
+                    {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": { "name": "get_weather", "arguments": "{\"city\":\"Paris\"}" }
+                        }]
+                    },
+                    { "role": "tool", "tool_call_id": "call_1", "content": "sunny" }
+                ],
+                "tools": [{ "type": "function", "function": { "name": "get_weather", "parameters": {"type":"object"} } }],
+                "tool_choice": "auto",
+                "parallel_tool_calls": false,
+                "max_tokens": 1,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[test]
+    fn a_tool_call_split_across_tokens_is_held_until_complete() {
+        let mut stream = ChatStream::new();
+        let mut calls = Vec::new();
+        let mut content = String::new();
+        for ch in TOOL_SCRIPT.chars() {
+            for action in stream.feed(&ch.to_string()) {
+                match action {
+                    ChatAction::Content(c) => content.push_str(&c),
+                    ChatAction::ToolCall {
+                        name, arguments, ..
+                    } => calls.push((name, arguments)),
+                }
+            }
+        }
+        let (emitted, flush) = stream.finish();
+        assert_eq!(emitted, 1);
+        assert!(flush.is_none());
+        assert_eq!(content, "");
+        assert_eq!(calls[0].0, "get_weather");
+        assert!(calls[0].1.contains("Paris"));
+    }
+
+    #[test]
+    fn an_unterminated_tool_call_is_flushed_as_content() {
+        let mut stream = ChatStream::new();
+        let mut out = String::new();
+        for ch in "<tool_call><function=x>".chars() {
+            for action in stream.feed(&ch.to_string()) {
+                if let ChatAction::Content(c) = action {
+                    out.push_str(&c);
+                }
+            }
+        }
+        let (emitted, flush) = stream.finish();
+        assert_eq!(emitted, 0);
+        out.push_str(flush.as_deref().unwrap_or(""));
+        assert_eq!(out, "<tool_call><function=x>");
     }
 }

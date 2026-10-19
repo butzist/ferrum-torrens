@@ -28,5 +28,5 @@ pub use sampling::{Rng, SamplingParams, argmax, sample};
 pub use scheduler::{
     Batch, Budget, FinishReason, Phase, Req, check_stop, match_stop_str, schedule_next_batch,
 };
-pub use tokenizer::{ChatMessage, Tokenizer, TokenizerError};
+pub use tokenizer::{ChatMessage, ChatTool, ChatToolCall, Tokenizer, TokenizerError};
 pub use weights::{DType, QuantFormat, TensorDesc, TensorKind, WeightsReader};

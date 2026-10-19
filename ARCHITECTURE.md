@@ -141,7 +141,7 @@ stays pure: `Tensor` and CUDA handles never cross it (section 4).
 | Block | Runs on | Where |
 |---|---|---|
 | HTTP + SSE, batching dispatcher, scheduling, stop rules, streaming | Host | `infrastructure/http.rs`, `application/dispatcher.rs`, `domain/scheduler.rs`, `application/generation.rs` |
-| Tokenize / detokenize, chat template | Host | `infrastructure/tokenizers_hf.rs`, via `Engine::encode/decode` |
+| Tokenize / detokenize, chat template + tools, tool-call parse | Host | `infrastructure/tokenizers_hf.rs`, `infrastructure/tool_call.rs`, via `Engine::encode/decode` |
 | Sampling (temperature/top-k/top-p/penalties) | Host | `domain/sampling.rs`, over f32 logits copied D2H |
 | Generation loop + KV page-table bookkeeping (`SequenceCache`) | Host | `domain/kvcache.rs`, `application/engine.rs` |
 | FTW index parse + O_DIRECT pread of the checkpoint | Host | `infrastructure/ftw.rs` |
@@ -627,7 +627,13 @@ EOS/stop-string over max-tokens.
 **Static.** `infrastructure/http.rs` (axum) exposes `/v1/completions`,
 `/v1/chat/completions`, `/v1/models`, `/health`; `application/generation.rs`
 owns the loop; `application/dispatcher.rs` owns the single model worker;
-`tokenizers_hf.rs` encodes/decodes and renders the chat template.
+`tokenizers_hf.rs` encodes/decodes and renders the chat template. The chat
+endpoint carries OpenAI tool calling (decision 74): `ChatMessage`/`ChatTool`
+(domain `tokenizer.rs`) are rendered with `tools`, and `tool_call.rs` parses the
+checkpoint's `<tool_call>` dialect out of the answer. Non-stream turns the whole
+answer into a `tool_calls` message; the chat stream buffers once a `<tool_call>`
+opener appears and emits `tool_calls` deltas, finishing with
+`finish_reason: "tool_calls"`.
 
 **Dynamic -- a streaming request.** Handlers never call the model directly: they
 tokenize, submit a `Job` to the `Dispatcher`, and await its reply. The dispatcher
@@ -778,7 +784,7 @@ reaches the oracle token through the captured graph.
 | Triton (cubins) | build-time authoring; committed artifacts at runtime | `python/ferrum_kernel/*`, `kernel/*.cubin` | The hand-written NVFP4 grouped-MoE GEMV, the silu/sum-reduce, the two offload staging kernels, and the paged GQA decode attention kernel. Authored and AOT-compiled in Python; launched by `cuda_driver` with no interpreter at runtime |
 | `c10_cuda` (torch C++) | runtime, via `build.rs` shim | `shim/c10_graph_shim.cpp`, `infrastructure/cuda_graph.rs`, `infrastructure/decode_graph.rs` | The torch current-stream set and the graph memory pool that `tch` does not expose; needed for CUDA-graph capture of torch ops |
 | `axum` + `tokio` | runtime | `infrastructure/http.rs`, `main.rs` | HTTP server, SSE streaming, and the async runtime that offloads forwards to blocking threads |
-| `tokenizers` + `minijinja` | runtime | `infrastructure/tokenizers_hf.rs` | HF byte-level BPE tokenizer and the checkpoint's chat template (Python string methods rewritten to filters) |
+| `tokenizers` + `minijinja` | runtime | `infrastructure/tokenizers_hf.rs` | HF byte-level BPE tokenizer and the checkpoint's chat template (Python string methods rewritten to filters; `json` feature for the template's `tojson`) |
 | Python + `uv` (FreeToken venv) | build-time only | `scripts/convert_hf_to_ftw.py`, `FreeToken/` | The one-time HF -> FTW conversion via `ft checkpoint`; never in the serving process |
 
 Boundary note: `tch`/`Tensor` and the CUDA driver handles live entirely in

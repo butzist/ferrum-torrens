@@ -410,9 +410,13 @@ impl Engine {
 
     /// Turn a conversation into a prompt with the checkpoint's own chat
     /// template, ready for `encode`.
-    pub fn render_chat(&self, messages: &[ChatMessage]) -> Result<String, EngineError> {
+    pub fn render_chat(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[crate::domain::ChatTool],
+    ) -> Result<String, EngineError> {
         self.tokenizer
-            .render_chat(messages)
+            .render_chat(messages, tools)
             .map_err(|e| EngineError::Chat(e.to_string()))
     }
 
@@ -806,12 +810,16 @@ pub(crate) mod fake {
             Ok(ids.iter().map(|&b| char::from(b as u8)).collect())
         }
 
-        fn render_chat(&self, messages: &[ChatMessage]) -> Result<String, TokenizerError> {
+        fn render_chat(
+            &self,
+            messages: &[ChatMessage],
+            _tools: &[crate::domain::ChatTool],
+        ) -> Result<String, TokenizerError> {
             let mut out = String::new();
             for m in messages {
                 out.push_str(&m.role);
                 out.push('\n');
-                out.push_str(&m.content);
+                out.push_str(m.content.as_deref().unwrap_or(""));
                 out.push('\n');
             }
             out.push_str("assistant\n");

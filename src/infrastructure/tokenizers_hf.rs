@@ -8,7 +8,7 @@ use std::path::Path;
 use minijinja::{Environment, Value};
 use tokenizers::Tokenizer as Hf;
 
-use crate::domain::{ChatMessage, Tokenizer, TokenizerError};
+use crate::domain::{ChatMessage, ChatTool, Tokenizer, TokenizerError};
 
 pub struct HfTokenizer {
     inner: Hf,
@@ -46,9 +46,13 @@ impl Tokenizer for HfTokenizer {
             .map_err(|e| TokenizerError::Message(e.to_string()))
     }
 
-    fn render_chat(&self, messages: &[ChatMessage]) -> Result<String, TokenizerError> {
+    fn render_chat(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ChatTool],
+    ) -> Result<String, TokenizerError> {
         match &self.chat {
-            Some(chat) => chat.render(messages),
+            Some(chat) => chat.render(messages, tools),
             None => Err(TokenizerError::NoChatTemplate),
         }
     }
@@ -106,25 +110,102 @@ impl ChatTemplate {
         Ok(Self { env })
     }
 
-    fn render(&self, messages: &[ChatMessage]) -> Result<String, TokenizerError> {
+    fn render(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ChatTool],
+    ) -> Result<String, TokenizerError> {
         let template = self
             .env
             .get_template("chat")
             .map_err(|e| TokenizerError::Message(format!("chat template: {e}")))?;
         let turns: Vec<serde_json::Value> = messages
             .iter()
-            .map(|m| serde_json::json!({ "role": m.role, "content": m.content }))
+            .map(|m| {
+                let mut turn = serde_json::Map::new();
+                turn.insert("role".into(), serde_json::json!(m.role));
+                turn.insert(
+                    "content".into(),
+                    match &m.content {
+                        Some(content) => serde_json::json!(content),
+                        None => serde_json::Value::Null,
+                    },
+                );
+                if !m.tool_calls.is_empty() {
+                    turn.insert(
+                        "tool_calls".into(),
+                        serde_json::Value::Array(
+                            m.tool_calls
+                                .iter()
+                                .map(|c| {
+                                    serde_json::json!({
+                                        "id": c.id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": c.name,
+                                            "arguments": args_object(&c.arguments),
+                                        },
+                                    })
+                                })
+                                .collect(),
+                        ),
+                    );
+                }
+                if let Some(id) = &m.tool_call_id {
+                    turn.insert("tool_call_id".into(), serde_json::json!(id));
+                }
+                serde_json::Value::Object(turn)
+            })
             .collect();
+        let tools = tool_specs(tools);
         let ctx = serde_json::json!({
             "messages": turns,
             "add_generation_prompt": true,
             "enable_thinking": true,
-            "tools": serde_json::Value::Null,
+            "tools": tools,
         });
         template
             .render(ctx)
             .map_err(|e| TokenizerError::Message(format!("chat template: {e:#}")))
     }
+}
+
+/// The template iterates `tool_call.arguments|items`, so arguments must be a
+/// mapping. The wire string is parsed to an object; a parse failure (a client
+/// sent a non-object) falls back to an empty object so the render still runs.
+fn args_object(arguments: &str) -> serde_json::Value {
+    match serde_json::from_str::<serde_json::Value>(arguments) {
+        Ok(v @ serde_json::Value::Object(_)) => v,
+        _ => serde_json::json!({}),
+    }
+}
+
+/// The `tools` context value: `null` when there are none (what the template's
+/// `if tools` guard expects), else the OpenAI function list.
+fn tool_specs(tools: &[ChatTool]) -> serde_json::Value {
+    if tools.is_empty() {
+        return serde_json::Value::Null;
+    }
+    serde_json::Value::Array(
+        tools
+            .iter()
+            .map(|t| {
+                let mut function = serde_json::Map::new();
+                function.insert("name".into(), serde_json::json!(t.name));
+                if let Some(description) = &t.description {
+                    function.insert("description".into(), serde_json::json!(description));
+                }
+                function.insert(
+                    "parameters".into(),
+                    t.parameters
+                        .as_deref()
+                        .and_then(|p| serde_json::from_str(p).ok())
+                        .unwrap_or_else(|| serde_json::json!({})),
+                );
+                serde_json::json!({ "type": "function", "function": function })
+            })
+            .collect(),
+    )
 }
 
 /// `raise_exception` is a transformers jinja global. minijinja has no Python
@@ -418,8 +499,16 @@ mod tests {
     }
 
     fn render(src: &str, messages: &[ChatMessage]) -> Result<String, TokenizerError> {
+        render_with_tools(src, messages, &[])
+    }
+
+    fn render_with_tools(
+        src: &str,
+        messages: &[ChatMessage],
+        tools: &[ChatTool],
+    ) -> Result<String, TokenizerError> {
         let template = ChatTemplate::new(src).unwrap();
-        template.render(messages)
+        template.render(messages, tools)
     }
 
     #[test]
@@ -453,10 +542,11 @@ mod tests {
         let src = "{% set content = messages[1].content %}{% if content.startswith('<tool_response>') and content.endswith('</tool_response>') %}match{% else %}plain{% endif %}";
         let t = ChatTemplate::new(src).unwrap();
         assert_eq!(
-            t.render(&chat("<tool_response>x</tool_response>")).unwrap(),
+            t.render(&chat("<tool_response>x</tool_response>"), &[])
+                .unwrap(),
             "match"
         );
-        assert_eq!(t.render(&chat("plain")).unwrap(), "plain");
+        assert_eq!(t.render(&chat("plain"), &[]).unwrap(), "plain");
     }
 
     #[test]
@@ -471,6 +561,68 @@ mod tests {
         assert_eq!(
             render("{{ 'content.startswith(x)' }}", &chat("hi")).unwrap(),
             "content.startswith(x)"
+        );
+    }
+
+    #[test]
+    fn tools_reach_the_template_as_json() {
+        let src = "{% for t in tools %}{{ t.function.name }}={{ t.function.parameters|tojson }}{% endfor %}";
+        let tools = vec![ChatTool {
+            name: "get_weather".to_string(),
+            description: Some("look up weather".to_string()),
+            parameters: Some(r#"{"type":"object"}"#.to_string()),
+        }];
+        assert_eq!(
+            render_with_tools(src, &chat("hi"), &tools).unwrap(),
+            r#"get_weather={"type":"object"}"#
+        );
+    }
+
+    #[test]
+    fn an_assistant_tool_call_renders_its_parsed_arguments() {
+        let src = "{% for tc in messages[1].tool_calls %}{{ tc.function.name }}:{{ tc.function.arguments.city }}{% endfor %}";
+        let messages = vec![
+            ChatMessage::new("user", "weather?"),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: None,
+                tool_calls: vec![crate::domain::ChatToolCall {
+                    id: "call_1".to_string(),
+                    name: "get_weather".to_string(),
+                    arguments: r#"{"city":"Paris"}"#.to_string(),
+                }],
+                tool_call_id: None,
+            },
+        ];
+        assert_eq!(
+            render_with_tools(src, &messages, &[]).unwrap(),
+            "get_weather:Paris"
+        );
+    }
+
+    #[test]
+    fn real_checkpoint_chat_template_renders_tools() {
+        let Some(path) = real_dir() else {
+            eprintln!("skipped: no converted checkpoint in .model-cache");
+            return;
+        };
+        let t = HfTokenizer::from_file(&path).unwrap();
+        let tools = vec![ChatTool {
+            name: "get_weather".to_string(),
+            description: None,
+            parameters: Some(
+                r#"{"type":"object","properties":{"city":{"type":"string"}}}"#.to_string(),
+            ),
+        }];
+        let prompt = t.render_chat(&chat("weather in Paris?"), &tools).unwrap();
+        assert!(prompt.contains("<tools>"), "tools block is opened");
+        assert!(
+            prompt.contains(r#""get_weather""#),
+            "the tool name is in the prompt"
+        );
+        assert!(
+            prompt.contains("<tool_call>"),
+            "the format instructions are in the prompt"
         );
     }
 
@@ -493,7 +645,7 @@ mod tests {
     fn a_bare_tokenizer_json_has_no_chat_template() {
         let t = HfTokenizer::from_json(FIXTURE).unwrap();
         assert_eq!(
-            t.render_chat(&chat("hi")),
+            t.render_chat(&chat("hi"), &[]),
             Err(TokenizerError::NoChatTemplate)
         );
     }
@@ -511,7 +663,9 @@ mod tests {
             return;
         };
         let t = HfTokenizer::from_file(&path).unwrap();
-        let prompt = t.render_chat(&chat("The capital of France is")).unwrap();
+        let prompt = t
+            .render_chat(&chat("The capital of France is"), &[])
+            .unwrap();
         let ids = t.encode(&prompt).unwrap();
         assert_eq!(
             count_turn_openers(&ids),

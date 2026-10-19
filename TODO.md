@@ -32,11 +32,12 @@ in `linear`/`lm_head_logits_into` removed the per-step f32 upcast of every weigh
 bound, so the next lever is the **bf16-KV attention fallback** (item 14), not the
 projection bytes. FreeToken on the same GPU/FTW does **22.5-30.3 tok/s**
 (decision 76), so both the compute path and the GPU memory budget remain open.
-Tool calling on `/v1/chat/completions` was brought into scope
-(decision 74) so the server can drive opencode/agentic clients; it is the next
-feature. Open work: tool calling, the `[opt] /v1/responses` surface, server-side
-batching, the bf16-attention/remaining decode gap (items 14, 17), and the
-section 8 experiments.
+Tool calling on `/v1/chat/completions` landed (decision 74 scope, decision 105
+implementation): `tools`/`tool_choice` are rendered through the checkpoint's own
+chat template, the `<tool_call>` dialect is parsed into a `tool_calls` message
+(non-stream) or `tool_calls` deltas (stream), and `role: "tool"` results are
+accepted. Open work: the `[opt] /v1/responses` surface, server-side batching, the
+bf16-attention/remaining decode gap (items 14, 17), and the section 8 experiments.
 The decode gap is now pursued by **vendoring FreeToken's own Triton kernels**
 (decision 82, plan in `OPTIMIZATION.md`). Slices 1-2 landed: bf16 paged attention
 (decision 83) and the W8A16 FP8 projections (decision 84), which with the packed
@@ -94,7 +95,7 @@ levers. Decode is at parity; prefill is MoE-bound (`pf_gemm` ~3.5 ms/token).
 Remaining: the gdn tail norm, R8.5 fp8 KV (VRAM), the FLA prefill chunk kernels
 (slice 4, low value now), tool calling (decision 74), and `[opt] /v1/responses`.
 Instruments: `FT_PROFILE=1`, `scripts/freetoken_probe/`.
-Progress history and the full decision log (numbers 1..103) live in `DONE.md`;
+Progress history and the full decision log (numbers 1..105) live in `DONE.md`;
 read that for the "why" behind any decision number referenced in code or tests.
 
 Goal: a **minimal, fast, single-GPU** Rust serving engine for **one model** --
@@ -312,7 +313,7 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 
 ### Server (axum recommended)
 
-- [ ] P0 **tool calling on `/v1/chat/completions` -- decision 74, next feature.** Accept `tools`/`tool_choice`, render through the checkpoint's chat template, stream `tool_calls` deltas, accept `role: "tool"` results. Required for opencode/agentic clients.
+- [x] P0 **tool calling on `/v1/chat/completions` -- DONE (2026-10-19), decisions 74, 105.** Accepts `tools`/`tool_choice`/`parallel_tool_calls`, renders them through the checkpoint's chat template (minijinja `json` feature), parses the `<tool_call>` dialect (`infrastructure/tool_call.rs`), returns a `tool_calls` message or streams `tool_calls` deltas with `finish_reason: "tool_calls"`, and accepts `role: "tool"` result turns.
 - [ ] [opt] `/v1/responses` (needed only for Codex; opencode talks chat-completions, decision 74).
 - Anthropic `/v1/messages` is out of the MVP (decision 38).
 
@@ -353,8 +354,9 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
   and the gated cross-request oracle DONE (decisions 68, 69, 70, 71); startup
   load tuning DONE (decision 72); throughput smoke DONE (decision 73);
   `[opt] /v1/responses` remains, plus the section 8 experiments.
-- **M6 (CURRENT): agentic serving.** Tool calling on `/v1/chat/completions` so
-  opencode/agentic clients can drive the model (decision 74). The decode gap is
+- **M6 (CURRENT): agentic serving.** Tool calling on `/v1/chat/completions` is
+  DONE (decisions 74, 105), so opencode/agentic clients can drive the model. The
+  decode gap is
   pursued by vendoring FreeToken's own Triton kernels (decision 82): bf16 paged
   attention (decision 83) and the W8A16 FP8 projections (decision 84) landed,
   taking tg 8.2 -> 10.9 tok/s and VRAM 7.9 -> 4.83 GiB; the remaining slices are
@@ -364,7 +366,7 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 
 ## 7. Decisions
 
-The full log of confirmed decisions (numbers 1..94, stable -- code, tests and
+The full log of confirmed decisions (numbers 1..105, stable -- code, tests and
 `ARCHITECTURE.md` reference them by number) lives in `DONE.md`. This section
 lists only the decisions that still bind open work; everything else there is
 history.

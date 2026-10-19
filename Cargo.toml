@@ -26,7 +26,7 @@ axum = "0.8"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync"] }
 futures-core = "0.3"
 tch = { version = "0.22", default-features = false, optional = true }
-minijinja = { version = "2.24.0", features = ["serde"] }
+minijinja = { version = "2.24.0", features = ["serde", "json"] }
 
 [dev-dependencies]
 mockall = "0.13"
