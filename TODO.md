@@ -102,6 +102,13 @@ the tool result. The open perf/eval items are now resolved: R9.2 rejected
 and slice 4 closed (GDN is 0.19 ms/token of prefill). The remaining prefill lever
 is the host attention fallback (~1.2 ms/token) and `norm_in` (0.87); the only
 open serving lever is item 11 (server-side batching).
+
+FreeToken's two missing baselines are now measured (2026-10-20,
+`scripts/freetoken_probe/baselines.py`): its prefill pp is **366.2 +/- 1.3 tok/s
+at 476-478 tokens and 725.0 +/- 3.1 at 1878**, its K=4 aggregate **25.17 batched
+(11.70 serial)** -- against our 150 / 156 and 26.2 / 16.6, so prefill is the
+measured gap (table and caveats in `OPTIMIZATION.md`, under R9 "Reference
+baselines").
 Instruments: `FT_PROFILE=1`, `FT_SLOTS_REPORT=1`, `scripts/freetoken_probe/`.
 Progress history and the full decision log (numbers 1..111) live in `DONE.md`;
 read that for the "why" behind any decision number referenced in code or tests.
@@ -916,6 +923,15 @@ prompt override before comparing miss rates.
   (HEAD 27.69 +/- 0.30 vs 25.93 +/- 0.67, n=12+12, interleaved); each fusion alone
   and eager are neutral, only the combination regresses. Not shipped; the attempt
   stays in `git stash`.
+- [x] **Reference baselines: FreeToken prefill pp + K=4 aggregate** -- DONE
+  (2026-10-20). `scripts/freetoken_probe/baselines.py` measures the two missing
+  upstream numbers over HTTP (one `ft serve`, ratio 0.9, expandable allocator
+  off, nonce-prefixed prompts so radix stays at `#cached-token: 0`): pp
+  **366.2 +/- 1.3** tok/s at 476-478 tokens and **725.0 +/- 3.1** at 1878-1879,
+  K=4 aggregate **25.17** batched / **11.70** serial (n=5 each), vs our 150 /
+  156 and 26.2 / 16.6. Prefill is the gap. Full table, method and caveats in
+  `OPTIMIZATION.md` under R9 "Reference baselines"; logs under
+  `/tmp/opencode/freetoken_baseline/`.
 
 ### State of play
 

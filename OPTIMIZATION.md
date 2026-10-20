@@ -1135,3 +1135,56 @@ Next levers after R9.1, re-ranked 2026-10-18:
   only with a per-kernel GPU timing under capture to explain the interaction.
 - The copy (~13 ms, ~87% of pinned H2D peak) and the FP8 projections (~220 GB/s,
   read roofline) are at parity with the reference; not levers.
+
+### Reference baselines (2026-10-20): prefill pp + K=4 aggregate
+
+The two comparisons the plan of record never had, measured on the same GPU/FTW
+with `scripts/freetoken_probe/baselines.py`: one `ft serve` session per run
+(decision 76's config plus `--max-running-requests 4 --cuda-graph-max-bs 4
+--memory-ratio 0.9 --max-seq-len-override 8216`), numbers taken through the real
+HTTP surface, same prompt texts and params as our smokes, warm-ups discarded,
+n=5 per metric, rounds order-balanced.
+
+| metric | ours (recorded) | FreeToken (2026-10-20) |
+|---|---|---|
+| pp @517 / 476-478 tok | 143 (dec 102) -> **150** (dec 103) tok/s | **366.2 +/- 1.3** (n=5, min 364.4, max 368.0) |
+| pp @2057 / 1878-1879 tok | **156** tok/s (dec 103) | **725.0 +/- 3.1** (n=5, min 719.9, max 727.4) |
+| K=4 aggregate, batched | **26.2** tok/s | **25.17 +/- 0.05** (n=5, min 25.09, max 25.21) |
+| K=4 serial window | 16.6 tok/s | **11.70 +/- 0.01** (n=5, 8.19-8.21 s windows) |
+| bs=1 captured decode | 28.3 tok/s | 30.3 tok/s (decision 76, unchanged) |
+
+Method notes and caveats:
+
+- **pp** = `usage.prompt_tokens / (first SSE text chunk - request send)` on raw
+  `/v1/completions` with `stream_options.include_usage`, greedy, `max_tokens 4`.
+  Ours is in-process first-token time (`tests/throughput_smoke.rs`): the HTTP
+  frame costs *them*, not us. A fit over their two lengths (1.30 s at 478,
+  2.59 s at 1878) gives ~0.87 s fixed per request plus ~1086 tok/s marginal,
+  so their compute-side prefill gap is wider than the table's 2.4x / 4.6x.
+- **Prompt counts**: same prompt text, but our smoke repeats the *pre-encoded*
+  unit (11 ids/rep -> 517/2057) while the server re-encodes the string (interior
+  `". "` boundaries merge -> 471/1871) and the driver prepends a random 8-char
+  nonce (6-8 tokens), hence 476-479 / 1878-1879. Tokenizer identity checked:
+  both encode the single unit to the same 11 ids.
+- **Radix validity gate**: every measured prefill shows `#cached-token: 0` in
+  `serve.log`. The pp prompts carry the random prefix so the hybrid radix never
+  serves them; an earlier run with identical prompts hit 448-1856 cached tokens
+  (TTFT then measured the cache, not prefill) and was discarded, not recorded.
+- **Config**: `PYTORCH_ALLOC_CONF=expandable_segments:False` is required with
+  `--cuda-graph-max-bs 4`: with torch's default expandable allocator the bs=4
+  graph capture OOMs on 2-4 MiB allocations while ~1.5 GiB is still free (the
+  engine's `_ensure_expandable_segments` skips when the env var is set), and
+  capture [1, 2, 4] passes with it off at 0.58 GiB free. The auto MoE cache
+  resolved **1195 slots** at ratio 0.9 (KV pool 8236 tokens; VRAM 7.02 GiB).
+- **Sanity re-check** (the plan's >2x rule): serve flags match
+  `bench_decode_moe.py`'s serve (see `serve.log`), radix hits ruled out, the
+  frame direction works against them, and K=4 lands in our band (25.17 vs 26.2)
+  -- so the pp gap is real and is the largest measured difference. It is
+  consistent with our own prefill attribution (item 20, decision 111: `pf_gemm`
+  ~3.5 ms/token at the streaming floor, i.e. per-token weight streaming, against
+  their chunked prefill amortizing weights over the batch).
+
+Commands + logs: env recipe and run steps in
+`plans/2026-10-20-freetoken-prefill-k4-baselines.md` (untracked), driver
+docstring in `scripts/freetoken_probe/baselines.py`; logs
+`/tmp/opencode/freetoken_baseline/{run.log,serve.log,baseline_rows.json}`.
