@@ -1197,10 +1197,13 @@ decode is at parity. The R9.1-era attribution of a 451-token chunk (decision
 ~1.2 (16%, `CacheAccess::Host` gathers + SDPA), `norm_in` 0.87 (11%), GDN 0.19
 (closed). Slices, in order (TODO.md section 8 has the checkboxes):
 
-- **R10.1 chunk 512 confirmation** -- the GEMV-level sweep in `cuda_moe.rs`'s
-  const comment already flattened past 256 (16 -> 512: MoE GEMV 2.32 -> 1.50 s
-  at 517 tokens); only end-to-end pp at 2057 is unmeasured. A `FERRUM_PF_CHUNK`
-  diagnostic knob plus one order-balanced A/B; record the negative if flat.
+- **R10.1 chunk 512 -- LANDED (2026-10-20).** The GEMV-level sweep in
+  `cuda_moe.rs`'s const comment already flattened past 256 (16 -> 512: MoE GEMV
+  2.32 -> 1.50 s at 517 tokens), but the end-to-end pp A/B (`FERRUM_PF_CHUNK`
+  knob, n=3 per arm, order-balanced, warm-up discarded, 12 runs) still gained
+  **+2.8% at 517 (149.0 -> 153.2 tok/s) and +3.2% at 2057 (156.9 -> 161.9)**,
+  run-to-run sd ~0.5, at identical VRAM (7190 MiB). `PREFILL_CHUNK_TOKENS` is
+  now 512; the knob stays as a diagnostic. Logs `/tmp/opencode/pp_sweep/`.
 - **R10.2 batched grouped MoE GEMM** -- the 46% lever. Prefill launches one
   M=1 `gemv_gate_up`/`gemv_down` per route (`group_with_slots`, scratch
   `[routes, ...]`), so each expert's weight is re-fetched from L2 per route;

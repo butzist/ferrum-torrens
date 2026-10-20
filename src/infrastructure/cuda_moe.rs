@@ -1364,7 +1364,7 @@ impl CudaMoE {
         // chunks almost every route in a chunk names a distinct expert, so the
         // per-route GEMV re-reads each expert from HBM, while a 256-token chunk
         // gives each expert enough routes that its weight is reused from L2.
-        let chunk = PREFILL_CHUNK_TOKENS.min(tokens);
+        let chunk = prefill_chunk_tokens().min(tokens);
         let dev = self.device.to_tch();
         let mut start = 0usize;
         while start < tokens {
@@ -1469,9 +1469,28 @@ fn staged_chunk_tokens(block_k: usize, top_k: usize) -> usize {
 /// expert and each weight is streamed from HBM once per route, while at 256
 /// tokens an expert's 8-ish routes share one resident read (L2 reuse). Measured
 /// on the RTX 5060 Laptop, 517-token prompt: 16 -> 512 tokens took the MoE GEMV
-/// 2.32 -> 1.50 s, and the returns flatten past ~256. Capped so a long
-/// `max_prefill_length` cannot balloon the per-layer scratch (~8 MiB at 256).
-const PREFILL_CHUNK_TOKENS: usize = 256;
+/// 2.32 -> 1.50 s, and the returns flatten past ~256 -- yet the end-to-end pp
+/// A/B (R10.1, 2026-10-20, n=3 per arm, order-balanced) still gained **+2.8% at
+/// 517 and +3.2% at 2057** going 256 -> 512 (149.0 -> 153.2 and 156.9 ->
+/// 161.9 tok/s, run-to-run sd ~0.5), at identical VRAM (7190 MiB), so 512 is
+/// the default. The scratch doubles to ~16 MiB transient. Capped so a long
+/// `max_prefill_length` cannot balloon it. `FERRUM_PF_CHUNK` overrides both
+/// for measurement (a diagnostic knob from R10.1's A/B, never needed in
+/// serving).
+const PREFILL_CHUNK_TOKENS: usize = 512;
+
+/// The live prefill chunk ceiling: `FERRUM_PF_CHUNK` when it parses to a
+/// non-zero token count, else the default.
+fn prefill_chunk_tokens() -> usize {
+    prefill_chunk_from(std::env::var("FERRUM_PF_CHUNK").ok().as_deref())
+}
+
+fn prefill_chunk_from(value: Option<&str>) -> usize {
+    value
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(PREFILL_CHUNK_TOKENS)
+}
 
 /// Packed plus scales plus globals for one expert's two slabs.
 fn per_expert(shapes: ExpertShapes) -> usize {
@@ -1576,6 +1595,16 @@ mod tests {
         fn slab(&self, _: usize, _: u32, _: Part) -> Result<Slab, MoEError> {
             unreachable!("the CPU paths must refuse before staging")
         }
+    }
+
+    /// The prefill chunk ceiling: `FERRUM_PF_CHUNK` overrides the default, and
+    /// anything unparseable (or zero, which would loop forever) falls back.
+    #[test]
+    fn a_prefill_chunk_env_override_parses() {
+        assert_eq!(prefill_chunk_from(None), PREFILL_CHUNK_TOKENS);
+        assert_eq!(prefill_chunk_from(Some("512")), 512);
+        assert_eq!(prefill_chunk_from(Some("garbage")), PREFILL_CHUNK_TOKENS);
+        assert_eq!(prefill_chunk_from(Some("0")), PREFILL_CHUNK_TOKENS);
     }
 
     /// The prefill chunker keeps every chunk inside the committed route cap, and

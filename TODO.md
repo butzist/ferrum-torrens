@@ -943,11 +943,13 @@ Findings in `OPTIMIZATION.md` R10. Prefill is 2.4-4.6x behind FreeToken
 7.72 ms/token as `pf_gemm` 3.53 (46%), host attention ~1.2 (16%), `norm_in`
 0.87 (11%), GDN 0.19 (closed, decision 111).
 
-- [ ] **R10.1 Prefill chunk 512 confirmation.** The GEMV-level sweep already
-  flattened past 256 (`cuda_moe.rs` const comment: 16 -> 512 took the MoE GEMV
-  2.32 -> 1.50 s at a 517-token prompt), so only end-to-end pp at 2057 is
-  unmeasured. Add a `FERRUM_PF_CHUNK` diagnostic knob (default 256), order-
-  balanced pp A/B at 517 and 2057, close it in the same pass if flat.
+- [x] **R10.1 Prefill chunk 512 confirmation** -- DONE (2026-10-20). The
+  GEMV-level sweep in the `cuda_moe.rs` const comment had flattened past 256,
+  but the end-to-end pp A/B (`FERRUM_PF_CHUNK`, n=3 per arm, order-balanced,
+  warm-up discarded) gained **+2.8% at 517 (149.0 -> 153.2 tok/s) and +3.2% at
+  2057 (156.9 -> 161.9)** going 256 -> 512, at identical VRAM (7190 MiB), so
+  512 is the new default and the knob stays as a diagnostic. Logs under
+  `/tmp/opencode/pp_sweep/`.
 - [ ] **R10.2 Batched grouped MoE GEMM for prefill.** Prefill runs per-route
   M=1 `gemv_gate_up`/`gemv_down` over each chunk (`group_with_slots`, scratch
   `[routes, ...]`); FreeToken's prefill is a true BLOCK_M>1 grouped GEMM over
