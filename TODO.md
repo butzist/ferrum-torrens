@@ -109,6 +109,9 @@ at 476-478 tokens and 725.0 +/- 3.1 at 1878**, its K=4 aggregate **25.17 batched
 (11.70 serial)** -- against our 150 / 156 and 26.2 / 16.6, so prefill is the
 measured gap (table and caveats in `OPTIMIZATION.md`, under R9 "Reference
 baselines").
+A four-slice prefill plan (R10: chunk confirmation, batched grouped MoE GEMM,
+device prefill attention, fused `norm_in`) is queued in section 8 and
+`OPTIMIZATION.md` R10.
 Instruments: `FT_PROFILE=1`, `FT_SLOTS_REPORT=1`, `scripts/freetoken_probe/`.
 Progress history and the full decision log (numbers 1..111) live in `DONE.md`;
 read that for the "why" behind any decision number referenced in code or tests.
@@ -932,6 +935,34 @@ prompt override before comparing miss rates.
   156 and 26.2 / 16.6. Prefill is the gap. Full table, method and caveats in
   `OPTIMIZATION.md` under R9 "Reference baselines"; logs under
   `/tmp/opencode/freetoken_baseline/`.
+
+### R10 prefill plan (2026-10-20, pp is the measured gap)
+
+Findings in `OPTIMIZATION.md` R10. Prefill is 2.4-4.6x behind FreeToken
+(150/156 vs 366/725 tok/s); decode is at parity. A 451-token chunk splits
+7.72 ms/token as `pf_gemm` 3.53 (46%), host attention ~1.2 (16%), `norm_in`
+0.87 (11%), GDN 0.19 (closed, decision 111).
+
+- [ ] **R10.1 Prefill chunk 512 confirmation.** The GEMV-level sweep already
+  flattened past 256 (`cuda_moe.rs` const comment: 16 -> 512 took the MoE GEMV
+  2.32 -> 1.50 s at a 517-token prompt), so only end-to-end pp at 2057 is
+  unmeasured. Add a `FERRUM_PF_CHUNK` diagnostic knob (default 256), order-
+  balanced pp A/B at 517 and 2057, close it in the same pass if flat.
+- [ ] **R10.2 Batched grouped MoE GEMM for prefill.** Prefill runs per-route
+  M=1 `gemv_gate_up`/`gemv_down` over each chunk (`group_with_slots`, scratch
+  `[routes, ...]`); FreeToken's prefill is a true BLOCK_M>1 grouped GEMM over
+  the chunk (`fused_nvfp4.py:4`). Author `_nvfp4_grouped_gemm` (Triton, AOT
+  cubin) processing one expert's route segment in one program, weights read
+  once per expert per chunk. Decode stays on the M=1 gemv. Gates: interp
+  selftest vs the torch oracle, `check-kernels.sh`, ABI units, decode gates
+  untouched-green, pp smoke + `FT_PROFILE` `pf_gemm` before/after.
+- [ ] **R10.3 Device prefill attention.** Replace the `CacheAccess::Host`
+  gather+SDPA fallback (`forward_torch.rs:1821/2424`), ~1.2 ms/token across
+  `attn`/`attn_out`/`attn_mem`: extend the paged attention kernel to chunked
+  prefill. Gate: attention oracle vs the host SDPA reference.
+- [ ] **R10.4 Fused prefill `norm_in`.** 0.87 ms/token at
+  `forward_torch.rs:2490`; reuse the decode-side `add_rmsnorm` pattern
+  (decision 100) for the chunk rows. Gate: norm oracle + pp smoke.
 
 ### State of play
 

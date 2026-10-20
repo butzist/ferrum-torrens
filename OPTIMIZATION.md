@@ -1188,3 +1188,32 @@ Commands + logs: env recipe and run steps in
 `plans/2026-10-20-freetoken-prefill-k4-baselines.md` (untracked), driver
 docstring in `scripts/freetoken_probe/baselines.py`; logs
 `/tmp/opencode/freetoken_baseline/{run.log,serve.log,baseline_rows.json}`.
+
+## R10 -- prefill (the measured gap, queued 2026-10-20)
+
+Prefill is 2.4-4.6x behind FreeToken (150/156 vs 366/725 tok/s, R9 baselines);
+decode is at parity. The R9.1-era attribution of a 451-token chunk (decision
+111: 7.72 ms/token) still holds: `pf_gemm` 3.53 (46%), host attention fallback
+~1.2 (16%, `CacheAccess::Host` gathers + SDPA), `norm_in` 0.87 (11%), GDN 0.19
+(closed). Slices, in order (TODO.md section 8 has the checkboxes):
+
+- **R10.1 chunk 512 confirmation** -- the GEMV-level sweep in `cuda_moe.rs`'s
+  const comment already flattened past 256 (16 -> 512: MoE GEMV 2.32 -> 1.50 s
+  at 517 tokens); only end-to-end pp at 2057 is unmeasured. A `FERRUM_PF_CHUNK`
+  diagnostic knob plus one order-balanced A/B; record the negative if flat.
+- **R10.2 batched grouped MoE GEMM** -- the 46% lever. Prefill launches one
+  M=1 `gemv_gate_up`/`gemv_down` per route (`group_with_slots`, scratch
+  `[routes, ...]`), so each expert's weight is re-fetched from L2 per route;
+  FreeToken's prefill is a true BLOCK_M>1 grouped GEMM over the chunk
+  (`fused_nvfp4.py:4`, autotuned `(BLOCK_M, BLOCK_N, ...)`) reading each expert
+  once per chunk. Author `_nvfp4_grouped_gemm` (Triton, AOT cubin), wire the
+  prefill path with a size-threshold dispatch, keep the decode M=1 gemv.
+- **R10.3 device prefill attention** -- replace the Host gather+SDPA fallback
+  (~1.2 ms/token) with the paged attention kernel extended to chunked prefill.
+- **R10.4 fused prefill `norm_in`** -- 0.87 ms/token; reuse the decode-side
+  `add_rmsnorm` pattern (decision 100) for the chunk rows.
+
+If all four land, the arithmetic floor is ~2 ms/token (~400-500 tok/s pp) at
+the current chunk size; their marginal (R9 baselines, after ~0.87 s of HTTP
+per request) is ~1086 tok/s, so further levers (larger chunks under the batched
+GEMM, scratch-budget tuning) may follow.
