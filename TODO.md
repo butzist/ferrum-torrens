@@ -123,7 +123,12 @@ for pp. R10.3 (device prefill attention) and R10.4 (fused `norm_in`) remain.
 Instruments: `FT_PROFILE=1`, `FT_SLOTS_REPORT=1`, `scripts/freetoken_probe/`.
 Build hygiene (2026-10-21, decision 113): the kernel artifacts are built by
 `nix/kernels.nix` and never committed; cargo runs in the devshell, which exports
-`FERRUM_KERNEL_DIR`.
+`FERRUM_KERNEL_DIR`. R10.3 also has a first paged-prefill implementation (the
+decode kernel driven by a per-row prefix window); it is CPU-green but
+**unmeasured**, so it is parked in `git stash` (message "R10.3 paged prefill
+attention"): the 2026-10-21 agent sandbox exposed no CUDA device. Pop it, run the
+GPU gate and pp A/B, then either land it or record the negative result. The
+torch-less runtime is planned as M7 (decision 114).
 Progress history and the full decision log (numbers 1..113) live in `DONE.md`;
 read that for the "why" behind any decision number referenced in code or tests.
 
@@ -392,6 +397,32 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
   (item 20), with cache growth (item 21) and server-side batching (item 11) as
   the other levers.
 
+## 6b. M7 -- torch-less compute runtime (planned 2026-10-21)
+
+Decision 114 and `plans/2026-10-21-torchless-runtime-candle-eval.md`. Replace
+`tch`/libtorch with a Rust tensor runtime (candle 0.11 first, a minimal cudarc
+layer as the fallback) while keeping every Triton cubin and the domain unchanged.
+The old blockers in decision 17 no longer decide it: NVFP4/GDN are our kernels,
+and graph capture is engine-owned; candle 0.11 has a primary-context cudarc
+backend, raw pointers, cuBLAS BF16 GEMM and a public stream. Do the spike before
+any port.
+
+- [ ] **M7.0 spike.** Candle BF16 GEMM parity/speed on the real projection
+  shapes; capture/replay of a candle op sequence on a cudarc side stream; one
+  cubin fed by a candle tensor pointer/stream; FTW load + VRAM + no libtorch.
+  Gates: argmax-equal and at most 5% slower on prefill shapes; replay equal and
+  no host sync; pointer gate exact where deterministic.
+- [ ] **M7.1 runtime adapter.** `ComputeRuntime` over candle; port
+  `infrastructure/torch.rs` and `Device`.
+- [ ] **M7.2 weights/load.** FTW dense widening and upload through candle;
+  `domain::dequant` stays the host transform.
+- [ ] **M7.3 forward.** Port `forward_torch.rs` off `tch::Tensor`; the scalar
+  oracle stays the gate.
+- [ ] **M7.4 kernels/capture.** Launchers take the candle stream and raw storage;
+  disable event tracking for capture; delete `shim/c10_graph_shim.cpp`.
+- [ ] **M7.5 remove libtorch.** Drop `tch`, `torch-sys`, the C++ build script and
+  the libtorch closure; keep the same gate set.
+
 ## 7. Decisions
 
 The full log of confirmed decisions (numbers 1..113, stable -- code, tests and
@@ -408,6 +439,16 @@ history.
   artifact comparison, which cannot work because ptxas embeds the source path).
   Binds the devshell env (`FERRUM_KERNEL_DIR`, `FERRUM_PYTHON`) and the verify
   line in `AGENTS.md`.
+- **114** -- **candle 0.11 is a viable torch-less tensor-runtime candidate**;
+  the old rejection (decision 17) turned on NVFP4, GDN and a graph-capture API,
+  and the first two are ours while capture is now engine-owned (see
+  `plans/2026-10-21-torchless-runtime-candle-eval.md`). This is a spike
+  commitment, not a port commitment: M7.0 must prove BF16 cuBLAS GEMM parity
+  and speed on the real prefill shapes, capture/replay of candle ops on our
+  stream, and raw-pointer interop with one cubin. If it fails, the fallback is a
+  minimal cudarc tensor layer. The domain, scalar oracle, FTW reader and every
+  Triton cubin stay put; only `infrastructure/torch.rs` and
+  `models/qwen3_6/forward_torch.rs` move.
 
 - **94** -- the whole-layer prefill's buffer is the `2 * num_experts` **coldest**
   slots chosen by `usage.argsort` (`select_buffer_slots`); it frees exactly those
@@ -978,8 +1019,10 @@ Findings in `OPTIMIZATION.md` R10. Prefill is 2.4-4.6x behind FreeToken
   `pf_gemm` -72%. Detail in `OPTIMIZATION.md` R10.2 and `DONE.md` decision 112.
 - [ ] **R10.3 Device prefill attention.** Replace the `CacheAccess::Host`
   gather+SDPA fallback (`forward_torch.rs:1821/2424`), ~1.2 ms/token across
-  `attn`/`attn_out`/`attn_mem`: extend the paged attention kernel to chunked
-  prefill. Gate: attention oracle vs the host SDPA reference.
+  `attn`/`attn_out`/`attn_mem`. First implementation is parked in `git stash`
+  (decode kernel driven by a per-row prefix window built once per chunk;
+  `FERRUM_PF_ATTN=0` restores the fallback). CPU gates green; pop it in the GPU
+  devshell, run the attention gate and the pp A/B, then land or record.
 - [ ] **R10.4 Fused prefill `norm_in`.** 0.87 ms/token at
   `forward_torch.rs:2490`; reuse the decode-side `add_rmsnorm` pattern
   (decision 100) for the chunk rows. Gate: norm oracle + pp smoke.

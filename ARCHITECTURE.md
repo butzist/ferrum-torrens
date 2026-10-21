@@ -813,6 +813,14 @@ reaches the oracle token through the captured graph.
 Boundary note: `tch`/`Tensor` and the CUDA driver handles live entirely in
 `infrastructure`; the domain sees only `MoETensor`, counts and opaque bytes.
 
+**Planned boundary `[TODO]`: torch-less tensor runtime (M7).** Replace `tch`
+with a Rust tensor runtime (candle 0.11 first, a minimal cudarc layer as the
+fallback) behind the same `cuda` adapter boundary. The domain, the FTW reader,
+the scalar oracle and every cubin ABI stay put; the adapter would own device
+tensors, cuBLAS GEMM, raw pointers and the stream the driver launches on, and
+`shim/c10_graph_shim.cpp` would disappear with libtorch. Nothing is built yet;
+the M7.0 spike (decision 114) decides it before a port.
+
 ---
 
 ## 5. Cross-cutting invariants

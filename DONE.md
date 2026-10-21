@@ -2910,6 +2910,42 @@ settled.
        path in the debug info is the reason `.text`/manifest are the parity
        proof rather than a byte compare.
 
+114. **candle 0.11 is a viable torch-less tensor-runtime candidate** (2026-10-21,
+     `plans/2026-10-21-torchless-runtime-candle-eval.md`). Re-opens decision 17 on
+     its own terms and supersedes its conclusion; it is a spike commitment, not a
+     port commitment.
+     - **Why 17 no longer decides it.** 17 rejected candle-core for no NVFP4, no
+       GDN, and no public CUDA-graph capture. The first two are ours already (the
+       Triton cubins own every NVFP4/FP8/GDN/attention op), and capture moved to
+       the engine (`cuda_driver`/`decode_graph`). Candle's CUDA backend is
+       `cudarc` 0.19.10 and `CudaContext::new` retains the **primary** context
+       (`cudarc` safe/core.rs:77), the same one `Driver::attach_primary_context`
+       uses, so candle tensors and our launches share a context.
+     - **Audited surface (candle 0.11.0, 2026-06-26).** `CudaDevice::cuda_stream()`
+       and `CudaStream::cu_stream()` are public; `Tensor::storage_and_layout`,
+       `Storage::Cuda`, `CudaStorage`, `CudaStorageSlice` and cudarc's
+       `device_ptr` expose raw pointers; BF16/F16/F32 `matmul` is cuBLAS
+       `gemm_strided_batched`; `embedding`/`index_select`/`gather`/`narrow`/
+       `rope`/`conv1d`/`softmax` cover the non-quantized ops; `cuMemAllocAsync`
+       is used when the device has memory pools, and candle has capture-aware
+       `capture_status`/HTOD-cache guards plus `disable_event_tracking`. `DType`
+       has MX4 `F4`, not NVFP4, which is fine: the NVFP4 banks stay our U8/I32
+       tensors.
+     - **Plan.** M7.0 spike first: (1) candle BF16 GEMM parity and <=5% prefill
+       slowdown on the real shapes (`H=2048`, `I=512`, `vocab=248320`, including
+       the transposed weight), (2) capture/replay of a candle op sequence on a
+       cudarc side stream with stable addresses and no host sync, (3) one cubin
+       fed a candle tensor pointer/stream where deterministic, (4) FTW load +
+       VRAM + no libtorch. If green, M7.1 runtime adapter, M7.2 weights/load,
+       M7.3 forward, M7.4 stream/pointer/capture, M7.5 remove libtorch. If the
+       spike fails, fall back to a minimal cudarc tensor layer.
+     - **Out of scope.** Re-implementing NVFP4/GDN/attention in candle, changing
+       the domain or scalar oracle, or touching the FTW reader; the port is
+       `infrastructure/torch.rs` + `models/qwen3_6/forward_torch.rs`.
+     - **Blocked measurement.** The 2026-10-21 agent sandbox had no
+       `/dev/nvidia*` and no `/run/opengl-driver/lib/libcuda.so.1`, so R10.3's
+       GPU gate/pp A/B and the M7.0 spike must run in the GPU devshell.
+
 ---
 
 
