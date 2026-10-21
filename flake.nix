@@ -99,6 +99,10 @@
         basePackages = [
           rustNightly
           pkgs.stdenv.cc
+          # The cargo linker the home/user config selects (`linker = "clang"`,
+          # `--ld-path=mold`). Without it a plain `cargo test` in the devshell
+          # dies at the first build script.
+          pkgs.clang
           pkgs.mold
           pkgs.fd
           pkgs.cargo-llvm-cov
