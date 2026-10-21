@@ -1222,8 +1222,19 @@ Slices, in order (TODO.md section 8 has the checkboxes):
   matches the host plan to a bf16 budget rather than bit-exactly (the GEMV arm
   stays exact); `a_whole_layer_prefill_overlap_matches_the_host_plan` now gates
   both arms. Logs `/tmp/opencode/r10_2/`.
-- **R10.3 device prefill attention** -- replace the Host gather+SDPA fallback
-  (~1.2 ms/token) with the paged attention kernel extended to chunked prefill.
+- **R10.3 device prefill attention -- implementation parked, gate in progress
+  (2026-10-21).** The first cut runs the decode paged-attention kernel with one
+  row per query token and a per-row prefix window built once per chunk
+  (`FERRUM_PF_ATTN=0` restores the Host fallback). A new kernel-level GPU gate
+  (`tests/paged_attention_kernel.rs`, 6 tokens, one query row each, bf16 output)
+  matches causal SDPA in 0.33 s, so the window/kernel mapping is right. The
+  integrated gate (`tests/prefill_attention_matches_host.rs`) is not yet
+  like-for-like: the cubin's output pointer is bf16 (decision 87) while the Host
+  fallback returns f32, and its exact-argmax assertion failed on random ids
+  (39543 vs 220) before the logit diff was measured. Next: make both arms one
+  dtype (or gate the real prompt's oracle token), then run the pp A/B. The
+  implementation is in `git stash` ("R10.3 paged prefill attention (bf16 kernel
+  gate green)"). No pp number exists yet.
 - **R10.4 fused prefill `norm_in`** -- 0.87 ms/token; reuse the decode-side
   `add_rmsnorm` pattern (decision 100) for the chunk rows.
 

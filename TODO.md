@@ -124,11 +124,16 @@ Instruments: `FT_PROFILE=1`, `FT_SLOTS_REPORT=1`, `scripts/freetoken_probe/`.
 Build hygiene (2026-10-21, decision 113): the kernel artifacts are built by
 `nix/kernels.nix` and never committed; cargo runs in the devshell, which exports
 `FERRUM_KERNEL_DIR`. R10.3 also has a first paged-prefill implementation (the
-decode kernel driven by a per-row prefix window); it is CPU-green but
-**unmeasured**, so it is parked in `git stash` (message "R10.3 paged prefill
-attention"): the 2026-10-21 agent sandbox exposed no CUDA device. Pop it, run the
-GPU gate and pp A/B, then either land it or record the negative result. The
-torch-less runtime is planned as M7 (decision 114).
+decode kernel driven by a per-row prefix window). It is CPU-green and the new
+kernel-level GPU gate (`tests/paged_attention_kernel.rs`, one query row per
+token, bf16 output) matches causal SDPA; the end-to-end model gate is **not
+like-for-like yet**: the cubin writes bf16 (decision 87) while the Host fallback
+returns f32, so its exact-argmax check fails on random token ids. The pp A/B is
+still unmeasured. Parked in `git stash` (message "R10.3 paged prefill attention
+(bf16 kernel gate green)"): make the model gate compare at one dtype, then run
+the pp A/B and land or record. The 2026-10-21 sandbox did expose a CUDA device
+(the earlier no-device note was wrong). The torch-less runtime is planned as M7
+(decision 114).
 Progress history and the full decision log (numbers 1..113) live in `DONE.md`;
 read that for the "why" behind any decision number referenced in code or tests.
 
@@ -1029,8 +1034,13 @@ Findings in `OPTIMIZATION.md` R10. Prefill is 2.4-4.6x behind FreeToken
   gather+SDPA fallback (`forward_torch.rs:1821/2424`), ~1.2 ms/token across
   `attn`/`attn_out`/`attn_mem`. First implementation is parked in `git stash`
   (decode kernel driven by a per-row prefix window built once per chunk;
-  `FERRUM_PF_ATTN=0` restores the fallback). CPU gates green; pop it in the GPU
-  devshell, run the attention gate and the pp A/B, then land or record.
+  `FERRUM_PF_ATTN=0` restores the fallback). CPU gates green; the kernel-level
+  GPU gate is green (`tests/paged_attention_kernel.rs`: one query row per token
+  against its prefix window matches causal SDPA at bf16, 0.33 s). The
+  integrated gate (`tests/prefill_attention_matches_host.rs`) still fails its
+  exact-argmax check because it compares bf16 paged output against the f32 Host
+  fallback; make the two arms one dtype (or gate on the real-prompt oracle),
+  then run the pp A/B and land or record.
 - [ ] **R10.4 Fused prefill `norm_in`.** 0.87 ms/token at
   `forward_torch.rs:2490`; the Host path already calls the decode-side
   `add_rms_norm` for `residual=Some`, so re-profile before adding another
