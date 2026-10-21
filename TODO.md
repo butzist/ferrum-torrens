@@ -998,6 +998,14 @@ prompt override before comparing miss rates.
   `OPTIMIZATION.md` under R9 "Reference baselines"; logs under
   `/tmp/opencode/freetoken_baseline/`.
 
+**Known red gate (2026-10-21).**
+`kvcache_incremental_decode::incremental_decode_matches_refeeding_the_whole_prefix`
+fails on the CPU backend at HEAD: start=3, 4-token chunk, argmax equal but
+`max|dlogit|/scale = 0.3004` against the 1e-3 bound. It predates R10.3
+(reproduced with the paged prefill disabled and with `FERRUM_PF_GEMV=1`). Check
+whether CPU bf16 GEMM shape reassociation is the cause, then either pin the test
+to the device it was calibrated for or loosen it to the decision-80 argmax gate.
+
 ### R10 prefill plan (2026-10-20, pp is the measured gap)
 
 Findings in `OPTIMIZATION.md` R10. Prefill is 2.4-4.6x behind FreeToken
@@ -1024,8 +1032,10 @@ Findings in `OPTIMIZATION.md` R10. Prefill is 2.4-4.6x behind FreeToken
   `FERRUM_PF_ATTN=0` restores the fallback). CPU gates green; pop it in the GPU
   devshell, run the attention gate and the pp A/B, then land or record.
 - [ ] **R10.4 Fused prefill `norm_in`.** 0.87 ms/token at
-  `forward_torch.rs:2490`; reuse the decode-side `add_rmsnorm` pattern
-  (decision 100) for the chunk rows. Gate: norm oracle + pp smoke.
+  `forward_torch.rs:2490`; the Host path already calls the decode-side
+  `add_rms_norm` for `residual=Some`, so re-profile before adding another
+  kernel. The open piece is the first layer (`residual=None`), which still uses
+  the op chain. Gate: norm oracle + pp smoke.
 
 ### State of play
 
