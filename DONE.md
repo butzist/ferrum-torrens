@@ -2946,8 +2946,40 @@ settled.
        `/dev/nvidia*` and no `/run/opengl-driver/lib/libcuda.so.1`, so R10.3's
        GPU gate/pp A/B and the M7.0 spike must run in the GPU devshell.
 
----
+115. **The jailed opencode gets the host's opencode config and provider
+     secrets** (2026-10-21, implemented) -- `nix/agents.nix`.
+     - **Why.** The jailed opencode loaded only
+       `~/.config/opencode/{config.json,opencode.json,opencode.jsonc}` (a
+       50-byte schema stub) and never the host's shared config, so the
+       `opencode-go` provider did not exist in the jail at all (the host
+       session runs on it, the jail fell back to the zen default). The agenix
+       secret links (`~/.config/opencode/opencode-go-token` ->
+       `/run/user/<uid>/agenix/opencode-go-token`) dangled as well: the jail
+       binds neither `/run` nor the host store, so even a configured provider
+       would have had no key.
+     - **What changed.** `resolveOpencodeSymlinks` replaces the store-only
+       resolver: it walks every symlink in `~/.config/opencode` and emits
+       every hop under `/nix/store` *or* under `/run`, which the jail's
+       `add-runtime` step ro-binds at its own path. Bubblewrap creates the
+       missing parent directories of a bind and resolves a symlinked source
+       (verified on the host), so binding the `/run` hop makes the whole
+       chain readable inside the jail.
+     - **The key.** The jail entry (jail.nix `wrap-entry`) reads the bound
+       token files and exports `OPENCODE_API_KEY` + `OPENCODE_GO_API_KEY`
+       (opencode-go) and `GREENPT_API_KEY` before opencode starts.
+       `opencode-go` is a built-in provider in opencode 1.19 and reads
+       `OPENCODE_API_KEY`; the host's shared config spells the same secret
+       `OPENCODE_GO_API_KEY`, so both names are exported. The secrets are
+       read inside the jail at start time: they reach neither the nix store
+       nor the host's process list, and an unreadable token file is skipped,
+       so the jail still boots (the provider is then simply not configured).
+     - **`OPENCODE_CONFIG`.** It joins `fwdEnv` (decision 53's list), so a
+       jail launched from an environment that carries the host's shared config
+       (the agent-toolbox wrapper exports it) inherits the same providers,
+       model and MCP servers. Unset in a plain shell, and then the jail uses
+       opencode's own built-in providers.
 
+---
 
 
 ## Progress log (narrative, pre-2026-10-15 compaction)

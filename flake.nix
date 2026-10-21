@@ -5,14 +5,14 @@
     flake-parts.url = "github:hercules-ci/flake-parts";
     flake-root.url = "github:srid/flake-root";
     rust-overlay.url = "github:oxalica/rust-overlay";
-    jailed-agents.url = "github:andersonjoseph/jailed-agents";
+    agent-toolbox.url = "github:butzist/agent-toolbox";
   };
 
   outputs = inputs @ {
     nixpkgs,
     flake-parts,
     rust-overlay,
-    jailed-agents,
+    agent-toolbox,
     ...
   }:
     flake-parts.lib.mkFlake {inherit inputs;} {
@@ -30,9 +30,6 @@
           inherit system overlays;
           config.allowUnfree = true;
         };
-
-        jlib = jailed-agents.lib.${system};
-        combinators = jlib.internals.jail.combinators;
 
         rustNightly = pkgs.rust-bin.nightly.latest.default.override {
           extensions = [
@@ -145,147 +142,9 @@
           pkgs.ninja
         ];
 
-        cudaDevicePaths = with combinators; [
-          (unsafe-add-raw-args
-            ''--dev-bind /dev dev'')
-        ];
-
-        jailOptions = with combinators;
-          jlib.commonJailOptions
-          ++ [
-            (readwrite (noescape "\"$FLAKE_ROOT\""))
-            (readonly "/run/user")
-            # `nix build` inside the jail needs the store (ro) and the daemon
-            # socket (rw) so the kernel derivation can be realised; the nix
-            # binary itself is in basePackages. The jail otherwise binds only
-            # its packages' closures, so without these the store is absent.
-            (readonly "/nix/store")
-            (readonly "/nix/var/nix/db")
-            (readwrite (noescape "\"/nix/var/nix/daemon-socket\""))
-          ]
-          # jail.nix `gpu`: ro-binds the PCI GPU dirs in /sys/devices, mounts
-          # /sys/dev/char + /run/opengl-driver(-32) and --dev-binds /dev/dri.
-          ++ [combinators.gpu]
-          ++ cudaDevicePaths;
-
-        # Home-manager surfaces opencode's config as a symlink chain into the
-        # nix store, e.g.
-        #
-        #   ~/.config/opencode/opencode.jsonc
-        #     -> /nix/store/<hash>-home-manager-files/.config/opencode/opencode.jsonc
-        #     -> /nix/store/<hash>-hm_opencodeopencode.jsonc
-        #
-        # The jail binds the config dir (from `configPaths`) but not the host
-        # `/nix` store, so those symlinks dangle and opencode cannot read its
-        # own config. Nix evaluation is pure and has no `readlink`, and the
-        # targets' hashes are not known statically, so resolve the chain at
-        # runtime instead: this script runs on the host in the jail's
-        # `add-runtime` step and prints each `/nix/store/*` hop, which is then
-        # ro-bound at its own location. Every hop is emitted (not just the
-        # final target) so intermediate symlinks such as the
-        # `home-manager-files` path resolve too.
-        opencodeConfigFiles = ["$HOME/.config/opencode/opencode.jsonc"];
-
-        resolveOpencodeStoreSymlinks = pkgs.writeShellApplication {
-          name = "opencode-resolve-store-symlinks";
-          runtimeInputs = [pkgs.coreutils];
-          text = ''
-            collect() {
-              local p="$1" dir
-              dir="$(dirname "$p")"
-              while [ -L "$p" ]; do
-                p="$(readlink "$p")"
-                case "$p" in
-                  /*) ;;
-                  *) p="$dir/$p" ;;
-                esac
-                case "$p" in
-                  /nix/store/*)
-                    if [ -e "$p" ]; then
-                      printf '%s\n' "$p"
-                    fi
-                    ;;
-                esac
-                dir="$(dirname "$p")"
-              done
-            }
-            ${builtins.concatStringsSep "\n" (map (f: ''collect "${f}"'') opencodeConfigFiles)}
-          '';
-        };
-
-        # `--ro-bind-try` so the jail still boots if a target has since been
-        # garbage-collected.
-        bindOpencodeStorePaths = combinators.add-runtime ''
-          while IFS= read -r store_path; do
-            [ -n "$store_path" ] || continue
-            RUNTIME_ARGS+=(--ro-bind-try "$store_path" "$store_path")
-          done < <(${resolveOpencodeStoreSymlinks}/bin/opencode-resolve-store-symlinks)
-        '';
-
-        jailedOpencode = jlib.makeJailedOpencode {
-          name = "opencode";
-          extraPkgs = basePackages;
-          baseJailOptions = jailOptions;
-          extraJailOptions = [bindOpencodeStorePaths];
-          # Inherit the devshell's build/runtime env (jail.nix `try-fwd-env`:
-          # forward if set, ignore otherwise). Launching the agent from a
-          # `nix develop` shell then gives it the torch/cuda/python toolchain
-          # env without hand-exporting it; launching elsewhere just leaves it
-          # unset, as before.
-          fwdEnv = [
-            "LIBTORCH"
-            "LIBTORCH_INCLUDE"
-            "LIBTORCH_LIB"
-            "CUDA_HOME"
-            "CXX"
-            "LD_LIBRARY_PATH"
-            "PYTHONPATH"
-            "TRITON_LIBCUDA_PATH"
-            "TRITON_PTXAS_PATH"
-            "TRITON_PTXAS_BLACKWELL_PATH"
-            "FERRUM_KERNEL_DIR"
-            "NIX_REMOTE"
-          ];
-        };
-
-        # Google Antigravity CLI (`agy`), jailed like opencode. Its permission
-        # prompts are skipped by force-injecting `--dangerously-skip-permissions`
-        # on every launch: safe here precisely because the jail, not the CLI, is
-        # the isolation boundary. That flag also gives up agy's inner sandbox
-        # (it auto-approves sandbox bypass), which is the point.
-        jailedAntigravity = jlib.makeJailedAgent {
-          name = "agy";
-          pkg = pkgs.antigravity-cli;
-          # `~/.gemini` holds settings.json, conversations and the CLI's
-          # self-updated binaries; `~/.cache/antigravity` holds its embedded rg.
-          configPaths = [
-            "~/.gemini"
-            "~/.cache/antigravity"
-          ];
-          extraPkgs = basePackages;
-          baseJailOptions = jailOptions;
-          # Forge the flag in front of whatever argv the caller passes (before
-          # any subcommand or positional prompt), so every run auto-approves.
-          extraJailOptions = [
-            (combinators.set-argv [
-              "--dangerously-skip-permissions"
-              (combinators.noescape "\"$@\"")
-            ])
-          ];
-          fwdEnv = [
-            "LIBTORCH"
-            "LIBTORCH_INCLUDE"
-            "LIBTORCH_LIB"
-            "CUDA_HOME"
-            "CXX"
-            "LD_LIBRARY_PATH"
-            "PYTHONPATH"
-            "TRITON_LIBCUDA_PATH"
-            "TRITON_PTXAS_PATH"
-            "TRITON_PTXAS_BLACKWELL_PATH"
-            "FERRUM_KERNEL_DIR"
-            "NIX_REMOTE"
-          ];
+        # Jailed agents, their jail options and the forwarded devshell env.
+        agents = import ./nix/agents.nix {
+          inherit pkgs agent-toolbox basePackages;
         };
       in {
         packages = {
@@ -297,8 +156,7 @@
           packages =
             basePackages
             ++ [
-              jailedOpencode
-              jailedAntigravity
+              agents.opencode
             ];
 
           inputsFrom = [config.flake-root.devShell];

@@ -145,12 +145,18 @@ Instructions for AI coding agents working in this repository.
   `/run/opengl-driver/lib/libcuda.so.1` and `cuInit` succeeds), so the gated GPU
   tests run here. The agent jail inherits `LIBTORCH*`, `CUDA_HOME`, `CXX`
   `LD_LIBRARY_PATH`, `PYTHONPATH` and the `TRITON_*` knobs from the devshell
-  (`fwdEnv` in `flake.nix`, jail.nix `try-fwd-env`), so launching the agent from
+  (`fwdEnv` in `nix/agents.nix`, jail.nix `try-fwd-env`), so launching the agent from
   a `nix develop` shell needs no manual export; from elsewhere, export them (see
   below). The compute runtime still auto-detects and falls back to CPU, which is
   what keeps `cargo test --features cuda` meaningful on a box with no device
   (`DONE.md` decision 21). `model.device = "cuda"` forces the GPU. CUDA-graph
   capture is still asked for explicitly rather than discovered by a red test.
+- The jailed opencode gets its **own** config, baked into the package by
+  `agent-toolbox` from the toolbox's default opencode settings plus the
+  project's model and provider; no host config or state dirs are bound. The
+  opencode-go credential is read on the host from its file (following any
+  symlink) by `envFromFile` and forwarded as `OPENCODE_GO_API_KEY`, so the
+  value never reaches the nix store.
 - The FTW checkpoint is served from the Nix store: add it with
   `nix store add-path <dir> --name qwen3.6-35b-a3b-nvfp4`. The jail binds only
   the runtime closure of `basePackages` (decision 52), not the whole `/nix/store`,

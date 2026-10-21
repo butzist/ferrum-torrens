@@ -236,6 +236,12 @@ flowchart LR
   `LIBTORCH_LIB`, `CXX`, `CUDA_HOME` and the loader path, and wires Triton's
   `ptxas` and `libcuda` probes. `scripts/run-gated.sh` (`ft-gate`) runs the
   heavy real-checkpoint tests serially under an `RLIMIT_AS` cap.
+- **The Nix side is three files.** `flake.nix` owns the project (the toolchain
+  packages and the devshell), `nix/kernels.nix` builds the cubins, and
+  `nix/agents.nix` owns the jailed opencode: agent-toolbox bakes the agent
+  config into the package, `envFromFile` reads the opencode-go credential on
+  the host, and the permissions grant the GPU, the store and the daemon
+  socket. The devshell provides the agent package (`agents.opencode`).
 
 ---
 
