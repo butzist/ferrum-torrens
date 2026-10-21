@@ -53,8 +53,9 @@
         libtorchCuda = pkgs.libtorch-bin.override {cudaSupport = true;};
 
         # Python for the kernel toolchain, from nixpkgs rather than a venv: the
-        # harness that compiles the committed cubins (`aot.py`) and checks the
-        # kernels against the torch reference (`selftest.py --interp`). It is a
+        # harness that compiles the cubins (`aot.py`, run by the `kernels`
+        # derivation below) and checks the kernels against the torch reference
+        # (`selftest.py --interp`). It is a
         # build-time tool only: the engine launches the cubins over the CUDA
         # driver API and never starts an interpreter (decision 30). Verified:
         # torch 2.13.0 (cu12.9) plus triton 3.7.1, and the kernel selftest
@@ -243,6 +244,7 @@
             "TRITON_PTXAS_PATH"
             "TRITON_PTXAS_BLACKWELL_PATH"
             "FERRUM_KERNEL_DIR"
+            "NIX_REMOTE"
           ];
         };
 
@@ -282,6 +284,7 @@
             "TRITON_PTXAS_PATH"
             "TRITON_PTXAS_BLACKWELL_PATH"
             "FERRUM_KERNEL_DIR"
+            "NIX_REMOTE"
           ];
         };
       in {
@@ -332,6 +335,12 @@
           # are the `kernels` derivation's output (nix/kernels.nix), built from
           # the Triton sources, not committed.
           FERRUM_KERNEL_DIR = "${kernels}";
+
+          # `store = auto` makes nix pick local mode inside the jail, which
+          # writes `/nix/var/nix/db` directly; the jail ro-binds that, so
+          # `nix build` dies on the db lock. Force the daemon client instead:
+          # the socket is bound rw and the daemon owns all store writes.
+          NIX_REMOTE = "daemon";
 
           shellHook = ''
             # No RUSTFLAGS here on purpose. The previous
@@ -385,7 +394,9 @@
             # The kernel self-check on CPU tensors through Triton's interpreter.
             alias kernel-selftest="''${FERRUM_PYTHON} -m ferrum_kernel.selftest --interp"
             alias kernel-compile-check="''${FERRUM_PYTHON} -m ferrum_kernel.compile_check"
-            # Rebuild kernel/*.cubin and kernel/*.ptx from the Triton sources.
+            # Rebuild kernel/*.cubin and kernel/*.ptx from the Triton sources,
+            # into the gitignored local kernel/ for inspection only. The build
+            # the engine consumes comes from the `kernels` derivation, not this.
             alias kernel-aot="''${FERRUM_PYTHON} -m ferrum_kernel.aot"
             # A gated run maps the 20 GiB FTW shard and holds the 4.5 GiB tower
             # resident; a live FreeToken engine keeps ~22 GiB of weights of its
