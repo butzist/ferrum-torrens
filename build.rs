@@ -61,6 +61,11 @@ fn stage_kernels() {
     }) {
         let entry = entry.unwrap();
         let to = out.join(entry.file_name());
+        // The store files are mode 0444, and `copy` preserves that, so a second
+        // build in the same OUT_DIR would fail to reopen its own output.
+        if to.exists() {
+            std::fs::remove_file(&to).unwrap();
+        }
         std::fs::copy(entry.path(), &to).unwrap();
         println!("cargo:rerun-if-changed={}", entry.path().display());
     }
