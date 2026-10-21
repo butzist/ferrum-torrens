@@ -123,9 +123,12 @@ Instructions for AI coding agents working in this repository.
   conversion via FreeToken's `ft` CLI (see below) and as the kernel toolchain:
   the NVFP4 grouped-MoE kernel is authored in Triton (libtorch has no CUDA NVFP4
   GEMM, and neither does upstream FreeToken, which is why it hand-writes the
-  kernel in Triton), compiled ahead of time by `python/ferrum_kernel/aot.py`, and
-  the resulting `kernel/*.cubin` are committed and launched by the driver-API
-  adapter (`infrastructure/cuda_driver.rs`, `infrastructure/cuda_moe.rs`).
+  kernel in Triton), compiled ahead of time by `python/ferrum_kernel/aot.py` in
+  the `kernels` Nix derivation (`nix/kernels.nix`) into `kernel/*.cubin`, and
+  launched by the driver-API adapter (`infrastructure/cuda_driver.rs`,
+  `infrastructure/cuda_moe.rs`). The artifacts are never committed: `build.rs`
+  copies `$FERRUM_KERNEL_DIR/kernel` into `OUT_DIR/kernel`, so every cargo build
+  runs in the devshell, which sets that variable.
   The pyo3 interpreter path is gone (`DONE.md` decision 30): there is no
   `triton` cargo feature and `infrastructure/triton.rs` no longer exists.
   A hand-written cudarc version of the kernel is deferred, not ruled out. Keep
@@ -174,8 +177,10 @@ Instructions for AI coding agents working in this repository.
   which already has the loader path):
   `FreeToken/.venv/bin/ft checkpoint --model /nix/store/mpwkgysbh8dyxz8jlrwkhzcsp01v6my3-qwen3.6-35b-a3b-nvfp4 \
    --out .model-cache/Qwen3.6-35B-A3B-NVFP4.ftw --moe-backend offload --shard-gib 8`
-- Verify with: `cargo fmt --check`, `cargo clippy --all-targets`, `cargo test`.
-  These are the CPU-only path and must stay green with no libtorch. The libtorch
+- Verify with: `cargo fmt --check`, `cargo clippy --all-targets`, `cargo test`,
+  all inside `nix develop`. These are the CPU-only path and must stay green with
+  no libtorch; the devshell supplies the `kernels` derivation through
+  `FERRUM_KERNEL_DIR`, which `build.rs` requires. The libtorch
   adapter is behind the non-default `cuda` feature, so additionally run
   `cargo clippy --all-targets --features cuda` inside the devshell (the flake
   exports `LIBTORCH`, `LIBTORCH_INCLUDE`, `LIBTORCH_LIB`, `CXX`; see
@@ -184,15 +189,12 @@ Instructions for AI coding agents working in this repository.
   cannot run them; hand them to a devshell run. Run a gated test with
   `... -- --ignored --nocapture 2>&1 | tee log`: cargo captures a failing test's
   panic text on stderr, so a plain `| tee` log reads as an empty failure.
-- Any change under `python/ferrum_kernel/` or `kernel/` must pass
-  `scripts/check-kernels.sh` (equivalent to `kernel-compile-check` +
-  `aot.py --check`) before committing: it lowers every kernel for sm_120 and
-  recompiles each committed `kernel/*.cubin`/`.ptx` in memory, so a kernel edit
-  without a matching `kernel-aot` fails instead of shipping stale artifacts.
-  Run it in the devShell; it needs no GPU. The comparison canonicalizes the
-  debug-info store paths, source mtimes and sizes (and `aot.py` compiles into a
-  fresh temp `TRITON_CACHE_DIR`), so it is stable across toolchains and caches
-  (DONE.md decision 106) -- a stale report now means a real kernel change.
+- Any change under `python/ferrum_kernel/` must pass
+  `scripts/check-kernels.sh` before committing: it lowers every kernel for
+  sm_120, so a source edit that does not compile fails fast. There are no
+  committed artifacts to be stale any more; `nix build .#kernels` is the gate
+  that turns the sources into the `kernel/` tree the Rust build consumes. Run
+  both in the devShell; neither needs a GPU.
 - Kernel work has a CPU inner loop, no GPU needed (DONE.md decision 31), and it
   is **hermetic in the devShell**. The flake's `pythonEnv` is torch + triton +
   numpy, and its `shellHook` wires triton to the cudatoolkit's `ptxas`
@@ -205,10 +207,10 @@ Instructions for AI coding agents working in this repository.
     them against the torch reference.
   - `kernel-compile-check` = `python -m ferrum_kernel.compile_check` -- checks
     they still compile for sm_120.
-  - `kernel-aot` = `python -m ferrum_kernel.aot` -- rebuilds `kernel/*.cubin` and
-    `kernel/*.ptx`. Those artifacts are committed, so only touch them when the
-    kernel itself changes, and note that a full rebuild currently churns the
-    gemv artifacts (DONE.md decision 45).
+  - `kernel-aot` = `python -m ferrum_kernel.aot` -- writes `kernel/*.cubin` and
+    `kernel/*.ptx` into the gitignored local `kernel/` for inspection. The
+    committed build uses the `kernels` Nix derivation, which compiles the same
+    sources into the store output that `FERRUM_KERNEL_DIR` points at.
   Do **not** run the kernel toolchain out of `FreeToken/.venv`: that environment
   is only for the FTW conversion (decision 35) and carries a different
   torch/triton. Use `--interp` before running the gated

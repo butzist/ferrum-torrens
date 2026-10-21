@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# Reproduce the committed kernel artifacts, so a `python/ferrum_kernel/` edit
-# without a matching `kernel-aot` fails loudly instead of shipping stale cubins
-# that only a real-GPU run would catch.
+# Lower every Triton kernel for sm_120, so a `python/ferrum_kernel/` edit that
+# does not compile (typo, constexpr arity, bad type) fails here instead of in
+# the `kernels` Nix build or, worse, a real-GPU run. The Nix derivation builds
+# the artifacts from the same sources on every change, so there is no committed
+# set to drift; this is the fast source-level gate.
 #
 # Run inside the devShell (its python env carries torch + triton and wires
 # `TRITON_PTXAS_*`); no GPU is needed.
 #
 #   scripts/check-kernels.sh
 #
-# `compile_check` lowers every Triton kernel for sm_120 (typos, constexpr arity
-# and type errors fail here), and `aot.py --check` recompiles every artifact in
-# memory and compares it against the committed `kernel/*.cubin`/`.ptx`
-# (decision 45 normalizes the nix-store path baked into the debug info, so a
-# rebuilt toolchain closure is not reported as a kernel change).
+# `compile_check` lowers every Triton kernel for sm_120 and checks the manifest
+# signatures. `aot.py` itself is exercised by `nix build .#kernels`, which is
+# what the Rust build consumes via `$FERRUM_KERNEL_DIR`.
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -30,9 +30,7 @@ done
 export LD_LIBRARY_PATH="$clean_ld"
 
 export PYTHONPATH="python${PYTHONPATH:+:$PYTHONPATH}"
+python="${FERRUM_PYTHON:-python3}"
 
 echo "== kernel compile check (sm_120) ==" >&2
-python -m ferrum_kernel.compile_check
-
-echo "== committed artifact check ==" >&2
-python -m ferrum_kernel.aot --check
+"$python" -m ferrum_kernel.compile_check

@@ -92,7 +92,7 @@ flowchart TB
     FTW[(".model-cache/*.ftw")]
     LibTorch[["libtorch (via tch)"]]
     LibCuda[["libcuda.so.1 (driver)"]]
-    Cubins[("kernel/*.cubin\n(committed)")]
+    Cubins[("kernel/*.cubin\n(Nix build output)")]
   end
 
   Client --> Http
@@ -129,7 +129,7 @@ the `engine`, which dispatches once through the `registry` to an arch `Model`.
 The model runs its forward via `torch` (serving) or the scalar oracle. The MoE
 block is not part of the model: the model hands its routing decision to the
 core `MoEExecutor` port, implemented by `run_experts::CachedExperts` over the
-  `cuda_moe` adapter and the committed cubins. Everything the domain sees is a
+  `cuda_moe` adapter and the cubins. Everything the domain sees is a
   trait.
 
 ### 1.1 Host/device split (one process, one GPU)
@@ -196,7 +196,7 @@ flowchart LR
     direction TB
     K1["python/ferrum_kernel/\nnvfp4_moe.py, offload.py,\nattention.py, gdn.py, linear.py,\nfp8_linear.py, signatures.py"]
     K2["aot.py: triton.compile\nGPUTarget cuda sm_120"]
-    K3[("kernel/*.cubin + *.ptx\n+ manifest.json (committed)")]
+    K3[("kernel/*.cubin + *.ptx\n+ manifest.json (Nix output)")]
     K1 --> K2 --> K3
   end
 
@@ -208,14 +208,17 @@ flowchart LR
   off, the registry hands back the scalar oracle; with it on, the libtorch
   forward. `cargo fmt` + `cargo clippy` + `cargo test` stay green without the
   feature and must be re-run with it in the devshell.
-- **`build.rs` only compiles the capture bridge.** Under `--features cuda` it
+- **`build.rs` stages the cubins and compiles the capture bridge.** Every build
+  copies `$FERRUM_KERNEL_DIR/kernel` (the `kernels` Nix derivation,
+  `nix/kernels.nix`) into `OUT_DIR/kernel`; under `--features cuda` it also
   invokes `cc` on `shim/c10_graph_shim.cpp` (the torch CUDA current-stream and
-  graph-mempool facilities `tch` does not expose), and adds
-  `-L$LIBTORCH_LIB/lib -lc10_cuda`. Without the feature it is a no-op.
-- **Kernels are authored in Triton, compiled ahead of time, and committed.**
+  graph-mempool facilities `tch` does not expose) and adds
+  `-L$LIBTORCH_LIB/lib -lc10_cuda`.
+- **Kernels are authored in Triton and compiled ahead of time by Nix.**
   `python/ferrum_kernel/aot.py` emits `kernel/*.cubin`, `*.ptx` and
-  `manifest.json`. The engine never runs an interpreter; `kernel_abi.rs` parses
-  the manifest and `cuda_driver.rs` launches the cubins. The manifest has four
+  `manifest.json` in the `kernels` derivation; nothing is committed. The engine
+  never runs an interpreter; `kernel_abi.rs` parses the manifest and
+  `cuda_driver.rs` launches the cubins. The manifest has four
   launch contracts, one section each: `kernels` (the six grouped-MoE passes:
   `gemv_gate_up`/`gemv_down` for decode, `grouped_gate_up`/`grouped_down`, the
   batched prefill grouped GEMM (R10.2, decision 112), `silu_mul` and
@@ -756,12 +759,12 @@ the untouched single-row host helpers; only the tower tail branches (prefill
 normalizes the last token, decode normalizes all rows). The device attention arm
 runs the paged GQA kernel through `infrastructure/cuda_attention.rs`
 (`PagedAttention`): it loads the `attention` manifest section and launches the
-committed cubin on the capture's stream, reading the row's KV straight out of the
+AOT cubin on the capture's stream, reading the row's KV straight out of the
 `MhaPool` slabs (`kv_slab_ptrs`) through the staged `DecodeBuffers` location
 window; when the launcher is absent or the pool is not f32 the arm falls back to
 the dense padded-window gather (decision 55). The device GDN arm runs the fused
 decode kernel through `infrastructure/cuda_gdn.rs` (`GdnDecode`): it loads the
-`linear` manifest section and launches the committed cubin on the capture's
+`linear` manifest section and launches the AOT cubin on the capture's
 stream, folding the gating, the q/k L2-norm and the delta-rule update into one
 launch per layer and reading/writing the row's `LinearStateSlabs` recurrent state
 in place; when the launcher is absent (CPU, decision 21) the arm keeps the
@@ -800,8 +803,8 @@ reaches the oracle token through the captured graph.
 | Library / tool | Kind | Used by | Purpose |
 |---|---|---|---|
 | `libtorch` (via `tch`) | runtime, `cuda` feature | `infrastructure/torch.rs`, `models/qwen3_6/forward_torch.rs`, `infrastructure/kvcache_dev.rs`, `infrastructure/cuda_moe.rs`, `infrastructure/decode_graph.rs` | All dense compute (GEMMs, norms, rope, attention, GDN), device tensors, the KV/state slabs, and the MoE slot banks |
-| CUDA driver API (`libcuda.so.1`) | runtime, hand-rolled FFI | `infrastructure/cuda_driver.rs` | Load and launch the committed cubins, allocate device + page-locked memory, capture and replay CUDA graphs |
-| Triton (cubins) | build-time authoring; committed artifacts at runtime | `python/ferrum_kernel/*`, `kernel/*.cubin` | The hand-written NVFP4 grouped-MoE GEMV, the silu/sum-reduce, the two offload staging kernels, and the paged GQA decode attention kernel. Authored and AOT-compiled in Python; launched by `cuda_driver` with no interpreter at runtime |
+| CUDA driver API (`libcuda.so.1`) | runtime, hand-rolled FFI | `infrastructure/cuda_driver.rs` | Load and launch the cubins, allocate device + page-locked memory, capture and replay CUDA graphs |
+| Triton (cubins) | build-time authoring; artifacts embedded at compile time | `python/ferrum_kernel/*`, `nix/kernels.nix` | The hand-written NVFP4 grouped-MoE GEMV, the silu/sum-reduce, the two offload staging kernels, and the paged GQA decode attention kernel. Authored and AOT-compiled in Python; launched by `cuda_driver` with no interpreter at runtime |
 | `c10_cuda` (torch C++) | runtime, via `build.rs` shim | `shim/c10_graph_shim.cpp`, `infrastructure/cuda_graph.rs`, `infrastructure/decode_graph.rs` | The torch current-stream set and the graph memory pool that `tch` does not expose; needed for CUDA-graph capture of torch ops |
 | `axum` + `tokio` | runtime | `infrastructure/http.rs`, `main.rs` | HTTP server, SSE streaming, and the async runtime that offloads forwards to blocking threads |
 | `tokenizers` + `minijinja` | runtime | `infrastructure/tokenizers_hf.rs` | HF byte-level BPE tokenizer and the checkpoint's chat template (Python string methods rewritten to filters; `json` feature for the template's `tojson`) |

@@ -87,6 +87,12 @@
           ps.numpy
         ]);
 
+        # The cubins are no longer committed: this derivation builds them from
+        # the Triton sources (`python/ferrum_kernel/aot.py`, CPU-only) and the
+        # engine's build.rs copies its `kernel/` tree into `OUT_DIR`. See
+        # nix/kernels.nix.
+        kernels = pkgs.callPackage ./nix/kernels.nix {inherit pythonEnv;};
+
         # Rust is the production language, and the only one at runtime. Python
         # is used for the one-time HF -> FTW conversion via FreeToken's `ft
         # checkpoint` and for the kernel toolchain (see AGENTS.md).
@@ -97,6 +103,11 @@
           pkgs.fd
           pkgs.cargo-llvm-cov
           pkgs.git
+          # `nix build`/`nix develop` inside the jail: the kernel derivation is
+          # realized at build time from the Triton sources instead of shipping
+          # committed cubins (nix/kernels.nix). The store and daemon socket are
+          # bound in jailOptions.
+          pkgs.nix
           pkgs.jq
           pkgs.ripgrep
           pkgs.coreutils
@@ -139,6 +150,13 @@
           ++ [
             (readwrite (noescape "\"$FLAKE_ROOT\""))
             (readonly "/run/user")
+            # `nix build` inside the jail needs the store (ro) and the daemon
+            # socket (rw) so the kernel derivation can be realised; the nix
+            # binary itself is in basePackages. The jail otherwise binds only
+            # its packages' closures, so without these the store is absent.
+            (readonly "/nix/store")
+            (readonly "/nix/var/nix/db")
+            (readwrite (noescape "\"/nix/var/nix/daemon-socket\""))
           ]
           # jail.nix `gpu`: ro-binds the PCI GPU dirs in /sys/devices, mounts
           # /sys/dev/char + /run/opengl-driver(-32) and --dev-binds /dev/dri.
@@ -220,6 +238,7 @@
             "TRITON_LIBCUDA_PATH"
             "TRITON_PTXAS_PATH"
             "TRITON_PTXAS_BLACKWELL_PATH"
+            "FERRUM_KERNEL_DIR"
           ];
         };
 
@@ -258,9 +277,14 @@
             "TRITON_LIBCUDA_PATH"
             "TRITON_PTXAS_PATH"
             "TRITON_PTXAS_BLACKWELL_PATH"
+            "FERRUM_KERNEL_DIR"
           ];
         };
       in {
+        packages = {
+          inherit kernels;
+          default = kernels;
+        };
         devShells.default = pkgs.mkShell {
           name = "ferrum-torrens";
           packages =
@@ -300,6 +324,11 @@
           # ship.
           CUDA_HOME = "${pkgs.cudatoolkit}";
 
+          # build.rs copies `$FERRUM_KERNEL_DIR/kernel` into OUT_DIR; the cubins
+          # are the `kernels` derivation's output (nix/kernels.nix), built from
+          # the Triton sources, not committed.
+          FERRUM_KERNEL_DIR = "${kernels}";
+
           shellHook = ''
             # No RUSTFLAGS here on purpose. The previous
             # `-C link-arg=-mold -C default-lib-fmt=rustls` made every cargo
@@ -338,24 +367,22 @@
                 export LD_LIBRARY_PATH="$libstdcxx:/run/opengl-driver/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
               fi
             fi
-            # `import ferrum_kernel` has to resolve for both pythons that run
-            # kernel work: the nix python (the toolchain) and FreeToken/.venv
-            # (the FTW conversion). Prepending the package dir works for both,
-            # it only adds our own module to whatever else is on the path.
-            #
-            # The env's own site-packages is spelled out because running
-            # ``python3`` from the env does not put it on the path: an env's
-            # site-packages is reachable only through that interpreter's own
-            # prefix, which is why the toolchain aliases below call it by name
-            # rather than a bare `python`.
-            export PYTHONPATH="$FLAKE_ROOT/python:${pythonEnv}/${pkgs.python3.sitePackages}''${PYTHONPATH:+:$PYTHONPATH}"
+            # `import ferrum_kernel` resolves through the editable source tree,
+            # not a store copy, so the aliases below pick up a kernel edit
+            # without rebuilding the devshell. The env interpreter already has
+            # its own site-packages on sys.path, so only our module is added.
+            export PYTHONPATH="$FLAKE_ROOT/python''${PYTHONPATH:+:$PYTHONPATH}"
+            # The kernel toolchain python (torch + triton), not the bare
+            # `python3` on PATH (python312, which carries the FreeToken venv's
+            # interpreter use but not the kernel deps).
+            export FERRUM_PYTHON="${pythonEnv}/bin/python3"
             # via bash, not the shebang: the jail has no /usr/bin/env.
             alias ft-gate="bash $FLAKE_ROOT/scripts/run-gate.sh"
             # The kernel self-check on CPU tensors through Triton's interpreter.
-            alias kernel-selftest="''${pythonEnv}/bin/python3 -m ferrum_kernel.selftest --interp"
-            alias kernel-compile-check="''${pythonEnv}/bin/python3 -m ferrum_kernel.compile_check"
+            alias kernel-selftest="''${FERRUM_PYTHON} -m ferrum_kernel.selftest --interp"
+            alias kernel-compile-check="''${FERRUM_PYTHON} -m ferrum_kernel.compile_check"
             # Rebuild kernel/*.cubin and kernel/*.ptx from the Triton sources.
-            alias kernel-aot="''${pythonEnv}/bin/python3 -m ferrum_kernel.aot"
+            alias kernel-aot="''${FERRUM_PYTHON} -m ferrum_kernel.aot"
             # A gated run maps the 20 GiB FTW shard and holds the 4.5 GiB tower
             # resident; a live FreeToken engine keeps ~22 GiB of weights of its
             # own, which is enough together to invite the OOM killer. Warn, do

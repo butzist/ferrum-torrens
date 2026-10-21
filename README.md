@@ -8,9 +8,10 @@ multi-GPU.
 
 The target is an RTX 5060 Mobile (8 GB, sm_120). Dense compute is libtorch via
 the `cuda` feature; the one hand-written GPU kernel (NVFP4 grouped-MoE GEMV,
-plus its staging and paged-attention peers) is authored in Triton, compiled
-ahead of time to the committed `kernel/*.cubin`, and launched through the CUDA
-driver API. There is no Python at runtime.
+plus its staging and paged-attention peers) is authored in Triton and
+AOT-compiled by the `kernels` Nix derivation into `kernel/*.cubin`; the Rust
+build copies that tree in and launches it through the CUDA driver API. There is
+no Python at runtime and no committed binary artifact.
 
 ## Documentation map
 
@@ -29,7 +30,9 @@ driver API. There is no Python at runtime.
 
 ## Build and test
 
-The CPU-only path needs no libtorch and must stay green:
+The CPU-only path needs no libtorch and must stay green. The cubins now come
+from the `kernels` flake derivation (`FERRUM_KERNEL_DIR`, set by the devshell),
+so run cargo inside `nix develop`:
 
 ```sh
 cargo fmt --check
@@ -55,5 +58,5 @@ scripts/run-gated.sh --release --features cuda <test_name>
 
 Kernel work has a CPU inner loop in the devshell (`kernel-selftest`,
 `kernel-compile-check`, `kernel-aot`); any change under `python/ferrum_kernel/`
-or `kernel/` must pass `scripts/check-kernels.sh` before committing. See
+must pass `scripts/check-kernels.sh` before committing. See
 `AGENTS.md` for the exact environment and aliases.

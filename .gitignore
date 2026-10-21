@@ -4,3 +4,8 @@ target/
 __pycache__/
 *.pyc
 *.log
+
+# The sm_120 cubins are built by the `kernels` flake derivation (nix/kernels.nix)
+# from the Triton sources under python/ferrum_kernel/; they are never committed.
+# `kernel-aot` writes here for local inspection only.
+/kernel/

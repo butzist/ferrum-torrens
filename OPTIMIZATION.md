@@ -36,7 +36,7 @@ Kernels FreeToken actually uses:
 - **Experts**: NVFP4 W4A16 group 16, backend `auto` -> on sm_120 the candidates
   are `nvfp4_b12x` (flashinfer SM12x) or the native FreeToken Triton kernels
   (`nvfp4`); `nvfp4_marlin` is sm_80-99 and excluded. We have our own NVFP4
-  grouped-MoE Triton kernels (committed cubins) and do not need theirs.
+  grouped-MoE Triton kernels (AOT cubins) and do not need theirs.
 
 Dtypes (`gdn_kernels.py::gdn_decode_fla` docstring):
 - `q`,`k`: `[1, B, num_k_heads, head_k_dim]` **bf16**, NOT GQA-expanded.
@@ -184,7 +184,7 @@ Follow the existing kernel pattern (see `python/ferrum_kernel/offload.py`,
    `gdn_recurrence_step_batch` -- add the GDN decode case to
    `python/ferrum_kernel/selftest.py`.
 6. `kernel-aot` to regenerate `kernel/*.cubin` + `kernel/manifest.json`;
-   `scripts/check-kernels.sh` must pass (it also recompiles committed artifacts).
+   `scripts/check-kernels.sh` must pass (`nix build .#kernels` builds the tree).
 7. Wire `gdn_core_batch` (or a new decode-only path in `forward_torch.rs`) to
    launch the kernel instead of the op soup. Dispatch is model-specific
    (`src/models/qwen3_6/`) but the kernel/ABI is shared infra.

@@ -121,7 +121,10 @@ old GEMV): pp **189.7 -> 267.4 tok/s at 517 (+41%)** and **217.5 -> 391.7 at 205
 ~14% of prefill. Decode keeps the M=1 GEMV; the R10 baselines still stand only
 for pp. R10.3 (device prefill attention) and R10.4 (fused `norm_in`) remain.
 Instruments: `FT_PROFILE=1`, `FT_SLOTS_REPORT=1`, `scripts/freetoken_probe/`.
-Progress history and the full decision log (numbers 1..111) live in `DONE.md`;
+Build hygiene (2026-10-21, decision 113): the kernel artifacts are built by
+`nix/kernels.nix` and never committed; cargo runs in the devshell, which exports
+`FERRUM_KERNEL_DIR`.
+Progress history and the full decision log (numbers 1..113) live in `DONE.md`;
 read that for the "why" behind any decision number referenced in code or tests.
 
 Goal: a **minimal, fast, single-GPU** Rust serving engine for **one model** --
@@ -227,7 +230,7 @@ ferrum-torrens/
       torch.rs                  # libtorch compute runtime: device, tensors, streams, graphs
       cuda_driver.rs            # hand-rolled libcuda FFI: load cubins, launch, copy
       cuda_graph.rs             # torch current-stream + graph-mempool bridge for capture
-      kernel_abi.rs             # the committed cubin ABI manifest, argument packing
+      kernel_abi.rs             # the cubin ABI manifest, argument packing
       cuda_moe.rs               # NVFP4 expert GEMV adapter over the driver API (the one kernel)
       kvcache_dev.rs            # mha_pool + gdn state slabs + the DeviceCache port impl
       http.rs                   # axum routes, SSE, chat template, generation
@@ -391,10 +394,20 @@ Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]**
 
 ## 7. Decisions
 
-The full log of confirmed decisions (numbers 1..111, stable -- code, tests and
+The full log of confirmed decisions (numbers 1..113, stable -- code, tests and
 `ARCHITECTURE.md` reference them by number) lives in `DONE.md`. This section
 lists only the decisions that still bind open work; everything else there is
 history.
+
+- **113** -- the kernel artifacts are **built by Nix, never committed**
+  (`nix/kernels.nix`). `build.rs` requires `$FERRUM_KERNEL_DIR` and copies its
+  `kernel/` tree into `OUT_DIR`, so a cargo build runs in the devshell. Do not
+  add a checked-in fallback: the sources under `python/ferrum_kernel/` are the
+  only artifact source, and `nix build .#kernels` is the build gate.
+  `scripts/check-kernels.sh` is the fast sm_120 lowering check (no cross-root
+  artifact comparison, which cannot work because ptxas embeds the source path).
+  Binds the devshell env (`FERRUM_KERNEL_DIR`, `FERRUM_PYTHON`) and the verify
+  line in `AGENTS.md`.
 
 - **94** -- the whole-layer prefill's buffer is the `2 * num_experts` **coldest**
   slots chosen by `usage.argsort` (`select_buffer_slots`); it frees exactly those

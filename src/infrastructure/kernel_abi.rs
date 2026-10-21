@@ -1,10 +1,11 @@
-//! The committed kernels' launch ABI: what each cubin takes, in what order.
+//! The kernels' launch ABI: what each cubin takes, in what order.
 //!
 //! Triton authors the NVFP4 MoE kernel and `ferrum_kernel.aot` freezes it into
-//! `kernel/*.cubin` plus a manifest; this module is the Rust side of that
-//! contract. Nothing here calls CUDA, which is the point: the argument layout is
-//! where a hand-written launcher goes wrong silently, so it is a pure function
-//! of the manifest and can be checked against the committed PTX on any machine.
+//! `kernel/*.cubin` plus a manifest (the `kernels` Nix derivation, nix/kernels.nix);
+//! `build.rs` copies that tree into `OUT_DIR/kernel` and this module includes each
+//! artifact from there. Nothing here calls CUDA, which is the point: the argument
+//! layout is where a hand-written launcher goes wrong silently, so it is a pure
+//! function of the manifest and can be checked against the PTX on any machine.
 //!
 //! The manifest is the source of truth, not the code below, and the PTX is the
 //! oracle the manifest is checked against. A kernel edited without re-running
@@ -22,7 +23,7 @@ use serde::Deserialize;
 
 use crate::domain::expert_kernel::MoEError;
 
-const MANIFEST_JSON: &str = include_str!("../../kernel/manifest.json");
+const MANIFEST_JSON: &str = include_str!(concat!(env!("OUT_DIR"), "/kernel/manifest.json"));
 
 /// How wide one launch parameter is, which is also how the driver reads it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -261,12 +262,14 @@ const NAMES: [&str; 6] = [
 /// is a compile error rather than a runtime surprise.
 pub fn cubin(name: &str) -> Result<&'static [u8], MoEError> {
     Ok(match name {
-        GEMV_GATE_UP => include_bytes!("../../kernel/gemv_gate_up.cubin"),
-        GEMV_DOWN => include_bytes!("../../kernel/gemv_down.cubin"),
-        GROUPED_GATE_UP => include_bytes!("../../kernel/grouped_gate_up.cubin"),
-        GROUPED_DOWN => include_bytes!("../../kernel/grouped_down.cubin"),
-        SILU_MUL => include_bytes!("../../kernel/silu_mul.cubin"),
-        SUM_REDUCE => include_bytes!("../../kernel/sum_reduce.cubin"),
+        GEMV_GATE_UP => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/gemv_gate_up.cubin")),
+        GEMV_DOWN => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/gemv_down.cubin")),
+        GROUPED_GATE_UP => {
+            include_bytes!(concat!(env!("OUT_DIR"), "/kernel/grouped_gate_up.cubin"))
+        }
+        GROUPED_DOWN => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/grouped_down.cubin")),
+        SILU_MUL => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/silu_mul.cubin")),
+        SUM_REDUCE => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/sum_reduce.cubin")),
         other => return Err(MoEError::Bad(format!("no committed cubin for {other}"))),
     })
 }
@@ -402,8 +405,8 @@ impl StagingAbi {
 /// The staging cubin bytes, by name.
 pub fn staging_cubin(name: &str) -> Result<&'static [u8], MoEError> {
     Ok(match name {
-        LRU_ENSURE => include_bytes!("../../kernel/lru_ensure.cubin"),
-        INDEX_COPY => include_bytes!("../../kernel/index_copy.cubin"),
+        LRU_ENSURE => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/lru_ensure.cubin")),
+        INDEX_COPY => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/index_copy.cubin")),
         other => return Err(MoEError::Bad(format!("no committed cubin for {other}"))),
     })
 }
@@ -412,8 +415,8 @@ pub fn staging_cubin(name: &str) -> Result<&'static [u8], MoEError> {
 #[cfg(test)]
 fn staging_ptx(name: &str) -> &'static str {
     match name {
-        LRU_ENSURE => include_str!("../../kernel/lru_ensure.ptx"),
-        INDEX_COPY => include_str!("../../kernel/index_copy.ptx"),
+        LRU_ENSURE => include_str!(concat!(env!("OUT_DIR"), "/kernel/lru_ensure.ptx")),
+        INDEX_COPY => include_str!(concat!(env!("OUT_DIR"), "/kernel/index_copy.ptx")),
         other => panic!("no committed ptx for {other}"),
     }
 }
@@ -548,8 +551,13 @@ impl AttentionAbi {
 /// The attention cubin bytes, by name.
 pub fn attention_cubin(name: &str) -> Result<&'static [u8], MoEError> {
     Ok(match name {
-        PAGED_ATTENTION => include_bytes!("../../kernel/paged_attention.cubin"),
-        PAGED_ATTENTION_BF16 => include_bytes!("../../kernel/paged_attention_bf16.cubin"),
+        PAGED_ATTENTION => {
+            include_bytes!(concat!(env!("OUT_DIR"), "/kernel/paged_attention.cubin"))
+        }
+        PAGED_ATTENTION_BF16 => include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/kernel/paged_attention_bf16.cubin"
+        )),
         other => return Err(MoEError::Bad(format!("no committed cubin for {other}"))),
     })
 }
@@ -558,8 +566,10 @@ pub fn attention_cubin(name: &str) -> Result<&'static [u8], MoEError> {
 #[cfg(test)]
 fn attention_ptx(name: &str) -> &'static str {
     match name {
-        PAGED_ATTENTION => include_str!("../../kernel/paged_attention.ptx"),
-        PAGED_ATTENTION_BF16 => include_str!("../../kernel/paged_attention_bf16.ptx"),
+        PAGED_ATTENTION => include_str!(concat!(env!("OUT_DIR"), "/kernel/paged_attention.ptx")),
+        PAGED_ATTENTION_BF16 => {
+            include_str!(concat!(env!("OUT_DIR"), "/kernel/paged_attention_bf16.ptx"))
+        }
         other => panic!("no committed ptx for {other}"),
     }
 }
@@ -716,14 +726,18 @@ impl LinearAbi {
 /// The linear-attention cubin bytes, by name.
 pub fn linear_cubin(name: &str) -> Result<&'static [u8], MoEError> {
     Ok(match name {
-        GDN_DECODE => include_bytes!("../../kernel/gdn_decode.cubin"),
-        CONV_DECODE => include_bytes!("../../kernel/conv_decode.cubin"),
-        ADD_RMSNORM => include_bytes!("../../kernel/add_rmsnorm.cubin"),
-        GDN_TRI_SOLVE => include_bytes!("../../kernel/gdn_tri_solve.cubin"),
-        NVFP4_DENSE_GEMV => include_bytes!("../../kernel/nvfp4_dense_gemv.cubin"),
-        FP8_GEMV => include_bytes!("../../kernel/fp8_gemv.cubin"),
-        FP8_SPLITK_REDUCE => include_bytes!("../../kernel/fp8_splitk_reduce.cubin"),
-        FP8_GEMM => include_bytes!("../../kernel/fp8_gemm.cubin"),
+        GDN_DECODE => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/gdn_decode.cubin")),
+        CONV_DECODE => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/conv_decode.cubin")),
+        ADD_RMSNORM => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/add_rmsnorm.cubin")),
+        GDN_TRI_SOLVE => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/gdn_tri_solve.cubin")),
+        NVFP4_DENSE_GEMV => {
+            include_bytes!(concat!(env!("OUT_DIR"), "/kernel/nvfp4_dense_gemv.cubin"))
+        }
+        FP8_GEMV => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/fp8_gemv.cubin")),
+        FP8_SPLITK_REDUCE => {
+            include_bytes!(concat!(env!("OUT_DIR"), "/kernel/fp8_splitk_reduce.cubin"))
+        }
+        FP8_GEMM => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/fp8_gemm.cubin")),
         other => return Err(MoEError::Bad(format!("no committed cubin for {other}"))),
     })
 }
@@ -732,14 +746,16 @@ pub fn linear_cubin(name: &str) -> Result<&'static [u8], MoEError> {
 #[cfg(test)]
 fn linear_ptx(name: &str) -> &'static str {
     match name {
-        GDN_DECODE => include_str!("../../kernel/gdn_decode.ptx"),
-        CONV_DECODE => include_str!("../../kernel/conv_decode.ptx"),
-        ADD_RMSNORM => include_str!("../../kernel/add_rmsnorm.ptx"),
-        GDN_TRI_SOLVE => include_str!("../../kernel/gdn_tri_solve.ptx"),
-        NVFP4_DENSE_GEMV => include_str!("../../kernel/nvfp4_dense_gemv.ptx"),
-        FP8_GEMV => include_str!("../../kernel/fp8_gemv.ptx"),
-        FP8_SPLITK_REDUCE => include_str!("../../kernel/fp8_splitk_reduce.ptx"),
-        FP8_GEMM => include_str!("../../kernel/fp8_gemm.ptx"),
+        GDN_DECODE => include_str!(concat!(env!("OUT_DIR"), "/kernel/gdn_decode.ptx")),
+        CONV_DECODE => include_str!(concat!(env!("OUT_DIR"), "/kernel/conv_decode.ptx")),
+        ADD_RMSNORM => include_str!(concat!(env!("OUT_DIR"), "/kernel/add_rmsnorm.ptx")),
+        GDN_TRI_SOLVE => include_str!(concat!(env!("OUT_DIR"), "/kernel/gdn_tri_solve.ptx")),
+        NVFP4_DENSE_GEMV => include_str!(concat!(env!("OUT_DIR"), "/kernel/nvfp4_dense_gemv.ptx")),
+        FP8_GEMV => include_str!(concat!(env!("OUT_DIR"), "/kernel/fp8_gemv.ptx")),
+        FP8_SPLITK_REDUCE => {
+            include_str!(concat!(env!("OUT_DIR"), "/kernel/fp8_splitk_reduce.ptx"))
+        }
+        FP8_GEMM => include_str!(concat!(env!("OUT_DIR"), "/kernel/fp8_gemm.ptx")),
         other => panic!("no committed ptx for {other}"),
     }
 }
@@ -748,12 +764,12 @@ fn linear_ptx(name: &str) -> &'static str {
 #[cfg(test)]
 fn ptx(name: &str) -> &'static str {
     match name {
-        GEMV_GATE_UP => include_str!("../../kernel/gemv_gate_up.ptx"),
-        GEMV_DOWN => include_str!("../../kernel/gemv_down.ptx"),
-        GROUPED_GATE_UP => include_str!("../../kernel/grouped_gate_up.ptx"),
-        GROUPED_DOWN => include_str!("../../kernel/grouped_down.ptx"),
-        SILU_MUL => include_str!("../../kernel/silu_mul.ptx"),
-        SUM_REDUCE => include_str!("../../kernel/sum_reduce.ptx"),
+        GEMV_GATE_UP => include_str!(concat!(env!("OUT_DIR"), "/kernel/gemv_gate_up.ptx")),
+        GEMV_DOWN => include_str!(concat!(env!("OUT_DIR"), "/kernel/gemv_down.ptx")),
+        GROUPED_GATE_UP => include_str!(concat!(env!("OUT_DIR"), "/kernel/grouped_gate_up.ptx")),
+        GROUPED_DOWN => include_str!(concat!(env!("OUT_DIR"), "/kernel/grouped_down.ptx")),
+        SILU_MUL => include_str!(concat!(env!("OUT_DIR"), "/kernel/silu_mul.ptx")),
+        SUM_REDUCE => include_str!(concat!(env!("OUT_DIR"), "/kernel/sum_reduce.ptx")),
         other => panic!("no committed ptx for {other}"),
     }
 }

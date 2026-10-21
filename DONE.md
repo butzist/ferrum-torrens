@@ -2871,6 +2871,45 @@ settled.
        725, so larger chunks under the batched GEMM and scratch tuning are the
        next opening.
 
+113. **Kernel artifacts are built by Nix and never committed** (2026-10-21).
+     Replaces the committed `kernel/*.cubin`/`.ptx`/`manifest.json` set with the
+     `kernels` derivation (`nix/kernels.nix`), which runs `aot.py` on a CPU-only
+     builder and emits the same tree.
+     - **Why.** The 44k-line committed binary/PTX set was the largest source of
+       churn and could only be checked by a host-local `aot.py --check`; a kernel
+       edit could ship a stale artifact that only a real-GPU run caught. The
+       derivation makes the sources the only input and the AOT step part of every
+       build. It also removes the last need for a second source of ptxas: the
+       build uses the cudatoolkit's, with `TRITON_PTXAS_*`/`TRITON_LIBCUDA_PATH`
+       set in the derivation.
+     - **How it binds.** `build.rs` requires `$FERRUM_KERNEL_DIR` and copies
+       `$FERRUM_KERNEL_DIR/kernel` into `OUT_DIR/kernel`; `kernel_abi.rs`
+       `include_bytes!`/`include_str!` from there. The devshell exports
+       `FERRUM_KERNEL_DIR = "${kernels}"`, so every cargo command (including the
+       CPU-only suite) runs there. `FERRUM_PYTHON` is exported for the same
+       reason: the kernel toolchain python is the `withPackages` env, not the
+       bare `python3` (python312) on PATH. `aot.py --out DIR` makes a local
+       `kernel-aot` write/check against an explicit tree.
+     - **Check split.** `scripts/check-kernels.sh` now only lowers every kernel
+       for sm_120 (`compile_check`): the Nix derivation is the artifact gate, so
+       there is no committed set to drift. The old `aot.py --check` comparison
+       cannot run across source roots because ptxas embeds absolute source paths
+       (the `.debug_line` normalizer fixed store paths and mtimes, not the
+       checkout root; `/build/source` vs the repo path made every artifact read
+       stale). `_PACKAGE_PATH` normalization was added for same-root use, but the
+       gate no longer relies on it.
+     - **Parity.** The Nix-built cubins match the deleted committed set's
+       `.text` and manifest exactly (all 18; only `.debug_*`/`.nv_debug_ptx_txt`
+       differ, as their source path does). The two original failures were
+       `nix/kernels.nix` filtering out the `python` directory itself and not
+       putting the source tree on `PYTHONPATH`; both are fixed (`-m` now runs
+       from `python/`).
+     - **Gates.** `nix build .#kernels`, `nix develop --command true`,
+       `scripts/check-kernels.sh`, `cargo fmt --check`, `cargo clippy
+       --all-targets` and `--features cuda`, `cargo test`. The absolute source
+       path in the debug info is the reason `.text`/manifest are the parity
+       proof rather than a byte compare.
+
 ---
 
 

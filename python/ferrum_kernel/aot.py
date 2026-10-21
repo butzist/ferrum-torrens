@@ -260,6 +260,10 @@ LINEAR_KERNELS: dict[str, dict] = {
 # Normalize store paths away before comparing, or `--check` would call a healthy
 # set stale on any box whose toolchain closure was rebuilt (DONE.md decision 45).
 _STORE_PATH = re.compile(rb"/nix/store/[a-z0-9]{32}-[^/\x00]+")
+# The source root is wherever the tree was unpacked: the repo checkout, or
+# `/build/source` under the Nix builder. Only the package-relative part is part
+# of the artifact's identity, so normalize the prefix too.
+_PACKAGE_PATH = re.compile(rb"(?:/[^\s\"\'\x00]+)*/python/ferrum_kernel/")
 
 # ptxas also bakes each source file's size and mtime into the DWARF
 # `.debug_line` file table. Neither is reproducible: a `git checkout` stamps
@@ -396,7 +400,8 @@ def _canon_debug_lines(blob: bytes) -> bytes:
 
 
 def _norm(blob: bytes) -> bytes:
-    return _STORE_PATH.sub(b"/nix/store/<store>", _canon_debug_lines(blob))
+    blob = _STORE_PATH.sub(b"/nix/store/<store>", _canon_debug_lines(blob))
+    return _PACKAGE_PATH.sub(b"<src>/python/ferrum_kernel/", blob)
 
 
 # `.param .u64 .ptr .global .align 1 f_param_0`: the arg kind is the type, the
@@ -533,25 +538,25 @@ def _emit() -> Artifacts:
     return Artifacts(cubins=cubins, ptxs=ptxs, manifest=text)
 
 
-def write(art: Artifacts) -> list[pathlib.Path]:
+def write(art: Artifacts, out_dir: pathlib.Path = OUT_DIR) -> list[pathlib.Path]:
     """Write every artifact whose store-path-normalized bytes changed.
 
     A rebuild on a different toolchain closure differs only in the `/nix/store`
-    paths triton bakes into the debug info. Leaving those artifacts as committed
-    means registering a new kernel cannot churn the cubins the GPU gates were
-    qualified against (DONE.md decision 45); a real codegen change still writes.
+    paths triton bakes into the debug info. Comparing normalized bytes means
+    registering a new kernel does not churn artifacts a GPU gate qualified
+    (DONE.md decision 45); a real codegen change still writes.
     """
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
     written = []
     for name, cubin in art.cubins.items():
         for suffix, fresh in (("cubin", cubin), ("ptx", art.ptxs[name].encode())):
-            path = OUT_DIR / f"{name}.{suffix}"
+            path = out_dir / f"{name}.{suffix}"
             have = path.read_bytes() if path.exists() else b""
             if _norm(have) == _norm(fresh):
                 continue
             path.write_bytes(fresh)
             written.append(path)
-    manifest = OUT_DIR / "manifest.json"
+    manifest = out_dir / "manifest.json"
     have = manifest.read_bytes() if manifest.exists() else b""
     if _norm(have) != _norm(art.manifest.encode()):
         manifest.write_text(art.manifest)
@@ -559,8 +564,8 @@ def write(art: Artifacts) -> list[pathlib.Path]:
     return written
 
 
-def stale(art: Artifacts) -> list[pathlib.Path]:
-    """Every committed artifact a fresh build disagrees with.
+def stale(art: Artifacts, out_dir: pathlib.Path = OUT_DIR) -> list[pathlib.Path]:
+    """Every artifact in `out_dir` a fresh build disagrees with.
 
     The binaries and PTX count, not just the manifest: a kernel edit that leaves
     the entry signature and shapes alone still changes the PTX, and the launcher
@@ -569,11 +574,11 @@ def stale(art: Artifacts) -> list[pathlib.Path]:
     out = []
     for name, cubin in art.cubins.items():
         for suffix, fresh in (("cubin", cubin), ("ptx", art.ptxs[name].encode())):
-            path = OUT_DIR / f"{name}.{suffix}"
+            path = out_dir / f"{name}.{suffix}"
             have = path.read_bytes() if path.exists() else b""
             if _norm(have) != _norm(fresh):
                 out.append(path)
-    manifest = OUT_DIR / "manifest.json"
+    manifest = out_dir / "manifest.json"
     have = manifest.read_bytes() if manifest.exists() else b""
     if _norm(have) != _norm(art.manifest.encode()):
         out.append(manifest)
@@ -582,21 +587,23 @@ def stale(art: Artifacts) -> list[pathlib.Path]:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--check", action="store_true", help="fail if the committed set is stale")
+    ap.add_argument("--check", action="store_true", help="fail if the artifact set is stale")
+    ap.add_argument("--out", type=pathlib.Path, default=OUT_DIR,
+                    help="artifact directory to write or check (default: kernel)")
     args = ap.parse_args()
 
     art = emit()
     if args.check:
-        stale_paths = stale(art)
+        stale_paths = stale(art, args.out)
         if stale_paths:
             print("STALE: a fresh build differs from " + ", ".join(str(p) for p in stale_paths) +
                   "; run `python -m ferrum_kernel.aot`", file=sys.stderr)
             return 1
-        print(f"committed kernels are up to date ({len(art.cubins)} cubins)")
+        print(f"kernels are up to date ({len(art.cubins)} cubins)")
         return 0
 
-    written = write(art)
-    print(f"wrote {len(written)} files under {OUT_DIR}/")
+    written = write(art, args.out)
+    print(f"wrote {len(written)} files under {args.out}/")
     return 0
 
 
