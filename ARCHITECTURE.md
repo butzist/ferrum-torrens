@@ -216,7 +216,10 @@ flowchart LR
   `python/ferrum_kernel/aot.py` emits `kernel/*.cubin`, `*.ptx` and
   `manifest.json`. The engine never runs an interpreter; `kernel_abi.rs` parses
   the manifest and `cuda_driver.rs` launches the cubins. The manifest has four
-  launch contracts, one section each: `kernels` (the four grouped-MoE passes),
+  launch contracts, one section each: `kernels` (the six grouped-MoE passes:
+  `gemv_gate_up`/`gemv_down` for decode, `grouped_gate_up`/`grouped_down`, the
+  batched prefill grouped GEMM (R10.2, decision 112), `silu_mul` and
+  `sum_reduce`),
   `staging` (`lru_ensure`, `index_copy`), `attention` (`paged_attention` f32 and
   `paged_attention_bf16`, the pool-dtype variants) and
   `linear` (`gdn_decode`, the fused GDN decode, `conv_decode`, the fused GDN
@@ -468,7 +471,7 @@ flowchart TB
   CM --> AB --> DR
   CM --> PB
   FB --> PB
-  DR --> Cubins[("gemv_gate_up, gemv_down,\nsilu_mul, sum_reduce,\nlru_ensure, index_copy")]
+  DR --> Cubins[("gemv_gate_up, gemv_down,\ngrouped_gate_up, grouped_down,\nsilu_mul, sum_reduce,\nlru_ensure, index_copy")]
 ```
 
 **Dynamic -- device-staged layer step** (`grouped_moe_staged`). This is the path
@@ -512,7 +515,11 @@ is one streamed copy of the layer plus one GEMV pass instead of a per-chunk
 stream while layer `l` computes (`begin`/`ready`/`release` events order the two
 streams; the copy reuses `index_copy` in `BLOCK_K`-row groups with static index
 tensors). The GEMV still runs per route chunk only to bound the `[routes, ...]`
-scratch. A step that drops back below the cap returns to `Decode`; the buffer's
+scratch. Since R10.2 (decision 112) the whole-layer path launches the batched
+grouped GEMM (`launch_grouped`, one program per (slot segment, N tile) over a
+per-chunk slot CSR) instead of the per-route GEMV, so each expert's weight is
+read once per chunk; decode keeps the GEMV and `FERRUM_PF_GEMV=1` forces it for
+the A/B. A step that drops back below the cap returns to `Decode`; the buffer's
 slots are the `2 * num_experts` **coldest** (chosen by `usage.argsort` on entry,
 freed there, with the per-half copy rows and the `(half, expert) -> slot` map
 rebuilt from them), so the decode LRU's hot set survives the prefill

@@ -112,6 +112,14 @@ baselines").
 A four-slice prefill plan (R10: chunk confirmation, batched grouped MoE GEMM,
 device prefill attention, fused `norm_in`) is queued in section 8 and
 `OPTIMIZATION.md` R10.
+**R10.2 landed (2026-10-21, decision 112):** the whole-layer prefill MoE is now a
+true batched NVFP4 grouped GEMM (`_nvfp4_grouped_gemm`, slot-segment CSR, bf16
+`tl.dot`) instead of one M=1 GEMV per route, weights read once per expert per
+chunk. Order-balanced A/B (n=3/arm, same binary, `FERRUM_PF_GEMV=1` selects the
+old GEMV): pp **189.7 -> 267.4 tok/s at 517 (+41%)** and **217.5 -> 391.7 at 2057
+(+80%)**; `pf_gemm` at a 451-token chunk **1005 -> 278 ms (-72%)**, from 46% to
+~14% of prefill. Decode keeps the M=1 GEMV; the R10 baselines still stand only
+for pp. R10.3 (device prefill attention) and R10.4 (fused `norm_in`) remain.
 Instruments: `FT_PROFILE=1`, `FT_SLOTS_REPORT=1`, `scripts/freetoken_probe/`.
 Progress history and the full decision log (numbers 1..111) live in `DONE.md`;
 read that for the "why" behind any decision number referenced in code or tests.
@@ -950,14 +958,11 @@ Findings in `OPTIMIZATION.md` R10. Prefill is 2.4-4.6x behind FreeToken
   2057 (156.9 -> 161.9)** going 256 -> 512, at identical VRAM (7190 MiB), so
   512 is the new default and the knob stays as a diagnostic. Logs under
   `/tmp/opencode/pp_sweep/`.
-- [ ] **R10.2 Batched grouped MoE GEMM for prefill.** Prefill runs per-route
-  M=1 `gemv_gate_up`/`gemv_down` over each chunk (`group_with_slots`, scratch
-  `[routes, ...]`); FreeToken's prefill is a true BLOCK_M>1 grouped GEMM over
-  the chunk (`fused_nvfp4.py:4`). Author `_nvfp4_grouped_gemm` (Triton, AOT
-  cubin) processing one expert's route segment in one program, weights read
-  once per expert per chunk. Decode stays on the M=1 gemv. Gates: interp
-  selftest vs the torch oracle, `check-kernels.sh`, ABI units, decode gates
-  untouched-green, pp smoke + `FT_PROFILE` `pf_gemm` before/after.
+- [x] **R10.2 Batched grouped MoE GEMM for prefill** -- DONE (2026-10-21,
+  decision 112). Whole-layer prefill runs a slot-segment CSR grouped GEMM
+  (`_nvfp4_grouped_gemm`, bf16 `tl.dot`); decode stays on the M=1 gemv.
+  `FERRUM_PF_GEMV=1` restores the old path. pp +41% at 517, +80% at 2057;
+  `pf_gemm` -72%. Detail in `OPTIMIZATION.md` R10.2 and `DONE.md` decision 112.
 - [ ] **R10.3 Device prefill attention.** Replace the `CacheAccess::Host`
   gather+SDPA fallback (`forward_torch.rs:1821/2424`), ~1.2 ms/token across
   `attn`/`attn_out`/`attn_mem`: extend the paged attention kernel to chunked

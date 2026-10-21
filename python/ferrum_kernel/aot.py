@@ -47,9 +47,11 @@ from .fp8_linear import (
 )
 from .linear import DENSE_WARPS, _nvfp4_dense_gemv_kernel
 from .nvfp4_moe import (
+    GEMM_BLOCK_N,
     GEMV_BLOCK_N,
     REDUCE_BLOCK_N,
     _nvfp4_gemv_kernel,
+    _nvfp4_grouped_gemm_kernel,
     _silu_mul_kernel,
     _sum_reduce_kernel,
 )
@@ -77,6 +79,9 @@ from .signatures import (
     add_rmsnorm,
     add_rmsnorm_constexprs,
     gemv,
+    grouped_down_constexprs,
+    grouped_gate_up_constexprs,
+    grouped_gemm,
     index_copy,
     index_copy_constexprs,
     lru_constexprs,
@@ -101,8 +106,10 @@ from .signatures import (
 TARGET = GPUTarget("cuda", 120, 32)
 OUT_DIR = pathlib.Path("kernel")
 
-# The four launches one `grouped_moe` step is made of, in order. `N` is the
-# kernel's trip count over output columns and `block_i` the silu tile.
+# The launches one `grouped_moe` step is made of, plus the prefill grouped
+# pair (R10.2) that replaces the two GEMVs on the whole-layer prefill path.
+# `N` is the kernel's trip count over output columns and `block_i` the silu
+# tile.
 KERNELS: dict[str, dict] = {
     "gemv_gate_up": {
         "fn": _nvfp4_gemv_kernel,
@@ -117,6 +124,20 @@ KERNELS: dict[str, dict] = {
         "constexprs": down_constexprs(),
         "n": SERVING_HIDDEN,
         "block": GEMV_BLOCK_N,
+    },
+    "grouped_gate_up": {
+        "fn": _nvfp4_grouped_gemm_kernel,
+        "signature": grouped_gemm(),
+        "constexprs": grouped_gate_up_constexprs(),
+        "n": SERVING_INTER * 2,
+        "block": GEMM_BLOCK_N,
+    },
+    "grouped_down": {
+        "fn": _nvfp4_grouped_gemm_kernel,
+        "signature": grouped_gemm(),
+        "constexprs": grouped_down_constexprs(),
+        "n": SERVING_HIDDEN,
+        "block": GEMM_BLOCK_N,
     },
     "silu_mul": {
         "fn": _silu_mul_kernel,

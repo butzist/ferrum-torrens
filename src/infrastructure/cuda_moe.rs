@@ -30,9 +30,10 @@ use crate::infrastructure::cuda_driver::{
     StagingKernels,
 };
 use crate::infrastructure::kernel_abi::{
-    Abi, CopyArgs, GEMV_DOWN, GEMV_GATE_UP, INDEX_COPY, LRU_ENSURE, LruArgs, MoEArgs, SILU_MUL,
-    SUM_REDUCE, StagingAbi, gemv_down_args, gemv_gate_up_args, grid, index_copy_args,
-    lru_ensure_args, silu_mul_args, sum_reduce_args,
+    Abi, CopyArgs, GEMV_DOWN, GEMV_GATE_UP, GROUPED_DOWN, GROUPED_GATE_UP, INDEX_COPY, LRU_ENSURE,
+    LruArgs, MoEArgs, SILU_MUL, SUM_REDUCE, StagingAbi, gemv_down_args, gemv_gate_up_args, grid,
+    grouped_down_args, grouped_gate_up_args, index_copy_args, lru_ensure_args, silu_mul_args,
+    sum_reduce_args,
 };
 use crate::infrastructure::torch::{DevTensor, Device, bf16_tensor, f32_tensor, to_f32_vec};
 
@@ -933,6 +934,8 @@ impl CudaMoE {
             ic2: ptr(&g.ic2),
             ic3: ptr(&g.ic3),
             out: ptr(&g.result),
+            seg: 0,
+            route_idx: 0,
         };
         let stream = self.stream;
         for (name, rows, pack) in [
@@ -963,6 +966,98 @@ impl CudaMoE {
             // the context made current at construction, `pack` was built from
             // this kernel's manifest entry, and `stream` is the stream this
             // adapter was built for (the capture stream when one is used).
+            unsafe {
+                self.kernels
+                    .launch(kernel, grid(rows, kernel), &mut params, stream)
+                    .map_err(driver)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The staged banks' slot capacity: the grouped CSR indexes `seg` by the
+    /// slot id, so it sizes to the cache's slot count. `Banks` stores each of
+    /// its three arrays flat, so the slot count is not a tensor dimension.
+    fn slot_capacity(&self) -> usize {
+        self.slots
+    }
+
+    /// The prefill grouped GEMM launches (R10.2, OPTIMIZATION.md R10): both
+    /// GEMVs become one program per (slot segment, N tile) over the CSR
+    /// `seg`/`route_idx`, so an expert's weight is read once per (segment,
+    /// n-tile) however many routes name it. Decode keeps `launch`'s per-route
+    /// GEMV; the silu and the reduce are the same kernels in the same order,
+    /// and `route_idx` keeps `ic1`/`ic3` indexed by the original route. The
+    /// caller owns the CSR tensors and must hold them until the stream has
+    /// drained, like it holds `g`.
+    pub fn launch_grouped(
+        &self,
+        g: &StagedGroup,
+        seg: &Tensor,
+        route_idx: &Tensor,
+    ) -> Result<(), MoEError> {
+        let gu = self
+            .gate_up
+            .as_ref()
+            .ok_or_else(|| MoEError::Bad("launch before any expert was staged".into()))?;
+        let dn = self
+            .down
+            .as_ref()
+            .ok_or_else(|| MoEError::Bad("launch before any expert was staged".into()))?;
+        let (tokens, routes) = (g.tokens, g.routes);
+        let slots = self.slot_capacity();
+
+        let ptr = |t: &Tensor| t.data_ptr() as u64;
+        let args = MoEArgs {
+            tokens,
+            routes,
+            x: ptr(&g.x),
+            gu_packed: ptr(&gu.packed),
+            gu_scale: ptr(&gu.scale),
+            gu_global: ptr(&gu.global),
+            dn_packed: ptr(&dn.packed),
+            dn_scale: ptr(&dn.scale),
+            dn_global: ptr(&dn.global),
+            route_slot: ptr(&g.slot_t),
+            route_token: ptr(&g.token_t),
+            route_weight: ptr(&g.weight_t),
+            lut: ptr(&g.lut),
+            ic1: ptr(&g.ic1),
+            ic2: ptr(&g.ic2),
+            ic3: ptr(&g.ic3),
+            out: ptr(&g.result),
+            seg: ptr(seg),
+            route_idx: ptr(route_idx),
+        };
+        let stream = self.stream;
+        for (name, rows, pack) in [
+            (
+                GROUPED_GATE_UP,
+                slots,
+                grouped_gate_up_args(&self.abi, &args).map_err(bad_abi)?,
+            ),
+            (
+                SILU_MUL,
+                routes,
+                silu_mul_args(&self.abi, &args).map_err(bad_abi)?,
+            ),
+            (
+                GROUPED_DOWN,
+                slots,
+                grouped_down_args(&self.abi, &args).map_err(bad_abi)?,
+            ),
+            (
+                SUM_REDUCE,
+                tokens,
+                sum_reduce_args(&self.abi, &args).map_err(bad_abi)?,
+            ),
+        ] {
+            let kernel = self.abi.kernel(name).map_err(bad_abi)?;
+            let mut params = pack.kernel_params().map_err(bad_abi)?;
+            // SAFETY: every pointer in `args` is a live allocation the caller
+            // holds (`g` and the CSR) in the context made current at
+            // construction, `pack` came from this kernel's manifest entry, and
+            // `stream` is this adapter's.
             unsafe {
                 self.kernels
                     .launch(kernel, grid(rows, kernel), &mut params, stream)
@@ -1379,8 +1474,16 @@ impl CudaMoE {
                 .reshape([(n * top_k) as i64]);
             let mut oc = DevTensor(out.0.narrow(0, start as i64, n as i64));
             let g = self.group_with_slots(&DevTensor(xc), &DevTensor(wc), sc, token_t, n, top_k)?;
-            self.launch(&g)?;
-            self.collect_dev(&g, &mut oc)?;
+            if prefill_use_grouped() {
+                // The CSR lives as long as `g`: the queued launches read it
+                // asynchronously, the same lifetime the staged buffers have.
+                let (seg, route_idx) = build_grouped_csr(&g.slot_t, self.slot_capacity())?;
+                self.launch_grouped(&g, &seg, &route_idx)?;
+                self.collect_dev(&g, &mut oc)?;
+            } else {
+                self.launch(&g)?;
+                self.collect_dev(&g, &mut oc)?;
+            }
             start += n;
         }
         crate::infrastructure::profile::end("pf_gemm", sp);
@@ -1490,6 +1593,50 @@ fn prefill_chunk_from(value: Option<&str>) -> usize {
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|n| *n > 0)
         .unwrap_or(PREFILL_CHUNK_TOKENS)
+}
+
+/// Whether the whole-layer prefill runs the grouped GEMM (R10.2, the default)
+/// or the per-route GEMV it replaced. `FERRUM_PF_GEMV=1` forces the GEMV, for
+/// the A/B measurement and as a fallback.
+fn prefill_use_grouped() -> bool {
+    prefill_grouped_from(std::env::var("FERRUM_PF_GEMV").ok().as_deref())
+}
+
+fn prefill_grouped_from(value: Option<&str>) -> bool {
+    value != Some("1")
+}
+
+/// Bucket the prefill's routes per slot into a CSR the grouped launches read:
+/// `seg[s]..seg[s + 1]` indexes `route_idx`, which holds the original route
+/// ids in stable per-slot order, so the segment index is the slot id. Prefill
+/// routes are always resident (whole-layer staging); the decode-only shapes a
+/// non-resident or out-of-bank slot produces are refused here rather than
+/// misread by a segment program.
+fn build_grouped_csr(route_slot: &Tensor, slots: usize) -> Result<(Tensor, Tensor), MoEError> {
+    let slot64 = route_slot.to_kind(tch::Kind::Int64);
+    let resident = slot64.ge(0).all();
+    if resident.int64_value(&[]) == 0 {
+        return Err(MoEError::Bad(
+            "prefill grouped CSR: a route is not resident".into(),
+        ));
+    }
+    let counts = slot64.bincount(Option::<Tensor>::None, slots as i64);
+    if counts.size() != [slots as i64] {
+        return Err(MoEError::Bad(format!(
+            "prefill grouped CSR: a route names a slot past the {slots}-slot bank"
+        )));
+    }
+    let seg = Tensor::zeros([slots as i64 + 1], (tch::Kind::Int, route_slot.device()));
+    let mut tail = seg.narrow(0, 1, slots as i64);
+    tail.copy_(
+        &counts
+            .cumsum(0, Some(tch::Kind::Int64))
+            .to_kind(tch::Kind::Int),
+    );
+    let route_idx = slot64
+        .argsort_stable(true, 0, false)
+        .to_kind(tch::Kind::Int);
+    Ok((seg, route_idx))
 }
 
 /// Packed plus scales plus globals for one expert's two slabs.
@@ -1605,6 +1752,42 @@ mod tests {
         assert_eq!(prefill_chunk_from(Some("512")), 512);
         assert_eq!(prefill_chunk_from(Some("garbage")), PREFILL_CHUNK_TOKENS);
         assert_eq!(prefill_chunk_from(Some("0")), PREFILL_CHUNK_TOKENS);
+    }
+
+    /// The grouped prefill is the default (R10.2); `FERRUM_PF_GEMV=1` forces
+    /// the per-route GEMV path it replaced, for the A/B and as a fallback.
+    #[test]
+    fn a_prefill_grouped_env_override_parses() {
+        assert!(prefill_grouped_from(None));
+        assert!(prefill_grouped_from(Some("0")));
+        assert!(prefill_grouped_from(Some("garbage")));
+        assert!(!prefill_grouped_from(Some("1")));
+    }
+
+    /// The CSR the grouped launches read: bucketed per slot in stable route
+    /// order, a complete permutation of the routes, and it refuses the shapes
+    /// only the decode GEMV handles (a non-resident slot, a slot past the bank).
+    #[test]
+    fn a_grouped_csr_buckets_and_refuses_bad_slots() {
+        let slots_t = |flat: &[i64]| Tensor::from_slice(flat).to_kind(tch::Kind::Int);
+        let ints = |t: &Tensor| {
+            let flat = t.contiguous();
+            let mut out = vec![0i32; flat.numel()];
+            flat.copy_data(&mut out, flat.numel());
+            out
+        };
+
+        let (seg, route_idx) = build_grouped_csr(&slots_t(&[2, 0, 2, 0, 0, 1]), 3).unwrap();
+        assert_eq!(ints(&seg), vec![0, 3, 4, 6]);
+        assert_eq!(ints(&route_idx), vec![1, 3, 4, 5, 0, 2]);
+
+        let non_resident = slots_t(&[-1, 0]);
+        let err = build_grouped_csr(&non_resident, 3).unwrap_err().to_string();
+        assert!(err.contains("not resident"), "{err}");
+
+        let past_bank = slots_t(&[3]);
+        let err = build_grouped_csr(&past_bank, 3).unwrap_err().to_string();
+        assert!(err.contains("past the"), "{err}");
     }
 
     /// The prefill chunker keeps every chunk inside the committed route cap, and

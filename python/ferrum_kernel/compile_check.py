@@ -30,6 +30,7 @@ from .nvfp4_moe import (
     GEMV_BLOCK_N,
     REDUCE_BLOCK_N,
     _nvfp4_gemv_kernel,
+    _nvfp4_grouped_gemm_kernel,
     _silu_mul_kernel,
     _sum_reduce_kernel,
 )
@@ -58,6 +59,8 @@ from .signatures import gdn_tri_solve_constexprs
 from .signatures import add_rmsnorm as _add_rmsnorm_sig
 from .signatures import add_rmsnorm_constexprs
 from .signatures import gemv as _gemv_sig
+from .signatures import grouped_gemm as _grouped_sig
+from .signatures import grouped_down_constexprs, grouped_gate_up_constexprs
 from .signatures import index_copy as _index_copy_sig
 from .signatures import index_copy_constexprs, lru_constexprs
 from .signatures import lru_ensure as _lru_sig
@@ -120,6 +123,17 @@ def main() -> int:
     except Exception as e:  # noqa: BLE001
         failures += 1
         print(f"sum_reduce FAILED: {type(e).__name__}: {str(e)[:200]}")
+    # The prefill grouped GEMM (R10.2): the same kernel lowers for the gate/up
+    # and the down constexpr set.
+    for label, consts in (
+        ("grouped_gate_up", grouped_gate_up_constexprs()),
+        ("grouped_down", grouped_down_constexprs()),
+    ):
+        try:
+            check(label, _nvfp4_grouped_gemm_kernel, _grouped_sig(), consts)
+        except Exception as e:  # noqa: BLE001
+            failures += 1
+            print(f"{label} FAILED: {type(e).__name__}: {str(e)[:200]}")
     # The staging pair from DONE.md decision 40 prerequisite 4.
     try:
         check("lru_ensure", _ensure_experts_kernel, _lru_sig(), lru_constexprs())

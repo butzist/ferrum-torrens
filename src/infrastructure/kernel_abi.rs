@@ -118,6 +118,8 @@ pub struct Abi {
 /// The kernel names `grouped_moe` launches, in the order it launches them.
 pub const GEMV_GATE_UP: &str = "gemv_gate_up";
 pub const GEMV_DOWN: &str = "gemv_down";
+pub const GROUPED_GATE_UP: &str = "grouped_gate_up";
+pub const GROUPED_DOWN: &str = "grouped_down";
 pub const SILU_MUL: &str = "silu_mul";
 pub const SUM_REDUCE: &str = "sum_reduce";
 
@@ -246,7 +248,14 @@ impl Abi {
     }
 }
 
-const NAMES: [&str; 4] = [GEMV_GATE_UP, GEMV_DOWN, SILU_MUL, SUM_REDUCE];
+const NAMES: [&str; 6] = [
+    GEMV_GATE_UP,
+    GEMV_DOWN,
+    GROUPED_GATE_UP,
+    GROUPED_DOWN,
+    SILU_MUL,
+    SUM_REDUCE,
+];
 
 /// The cubin bytes, by name. `include_bytes!` so a missing or renamed artifact
 /// is a compile error rather than a runtime surprise.
@@ -254,6 +263,8 @@ pub fn cubin(name: &str) -> Result<&'static [u8], MoEError> {
     Ok(match name {
         GEMV_GATE_UP => include_bytes!("../../kernel/gemv_gate_up.cubin"),
         GEMV_DOWN => include_bytes!("../../kernel/gemv_down.cubin"),
+        GROUPED_GATE_UP => include_bytes!("../../kernel/grouped_gate_up.cubin"),
+        GROUPED_DOWN => include_bytes!("../../kernel/grouped_down.cubin"),
         SILU_MUL => include_bytes!("../../kernel/silu_mul.cubin"),
         SUM_REDUCE => include_bytes!("../../kernel/sum_reduce.cubin"),
         other => return Err(MoEError::Bad(format!("no committed cubin for {other}"))),
@@ -739,6 +750,8 @@ fn ptx(name: &str) -> &'static str {
     match name {
         GEMV_GATE_UP => include_str!("../../kernel/gemv_gate_up.ptx"),
         GEMV_DOWN => include_str!("../../kernel/gemv_down.ptx"),
+        GROUPED_GATE_UP => include_str!("../../kernel/grouped_gate_up.ptx"),
+        GROUPED_DOWN => include_str!("../../kernel/grouped_down.ptx"),
         SILU_MUL => include_str!("../../kernel/silu_mul.ptx"),
         SUM_REDUCE => include_str!("../../kernel/sum_reduce.ptx"),
         other => panic!("no committed ptx for {other}"),
@@ -930,7 +943,7 @@ impl ArgPack {
 /// raw address: the caller owns the memory (libtorch tensors, or the slot cache),
 /// and this module never allocates.
 ///
-/// `Default` is all zeroes so a caller that runs one kernel of the four only has
+/// `Default` is all zeroes so a caller that runs one kernel of the six only has
 /// to name the buffers that kernel reads.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MoEArgs {
@@ -951,6 +964,10 @@ pub struct MoEArgs {
     pub ic2: u64,
     pub ic3: u64,
     pub out: u64,
+    /// The grouped prefill's CSR (R10.2): `[S + 1]` segment starts and the
+    /// segment-major route permutation. Unused by the decode GEMV.
+    pub seg: u64,
+    pub route_idx: u64,
 }
 
 fn div_ceil(a: usize, b: usize) -> u32 {
@@ -1011,6 +1028,72 @@ pub fn gemv_down_args(abi: &Abi, a: &MoEArgs) -> Result<ArgPack, MoEError> {
     // A_ROW_IS_ROUTE is true: the activations are already one row per route.
     p.u32(a.routes as u32)?;
     p.u32(k.n as u32)?;
+    p.u32(inter as u32)?;
+    p.u32(1)?;
+    p.u64((rows * (inter / 8)) as u64)?;
+    p.u32((inter / 8) as u32)?;
+    p.u32(1)?;
+    p.u64((rows * (inter / 16)) as u64)?;
+    p.u32((inter / 16) as u32)?;
+    p.u32(1)?;
+    p.u64(rows as u64)?;
+    p.u32(1)?;
+    p.u64(hidden as u64)?;
+    p.u32(1)?;
+    Ok(p)
+}
+
+/// `x[token] @ gate_up^T` per slot segment (R10.2): one program per
+/// (segment, n-tile), routes via the CSR, no route weight, `N = 2 * inter`.
+pub fn grouped_gate_up_args(abi: &Abi, a: &MoEArgs) -> Result<ArgPack, MoEError> {
+    let k = abi.kernel(GROUPED_GATE_UP)?;
+    let (hidden, inter) = (abi.hidden, abi.inter);
+    let rows = 2 * inter;
+    let mut p = ArgPack::for_kernel(k);
+    p.ptr(a.x)?;
+    p.ptr(a.gu_packed)?;
+    p.ptr(a.gu_scale)?;
+    p.ptr(a.gu_global)?;
+    p.ptr(a.ic1)?;
+    p.ptr(a.route_token)?;
+    p.ptr(a.route_weight)?;
+    p.ptr(a.seg)?;
+    p.ptr(a.route_idx)?;
+    p.u32(k.n as u32)?;
+    // A_ROW_IS_ROUTE is false: the activations are x [tokens, hidden].
+    p.u32(hidden as u32)?;
+    p.u32(1)?;
+    p.u64((rows * (hidden / 8)) as u64)?;
+    p.u32((hidden / 8) as u32)?;
+    p.u32(1)?;
+    p.u64((rows * (hidden / 16)) as u64)?;
+    p.u32((hidden / 16) as u32)?;
+    p.u32(1)?;
+    p.u64(rows as u64)?;
+    p.u32(1)?;
+    p.u64((2 * inter) as u64)?;
+    p.u32(1)?;
+    Ok(p)
+}
+
+/// `ic2[route] @ down^T` per slot segment (R10.2): activations one row per
+/// route, route weight applied, `N = hidden`.
+pub fn grouped_down_args(abi: &Abi, a: &MoEArgs) -> Result<ArgPack, MoEError> {
+    let k = abi.kernel(GROUPED_DOWN)?;
+    let (hidden, inter) = (abi.hidden, abi.inter);
+    let rows = hidden;
+    let mut p = ArgPack::for_kernel(k);
+    p.ptr(a.ic2)?;
+    p.ptr(a.dn_packed)?;
+    p.ptr(a.dn_scale)?;
+    p.ptr(a.dn_global)?;
+    p.ptr(a.ic3)?;
+    p.ptr(a.route_token)?;
+    p.ptr(a.route_weight)?;
+    p.ptr(a.seg)?;
+    p.ptr(a.route_idx)?;
+    p.u32(k.n as u32)?;
+    // A_ROW_IS_ROUTE is true: the activations are already one row per route.
     p.u32(inter as u32)?;
     p.u32(1)?;
     p.u64((rows * (inter / 8)) as u64)?;
@@ -1550,7 +1633,7 @@ mod tests {
     }
 
     #[test]
-    fn the_manifest_lists_exactly_the_four_launches() {
+    fn the_manifest_lists_exactly_the_six_launches() {
         let abi = abi();
         assert_eq!(abi.hidden, 2048);
         assert_eq!(abi.inter, 512);
@@ -1561,6 +1644,8 @@ mod tests {
         }
         assert_eq!(abi.kernel(GEMV_GATE_UP).unwrap().n, 2 * abi.inter);
         assert_eq!(abi.kernel(GEMV_DOWN).unwrap().n, abi.hidden);
+        assert_eq!(abi.kernel(GROUPED_GATE_UP).unwrap().n, 2 * abi.inter);
+        assert_eq!(abi.kernel(GROUPED_DOWN).unwrap().n, abi.hidden);
     }
 
     /// The whole point of the module: the manifest and the PTX must agree, or
@@ -1602,10 +1687,14 @@ mod tests {
             ic2: 0xd000,
             ic3: 0xe000,
             out: 0xf000,
+            seg: 0x1_0000,
+            route_idx: 0x1_1000,
         };
         let built = [
             (GEMV_GATE_UP, gemv_gate_up_args(&abi, &args)),
             (GEMV_DOWN, gemv_down_args(&abi, &args)),
+            (GROUPED_GATE_UP, grouped_gate_up_args(&abi, &args)),
+            (GROUPED_DOWN, grouped_down_args(&abi, &args)),
             (SILU_MUL, silu_mul_args(&abi, &args)),
             (SUM_REDUCE, sum_reduce_args(&abi, &args)),
         ];
@@ -1627,6 +1716,61 @@ mod tests {
                 assert_eq!(*slot, 0, "{name}: scratch slot is not null");
             }
         }
+    }
+
+    /// The grouped builders hardcode the contiguous strides of the buffers
+    /// `group_with_slots` makes; a swapped slot / row stride would misread the
+    /// banks silently, so the values are pinned against the manifest shapes.
+    #[test]
+    fn the_grouped_builders_pin_the_contiguous_strides() {
+        let abi = abi();
+        let (hidden, inter) = (abi.hidden, abi.inter);
+        let args = MoEArgs {
+            tokens: 4,
+            routes: 32,
+            ..MoEArgs::default()
+        };
+        let gate = grouped_gate_up_args(&abi, &args).unwrap();
+        // param 9: N, then (mn, mk, a_rs, a_cs, a_ws) for pe/pn/pkw, se/sn/sblk, ge/gn, cm, cn
+        assert_eq!(
+            &gate.slots()[9..22],
+            &[
+                (2 * inter) as u64,
+                hidden as u64,
+                1,
+                (2 * inter * (hidden / 8)) as u64,
+                (hidden / 8) as u64,
+                1,
+                (2 * inter * (hidden / 16)) as u64,
+                (hidden / 16) as u64,
+                1,
+                (2 * inter) as u64,
+                1,
+                (2 * inter) as u64,
+                1,
+            ],
+            "grouped_gate_up strides"
+        );
+        let down = grouped_down_args(&abi, &args).unwrap();
+        assert_eq!(
+            &down.slots()[9..22],
+            &[
+                hidden as u64,
+                inter as u64,
+                1,
+                (hidden * (inter / 8)) as u64,
+                (inter / 8) as u64,
+                1,
+                (hidden * (inter / 16)) as u64,
+                (inter / 16) as u64,
+                1,
+                hidden as u64,
+                1,
+                hidden as u64,
+                1,
+            ],
+            "grouped_down strides"
+        );
     }
 
     #[test]

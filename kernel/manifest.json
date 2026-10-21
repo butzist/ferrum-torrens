@@ -412,6 +412,286 @@
       "scratch_params": 2,
       "shared": 256
     },
+    "grouped_down": {
+      "block": 32,
+      "constexprs": {
+        "A_ROW_IS_ROUTE": true,
+        "BLOCK_KW": 16,
+        "BLOCK_M": 32,
+        "BLOCK_N": 32,
+        "K_WORDS": 64,
+        "MUL_WEIGHT": true
+      },
+      "declared_args": [
+        "a_ptr",
+        "packed_ptr",
+        "scale_ptr",
+        "global_ptr",
+        "c_ptr",
+        "route_token_ptr",
+        "route_weight_ptr",
+        "seg_ptr",
+        "route_idx_ptr",
+        "N",
+        "stride_am",
+        "stride_ak",
+        "stride_pe",
+        "stride_pn",
+        "stride_pkw",
+        "stride_se",
+        "stride_sn",
+        "stride_sblk",
+        "stride_ge",
+        "stride_gn",
+        "stride_cm",
+        "stride_cn"
+      ],
+      "entry": "_nvfp4_grouped_gemm_kernel",
+      "global_scratch_size": 0,
+      "n": 2048,
+      "num_warps": 4,
+      "params": [
+        {
+          "index": 0,
+          "kind": "ptr"
+        },
+        {
+          "index": 1,
+          "kind": "ptr"
+        },
+        {
+          "index": 2,
+          "kind": "ptr"
+        },
+        {
+          "index": 3,
+          "kind": "ptr"
+        },
+        {
+          "index": 4,
+          "kind": "ptr"
+        },
+        {
+          "index": 5,
+          "kind": "ptr"
+        },
+        {
+          "index": 6,
+          "kind": "ptr"
+        },
+        {
+          "index": 7,
+          "kind": "ptr"
+        },
+        {
+          "index": 8,
+          "kind": "ptr"
+        },
+        {
+          "index": 9,
+          "kind": "u32"
+        },
+        {
+          "index": 10,
+          "kind": "u32"
+        },
+        {
+          "index": 11,
+          "kind": "u32"
+        },
+        {
+          "index": 12,
+          "kind": "u64"
+        },
+        {
+          "index": 13,
+          "kind": "u32"
+        },
+        {
+          "index": 14,
+          "kind": "u32"
+        },
+        {
+          "index": 15,
+          "kind": "u64"
+        },
+        {
+          "index": 16,
+          "kind": "u32"
+        },
+        {
+          "index": 17,
+          "kind": "u32"
+        },
+        {
+          "index": 18,
+          "kind": "u64"
+        },
+        {
+          "index": 19,
+          "kind": "u32"
+        },
+        {
+          "index": 20,
+          "kind": "u64"
+        },
+        {
+          "index": 21,
+          "kind": "u32"
+        },
+        {
+          "index": 22,
+          "kind": "ptr"
+        },
+        {
+          "index": 23,
+          "kind": "ptr"
+        }
+      ],
+      "profile_scratch_size": 0,
+      "scratch_params": 2,
+      "shared": 12288
+    },
+    "grouped_gate_up": {
+      "block": 32,
+      "constexprs": {
+        "A_ROW_IS_ROUTE": false,
+        "BLOCK_KW": 16,
+        "BLOCK_M": 32,
+        "BLOCK_N": 32,
+        "K_WORDS": 256,
+        "MUL_WEIGHT": false
+      },
+      "declared_args": [
+        "a_ptr",
+        "packed_ptr",
+        "scale_ptr",
+        "global_ptr",
+        "c_ptr",
+        "route_token_ptr",
+        "route_weight_ptr",
+        "seg_ptr",
+        "route_idx_ptr",
+        "N",
+        "stride_am",
+        "stride_ak",
+        "stride_pe",
+        "stride_pn",
+        "stride_pkw",
+        "stride_se",
+        "stride_sn",
+        "stride_sblk",
+        "stride_ge",
+        "stride_gn",
+        "stride_cm",
+        "stride_cn"
+      ],
+      "entry": "_nvfp4_grouped_gemm_kernel",
+      "global_scratch_size": 0,
+      "n": 1024,
+      "num_warps": 4,
+      "params": [
+        {
+          "index": 0,
+          "kind": "ptr"
+        },
+        {
+          "index": 1,
+          "kind": "ptr"
+        },
+        {
+          "index": 2,
+          "kind": "ptr"
+        },
+        {
+          "index": 3,
+          "kind": "ptr"
+        },
+        {
+          "index": 4,
+          "kind": "ptr"
+        },
+        {
+          "index": 5,
+          "kind": "ptr"
+        },
+        {
+          "index": 6,
+          "kind": "ptr"
+        },
+        {
+          "index": 7,
+          "kind": "ptr"
+        },
+        {
+          "index": 8,
+          "kind": "ptr"
+        },
+        {
+          "index": 9,
+          "kind": "u32"
+        },
+        {
+          "index": 10,
+          "kind": "u32"
+        },
+        {
+          "index": 11,
+          "kind": "u32"
+        },
+        {
+          "index": 12,
+          "kind": "u64"
+        },
+        {
+          "index": 13,
+          "kind": "u32"
+        },
+        {
+          "index": 14,
+          "kind": "u32"
+        },
+        {
+          "index": 15,
+          "kind": "u64"
+        },
+        {
+          "index": 16,
+          "kind": "u32"
+        },
+        {
+          "index": 17,
+          "kind": "u32"
+        },
+        {
+          "index": 18,
+          "kind": "u64"
+        },
+        {
+          "index": 19,
+          "kind": "u32"
+        },
+        {
+          "index": 20,
+          "kind": "u64"
+        },
+        {
+          "index": 21,
+          "kind": "u32"
+        },
+        {
+          "index": 22,
+          "kind": "ptr"
+        },
+        {
+          "index": 23,
+          "kind": "ptr"
+        }
+      ],
+      "profile_scratch_size": 0,
+      "scratch_params": 2,
+      "shared": 12288
+    },
     "silu_mul": {
       "block": 256,
       "constexprs": {

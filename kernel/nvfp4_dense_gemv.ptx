@@ -254,7 +254,7 @@ cvt.rn.f16x2.e4m3x2 %r57, %rs7;
 	@%p6 ld.global.b16 { %rs8 }, [ %rd28 + 0 ];
 	// end inline asm
 $L__tmp3:
-	.loc	3 95 27                         // nvfp4_moe.py:95:27 @[ linear.py:96:56 ]
+	.loc	3 105 27                        // nvfp4_moe.py:105:27 @[ linear.py:96:56 ]
 	bar.sync 	0;
 	// begin inline asm
 	st.shared.b16 [ %r58 + 0 ], %rs8;
@@ -265,17 +265,17 @@ $L__tmp3:
 	ld.shared.v4.b32 	{%r83, %r84, %r85, %r86}, [%r9+128];
 	ld.shared.v4.b32 	{%r87, %r88, %r89, %r90}, [%r9+144];
 $L__tmp4:
-	.loc	3 82 15                         // nvfp4_moe.py:82:15 @[ linear.py:98:37 ]
+	.loc	3 92 15                         // nvfp4_moe.py:92:15 @[ linear.py:98:37 ]
 	shl.b32 	%r91, %r52, 9;
 	shl.b32 	%r92, %r53, 9;
 	shl.b32 	%r93, %r54, 9;
 	shl.b32 	%r94, %r55, 9;
-	.loc	3 82 20                         // nvfp4_moe.py:82:20 @[ linear.py:98:37 ]
+	.loc	3 92 20                         // nvfp4_moe.py:92:20 @[ linear.py:98:37 ]
 	and.b32 	%r95, %r91, 234884608;
 	and.b32 	%r96, %r92, 234884608;
 	and.b32 	%r97, %r93, 234884608;
 	and.b32 	%r98, %r94, 234884608;
-	.loc	3 82 55                         // nvfp4_moe.py:82:55 @[ linear.py:98:37 ]
+	.loc	3 92 55                         // nvfp4_moe.py:92:55 @[ linear.py:98:37 ]
 	shl.b32 	%r99, %r52, 12;
 	and.b32 	%r100, %r99, -2147450880;
 	shl.b32 	%r101, %r53, 12;
@@ -284,7 +284,7 @@ $L__tmp4:
 	and.b32 	%r104, %r103, -2147450880;
 	shl.b32 	%r105, %r55, 12;
 	and.b32 	%r106, %r105, -2147450880;
-	.loc	3 82 35                         // nvfp4_moe.py:82:35 @[ linear.py:98:37 ]
+	.loc	3 92 35                         // nvfp4_moe.py:92:35 @[ linear.py:98:37 ]
 	or.b32 	%r107, %r95, %r100;
 	or.b32 	%r108, %r96, %r102;
 	or.b32 	%r109, %r97, %r104;
@@ -297,7 +297,7 @@ $L__tmp5:
 	cvt.f32.bf16 	%r112, %rs19;
 	mov.b64 	%rd37, {%r112, %r111};
 $L__tmp6:
-	.loc	3 83 68                         // nvfp4_moe.py:83:68 @[ linear.py:98:37 ]
+	.loc	3 93 68                         // nvfp4_moe.py:93:68 @[ linear.py:98:37 ]
 	mov.b32 	{%rs21, %rs22}, %r107;
 	cvt.f32.f16 	%r113, %rs22;
 	cvt.f32.f16 	%r114, %rs21;
@@ -313,7 +313,7 @@ $L__tmp7:
 	cvt.f32.bf16 	%r119, %rs20;
 	mov.b64 	%rd40, {%r119, %r118};
 $L__tmp8:
-	.loc	3 83 68                         // nvfp4_moe.py:83:68 @[ linear.py:98:37 ]
+	.loc	3 93 68                         // nvfp4_moe.py:93:68 @[ linear.py:98:37 ]
 	mov.b32 	{%rs23, %rs24}, %r108;
 	cvt.f32.f16 	%r120, %rs24;
 	cvt.f32.f16 	%r121, %rs23;
@@ -331,7 +331,7 @@ $L__tmp9:
 	cvt.f32.bf16 	%r126, %rs27;
 	mov.b64 	%rd43, {%r126, %r125};
 $L__tmp10:
-	.loc	3 83 68                         // nvfp4_moe.py:83:68 @[ linear.py:98:37 ]
+	.loc	3 93 68                         // nvfp4_moe.py:93:68 @[ linear.py:98:37 ]
 	mov.b32 	{%rs29, %rs30}, %r109;
 	cvt.f32.f16 	%r127, %rs30;
 	cvt.f32.f16 	%r128, %rs29;
@@ -347,7 +347,7 @@ $L__tmp11:
 	cvt.f32.bf16 	%r133, %rs28;
 	mov.b64 	%rd46, {%r133, %r132};
 $L__tmp12:
-	.loc	3 83 68                         // nvfp4_moe.py:83:68 @[ linear.py:98:37 ]
+	.loc	3 93 68                         // nvfp4_moe.py:93:68 @[ linear.py:98:37 ]
 	mov.b32 	{%rs31, %rs32}, %r110;
 	cvt.f32.f16 	%r134, %rs32;
 	cvt.f32.f16 	%r135, %rs31;
@@ -369,17 +369,17 @@ $L__tmp13:
 	shr.s32 	%r145, %r54, 4;
 	shr.s32 	%r146, %r55, 4;
 $L__tmp14:
-	.loc	3 82 15                         // nvfp4_moe.py:82:15 @[ linear.py:101:37 ]
+	.loc	3 92 15                         // nvfp4_moe.py:92:15 @[ linear.py:101:37 ]
 	shl.b32 	%r147, %r143, 9;
 	shl.b32 	%r148, %r144, 9;
 	shl.b32 	%r149, %r145, 9;
 	shl.b32 	%r150, %r146, 9;
-	.loc	3 82 20                         // nvfp4_moe.py:82:20 @[ linear.py:101:37 ]
+	.loc	3 92 20                         // nvfp4_moe.py:92:20 @[ linear.py:101:37 ]
 	and.b32 	%r151, %r147, 234884608;
 	and.b32 	%r152, %r148, 234884608;
 	and.b32 	%r153, %r149, 234884608;
 	and.b32 	%r154, %r150, 234884608;
-	.loc	3 82 55                         // nvfp4_moe.py:82:55 @[ linear.py:101:37 ]
+	.loc	3 92 55                         // nvfp4_moe.py:92:55 @[ linear.py:101:37 ]
 	shl.b32 	%r155, %r143, 12;
 	and.b32 	%r156, %r155, -2147450880;
 	shl.b32 	%r157, %r144, 12;
@@ -388,7 +388,7 @@ $L__tmp14:
 	and.b32 	%r160, %r159, -2147450880;
 	shl.b32 	%r161, %r146, 12;
 	and.b32 	%r162, %r161, -2147450880;
-	.loc	3 82 35                         // nvfp4_moe.py:82:35 @[ linear.py:101:37 ]
+	.loc	3 92 35                         // nvfp4_moe.py:92:35 @[ linear.py:101:37 ]
 	or.b32 	%r163, %r151, %r156;
 	or.b32 	%r164, %r152, %r158;
 	or.b32 	%r165, %r153, %r160;
@@ -401,9 +401,9 @@ $L__tmp15:
 	cvt.f32.bf16 	%r168, %rs35;
 	mov.b64 	%rd49, {%r168, %r167};
 $L__tmp16:
-	.loc	3 84 0                          // nvfp4_moe.py:84 @[ linear.py:101:37 ]
+	.loc	3 94 0                          // nvfp4_moe.py:94 @[ linear.py:101:37 ]
 	prmt.b32 	%r169, %r163, %r163, 0x5432U;
-	.loc	3 84 65                         // nvfp4_moe.py:84:65 @[ linear.py:101:37 ]
+	.loc	3 94 65                         // nvfp4_moe.py:94:65 @[ linear.py:101:37 ]
 	mov.b32 	{%rs37, %rs38}, %r169;
 	cvt.f32.f16 	%r170, %rs38;
 	cvt.f32.f16 	%r171, %rs37;
@@ -419,9 +419,9 @@ $L__tmp17:
 	cvt.f32.bf16 	%r176, %rs36;
 	mov.b64 	%rd52, {%r176, %r175};
 $L__tmp18:
-	.loc	3 84 0                          // nvfp4_moe.py:84 @[ linear.py:101:37 ]
+	.loc	3 94 0                          // nvfp4_moe.py:94 @[ linear.py:101:37 ]
 	prmt.b32 	%r177, %r164, %r164, 0x5432U;
-	.loc	3 84 65                         // nvfp4_moe.py:84:65 @[ linear.py:101:37 ]
+	.loc	3 94 65                         // nvfp4_moe.py:94:65 @[ linear.py:101:37 ]
 	mov.b32 	{%rs39, %rs40}, %r177;
 	cvt.f32.f16 	%r178, %rs40;
 	cvt.f32.f16 	%r179, %rs39;
@@ -439,9 +439,9 @@ $L__tmp19:
 	cvt.f32.bf16 	%r184, %rs43;
 	mov.b64 	%rd55, {%r184, %r183};
 $L__tmp20:
-	.loc	3 84 0                          // nvfp4_moe.py:84 @[ linear.py:101:37 ]
+	.loc	3 94 0                          // nvfp4_moe.py:94 @[ linear.py:101:37 ]
 	prmt.b32 	%r185, %r165, %r165, 0x5432U;
-	.loc	3 84 65                         // nvfp4_moe.py:84:65 @[ linear.py:101:37 ]
+	.loc	3 94 65                         // nvfp4_moe.py:94:65 @[ linear.py:101:37 ]
 	mov.b32 	{%rs45, %rs46}, %r185;
 	cvt.f32.f16 	%r186, %rs46;
 	cvt.f32.f16 	%r187, %rs45;
@@ -457,9 +457,9 @@ $L__tmp21:
 	cvt.f32.bf16 	%r192, %rs44;
 	mov.b64 	%rd58, {%r192, %r191};
 $L__tmp22:
-	.loc	3 84 0                          // nvfp4_moe.py:84 @[ linear.py:101:37 ]
+	.loc	3 94 0                          // nvfp4_moe.py:94 @[ linear.py:101:37 ]
 	prmt.b32 	%r193, %r166, %r166, 0x5432U;
-	.loc	3 84 65                         // nvfp4_moe.py:84:65 @[ linear.py:101:37 ]
+	.loc	3 94 65                         // nvfp4_moe.py:94:65 @[ linear.py:101:37 ]
 	mov.b32 	{%rs47, %rs48}, %r193;
 	cvt.f32.f16 	%r194, %rs48;
 	cvt.f32.f16 	%r195, %rs47;
@@ -481,17 +481,17 @@ $L__tmp23:
 	shr.s32 	%r205, %r54, 8;
 	shr.s32 	%r206, %r55, 8;
 $L__tmp24:
-	.loc	3 82 15                         // nvfp4_moe.py:82:15 @[ linear.py:104:37 ]
+	.loc	3 92 15                         // nvfp4_moe.py:92:15 @[ linear.py:104:37 ]
 	shl.b32 	%r207, %r203, 9;
 	shl.b32 	%r208, %r204, 9;
 	shl.b32 	%r209, %r205, 9;
 	shl.b32 	%r210, %r206, 9;
-	.loc	3 82 20                         // nvfp4_moe.py:82:20 @[ linear.py:104:37 ]
+	.loc	3 92 20                         // nvfp4_moe.py:92:20 @[ linear.py:104:37 ]
 	and.b32 	%r211, %r207, 234884608;
 	and.b32 	%r212, %r208, 234884608;
 	and.b32 	%r213, %r209, 234884608;
 	and.b32 	%r214, %r210, 234884608;
-	.loc	3 82 55                         // nvfp4_moe.py:82:55 @[ linear.py:104:37 ]
+	.loc	3 92 55                         // nvfp4_moe.py:92:55 @[ linear.py:104:37 ]
 	shl.b32 	%r215, %r203, 12;
 	and.b32 	%r216, %r215, -2147450880;
 	shl.b32 	%r217, %r204, 12;
@@ -500,7 +500,7 @@ $L__tmp24:
 	and.b32 	%r220, %r219, -2147450880;
 	shl.b32 	%r221, %r206, 12;
 	and.b32 	%r222, %r221, -2147450880;
-	.loc	3 82 35                         // nvfp4_moe.py:82:35 @[ linear.py:104:37 ]
+	.loc	3 92 35                         // nvfp4_moe.py:92:35 @[ linear.py:104:37 ]
 	or.b32 	%r223, %r211, %r216;
 	or.b32 	%r224, %r212, %r218;
 	or.b32 	%r225, %r213, %r220;
@@ -513,9 +513,9 @@ $L__tmp25:
 	cvt.f32.bf16 	%r228, %rs51;
 	mov.b64 	%rd61, {%r228, %r227};
 $L__tmp26:
-	.loc	3 84 0                          // nvfp4_moe.py:84 @[ linear.py:104:37 ]
+	.loc	3 94 0                          // nvfp4_moe.py:94 @[ linear.py:104:37 ]
 	prmt.b32 	%r229, %r223, %r223, 0x5432U;
-	.loc	3 84 65                         // nvfp4_moe.py:84:65 @[ linear.py:104:37 ]
+	.loc	3 94 65                         // nvfp4_moe.py:94:65 @[ linear.py:104:37 ]
 	mov.b32 	{%rs53, %rs54}, %r229;
 	cvt.f32.f16 	%r230, %rs54;
 	cvt.f32.f16 	%r231, %rs53;
@@ -531,9 +531,9 @@ $L__tmp27:
 	cvt.f32.bf16 	%r236, %rs52;
 	mov.b64 	%rd64, {%r236, %r235};
 $L__tmp28:
-	.loc	3 84 0                          // nvfp4_moe.py:84 @[ linear.py:104:37 ]
+	.loc	3 94 0                          // nvfp4_moe.py:94 @[ linear.py:104:37 ]
 	prmt.b32 	%r237, %r224, %r224, 0x5432U;
-	.loc	3 84 65                         // nvfp4_moe.py:84:65 @[ linear.py:104:37 ]
+	.loc	3 94 65                         // nvfp4_moe.py:94:65 @[ linear.py:104:37 ]
 	mov.b32 	{%rs55, %rs56}, %r237;
 	cvt.f32.f16 	%r238, %rs56;
 	cvt.f32.f16 	%r239, %rs55;
@@ -551,9 +551,9 @@ $L__tmp29:
 	cvt.f32.bf16 	%r244, %rs59;
 	mov.b64 	%rd67, {%r244, %r243};
 $L__tmp30:
-	.loc	3 84 0                          // nvfp4_moe.py:84 @[ linear.py:104:37 ]
+	.loc	3 94 0                          // nvfp4_moe.py:94 @[ linear.py:104:37 ]
 	prmt.b32 	%r245, %r225, %r225, 0x5432U;
-	.loc	3 84 65                         // nvfp4_moe.py:84:65 @[ linear.py:104:37 ]
+	.loc	3 94 65                         // nvfp4_moe.py:94:65 @[ linear.py:104:37 ]
 	mov.b32 	{%rs61, %rs62}, %r245;
 	cvt.f32.f16 	%r246, %rs62;
 	cvt.f32.f16 	%r247, %rs61;
@@ -569,9 +569,9 @@ $L__tmp31:
 	cvt.f32.bf16 	%r252, %rs60;
 	mov.b64 	%rd70, {%r252, %r251};
 $L__tmp32:
-	.loc	3 84 0                          // nvfp4_moe.py:84 @[ linear.py:104:37 ]
+	.loc	3 94 0                          // nvfp4_moe.py:94 @[ linear.py:104:37 ]
 	prmt.b32 	%r253, %r226, %r226, 0x5432U;
-	.loc	3 84 65                         // nvfp4_moe.py:84:65 @[ linear.py:104:37 ]
+	.loc	3 94 65                         // nvfp4_moe.py:94:65 @[ linear.py:104:37 ]
 	mov.b32 	{%rs63, %rs64}, %r253;
 	cvt.f32.f16 	%r254, %rs64;
 	cvt.f32.f16 	%r255, %rs63;
@@ -588,22 +588,22 @@ $L__tmp33:
 	add.f32 	%r261, %r248, %r250;
 	add.f32 	%r262, %r256, %r258;
 $L__tmp34:
-	.loc	3 82 15                         // nvfp4_moe.py:82:15 @[ linear.py:107:37 ]
+	.loc	3 92 15                         // nvfp4_moe.py:92:15 @[ linear.py:107:37 ]
 	shr.u32 	%r263, %r52, 3;
 	shr.u32 	%r264, %r53, 3;
 	shr.u32 	%r265, %r54, 3;
 	shr.u32 	%r266, %r55, 3;
-	.loc	3 82 20                         // nvfp4_moe.py:82:20 @[ linear.py:107:37 ]
+	.loc	3 92 20                         // nvfp4_moe.py:92:20 @[ linear.py:107:37 ]
 	and.b32 	%r267, %r263, 234884608;
 	and.b32 	%r268, %r264, 234884608;
 	and.b32 	%r269, %r265, 234884608;
 	and.b32 	%r270, %r266, 234884608;
-	.loc	3 82 55                         // nvfp4_moe.py:82:55 @[ linear.py:107:37 ]
+	.loc	3 92 55                         // nvfp4_moe.py:92:55 @[ linear.py:107:37 ]
 	and.b32 	%r271, %r52, -2147450880;
 	and.b32 	%r272, %r53, -2147450880;
 	and.b32 	%r273, %r54, -2147450880;
 	and.b32 	%r274, %r55, -2147450880;
-	.loc	3 82 35                         // nvfp4_moe.py:82:35 @[ linear.py:107:37 ]
+	.loc	3 92 35                         // nvfp4_moe.py:92:35 @[ linear.py:107:37 ]
 	or.b32 	%r275, %r267, %r271;
 	or.b32 	%r276, %r268, %r272;
 	or.b32 	%r277, %r269, %r273;
@@ -616,9 +616,9 @@ $L__tmp35:
 	cvt.f32.bf16 	%r280, %rs67;
 	mov.b64 	%rd73, {%r280, %r279};
 $L__tmp36:
-	.loc	3 84 0                          // nvfp4_moe.py:84 @[ linear.py:107:37 ]
+	.loc	3 94 0                          // nvfp4_moe.py:94 @[ linear.py:107:37 ]
 	prmt.b32 	%r281, %r275, %r275, 0x5432U;
-	.loc	3 84 65                         // nvfp4_moe.py:84:65 @[ linear.py:107:37 ]
+	.loc	3 94 65                         // nvfp4_moe.py:94:65 @[ linear.py:107:37 ]
 	mov.b32 	{%rs69, %rs70}, %r281;
 	cvt.f32.f16 	%r282, %rs70;
 	cvt.f32.f16 	%r283, %rs69;
@@ -634,9 +634,9 @@ $L__tmp37:
 	cvt.f32.bf16 	%r288, %rs68;
 	mov.b64 	%rd76, {%r288, %r287};
 $L__tmp38:
-	.loc	3 84 0                          // nvfp4_moe.py:84 @[ linear.py:107:37 ]
+	.loc	3 94 0                          // nvfp4_moe.py:94 @[ linear.py:107:37 ]
 	prmt.b32 	%r289, %r276, %r276, 0x5432U;
-	.loc	3 84 65                         // nvfp4_moe.py:84:65 @[ linear.py:107:37 ]
+	.loc	3 94 65                         // nvfp4_moe.py:94:65 @[ linear.py:107:37 ]
 	mov.b32 	{%rs71, %rs72}, %r289;
 	cvt.f32.f16 	%r290, %rs72;
 	cvt.f32.f16 	%r291, %rs71;
@@ -654,9 +654,9 @@ $L__tmp39:
 	cvt.f32.bf16 	%r296, %rs75;
 	mov.b64 	%rd79, {%r296, %r295};
 $L__tmp40:
-	.loc	3 84 0                          // nvfp4_moe.py:84 @[ linear.py:107:37 ]
+	.loc	3 94 0                          // nvfp4_moe.py:94 @[ linear.py:107:37 ]
 	prmt.b32 	%r297, %r277, %r277, 0x5432U;
-	.loc	3 84 65                         // nvfp4_moe.py:84:65 @[ linear.py:107:37 ]
+	.loc	3 94 65                         // nvfp4_moe.py:94:65 @[ linear.py:107:37 ]
 	mov.b32 	{%rs77, %rs78}, %r297;
 	cvt.f32.f16 	%r298, %rs78;
 	cvt.f32.f16 	%r299, %rs77;
@@ -672,9 +672,9 @@ $L__tmp41:
 	cvt.f32.bf16 	%r304, %rs76;
 	mov.b64 	%rd82, {%r304, %r303};
 $L__tmp42:
-	.loc	3 84 0                          // nvfp4_moe.py:84 @[ linear.py:107:37 ]
+	.loc	3 94 0                          // nvfp4_moe.py:94 @[ linear.py:107:37 ]
 	prmt.b32 	%r305, %r278, %r278, 0x5432U;
-	.loc	3 84 65                         // nvfp4_moe.py:84:65 @[ linear.py:107:37 ]
+	.loc	3 94 65                         // nvfp4_moe.py:94:65 @[ linear.py:107:37 ]
 	mov.b32 	{%rs79, %rs80}, %r305;
 	cvt.f32.f16 	%r306, %rs80;
 	cvt.f32.f16 	%r307, %rs79;

@@ -25,46 +25,46 @@
 	.reg .b16 	%rs<8>;
 	.reg .b32 	%r<40>;
 	.reg .b64 	%rd<11>;
-	.loc	1 250 0                         // nvfp4_moe.py:250:0
+	.loc	1 392 0                         // nvfp4_moe.py:392:0
 $L__func_begin0:
-	.loc	1 250 0                         // nvfp4_moe.py:250:0
+	.loc	1 392 0                         // nvfp4_moe.py:392:0
 
 // %bb.0:
 	ld.param.b64 	%rd7, [_silu_mul_kernel_param_0];
 	ld.param.b64 	%rd8, [_silu_mul_kernel_param_1];
 $L__tmp0:
-	.loc	1 262 24                        // nvfp4_moe.py:262:24
+	.loc	1 404 24                        // nvfp4_moe.py:404:24
 	mov.u32 	%r1, %ctaid.x;
 	ld.param.b32 	%r2, [_silu_mul_kernel_param_2];
-	.loc	1 263 27                        // nvfp4_moe.py:263:27
+	.loc	1 405 27                        // nvfp4_moe.py:405:27
 	mov.u32 	%r3, %ctaid.y;
-	.loc	1 263 32                        // nvfp4_moe.py:263:32
+	.loc	1 405 32                        // nvfp4_moe.py:405:32
 	shl.b32 	%r4, %r3, 8;
 	ld.param.b32 	%r5, [_silu_mul_kernel_param_3];
 	ld.param.b32 	%r6, [_silu_mul_kernel_param_4];
-	.loc	1 263 55                        // nvfp4_moe.py:263:55
+	.loc	1 405 55                        // nvfp4_moe.py:405:55
 	mov.u32 	%r7, %tid.x;
 	and.b32 	%r8, %r7, 127;
 	ld.param.b32 	%r9, [_silu_mul_kernel_param_5];
-	.loc	1 263 42                        // nvfp4_moe.py:263:42
+	.loc	1 405 42                        // nvfp4_moe.py:405:42
 	or.b32 	%r10, %r4, %r8;
 	ld.param.b32 	%r11, [_silu_mul_kernel_param_6];
 	or.b32 	%r12, %r10, 128;
-	.loc	1 264 20                        // nvfp4_moe.py:264:20
+	.loc	1 406 20                        // nvfp4_moe.py:406:20
 	setp.lt.s32 	%p1, %r10, %r2;
 	setp.lt.s32 	%p2, %r12, %r2;
-	.loc	1 265 35                        // nvfp4_moe.py:265:35
+	.loc	1 407 35                        // nvfp4_moe.py:407:35
 	mul.lo.s32 	%r13, %r5, %r1;
-	.loc	1 265 29                        // nvfp4_moe.py:265:29
+	.loc	1 407 29                        // nvfp4_moe.py:407:29
 	mad.wide.s32 	%rd9, %r13, 2, %rd7;
-	.loc	1 265 56                        // nvfp4_moe.py:265:56
+	.loc	1 407 56                        // nvfp4_moe.py:407:56
 	mul.lo.s32 	%r14, %r6, %r10;
 	mul.lo.s32 	%r15, %r6, %r12;
-	.loc	1 265 47                        // nvfp4_moe.py:265:47
+	.loc	1 407 47                        // nvfp4_moe.py:407:47
 	mad.wide.s32 	%rd1, %r14, 2, %rd9;
 	mad.wide.s32 	%rd2, %r15, 2, %rd9;
 	mov.b16 	%rs2, 0;
-	.loc	1 265 19                        // nvfp4_moe.py:265:19
+	.loc	1 407 19                        // nvfp4_moe.py:407:19
 	// begin inline asm
 	mov.u16 %rs1, %rs2;
 	@%p1 ld.global.b16 { %rs1 }, [ %rd1 + 0 ];
@@ -73,19 +73,19 @@ $L__tmp0:
 	mov.u16 %rs3, %rs2;
 	@%p2 ld.global.b16 { %rs3 }, [ %rd2 + 0 ];
 	// end inline asm
-	.loc	1 265 92                        // nvfp4_moe.py:265:92
+	.loc	1 407 92                        // nvfp4_moe.py:407:92
 	cvt.f32.bf16 	%r16, %rs1;
 	cvt.f32.bf16 	%r17, %rs3;
-	.loc	1 267 46                        // nvfp4_moe.py:267:46
+	.loc	1 409 46                        // nvfp4_moe.py:409:46
 	add.s32 	%r18, %r2, %r10;
 	add.s32 	%r19, %r2, %r12;
-	.loc	1 267 55                        // nvfp4_moe.py:267:55
+	.loc	1 409 55                        // nvfp4_moe.py:409:55
 	mul.lo.s32 	%r20, %r6, %r18;
 	mul.lo.s32 	%r21, %r6, %r19;
-	.loc	1 267 36                        // nvfp4_moe.py:267:36
+	.loc	1 409 36                        // nvfp4_moe.py:409:36
 	mad.wide.s32 	%rd3, %r20, 2, %rd9;
 	mad.wide.s32 	%rd4, %r21, 2, %rd9;
-	.loc	1 267 8                         // nvfp4_moe.py:267:8
+	.loc	1 409 8                         // nvfp4_moe.py:409:8
 	// begin inline asm
 	mov.u16 %rs4, %rs2;
 	@%p1 ld.global.b16 { %rs4 }, [ %rd3 + 0 ];
@@ -94,48 +94,48 @@ $L__tmp0:
 	mov.u16 %rs5, %rs2;
 	@%p2 ld.global.b16 { %rs5 }, [ %rd4 + 0 ];
 	// end inline asm
-	.loc	1 268 9                         // nvfp4_moe.py:268:9
+	.loc	1 410 9                         // nvfp4_moe.py:410:9
 	cvt.f32.bf16 	%r22, %rs4;
 	cvt.f32.bf16 	%r23, %rs5;
 	mov.b32 	%r24, 0f00000000;
-	.loc	1 269 33                        // nvfp4_moe.py:269:33
+	.loc	1 411 33                        // nvfp4_moe.py:411:33
 	sub.f32 	%r25, %r24, %r16;
 	sub.f32 	%r26, %r24, %r17;
-	.loc	1 269 32                        // nvfp4_moe.py:269:32
+	.loc	1 411 32                        // nvfp4_moe.py:411:32
 	mul.f32 	%r27, %r25, 0f3FB8AA3B;
 	ex2.approx.f32 	%r28, %r27;
 	mul.f32 	%r29, %r26, 0f3FB8AA3B;
 	ex2.approx.f32 	%r30, %r29;
-	.loc	1 269 25                        // nvfp4_moe.py:269:25
+	.loc	1 411 25                        // nvfp4_moe.py:411:25
 	add.f32 	%r31, %r28, 0f3F800000;
 	add.f32 	%r32, %r30, 0f3F800000;
-	.loc	1 269 19                        // nvfp4_moe.py:269:19
+	.loc	1 411 19                        // nvfp4_moe.py:411:19
 	div.full.f32 	%r33, %r16, %r31;
 	div.full.f32 	%r34, %r17, %r32;
-	.loc	1 269 43                        // nvfp4_moe.py:269:43
+	.loc	1 411 43                        // nvfp4_moe.py:411:43
 	mul.f32 	%r35, %r33, %r22;
 	mul.f32 	%r36, %r34, %r23;
-	.loc	1 270 29                        // nvfp4_moe.py:270:29
+	.loc	1 412 29                        // nvfp4_moe.py:412:29
 	mul.lo.s32 	%r37, %r9, %r1;
-	.loc	1 270 23                        // nvfp4_moe.py:270:23
+	.loc	1 412 23                        // nvfp4_moe.py:412:23
 	mad.wide.s32 	%rd10, %r37, 2, %rd8;
-	.loc	1 270 50                        // nvfp4_moe.py:270:50
+	.loc	1 412 50                        // nvfp4_moe.py:412:50
 	mul.lo.s32 	%r38, %r11, %r10;
 	mul.lo.s32 	%r39, %r11, %r12;
-	.loc	1 270 41                        // nvfp4_moe.py:270:41
+	.loc	1 412 41                        // nvfp4_moe.py:412:41
 	mad.wide.s32 	%rd5, %r38, 2, %rd10;
 	mad.wide.s32 	%rd6, %r39, 2, %rd10;
-	.loc	1 270 68                        // nvfp4_moe.py:270:68
+	.loc	1 412 68                        // nvfp4_moe.py:412:68
 	cvt.rn.bf16.f32 	%rs6, %r35;
 	cvt.rn.bf16.f32 	%rs7, %r36;
-	.loc	1 270 61                        // nvfp4_moe.py:270:61
+	.loc	1 412 61                        // nvfp4_moe.py:412:61
 	// begin inline asm
 	@%p1 st.global.b16 [ %rd5 + 0 ], { %rs6 };
 	// end inline asm
 	// begin inline asm
 	@%p2 st.global.b16 [ %rd6 + 0 ], { %rs7 };
 	// end inline asm
-	.loc	1 270 4                         // nvfp4_moe.py:270:4
+	.loc	1 412 4                         // nvfp4_moe.py:412:4
 	ret;
 $L__tmp1:
 $L__func_end0:

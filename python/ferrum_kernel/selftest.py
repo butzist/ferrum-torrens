@@ -18,6 +18,8 @@ import os
 import sys
 
 import torch
+import triton
+import triton.language as tl
 
 from . import attention as attn
 from . import conv as conv_mod
@@ -26,7 +28,13 @@ from . import gdn as gdn_mod
 from . import linear as linear_mod
 from . import norm as norm_mod
 from . import offload as off
-from .nvfp4_moe import _check_constexprs, grouped_moe, require_native_e4m3
+from .nvfp4_moe import (
+    _check_constexprs,
+    _nvfp4_dequant_tile,
+    grouped_moe,
+    grouped_moe_gemm,
+    require_native_e4m3,
+)
 
 E4M1_LUT = torch.tensor(
     [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
@@ -215,6 +223,98 @@ def check_offload(device: torch.device) -> int:
     print("offload copy wide: " + ("ok" if ok_wide else "FAIL"))
     if not ok_wide:
         failures += 1
+    return failures
+
+
+@triton.jit
+def _grouped_tile_kernel(
+    packed_ptr,  # [N, K // 8] int32, one slot's slab
+    scale_ptr,  # [N, K // 16] e4m3fn
+    out_ptr,  # [8 * K_WORDS, N] f32
+    N,
+    stride_pn, stride_pkw,
+    stride_sn, stride_sblk,
+    stride_on, stride_ok,
+    K_WORDS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_KW: tl.constexpr,
+):
+    """Store one (n-tile, word-tile) dequantized slab at
+    `out[8 * w0 :8 * w0 + BLOCK_KW * 8, n]`, exercising `_nvfp4_dequant_tile`
+    without a `tl.dot` (which the interpreter miscomputes)."""
+    n_offs = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+    w0 = tl.program_id(1) * BLOCK_KW
+    widx = w0 + tl.arange(0, BLOCK_KW)
+    mask = (widx < K_WORDS)[:, None] & (n_offs < N)[None, :]
+    word = tl.load(
+        packed_ptr + n_offs[None, :] * stride_pn + widx[:, None] * stride_pkw,
+        mask=mask, other=0,
+    )
+    scale = tl.load(
+        scale_ptr
+        + n_offs[None, :] * stride_sn
+        + (widx[:, None] // 2) * stride_sblk,
+        mask=mask, other=0.0,
+    ).to(tl.float32) * 16384.0
+    tile = _nvfp4_dequant_tile(word, scale, BLOCK_KW, BLOCK_N)
+    k_offs = 8 * w0 + tl.arange(0, BLOCK_KW * 8)
+    tl.store(
+        out_ptr + k_offs[:, None] * stride_on + n_offs[None, :] * stride_ok,
+        tile,
+        mask=(k_offs[:, None] < 8 * K_WORDS) & (n_offs[None, :] < N),
+    )
+
+
+def check_grouped_tile(device: torch.device, interp: bool) -> int:
+    """The grouped GEMM's interpreter-side coverage (R10.2): the dequant tile
+    assembly (k = 8*w + j order, one e4m3 per two words) against the torch
+    dequant, and the CSR the wrapper builds (bucketed, complete, permutation).
+    The full-kernel numerics are the device loop in `main`, because `tl.dot`
+    miscomputes under the interpreter just like the fp8 GEMM's."""
+    failures = 0
+    _, (packed, scale, _glob), _, _, _, _ = random_case("cpu", tokens=1, hidden=64, inter=32, slots=2, top_k=1)
+    packed = packed[0]  # [N, K // 2] bytes
+    scale = scale[0]
+    n_cols, k_bytes = packed.shape
+    packed_i32 = packed.view(torch.int32)  # [N, K // 8]
+    k_words = k_bytes // 4
+    assert k_words * 4 == k_bytes
+    want = nvfp4_dequant(packed.unsqueeze(0), scale.unsqueeze(0), torch.ones((1, n_cols), dtype=torch.float16))[0].T  # [K, N], glob = 1
+    run_kernel = device.type == "cuda" or interp
+    if run_kernel:
+        for block_n, block_kw in ((32, 16), (16, 16)):
+            out = torch.zeros((8 * k_words, n_cols), dtype=torch.float32)
+            _grouped_tile_kernel[(triton.cdiv(n_cols, block_n), triton.cdiv(k_words, block_kw))](
+                packed_i32, scale, out, n_cols,
+                packed_i32.stride(0), packed_i32.stride(1),
+                scale.stride(0), scale.stride(1),
+                out.stride(0), out.stride(1),
+                K_WORDS=k_words, BLOCK_N=block_n, BLOCK_KW=block_kw, num_warps=4,
+            )
+            diff = (out - want).abs().max().item()
+            rel = diff / want.abs().max().clamp(min=1e-6).item()
+            print(f"grouped tile N={n_cols} K={8 * k_words} [{block_n},{block_kw}]: rel {rel:.3e}")
+            if rel > 1e-6:
+                failures += 1
+    for seed in range(3):
+        _, _, _, slot, _, _ = random_case("cpu", seed=seed)
+        slot = slot.clamp(min=0)
+        slots = int(slot.max()) + 1
+        counts = torch.bincount(slot.to(torch.int64), minlength=slots)
+        seg = torch.zeros((slots + 1,), dtype=torch.int32)
+        seg[1:] = counts.cumsum(0).to(torch.int32)
+        route_idx = torch.argsort(slot, stable=True)
+        bucketed = all(
+            bool((slot[route_idx[int(seg[s]):int(seg[s + 1])]] == s).all())
+            for s in range(slots)
+        )
+        complete = int(seg[-1]) == slot.numel() and sorted(route_idx.tolist()) == list(range(slot.numel()))
+        ok = bucketed and complete
+        print(f"grouped csr seed {seed}: " + ("ok" if ok else "FAIL"))
+        if not ok:
+            failures += 1
+    if not run_kernel:
+        print("grouped tile kernel: needs cuda or --interp, checks above were torch-only")
     return failures
 
 
@@ -629,6 +729,40 @@ def main(argv: list[str] | None = None) -> int:
             if rel > args.tol:
                 print("FAIL", file=sys.stderr)
                 return 1
+    # The grouped GEMM is the prefill path: whole-layer staging makes every
+    # route resident, so its contract has no -1 slots (the decode GEMV keeps
+    # that branch). The extra case gives one expert several routes, which is
+    # the only shape the segment loop sees on the real workload.
+    grouped_cases = cases + [
+        ("many-routes", {"tokens": 8, "hidden": 256, "inter": 128, "slots": 4, "top_k": 4}),
+    ]
+    for label, shape in grouped_cases:
+        for seed in range(4):
+            x, gu, dn, slot, token, weight = random_case(args.device, seed=seed, **shape)
+            slot = slot.clamp(min=0)
+            # The grouped path is the bf16 serving dtype (decision 87); the
+            # oracle sees the same rounded inputs, so the diff is the kernels'.
+            x = x.to(torch.bfloat16)
+            want = grouped_moe_reference(x, *gu, *dn, slot, token, weight)
+            if args.interp_child:
+                continue
+            if args.device == "cpu":
+                continue
+            require_native_e4m3(x.device)
+            got = grouped_moe_gemm(x, *gu, *dn, slot, token, weight).to(torch.float32)
+            rel = (got - want).abs().max() / want.abs().max().clamp(min=1e-6)
+            print(f"grouped {label} seed {seed}: max |diff| {(got - want).abs().max():.3e}, rel {rel:.3e}")
+            if rel > args.tol:
+                print("FAIL", file=sys.stderr)
+                return 1
+    # The grouped GEMM's `tl.dot` is as untrustworthy under the interpreter as
+    # the fp8 GEMM's (see check_fp8_linear): the device loop above is its
+    # numeric gate, and the tile/CSR checks below are the interpreter-side
+    # coverage for the layout logic that does not need a dot.
+    tile_failures = check_grouped_tile(torch.device(args.device), args.interp_child)
+    if tile_failures:
+        print("FAIL", file=sys.stderr)
+        return 1
     if args.device == "cpu" and not args.interp_child:
         print("no cuda device requested: kernel comparison skipped")
         print("PASS")

@@ -24,7 +24,7 @@ from .fp8_linear import (
 )
 from .linear import DENSE_BLOCK_KW, DENSE_BLOCK_N
 from .norm import NORM_BLOCK_H
-from .nvfp4_moe import GEMV_BLOCK_KW, GEMV_BLOCK_N, REDUCE_BLOCK_N
+from .nvfp4_moe import GEMM_BLOCK_KW, GEMM_BLOCK_M, GEMM_BLOCK_N, GEMV_BLOCK_KW, GEMV_BLOCK_N, REDUCE_BLOCK_N
 from .offload import COPY_SEG_I32, USAGE_MAX, copy_splits
 
 # The serving attention geometry (Qwen3.6-35B-A3B): 16 query heads over 2 KV
@@ -165,6 +165,71 @@ def down_constexprs() -> dict:
         "K_WORDS": SERVING_INTER // 8,
         "BLOCK_N": GEMV_BLOCK_N,
         "BLOCK_KW": GEMV_BLOCK_KW,
+        "MUL_WEIGHT": True,
+        "A_ROW_IS_ROUTE": True,
+    }
+
+
+def grouped_gemm(
+    a_dtype: str = SERVING_DTYPE,
+    packed_dtype: str = "i32",
+    scale_dtype: str = "fp8e4nv",
+    glob_dtype: str = "fp16",
+    c_dtype: str | None = None,
+) -> dict:
+    """The prefill grouped GEMM (OPTIMIZATION.md R10.2): one program per
+    (slot segment, N tile), routes CSR-bucketed by slot, bf16 `tl.dot`."""
+    return {
+        "a_ptr": f"*{a_dtype}",
+        "packed_ptr": f"*{packed_dtype}",
+        "scale_ptr": f"*{scale_dtype}",
+        "global_ptr": f"*{glob_dtype}",
+        "c_ptr": f"*{c_dtype or a_dtype}",
+        "route_token_ptr": "*i32",
+        "route_weight_ptr": "*fp32",
+        "seg_ptr": "*i32",
+        "route_idx_ptr": "*i32",
+        "N": "i32",
+        "stride_am": "i32",
+        "stride_ak": "i32",
+        "stride_pe": "i64",
+        "stride_pn": "i32",
+        "stride_pkw": "i32",
+        "stride_se": "i64",
+        "stride_sn": "i32",
+        "stride_sblk": "i32",
+        "stride_ge": "i64",
+        "stride_gn": "i32",
+        "stride_cm": "i64",
+        "stride_cn": "i32",
+        "K_WORDS": "constexpr",
+        "BLOCK_M": "constexpr",
+        "BLOCK_N": "constexpr",
+        "BLOCK_KW": "constexpr",
+        "MUL_WEIGHT": "constexpr",
+        "A_ROW_IS_ROUTE": "constexpr",
+    }
+
+
+def grouped_gate_up_constexprs() -> dict:
+    """`x[token] @ gate_up^T` per segment, no route weight, activations by token."""
+    return {
+        "K_WORDS": SERVING_HIDDEN // 8,
+        "BLOCK_M": GEMM_BLOCK_M,
+        "BLOCK_N": GEMM_BLOCK_N,
+        "BLOCK_KW": GEMM_BLOCK_KW,
+        "MUL_WEIGHT": False,
+        "A_ROW_IS_ROUTE": False,
+    }
+
+
+def grouped_down_constexprs() -> dict:
+    """`ic2[route] @ down^T` per segment, weight applied, activations by route."""
+    return {
+        "K_WORDS": SERVING_INTER // 8,
+        "BLOCK_M": GEMM_BLOCK_M,
+        "BLOCK_N": GEMM_BLOCK_N,
+        "BLOCK_KW": GEMM_BLOCK_KW,
         "MUL_WEIGHT": True,
         "A_ROW_IS_ROUTE": True,
     }

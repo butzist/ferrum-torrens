@@ -708,10 +708,24 @@ fn a_whole_layer_prefill_overlap_matches_the_host_plan() {
         );
         let got = to_f32_vec(&out.0);
         let want = &host_out[layer * TOKENS * hidden..(layer + 1) * TOKENS * hidden];
-        assert_eq!(
-            got, want,
-            "layer {layer}: the whole-layer overlap must equal the host plan"
-        );
+        // The GEMV prefill (FERRUM_PF_GEMV=1) is the exact f32 reduction the
+        // host plan is, so it matches bit for bit. The grouped GEMM is the
+        // default (R10.2) and runs the same dequant through bf16 `tl.dot`
+        // tensor cores, which reassociate the reduction, so it matches to a
+        // bf16 budget instead: decision 2/25 called this tile a perf swap
+        // behind the same `grouped_moe` entry point, not a numerics change.
+        if std::env::var("FERRUM_PF_GEMV").as_deref() == Ok("1") {
+            assert_eq!(
+                got, want,
+                "layer {layer}: the whole-layer overlap must equal the host plan"
+            );
+        } else {
+            let rel = max_abs_diff(&got, want) / scale_of(want).max(1e-6);
+            assert!(
+                rel <= 2e-2,
+                "layer {layer}: grouped prefill drifted from the host plan: rel {rel:.3e}"
+            );
+        }
     }
 
     // A decode-sized step after the prefill must drop back to the flat LRU (the

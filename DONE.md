@@ -2811,11 +2811,68 @@ settled.
      `attn_proj` 0.18, and **`gdn_recur` 0.19 (2.5%)**. A vendored
      `chunk_gated_delta_rule` could save only a fraction of that 0.19 ms/token,
      so it cannot move pp; the FLA `causal_conv1d_varlen` is similarly moot (the
-     conv is already a single kernel). The remaining prefill levers are the host
-     attention fallback (`CacheAccess::Host` gathers + SDPA for prefill, ~1.2
-     ms/token across `attn`/`attn_out`/`attn_mem`) and `norm_in`, not GDN.
+      conv is already a single kernel). The remaining prefill levers are the host
+      attention fallback (`CacheAccess::Host` gathers + SDPA for prefill, ~1.2
+      ms/token across `attn`/`attn_out`/`attn_mem`) and `norm_in`, not GDN.
+
+112. **The prefill MoE is a batched grouped GEMM; the decode GEMV stays**
+     (2026-10-21, OPTIMIZATION.md R10.2, TODO.md section 8). Closes the 46%
+     `pf_gemm` lever that decision 111 left open.
+     - **What.** Whole-layer prefill launched one M=1 `gemv_gate_up`/`gemv_down`
+       per route (`group_with_slots`, scratch `[routes, ...]`), so each expert's
+       weight was re-fetched from L2 once per route whatever the chunk size.
+       FreeToken's prefill is a true BLOCK_M>1 grouped GEMM. Ported it: a new
+       Triton kernel `_nvfp4_grouped_gemm_kernel` runs one program per (slot
+       segment, N tile), reads the chunk's routes through a CSR that buckets
+       them by slot, and dequantizes the expert weights to bf16 for `tl.dot`
+       (two constexpr sets: `grouped_gate_up` with `A_ROW_IS_ROUTE=false` and no
+       route weight, `grouped_down` with `A_ROW_IS_ROUTE=true` and the route
+       weight applied). Committed AOT cubins `kernel/grouped_gate_up.*` and
+       `kernel/grouped_down.*`; `signatures.py`/`aot.py`/`compile_check.py`/
+       `selftest.py` extended. `kernel_abi.rs` gains `GROUPED_GATE_UP`/`_DOWN`,
+       two `MoEArgs` CSR pointers and `grouped_*_args`; `cuda_moe.rs` gains
+       `build_grouped_csr` (a torch stable argsort/bincount per chunk) and
+       `launch_grouped` (grouped gate_up -> the same `silu_mul` -> grouped down
+       -> the same `sum_reduce`). The prefill path dispatches to it by default;
+       `FERRUM_PF_GEMV=1` restores the per-route GEMV for the A/B and as a
+       fallback. Decode is untouched: it keeps the M=1 GEMV (`launch`).
+     - **Why the CSR.** The segment index IS the slot id, so an expert's weight
+       is read once per (segment, n-tile) however many routes name it; the
+       decode-only shapes (a non-resident `-1` slot, a slot past the bank) are
+       refused in `build_grouped_csr` rather than misread, because whole-layer
+       staging makes every prefill route resident.
+     - **Numbers** (order-balanced A/B, n=3 per arm, same binary, warm-up
+       discarded, `prlimit --as=64GiB`, one model load at a time):
+       pp **189.7 -> 267.4 tok/s at 517 tokens (+41.0%)** and **217.5 -> 391.7 at
+       2057 (+80.1%)**; `FT_PROFILE` at a 451-token chunk: `pf_gemm` **1005 ->
+       278 ms (2.228 -> 0.617 ms/token, -72%)**, from 46% to ~14% of prefill.
+       Logs `/tmp/opencode/r10_2/`.
+     - **Numerics.** The GEMV prefill is the exact f32 reduction the host plan
+       is, so it matched bit for bit; the grouped path rounds through bf16
+       `tl.dot` tensor cores, which reassociate, so it matches to a bf16 budget
+       (~0.23% mean-rel, well inside the 2e-2 device selftest tol). Decision
+       2/25 already framed this tile as a perf swap behind the same
+       `grouped_moe` entry point, not a numerics change.
+       `a_whole_layer_prefill_overlap_matches_the_host_plan` now gates both: exact
+       for the GEMV arm, a 2e-2 relative budget otherwise.
+     - **Gates (all green).** `cargo fmt --check`, `cargo clippy --all-targets`
+       and `--features cuda`, `cargo test`, `cargo test --features cuda --lib`
+       (448), `scripts/check-kernels.sh` (18 cubins up to date), `selftest
+       --interp`, `compile_check`; and the gated GPU tests
+       `a_whole_layer_prefill_overlap_matches_the_host_plan` (both arms),
+       `the_committed_cubins_match_the_scalar_oracle_on_real_expert_slabs`,
+       `a_chunked_prefill_step_matches_the_host_plan`,
+       `a_cache_above_the_old_ceiling_stages_on_device`,
+       `a_prefill_retains_the_decode_expert_cache`,
+       `engine_real_generate::one_token_prediction_matches_the_oracle`,
+       `engine_real_generate::a_captured_engine_decodes_on_its_graphs`.
+     - **Follow-ups.** R10.3 (device prefill attention) and R10.4 (fused
+       `norm_in`) remain; the pp is now 392 tok/s at 2057, mid-way to FreeToken's
+       725, so larger chunks under the batched GEMM and scratch tuning are the
+       next opening.
 
 ---
+
 
 
 ## Progress log (narrative, pre-2026-10-15 compaction)
