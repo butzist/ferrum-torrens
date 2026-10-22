@@ -3730,3 +3730,55 @@ subsection names are kept verbatim.
        (N=2048) per layer; 62 routes per expert at 1991 tokens, so ~90% of the
        grid is an empty segment. Proposal: a compacted nonempty-segment launch
        list, then `BLOCK_M=64`/`BLOCK_N=64`/8 warps, then a `BLOCK_KW` sweep.
+
+122. **The grouped prefill GEMM tile is `BLOCK_N=64` at 4 warps: pp +7.9% at
+     2057** (2026-10-22, `OPTIMIZATION.md` R10.8, `TODO.md` section 8).
+     - **What.** `GEMM_BLOCK_N` 32 -> 64 in `nvfp4_moe.py`, tile otherwise
+       unchanged (`GEMM_BLOCK_M=32`, `GEMM_BLOCK_KW=16`, `GEMM_WARPS=4`). The
+       AOT entries for `grouped_gate_up`/`grouped_down` now pass `num_warps`
+       from `GEMM_WARPS`; before, the cubin always compiled at Triton's default
+       4 and a warp sweep would have measured a config it never ran. At the
+       shipped 4 warps the compiled artifact is unchanged.
+     - **Why N=64 wins.** The grid is `(slots, cdiv(N, BLOCK_N))`, so doubling N
+       halves the CTA count (26,624 gate_up + 53,248 down per layer instead of
+       53,248 + 106,496) and doubles the output per `tl.dot`, amortizing the
+       per-K-iteration NVFP4 dequant. Eight warps loses at this M (each warp's
+       MMA share shrinks); `BLOCK_M=64` removes the second M-tile for an
+       expert's ~62 routes but measures only +1.1%, under the 2% bar and not
+       interleaved, so it is not shipped; `BLOCK_KW=32` loses 5% (larger
+       dequant tile, more shared/registers).
+     - **Sweep** (2057, `FERRUM_SMOKE_PREFILL=2057`, chunk 8192, cache 1664,
+       tokens 2, one model load at a time, `prlimit --as=64GiB`; baseline
+       rebuilt from the old store cubins and interleaved W B B W W B W):
+       `32/32/16/4` 663.9/662.2/667.5 = 664.5; `32/64/16/8` 664.9/662.2 =
+       663.6; `32/64/16/4` 716.8/715.3/718.7/717.6 = **717.1 (+7.9%)**;
+       `32/128/16/8` 707.1/705.7 = 706.4; `64/64/16/8` 699.2/699.7 = 699.5;
+       `64/64/16/4` 727.1/723.3 = 725.2 (+1.1% over the winner, under the bar);
+       `64/64/32/4` 681.5/680.6 = 681.1. The 517 control is flat at 402.0
+       (402.1/402.1/401.9; R10.6b recorded 400.9), and the final tree repeats
+       714.9 at 2057 / 402.0 at 517.
+     - **Profile.** `FT_PROFILE` at 2057 (no graph, 40 decode tokens, skip 8):
+       the 1991-token step is **3096.7 -> 2878.4 ms** and `pf_gemm` **1037.8 ->
+       807.2 ms (0.521 -> 0.405 ms/token, -22.2%)**; all other stages are flat.
+       Effective routed throughput is ~5.0 TFLOP/s and the weight-read rate
+       ~21 GB/s, so the tile is dequant/occupancy bound, not dot or HBM bound.
+     - **Correctness.** `selftest --interp` passes for both grouped kernels;
+       `a_whole_layer_prefill_overlap_matches_the_host_plan` passes in the
+       grouped default arm and the `FERRUM_PF_GEMV=1` bit-exact arm;
+       `a_prefill_retains_the_decode_expert_cache` passes (256 residents before
+       and after); greedy ids are `[561, 3841]` in every measured run; VRAM is
+       7190/8151 MiB throughout. `cargo fmt --check`, `cargo clippy
+       --all-targets` and `--features cuda`, `cargo test` (342), `cargo test
+       --features cuda --lib` (453), and `scripts/check-kernels.sh` (PASS).
+     - **Artifacts.** No cubin/PTX is committed. `nix build .#kernels` could not
+       run in the sandbox (`/nix/var/nix/db/big-lock`: permission denied, no
+       store write); the local AOT tree was built from the same sources, its
+       `grouped_gate_up.cubin` was byte-compared into the Rust `OUT_DIR` before
+       the measurements, and `check-kernels.sh` lowers every kernel for sm_120.
+       The production artifact still needs the flake rebuild on a box with store
+       write access.
+     - **Risk.** Prefill-only tile shape; decode keeps its M=1 GEMV and was not
+       touched. The AOT `num_warps` change is a consistency fix, a no-op at 4
+       warps. The 0.405 ms/token is still above the 0.35 target, so the next
+       slice remains the compacted nonempty-segment grid.
+     - **Logs.** `/tmp/opencode/r10_8/`.

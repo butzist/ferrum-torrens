@@ -154,10 +154,15 @@ keeps the `index_copy` fallback (one log). Decode is unchanged.
 **R10.7 (2026-10-22, decision 121):** the prefill MoE chunk is now one launch
 per 1991-token forward (`PREFILL_CHUNK_TOKENS` 512 -> 2048): pp **583.2 ->
 633.6 -> 664.6 tok/s** at 512/1024/one chunk (+14.0% total), 517 control flat,
-and `pf_gemm` **1464.9 -> 1037.8 ms (-29.2%)** at 1991 tokens. `pf_gemm` is
-still 0.521 ms/token, so the next slice is the grouped-GEMM tile/grid (proposal
-in `OPTIMIZATION.md` R10.7).
-Progress history and the full decision log (numbers 1..121) live in `DONE.md`;
+and `pf_gemm` **1464.9 -> 1037.8 ms (-29.2%)** at 1991 tokens.
+**R10.8 (2026-10-22, decision 122):** the grouped GEMM tile is now
+`BLOCK_N=64` at 4 warps (was 32): interleaved A/B (n=3/4) pp **664.5 -> 717.1
+tok/s at 2057 (+7.9%)**, 517 control flat (402.0), `pf_gemm` **0.521 -> 0.405
+ms/token (-22.2%)**, total forward 3096.7 -> 2878.4 ms. `BLOCK_N=128`, 8 warps,
+`BLOCK_M=64` and `BLOCK_KW=32` all lost or stayed under the 2% bar. The next
+lever is the compacted nonempty-segment grid (proposal in `OPTIMIZATION.md`
+R10.8).
+Progress history and the full decision log (numbers 1..122) live in `DONE.md`;
 read that for the "why" behind any decision number referenced in code or tests.
 
 Goal: a **minimal, fast, single-GPU** Rust serving engine for **one model** --
@@ -1113,6 +1118,13 @@ re-profiled at HEAD: the GDN *bundle* is 42% (`gdn_qkvz` 0.85 + `gdn_ba`
   ids `[561, 3841]` in every run, VRAM flat. `pf_gemm` is still above the 0.45
   ms/token target, so the next slice is a tile/grid tune; facts and a proposal
   are in `OPTIMIZATION.md` R10.7. Logs `/tmp/opencode/r10_7/`.
+- [x] **R10.8 grouped GEMM tile tune (2026-10-22, decision 122).** `BLOCK_N`
+  32 -> 64 at 4 warps: interleaved A/B (n=3/4 per arm) pp **664.5 -> 717.1
+  tok/s at 2057 (+7.9%)**, 517 control flat (402.0), `pf_gemm` at 1991 tokens
+  **1037.8 -> 807.2 ms (0.521 -> 0.405 ms/token, -22.2%)**, total forward
+  3096.7 -> 2878.4 ms. `BLOCK_N=128`, 8 warps, `BLOCK_M=64` and `BLOCK_KW=32`
+  did not beat it by 2%. Greedy ids `[561, 3841]` in every run, VRAM flat.
+  AOT now passes `num_warps` from the same constant. Logs `/tmp/opencode/r10_8/`.
 
 ### State of play
 

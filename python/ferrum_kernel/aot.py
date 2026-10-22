@@ -48,6 +48,7 @@ from .fp8_linear import (
 from .linear import DENSE_WARPS, _nvfp4_dense_gemv_kernel
 from .nvfp4_moe import (
     GEMM_BLOCK_N,
+    GEMM_WARPS,
     GEMV_BLOCK_N,
     REDUCE_BLOCK_N,
     _nvfp4_gemv_kernel,
@@ -131,6 +132,7 @@ KERNELS: dict[str, dict] = {
         "constexprs": grouped_gate_up_constexprs(),
         "n": SERVING_INTER * 2,
         "block": GEMM_BLOCK_N,
+        "num_warps": GEMM_WARPS,
     },
     "grouped_down": {
         "fn": _nvfp4_grouped_gemm_kernel,
@@ -138,6 +140,7 @@ KERNELS: dict[str, dict] = {
         "constexprs": grouped_down_constexprs(),
         "n": SERVING_HIDDEN,
         "block": GEMM_BLOCK_N,
+        "num_warps": GEMM_WARPS,
     },
     "silu_mul": {
         "fn": _silu_mul_kernel,

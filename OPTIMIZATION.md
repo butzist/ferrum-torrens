@@ -1148,7 +1148,7 @@ n=5 per metric, rounds order-balanced.
 | metric | ours (current) | FreeToken (2026-10-20) | ratio |
 |---|---|---|---|
 | pp @517 / 476-478 tok | 143 (dec 102) -> 150 (dec 103) -> **267.4** (R10.2) -> **271.3** (R10.6a) -> **401.0** (R10.6b) tok/s | **366.2 +/- 1.3** (n=5, min 364.4, max 368.0) | **1.10x** |
-| pp @2057 / 1878-1879 tok | **391.7** (R10.2) -> **462.1** (R10.6a) -> **585.0** (R10.6b) -> **664.6** (R10.7) tok/s | **725.0 +/- 3.1** (n=5, min 719.9, max 727.4) | **0.92x** |
+| pp @2057 / 1878-1879 tok | **391.7** (R10.2) -> **462.1** (R10.6a) -> **585.0** (R10.6b) -> **664.6** (R10.7) -> **717.1** (R10.8) tok/s | **725.0 +/- 3.1** (n=5, min 719.9, max 727.4) | **0.99x** |
 | K=4 aggregate, batched | **26.2** tok/s | **25.17 +/- 0.05** (n=5, min 25.09, max 25.21) | **1.04x** |
 | K=4 serial window | 16.6 tok/s | **11.70 +/- 0.01** (n=5, 8.19-8.21 s windows) | **1.42x** |
 | bs=1 captured decode | 28.3 tok/s | 30.3 tok/s (decision 76, unchanged) | **0.93x** |
@@ -1489,3 +1489,53 @@ warps, so one tile covers a whole expert's 62 routes and the N tiles halve; (c)
 sweep `BLOCK_KW` 16/32. Gate with the existing
 `a_whole_layer_prefill_overlap_matches_the_host_plan` (bf16 budget), the kernel
 compile check and the 2057 A/B. Logs `/tmp/opencode/r10_7/`.
+
+**R10.8 grouped GEMM tile tune -- LANDED (2026-10-22, decision 122).** R10.7
+left `pf_gemm` at 0.521 ms/token with the R10.2 tile (`BLOCK_M=32`,
+`BLOCK_N=32`, `BLOCK_KW=16`, 4 warps); the grid was `(1664 slots, N/32)` and
+~90% of it retired on an empty segment. This slice changed only the
+centralized constants (plus `num_warps` in the AOT entries, so the compiled
+cubin follows `GEMM_WARPS` instead of silently taking Triton's default 4).
+Ordered sweep at 2057 (`FERRUM_SMOKE_PREFILL=2057`, chunk 8192, cache 1664,
+`FERRUM_SMOKE_TOKENS=2`, one model load at a time):
+
+| config (`M/N/KW/warps`) | raw runs (tok/s) | mean | vs best |
+|---|---|---:|---:|
+| baseline `32/32/16/4` | 663.9 / 662.2 / 667.5 | 664.5 | - |
+| `32/64/16/8` | 664.9 / 662.2 | 663.6 | -0.1% |
+| `32/64/16/4` | 716.8 / 715.3 / 718.7 / 717.6 | **717.1** | **+7.9%** |
+| `32/128/16/8` | 707.1 / 705.7 | 706.4 | -1.5% (vs best) |
+| `64/64/16/8` | 699.2 / 699.7 | 699.5 | -2.5% |
+| `64/64/16/4` | 727.1 / 723.3 | 725.2 | +1.1% (under the 2% bar) |
+| `64/64/32/4` | 681.5 / 680.6 | 681.1 | -5.0% |
+
+The baseline arm was rebuilt from the pre-change store cubins and interleaved
+with the winner (W B B W W B W), so the comparison is same-session. The 517
+control is flat: 402.1 / 402.1 / 401.9 = **402.0** (R10.6b recorded 400.9).
+Within-arm spread is <0.6%, and the winner repeated on the final tree (714.9 at
+2057, 402.0 at 517). Greedy ids are `[561, 3841]` in every run and VRAM stays
+7190/8151 MiB.
+
+Doubling N halves the grid (26,624 gate_up + 53,248 down CTAs per layer) and
+widens the `tl.dot` tile, so the per-K-iteration dequant is amortized over twice
+the output; 8 warps loses because each warp's MMA share shrinks and the CTA
+becomes launch/scheduling heavy at this M (62 routes per expert, two M-tiles).
+`BLOCK_M=64` removes the second M-tile but only gains 1.1%, under the repo's 2%
+bar and not interleaved, so it is not shipped.
+
+`FT_PROFILE` at 2057 (`FERRUM_SMOKE_NOGRAPH=1`, 40 decode tokens, skip 8) on the
+winner: the 1991-token step is **3096.7 -> 2878.4 ms (1.555 -> 1.446
+ms/token)** and `pf_gemm` **1037.8 -> 807.2 ms (0.521 -> 0.405 ms/token,
+-22.2%)**; every other stage is flat (GDN 1420.0 -> 1428.2, attention 531.8 ->
+536.7, `pf_wait` 32.1 -> 32.0). Effective grouped-GEMM throughput is ~5.0
+TFLOP/s (4.0 TFLOP of routed work), still far below the tensor-core roofline and
+also below the ~17.3 GiB / 0.81 s = 21 GB/s weight-read rate of the HBM, so the
+tile is now dequant/occupancy bound rather than dot bound.
+
+The next lever is unchanged from R10.7: launch over the **nonempty segment
+list** (a compacted `seg_ids` indirection, a kernel signature change plus a Rust
+CSR change) instead of all 1664 slot segments, ~6x fewer CTAs at this prompt.
+`pf_gemm` is 0.405 ms/token, still short of the 0.35 target. Gates: `--interp`
+equality for both grouped kernels, `a_whole_layer_prefill_overlap_matches_the_host_plan`
+(grouped default and `FERRUM_PF_GEMV=1`), 342 CPU units, 453 CUDA units,
+`check-kernels.sh`. Logs `/tmp/opencode/r10_8/`.

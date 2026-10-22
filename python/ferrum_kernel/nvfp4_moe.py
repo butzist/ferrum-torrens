@@ -67,8 +67,10 @@ REDUCE_WARPS = 4
 # is read once per (segment, n-tile) however many routes name it -- the lever
 # over the per-route decode GEMV, which re-reads the weight per route. The tile
 # is a real matmul: bf16 inputs into the sm_120 tensor cores, fp32 accumulate.
+# R10.8 swept the tile: N=64 at 4 warps is the win (pf_gemm 0.521 -> 0.405
+# ms/token, pp 664.5 -> 717.1 at 2057); N=128 and 8 warps, M=64 and KW=32 lost.
 GEMM_BLOCK_M = 32
-GEMM_BLOCK_N = 32
+GEMM_BLOCK_N = 64
 GEMM_BLOCK_KW = 16
 GEMM_WARPS = 4
 
