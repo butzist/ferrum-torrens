@@ -1145,13 +1145,20 @@ with `scripts/freetoken_probe/baselines.py`: one `ft serve` session per run
 HTTP surface, same prompt texts and params as our smokes, warm-ups discarded,
 n=5 per metric, rounds order-balanced.
 
-| metric | ours (recorded) | FreeToken (2026-10-20) |
-|---|---|---|
-| pp @517 / 476-478 tok | 143 (dec 102) -> **150** (dec 103) tok/s | **366.2 +/- 1.3** (n=5, min 364.4, max 368.0) |
-| pp @2057 / 1878-1879 tok | **156** tok/s (dec 103) | **725.0 +/- 3.1** (n=5, min 719.9, max 727.4) |
-| K=4 aggregate, batched | **26.2** tok/s | **25.17 +/- 0.05** (n=5, min 25.09, max 25.21) |
-| K=4 serial window | 16.6 tok/s | **11.70 +/- 0.01** (n=5, 8.19-8.21 s windows) |
-| bs=1 captured decode | 28.3 tok/s | 30.3 tok/s (decision 76, unchanged) |
+| metric | ours (current) | FreeToken (2026-10-20) | ratio |
+|---|---|---|---|
+| pp @517 / 476-478 tok | 143 (dec 102) -> 150 (dec 103) -> **267.4** (R10.2) tok/s | **366.2 +/- 1.3** (n=5, min 364.4, max 368.0) | **0.73x** |
+| pp @2057 / 1878-1879 tok | **391.7** (R10.2; 156 in dec 103) tok/s | **725.0 +/- 3.1** (n=5, min 719.9, max 727.4) | **0.54x** |
+| K=4 aggregate, batched | **26.2** tok/s | **25.17 +/- 0.05** (n=5, min 25.09, max 25.21) | **1.04x** |
+| K=4 serial window | 16.6 tok/s | **11.70 +/- 0.01** (n=5, 8.19-8.21 s windows) | **1.42x** |
+| bs=1 captured decode | 28.3 tok/s | 30.3 tok/s (decision 76, unchanged) | **0.93x** |
+
+The FreeToken prefill runs predate R10.2, so the `ours` column carries the
+post-R10.2 number (decision 112). A 2026-10-22 control on the same smoke config
+re-measured ours at 270.8 tok/s at 517 and 382.6 at 2057, within run-to-run noise
+of the R10.2 pair. R10.3's paged prefill attention was rejected (decision 117),
+so these pp values stand; the only open pp lever is `norm_in`.
+`ratio` is ours / FreeToken, so >1 means we are ahead.
 
 Method notes and caveats:
 
