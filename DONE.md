@@ -3544,3 +3544,31 @@ subsection names are kept verbatim.
   `" Paris"`). The gate asserts the id, so it fails until the port is actually
   right. Also pinned: `tests/ftw_real_forward.rs` (finite, deterministic,
   plausible argmax) for the scalar oracle.
+
+118. **R10.4 (fused prefill `norm_in`) is closed as a measured no-win; the
+     profile attribution was overlap, not norm math** (2026-10-22,
+     `OPTIMIZATION.md` R10.5 step-0 result). Nothing was shipped; the tree is
+     clean and the temporary diagnostic knobs were reverted.
+     - **The fused kernel was already taken.** A trace shows zero fallbacks on
+       the Host prefill path: all 39 residual layers call `add_rms_norm`. The
+       first layer's `residual=None` op chain is 0.078 ms for the whole layer,
+       and host time around all 40 `norm_in` calls at 451 tokens is 1.45 ms.
+     - **The stage span is the MoE copy.** `FT_ABLATE=moe` drops the 451-token
+       chunk from 4.231 to **0.832 ms/token** (375 ms total) and `norm_in` from
+       393 ms to 0.527 ms; `norm_post` behaves the same. The profiler's
+       per-stage events overlap the whole-layer prefill copy stream, so the
+       share is contention/wait, not the norm kernel.
+     - **Forcing the op chain changes nothing.** `fused` vs a forced legacy
+       op-chain arm (n=6 each, order-balanced) is +0.51% at 517 and +0.69% at
+       2057, inside run noise; pp means 271.9/272.3 vs 269.8/271.6 (517) and
+       382.9/382.8 vs 380.7/379.9 (2057). Logs `/tmp/opencode/r10_4/`.
+     - **Consequences for the plan.** The non-MoE path is already ~0.83
+       ms/token, i.e. at FreeToken's ~0.92 ms/token marginal compute, so the
+       prefill gap is the MoE expert stream, not the dense ops. The step-0
+       "GDN bundle 42%" reading is the same overlap artifact (ablated GDN is
+       ~0.66 ms/token); R10.6 is re-scoped from GDN projections to the MoE
+       prefill copy. Arithmetic: one whole-layer pass copies ~40 x 256 x
+       1.69 MiB = 17.3 GiB per chunk at ~11 GB/s, and the 2057 prompt runs two
+       chunks (`max_prefill_length` 1024), so it pays that twice; FreeToken's
+       pp arithmetic is consistent with ~20 GB/s and one forward, which is the
+       next two slices (larger prefill chunk, faster hit/miss copy).

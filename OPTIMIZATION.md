@@ -1359,3 +1359,14 @@ headroom, unlike raising `max_prefill_length`. `attn_mem` is the only stage that
 grew since decision 111 (0.16 -> 0.29/0.34), consistent with the bf16-gather
 first cut. Captured controls at HEAD: 271.4 tok/s at 517 and 379.9 at 2057
 (within single-run noise of 270.8 / 382.6).
+
+**Correction (R10.4, decision 118): the non-MoE path is already at parity, and
+the stage shares above are overlap-contaminated.** `FT_ABLATE=moe` takes the
+451-token chunk from 4.231 to **0.832 ms/token** (375 ms) and `norm_in` from
+393 to 0.527 ms, while a forced op-chain norm arm moves pp <1%. The profiler's
+spans overlap the whole-layer prefill copy, so `norm_in` (and the step-0 "GDN
+42%") are wait/contention, not math. The serial prefill gap is the MoE expert
+stream: one whole-layer pass is ~17.3 GiB per chunk at ~11 GB/s, and a 2057
+prompt pays it twice because `max_prefill_length` is 1024. FT's pp arithmetic is
+consistent with ~20 GB/s and one forward. R10.4 is closed; the next slices are
+(a) a larger prefill chunk and (b) a faster hit/miss copy.

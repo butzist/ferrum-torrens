@@ -1046,11 +1046,10 @@ re-profiled at HEAD: the GDN *bundle* is 42% (`gdn_qkvz` 0.85 + `gdn_ba`
   revisit needs a batched prefill kernel that shares K/V tiles. The two
   kernel-level gates stay in `tests/paged_attention_kernel.rs` (synthetic prefix
   window + real `MhaPool` scattered-page window). Logs `/tmp/opencode/r10_3/`.
-- [ ] **R10.4 Fused prefill `norm_in`.** 0.87 ms/token at
-  `forward_torch.rs:2490`; the Host path already calls the decode-side
-  `add_rms_norm` for `residual=Some`, so re-profile before adding another
-  kernel. The open piece is the first layer (`residual=None`), which still uses
-  the op chain. Gate: norm oracle + pp smoke.
+- [x] **R10.4 Fused prefill `norm_in` -- CLOSED as a no-win (2026-10-22,
+  decision 118).** The fused kernel is already taken on all 39 residual layers;
+  the 0.87 ms/token is the MoE copy overlap (`FT_ABLATE=moe`: 4.231 -> 0.832
+  ms/token) and forcing the op chain moves pp <1%. Nothing shipped.
 - [ ] **R10.5 pp parity ladder (2026-10-22).** FreeToken's compute-side prefill
   is ~0.92 ms/token (their table pp minus the ~0.87 s HTTP fixed cost); ours is
   3.69 ms/token at 517 and 2.61 at 2057, so the gap is ~4.0x / ~2.8x. The
@@ -1058,13 +1057,15 @@ re-profiled at HEAD: the GDN *bundle* is 42% (`gdn_qkvz` 0.85 + `gdn_ba`
   batched prefill attention kernel, chunk-size sweep under the grouped GEMM,
   MoE streaming floor, small-op fusion, and a speculative captured prefill
   step) are recorded in `OPTIMIZATION.md` R10.5.
-- [ ] **R10.6 GDN prefill projection audit (new, 2026-10-22).** The R10.5 step-0
-  profile says `gdn_qkvz` + `gdn_ba` are 1.41 ms/token at 451 and 0.83 at 968+,
-  the largest bucket, and decision 111 never counted them. Audit the M>1
-  dispatch (is `ba` on the tiled GEMM or the split-K GEMV/upcast path?), fuse
-  the two projections' GEMM if the launch/overhead is real, and A/B pp before
-  claiming it. `gdn_ba`'s absolute time is implausible for K=2048/N=64, so
-  validate with a microbench before implementing.
+- [ ] **R10.6 MoE prefill copy (re-scoped 2026-10-22, decision 118).** The
+  prefill gap is the expert stream, not the dense ops: non-MoE is 0.83
+  ms/token, and one whole-layer pass is ~17.3 GiB per chunk at ~11 GB/s.
+  Slices: (a) raise `max_prefill_length` so the 2057 prompt is one forward
+  instead of two (the 517 case is a control: already one chunk); (b) raise the
+  hit/miss copy rate toward FT's ~20 GB/s (batched async memcpy, coalesced
+  runs, D2D gather of resident experts, overlap). A/B pp and watch VRAM. The
+  step-0 "GDN 42%" was the same overlap artifact; no GDN action unless it
+  reappears after the copy is fixed.
 
 ### State of play
 
