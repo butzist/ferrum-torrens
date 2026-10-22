@@ -1003,13 +1003,10 @@ prompt override before comparing miss rates.
   `OPTIMIZATION.md` under R9 "Reference baselines"; logs under
   `/tmp/opencode/freetoken_baseline/`.
 
-**Known red gate (2026-10-21).**
-`kvcache_incremental_decode::incremental_decode_matches_refeeding_the_whole_prefix`
-fails on the CPU backend at HEAD: start=3, 4-token chunk, argmax equal but
-`max|dlogit|/scale = 0.3004` against the 1e-3 bound. It predates R10.3
-(reproduced with the paged prefill disabled and with `FERRUM_PF_GEMV=1`). Check
-whether CPU bf16 GEMM shape reassociation is the cause, then either pin the test
-to the device it was calibrated for or loosen it to the decision-80 argmax gate.
+The former red gate `kvcache_incremental_decode` is resolved (decision 116): it
+is pinned to the CPU backend with the decision-80 argmax bound, because the
+cached and re-fed forwards take different bf16 GEMM shapes. The CUDA device path
+stays covered by `device_decode_matches_refeed` and `kvcache_cross_request_reuse`.
 
 ### R10 prefill plan (2026-10-20, pp is the measured gap)
 

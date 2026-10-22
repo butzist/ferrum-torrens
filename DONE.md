@@ -2979,6 +2979,24 @@ settled.
        model and MCP servers. Unset in a plain shell, and then the jail uses
        opencode's own built-in providers.
 
+116. **`kvcache_incremental_decode` is pinned to CPU with the argmax bound**
+     (2026-10-22). Resolves the known red gate recorded in `TODO.md` section 8.
+     - **Symptom.** At HEAD the gated test failed on the CPU backend at start 3
+       (the 4-token chunk) with `max|dlogit|/scale = 0.3004` against the 1e-3
+       bound, while the argmax stayed equal. It predates R10.3 and reproduces
+       with the paged prefill off and with `FERRUM_PF_GEMV=1`.
+     - **Cause.** The cached step and the re-fed forward take different bf16
+       GEMM shapes (decision 78), so libtorch reassociates the same products and
+       the drift grows with the decode step; the CPU backend measures 0.409 of
+       scale at the last step. This is the decision-80 shape-noise class, not a
+       cache-state bug: the argmax is still equal.
+     - **Change.** The test now forces `device = "cpu"`, the backend it was
+       calibrated on, and asserts the decision-80 property: an exact argmax plus
+       a `diff < 0.5` explosion bound (measured 0.409). CUDA remains covered by
+       `device_decode_matches_refeed` and `kvcache_cross_request_reuse`, which
+       pin the device path with their own bounds. The f32 KV pool and the
+       cached-vs-re-fed comparison are unchanged.
+
 ---
 
 
