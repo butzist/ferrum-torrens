@@ -1148,7 +1148,7 @@ n=5 per metric, rounds order-balanced.
 | metric | ours (current) | FreeToken (2026-10-20) | ratio |
 |---|---|---|---|
 | pp @517 / 476-478 tok | 143 (dec 102) -> 150 (dec 103) -> **267.4** (R10.2) -> **271.3** (R10.6a) -> **401.0** (R10.6b) tok/s | **366.2 +/- 1.3** (n=5, min 364.4, max 368.0) | **1.10x** |
-| pp @2057 / 1878-1879 tok | **391.7** (R10.2) -> **462.1** (R10.6a) -> **585.0** (R10.6b) -> **664.6** (R10.7) -> **717.1** (R10.8) tok/s | **725.0 +/- 3.1** (n=5, min 719.9, max 727.4) | **0.99x** |
+| pp @2057 / 1878-1879 tok | **391.7** (R10.2) -> **462.1** (R10.6a) -> **585.0** (R10.6b) -> **664.6** (R10.7) -> **717.1** (R10.8) -> **929.4** (R10.9) tok/s | **725.0 +/- 3.1** (n=5, min 719.9, max 727.4) | **1.28x** |
 | K=4 aggregate, batched | **26.2** tok/s | **25.17 +/- 0.05** (n=5, min 25.09, max 25.21) | **1.04x** |
 | K=4 serial window | 16.6 tok/s | **11.70 +/- 0.01** (n=5, 8.19-8.21 s windows) | **1.42x** |
 | bs=1 captured decode | 28.3 tok/s | 30.3 tok/s (decision 76, unchanged) | **0.93x** |
@@ -1172,6 +1172,9 @@ now **401.0 at 517 (1.10x FreeToken, the first prefill point ahead of it)** and
 line rate; the 2057 one is compute-bound with the copy hidden. Decode is
 unchanged. **R10.7 (decision 121)** then raises the production MoE chunk to
 2048, making the 1991-token prefill one GEMM chunk: **664.6 at 2057 (0.92x)**,
+517 flat (400.9). **R10.8 (decision 122)** widens the grouped MoE tile to
+`BLOCK_N=64` (717.1 at 2057, 0.99x), and **R10.9 (decision 123)** fixes the FP8
+prefill GEMM's coalescing and 4-warp register spills: **929.4 at 2057 (1.28x)**,
 517 flat (400.9).
 
 Method notes and caveats:
@@ -1539,3 +1542,71 @@ CSR change) instead of all 1664 slot segments, ~6x fewer CTAs at this prompt.
 equality for both grouped kernels, `a_whole_layer_prefill_overlap_matches_the_host_plan`
 (grouped default and `FERRUM_PF_GEMV=1`), 342 CPU units, 453 CUDA units,
 `check-kernels.sh`. Logs `/tmp/opencode/r10_8/`.
+
+**R10.9 FP8 prefill GEMM coalescing + tile -- LANDED (2026-10-23, decision
+123).** At the 1991-token step the largest remaining dense bucket was
+`gdn_qkvz` (`[1991,2048] x [12288,2048]`, FP8 W8A16) at 718.8 ms / 0.361
+ms/token, with `attn_proj` 205.5 and `gdn_tail` 243.2 ms behind it. The vendored
+kernel loaded the weight as a `[BLOCK_K, BLOCK_N]` tile from the row-major
+`[N, K]` bank, so Triton 3.7.1 assigned the layout's fast axis to N (stride
+`K=2048`): each lane's `ld.global.b8` hit its own 32-byte sector. The same
+source under Triton 3.6 is canonicalized to a coalesced `[BLOCK_N, BLOCK_K]`
+load (verified in TTGIR), which is why the earlier 3.6-based JIT probe showed no
+problem and the codegen regression only appeared in the AOT cubin. The 3.7.1
+PTX at 4 warps also fails to fit: `ptxas` reports 1224/892 bytes of
+spill stores/loads at `64x128x64` (3.6 reports zero), so the shipped kernel was
+both sector-amplified and spilling.
+
+The fix is the coalesced orientation (`offs_n[:, None] * stride_wn +
+offs_k[None, :] * stride_wk`, then `tl.dot(a, tl.trans(w))`) plus an 8-warp
+`128x128x64` tile. The AOT entries now carry `num_stages` as well as
+`num_warps`, so the compiled cubin follows `GEMM_STAGES`/`GEMM_WARPS` instead of
+Triton's defaults. Decode is untouched: `M == 1` still runs the split-K GEMV.
+
+Isolated kernel bench with the committed cubins (same GPU, `[1991,2048] x
+[12288,2048]`, best of 20 after 2 warm-ups, CUDA-event sync per launch):
+
+| config (M/N/K/warps/stages) | best ms | TFLOP/s | notes |
+|---|---:|---:|---|
+| base `64/128/64/4/3` (uncoalesced) | 17.99 | 5.57 | 1224/892 B spills |
+| coalesced `64/128/64/4/3` | 14.91 | 6.72 | same spill, fixed sectors |
+| coalesced `64/128/64/8/3` | 6.61 | 15.16 | no spills |
+| coalesced `128/64/64/8/3` | 6.36 | 15.75 | no spills |
+| coalesced `128/128/64/8/3` | **5.36** | **18.71** | 40/20 B spill, **shipped** |
+| coalesced `128/128/32/8/3` | 5.50 | 18.22 | -2.7%, under the bar |
+| coalesced `128/128/64/8/2` | 5.90 | 16.98 | -10.2% |
+| coalesced `128/256/64/8/3` | 13.97 | 7.17 | 704/468 B spills |
+| coalesced `64/64/64/8/3` | 8.65 | 11.59 | -38% |
+
+Two configs failed to beat the winner by >2%, so the sweep stopped; `BLOCK_M=128`
+halves the per-M-tile weight re-reads (32 -> 16 tiles at 1991 rows) and
+`BLOCK_N=128` keeps the CTA count and dot width, while 8 warps is what removes
+the spill. Order-balanced A/B at 2057 (n=3/arm, same builder, base rebuilt from
+the pre-change store cubins, interleaved B W W B B W,
+`FERRUM_SMOKE_TOKENS=2`, `FERRUM_SMOKE_CACHE=1664`, chunk 8192): pp
+**713.1 -> 929.4 tok/s (+30.3%; raw 707.5/717.6/714.1 ->
+932.5/934.5/921.1)**. The 517 control is flat: **401.7 -> 400.9 tok/s (-0.2%;
+402.1/401.8/401.2 -> 398.8/401.7/402.2)**, because at 451 tokens prefill is
+still copy-bound. Greedy ids are `[561, 3841]` in every measured run and VRAM
+stays 7190/8151 MiB.
+
+`FT_PROFILE` at 2057 (`FERRUM_SMOKE_NOGRAPH=1`, 40 decode tokens, skip 8; two
+runs per arm, 2890.2/2900.7 vs 2236.5/2239.4 ms): the 1991-token step is
+**2890 -> 2239 ms (-22.5%)**; `gdn_qkvz` **718.8 -> 269.3 ms (-62.5%)**,
+`attn_proj` **205.5 -> 88.2 (-57.1%)**, `gdn_tail` **243.2 -> 98.8 (-59.4%)**,
+`attn_out` **90.9 -> 42.9 (-52.8%)**, `attn` 537.6 -> 392.8. The grouped MoE kernel is unchanged; `pf_gemm`
+measures 813.8 -> 856.7 ms (the profile spans overlap, so this is not attributed
+to the FP8 change) and `pf_wait` stays 32.1 ms, so the win is the dense FP8
+projections alone.
+
+Correctness: `selftest --interp` PASS (the interpreter does not cover the M>1
+`tl.dot`; the device numeric gates are below), `compile_check` and
+`scripts/check-kernels.sh` PASS, `a_whole_layer_prefill_overlap_matches_the_host_plan`
+both arms, `a_prefill_retains_the_decode_expert_cache`,
+`a_device_decode_step_matches_refeeding_the_whole_prefix`,
+`a_batched_decode_step_matches_n_single_row_steps` (the M=3 batched decode now
+runs the new GEMM tile) and `batching_raises_aggregate_decode_throughput`
+(serial 29.5 vs batched 46.5 tok/s, 1.57x, unchanged). `cargo fmt --check`,
+`cargo clippy --all-targets` and `--features cuda`, `cargo test` (342),
+`cargo test --features cuda --lib` (453) all pass. Logs
+`/tmp/opencode/r10_9/`.

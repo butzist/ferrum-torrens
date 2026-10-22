@@ -2421,7 +2421,10 @@ mod tests {
         let r = abi.kernel(FP8_SPLITK_REDUCE).unwrap();
         assert_eq!(r.constexpr("BLOCK").unwrap(), 256);
         let gm = abi.kernel(FP8_GEMM).unwrap();
-        assert_eq!(gm.constexpr("BLOCK_M").unwrap(), 64);
+        assert_eq!(gm.constexpr("BLOCK_M").unwrap(), 128);
+        assert_eq!(gm.constexpr("BLOCK_N").unwrap(), 128);
+        assert_eq!(gm.constexpr("BLOCK_K").unwrap(), 64);
+        assert_eq!(gm.num_warps, 8);
     }
 
     #[test]

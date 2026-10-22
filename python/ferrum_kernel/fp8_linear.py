@@ -35,9 +35,11 @@ GEMV_BLOCK_K = 128
 GEMV_REDUCE_BLOCK = 256
 
 # Tiled GEMM (M > 1).
-GEMM_BLOCK_M = 64
+GEMM_BLOCK_M = 128
 GEMM_BLOCK_N = 128
 GEMM_BLOCK_K = 64
+GEMM_WARPS = 8
+GEMM_STAGES = 3
 
 
 @triton.jit
@@ -137,18 +139,21 @@ def _fp8_gemm_kernel(
     m_mask = offs_m < M
     n_mask = offs_n < N
     a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
-    # Load the weight K-major `[BLOCK_K, BLOCK_N]` so the dot needs no transpose.
-    w_ptrs = w_ptr + offs_k[:, None] * stride_wk + offs_n[None, :] * stride_wn
+    # The weight is `[N, K]` row-major, so the K axis is contiguous. Load it as
+    # `[BLOCK_N, BLOCK_K]` with K innermost (coalesced lanes) and transpose for
+    # the dot; a `[BLOCK_K, BLOCK_N]` tile would put lanes along the K-strided N
+    # axis and read one 32-byte sector per lane.
+    w_ptrs = w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for k in range(tl.cdiv(K, BLOCK_K)):
         k_rem = K - k * BLOCK_K
         a = tl.load(a_ptrs, mask=m_mask[:, None] & (offs_k[None, :] < k_rem), other=0.0)
         w = tl.load(
             w_ptrs,
-            mask=(offs_k[:, None] < k_rem) & n_mask[None, :],
+            mask=n_mask[:, None] & (offs_k[None, :] < k_rem),
             other=0.0,
         ).to(a.dtype)
-        acc += tl.dot(a, w, out_dtype=tl.float32)
+        acc += tl.dot(a, tl.trans(w), out_dtype=tl.float32)
         a_ptrs += BLOCK_K * stride_ak
         w_ptrs += BLOCK_K * stride_wk
     scale = tl.load(scale_ptr + offs_n, mask=n_mask, other=0.0).to(tl.float32)
@@ -214,7 +219,7 @@ def fp8_gemm(
         a.stride(0), a.stride(1), weight.stride(0), weight.stride(1),
         out.stride(0), out.stride(1),
         BLOCK_M=GEMM_BLOCK_M, BLOCK_N=GEMM_BLOCK_N, BLOCK_K=GEMM_BLOCK_K,
-        num_warps=4, num_stages=3,
+        num_warps=GEMM_WARPS, num_stages=GEMM_STAGES,
     )
 
 

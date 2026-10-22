@@ -3782,3 +3782,71 @@ subsection names are kept verbatim.
        warps. The 0.405 ms/token is still above the 0.35 target, so the next
        slice remains the compacted nonempty-segment grid.
      - **Logs.** `/tmp/opencode/r10_8/`.
+
+123. **The FP8 prefill GEMM's weight load was sector-amplified and its 4-warp
+     tile spilled; coalescing plus a 128x128 8-warp tile gives pp +30.3% at
+     2057** (2026-10-23, `OPTIMIZATION.md` R10.9, `TODO.md` section 8).
+     - **Symptom.** After R10.8 the 1991-token prefill step was 2878 ms and
+       `gdn_qkvz` (`[1991,2048] x [12288,2048]`, the vendored W8A16 FP8 GEMM)
+       was the largest dense bucket: 718.8 ms / 0.361 ms/token, with
+       `attn_proj` 205.5 and `gdn_tail` 243.2 ms. That is ~4.2 TFLOP/s of routed
+       work against a ~24 TFLOP/s JIT reference.
+     - **Root cause (two, both codegen).** (a) The kernel loaded the weight as
+       `[BLOCK_K, BLOCK_N]` (`offs_k[:, None] * stride_wk + offs_n[None, :] *
+       stride_wn`) from the row-major `[N, K]` bank. Triton 3.7.1 keeps that
+       shape and assigns the layout's fast axis to N, whose real stride is
+       `K=2048`, so each lane loads its own 32-byte sector for one useful byte.
+       Triton 3.6 canonicalized the same source into a `[BLOCK_N, BLOCK_K]`
+       load with order `[0,1]` (fast axis K), which is why the earlier
+       venv-3.6 JIT probe measured no coalescing problem; the AOT build uses
+       the nix triton 3.7.1, and the regression is version-specific. (b) At
+       `64x128x64` and 4 warps, 3.7.1's PTX needs 255 registers and `ptxas`
+       spills 1224/892 bytes (3.6: zero); the shipped kernel was both
+       sector-amplified and spilling.
+     - **Fix.** Load `[BLOCK_N, BLOCK_K]` with K innermost and
+       `tl.dot(a, tl.trans(w))`, and run a `128x128x64`, 8-warp tile. The AOT
+       entries now pass `num_stages` alongside `num_warps` (both read
+       `GEMM_STAGES`/`GEMM_WARPS`), so the cubin cannot silently take Triton's
+       defaults. `M == 1` keeps the split-K GEMV; only `M > 1` changed.
+     - **Isolated bench** (committed cubins, same GPU, CUDA-event sync per
+       launch, best of 20): base `64/128/64/4` **17.99 ms / 5.57 TFLOP/s** ->
+       coalesced same tile 14.91 / 6.72 -> `64/128/64/8` 6.61 / 15.16 ->
+       `128/64/64/8` 6.36 / 15.75 -> `128/128/64/8` **5.36 / 18.71 (shipped)**.
+       `128/128/32/8` 5.50 (-2.7%), `128/128/64/8/2` 5.90 (-10.2%),
+       `128/256/64/8` 13.97 (704 B spills) and `64/64/64/8` 8.65 all lost by
+       >2%, so the sweep stopped. `BLOCK_M=128` halves the per-M-tile weight
+       re-reads (32 -> 16 at 1991 rows); 8 warps is what removes the spill.
+     - **End-to-end.** Order-balanced A/B (n=3/arm, base rebuilt from the
+       pre-change store cubins, interleaved, `FERRUM_SMOKE_PREFILL=2057`,
+       chunk 8192, cache 1664, tokens 2): pp **713.1 -> 929.4 tok/s (+30.3%)**
+       at 2057; 517 control **401.7 -> 400.9 (-0.2%)**, i.e. flat (it is still
+       copy-bound). Greedy ids `[561, 3841]` in all 12 runs, VRAM 7190/8151 MiB.
+       `FT_PROFILE` at 1991 tokens: total **2890 -> 2239 ms (-22.5%)**,
+       `gdn_qkvz` **718.8 -> 269.3 (-62.5%)**, `attn_proj` 205.5 -> 88.2,
+       `gdn_tail` 243.2 -> 98.8, `attn_out` 90.9 -> 42.9; the unchanged grouped MoE kernel's `pf_gemm` measures
+       813.8 -> 856.7 (overlap-contaminated, not attributed) and `pf_wait`
+       stays 32.1 ms, so the win is the FP8 projections only.
+     - **Correctness.** `selftest --interp` PASS (the interpreter does not
+       cover the M>1 `tl.dot`; it is covered by the device gates). Device:
+       `a_whole_layer_prefill_overlap_matches_the_host_plan` (grouped default
+       and `FERRUM_PF_GEMV=1`), `a_prefill_retains_the_decode_expert_cache`,
+       `a_device_decode_step_matches_refeeding_the_whole_prefix`,
+       `a_batched_decode_step_matches_n_single_row_steps` (M=3 batched decode
+       exercises the new tile) and `batching_raises_aggregate_decode_throughput`
+       (29.5 serial / 46.5 batched tok/s, 1.57x, unchanged). `cargo fmt
+       --check`, `cargo clippy --all-targets` and `--features cuda`,
+       `cargo test` (342), `cargo test --features cuda --lib` (453),
+       `scripts/check-kernels.sh` PASS.
+     - **Artifacts.** No cubin/PTX committed. Final tree built with
+       `nix build .#kernels` (daemon) to
+       `/nix/store/69cn0711zg5sfqjccf5dbh2zapmjb7y9-ferrum-torrens-kernels-0.1.0`
+       (manifest: `128/128/64`, 8 warps, 32768 B shared) and every measured
+       binary embedded that tree. `build.rs` does not rerun on a
+       `FERRUM_KERNEL_DIR` change, so the build scripts touch it before
+       switching roots and compare the staged `fp8_gemm.cubin` byte for byte.
+     - **Risk.** Prefill-only for pp. The M>1 path is also used by batched
+       decode (2..8 rows); the two decode gates above pass, and bs=1 decode
+       keeps the untouched split-K GEMV. VRAM is flat. `BLOCK_M=128` wastes
+       rows for tiny M, but the weight traffic per CTA is unchanged and the
+       measured batched aggregate is at its old 1.57x.
+     - **Logs.** `/tmp/opencode/r10_9/`.

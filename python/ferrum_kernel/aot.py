@@ -41,6 +41,8 @@ from .conv import _conv_decode_kernel
 from .gdn import _gdn_decode_kernel, _gdn_tri_solve_kernel
 from .norm import _add_rmsnorm_kernel
 from .fp8_linear import (
+    GEMM_STAGES,
+    GEMM_WARPS as FP8_GEMM_WARPS,
     _fp8_gemm_kernel,
     _fp8_gemv_splitk_kernel,
     _fp8_splitk_reduce_kernel,
@@ -246,7 +248,8 @@ LINEAR_KERNELS: dict[str, dict] = {
         "fn": _fp8_gemm_kernel,
         "signature": fp8_gemm(),
         "constexprs": fp8_gemm_constexprs(),
-        "num_warps": 4,
+        "num_warps": FP8_GEMM_WARPS,
+        "num_stages": GEMM_STAGES,
     },
     "add_rmsnorm": {
         "fn": _add_rmsnorm_kernel,
@@ -445,6 +448,8 @@ def _compile_one(spec: dict) -> dict:
     options["supported_fp8_dtypes"] = ("fp8e5", "fp8e4b15", "fp8e4nv")
     if "num_warps" in spec:
         options["num_warps"] = spec["num_warps"]
+    if "num_stages" in spec:
+        options["num_stages"] = spec["num_stages"]
     src = ASTSource(fn=spec["fn"], signature=spec["signature"], constexprs=spec["constexprs"])
     kern = triton_compile(src, target=TARGET, options=options)
     params = _entry_params(kern.asm["ptx"])

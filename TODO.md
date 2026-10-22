@@ -1,12 +1,13 @@
 # FerrumTorrens -- FreeToken MVP port to Rust: TODO
 
-Status (2026-10-22): M2 (API) current, late M3 in practice; **prefill pp is at
-FreeToken parity** after R10.6a/b, R10.7 and R10.8: 401.0 tok/s at 517 (FT 366.2,
-1.10x) and 717.1 at 2057 (FT 725.0, 0.99x, within the reference's +/-3.1 spread).
-The wins were the harness chunk cap (462), the DMA copy-engine prefetch (585),
-one grouped-GEMM chunk per prompt (665), and a 64-column grouped tile (717).
+Status (2026-10-23): M2 (API) current, late M3 in practice; **prefill pp is
+ahead of FreeToken** after R10.6a/b, R10.7, R10.8 and R10.9: 400.9 tok/s at 517
+(FT 366.2, 1.10x) and 929.4 at 2057 (FT 725.0, 1.28x). The wins were the harness
+chunk cap (462), the DMA copy-engine prefetch (585), one grouped-GEMM chunk per
+prompt (665), a 64-column grouped tile (717), and the FP8 prefill GEMM's
+coalesced load + 128x128 8-warp tile (929).
 Decode is unchanged; the remaining gap is bs=1 decode (0.93x) and optional
-compute slices at 2057 (GDN qkvz, attention). The heavy M3
+compute slices at 2057 (attention). The heavy M3
 infrastructure is landed and gated on the real checkpoint: driver-API kernels
 (NVFP4 MoE + paged GQA decode), device-staged offload, engine-owned per-batch-size
 decode graphs, and bf16 KV by default so a default config fits the 8 GiB target.
@@ -165,10 +166,15 @@ and `pf_gemm` **1464.9 -> 1037.8 ms (-29.2%)** at 1991 tokens.
 `BLOCK_N=64` at 4 warps (was 32): interleaved A/B (n=3/4) pp **664.5 -> 717.1
 tok/s at 2057 (+7.9%)**, 517 control flat (402.0), `pf_gemm` **0.521 -> 0.405
 ms/token (-22.2%)**, total forward 3096.7 -> 2878.4 ms. `BLOCK_N=128`, 8 warps,
-`BLOCK_M=64` and `BLOCK_KW=32` all lost or stayed under the 2% bar. The next
-lever is the compacted nonempty-segment grid (proposal in `OPTIMIZATION.md`
+`BLOCK_M=64` and `BLOCK_KW=32` all lost or stayed under the 2% bar.
+**R10.9 (2026-10-23, decision 123):** the FP8 W8A16 prefill GEMM loaded its
+`[N,K]` weight transposed-on-load and spilled at 4 warps under Triton 3.7.1;
+the coalesced load plus a `128x128x64` 8-warp tile raises pp **713.1 -> 929.4
+tok/s at 2057 (+30.3%)**, 517 flat (400.9), and `gdn_qkvz` **718.8 -> 269.3 ms**
+(-62.5%) / total 1991-token step 2890 -> 2239 ms. The next grouped-MoE lever is
+still the compacted nonempty-segment grid (proposal in `OPTIMIZATION.md`
 R10.8).
-Progress history and the full decision log (numbers 1..122) live in `DONE.md`;
+Progress history and the full decision log (numbers 1..123) live in `DONE.md`;
 read that for the "why" behind any decision number referenced in code or tests.
 
 Goal: a **minimal, fast, single-GPU** Rust serving engine for **one model** --
@@ -1131,6 +1137,18 @@ re-profiled at HEAD: the GDN *bundle* is 42% (`gdn_qkvz` 0.85 + `gdn_ba`
   3096.7 -> 2878.4 ms. `BLOCK_N=128`, 8 warps, `BLOCK_M=64` and `BLOCK_KW=32`
   did not beat it by 2%. Greedy ids `[561, 3841]` in every run, VRAM flat.
   AOT now passes `num_warps` from the same constant. Logs `/tmp/opencode/r10_8/`.
+- [x] **R10.9 FP8 prefill GEMM coalescing + tile (2026-10-23, decision 123).**
+  The vendored W8A16 GEMM loaded a `[BLOCK_K, BLOCK_N]` weight tile from the
+  row-major `[N, K]` bank, so Triton 3.7.1 put the fast layout axis on N
+  (stride 2048) and read one 32-byte sector per lane; 3.6 canonicalized it, so
+  only the AOT cubin regressed. The 4-warp `64x128x64` tile also spilled
+  1224/892 bytes under 3.7.1. Fix: coalesced `[BLOCK_N, BLOCK_K]` load with
+  `tl.trans`, and `128x128x64` at 8 warps (AOT now carries `num_stages` too).
+  Isolated committed-cubin bench 17.99 -> 5.36 ms (5.57 -> 18.71 TFLOP/s).
+  Interleaved A/B: pp **713.1 -> 929.4 tok/s at 2057 (+30.3%)**, 517 flat
+  (401.7 -> 400.9), `gdn_qkvz` **718.8 -> 269.3 ms**, total 1991-token step
+  **2890 -> 2239 ms (-22.5%)**; greedy ids `[561, 3841]`, VRAM flat, decode
+  gates green (M=1 GEMV untouched). Logs `/tmp/opencode/r10_9/`.
 
 ### State of play
 
