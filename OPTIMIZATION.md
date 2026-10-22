@@ -1201,7 +1201,8 @@ docstring in `scripts/freetoken_probe/baselines.py`; logs
 Prefill is 2.4-4.6x behind FreeToken (150/156 vs 366/725 tok/s, R9 baselines);
 decode is at parity. The R9.1-era attribution of a 451-token chunk (decision
 111: 7.72 ms/token) had `pf_gemm` 3.53 (46%), host attention fallback ~1.2 (16%,
-`CacheAccess::Host` gathers + SDPA), `norm_in` 0.87 (11%), GDN 0.19 (closed).
+`CacheAccess::Host` gathers + SDPA), `norm_in` 0.87 (11%), GDN recurrence 0.19 (closed; the bundle, which decision
+111 did not aggregate, is 42% -- see the step-0 result below).
 R10.2 then removed the `pf_gemm` share (down to ~0.62 ms/token, ~14%, decision
 112). R10.3 measured the host attention fallback and found the decode paged
 kernel slower, so the remaining lever is `norm_in`.
@@ -1318,3 +1319,43 @@ kernels (decision 111), R9.2's fused norms (stash, -6.4% captured), fp8 KV
 in eager mode, not bytes -- FreeToken's prefill is flashinfer attention over a
 handful of bf16 torch ops -- so a slice that removes launches (1, 2a, 5) is
 worth more per recorded ms than it looks.
+
+**Step 0 result (2026-10-22, HEAD d2467f5, eager FT_PROFILE, logs
+`/tmp/opencode/r10_5/`).** Final measured-chunk split, ms/token (451 / 968 /
+967 tok; the last is the 1024-prefix tail of the 2057 prompt):
+
+| stage | 451 | 968 | 967 |
+|---|---:|---:|---:|
+| total | 4.231 | 2.726 | 2.777 |
+| GDN bundle | 1.812 | 1.149 | 1.163 |
+| -- gdn_qkvz | 0.849 | 0.523 | 0.521 |
+| -- gdn_ba | 0.562 | 0.307 | 0.313 |
+| -- conv/recur/tail | 0.401 | 0.319 | 0.329 |
+| norm_in | 0.872 | 0.438 | 0.438 |
+| attention bundle | 0.663 | 0.417 | 0.513 |
+| -- attn_mem | 0.294 | 0.187 | 0.342 |
+| pf_gemm | 0.636 | 0.597 | 0.591 |
+
+Two corrections to the plan, both measured:
+
+1. **`norm_in` is a per-forward cost, not per-token math.** It is 393-424 ms
+   absolute per chunk (~8.2-8.8 ms per layer) at all three lengths, so it halves
+   per token when the chunk doubles, while decode measures 5.8 us/call on the
+   fused kernel. The fused `add_rms_norm` is already wired for residual layers
+   at HEAD, so R10.4 is not "port the kernel"; it is finding the remaining
+   per-forward overhead (likely the `residual=None` first layer or allocations).
+   The step-3 lever is therefore mostly `max_prefill_length`: making the 2057
+   prompt one forward instead of two removes a whole ~0.42 s norm_in tax.
+2. **The GDN *projections* are the largest single bucket (42%), and decision
+   111 never priced them** (it recorded only the recurrence, 0.19). `gdn_qkvz`
+   + `gdn_ba` are 1.41 ms/token at 451 and 0.83 at 968+, so this is a new
+   candidate slice (R10.6) ahead of attention. The `gdn_ba` number is
+   suspiciously large for a K=2048, N=64 GEMM and needs a dispatch/launch audit
+   before it is trusted.
+
+`pf_gemm` is flat from 968 to 1024 tokens (0.597 vs 0.591), so the R10.2
+amortization has already flattened; `FERRUM_PF_CHUNK` 512 -> 1024 has <2%
+headroom, unlike raising `max_prefill_length`. `attn_mem` is the only stage that
+grew since decision 111 (0.16 -> 0.29/0.34), consistent with the bf16-gather
+first cut. Captured controls at HEAD: 271.4 tok/s at 517 and 379.9 at 2057
+(within single-run noise of 270.8 / 382.6).

@@ -1017,7 +1017,9 @@ stays covered by `device_decode_matches_refeed` and `kvcache_cross_request_reuse
 Findings in `OPTIMIZATION.md` R10. Prefill is 2.4-4.6x behind FreeToken
 (150/156 vs 366/725 tok/s); decode is at parity. A 451-token chunk splits
 7.72 ms/token as `pf_gemm` 3.53 (46%), host attention ~1.2 (16%), `norm_in`
-0.87 (11%), GDN 0.19 (closed, decision 111).
+0.87 (11%), GDN recurrence 0.19 (closed, decision 111). Step 0 of R10.5
+re-profiled at HEAD: the GDN *bundle* is 42% (`gdn_qkvz` 0.85 + `gdn_ba`
+0.56 ms/token) and `norm_in` is a per-forward cost (see R10.6).
 
 - [x] **R10.1 Prefill chunk 512 confirmation** -- DONE (2026-10-20). The
   GEMV-level sweep in the `cuda_moe.rs` const comment had flattened past 256,
@@ -1056,6 +1058,13 @@ Findings in `OPTIMIZATION.md` R10. Prefill is 2.4-4.6x behind FreeToken
   batched prefill attention kernel, chunk-size sweep under the grouped GEMM,
   MoE streaming floor, small-op fusion, and a speculative captured prefill
   step) are recorded in `OPTIMIZATION.md` R10.5.
+- [ ] **R10.6 GDN prefill projection audit (new, 2026-10-22).** The R10.5 step-0
+  profile says `gdn_qkvz` + `gdn_ba` are 1.41 ms/token at 451 and 0.83 at 968+,
+  the largest bucket, and decision 111 never counted them. Audit the M>1
+  dispatch (is `ba` on the tiled GEMM or the split-K GEMV/upcast path?), fuse
+  the two projections' GEMM if the launch/overhead is real, and A/B pp before
+  claiming it. `gdn_ba`'s absolute time is implausible for K=2048/N=64, so
+  validate with a microbench before implementing.
 
 ### State of play
 
