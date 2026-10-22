@@ -1196,7 +1196,8 @@ decode is at parity. The R9.1-era attribution of a 451-token chunk (decision
 111: 7.72 ms/token) had `pf_gemm` 3.53 (46%), host attention fallback ~1.2 (16%,
 `CacheAccess::Host` gathers + SDPA), `norm_in` 0.87 (11%), GDN 0.19 (closed).
 R10.2 then removed the `pf_gemm` share (down to ~0.62 ms/token, ~14%, decision
-112), so the remaining levers are the host attention fallback and `norm_in`.
+112). R10.3 measured the host attention fallback and found the decode paged
+kernel slower, so the remaining lever is `norm_in`.
 Slices, in order (TODO.md section 8 has the checkboxes):
 
 - **R10.1 chunk 512 -- LANDED (2026-10-20).** The GEMV-level sweep in
@@ -1222,24 +1223,30 @@ Slices, in order (TODO.md section 8 has the checkboxes):
   matches the host plan to a bf16 budget rather than bit-exactly (the GEMV arm
   stays exact); `a_whole_layer_prefill_overlap_matches_the_host_plan` now gates
   both arms. Logs `/tmp/opencode/r10_2/`.
-- **R10.3 device prefill attention -- implementation parked, gate in progress
-  (2026-10-21).** The first cut runs the decode paged-attention kernel with one
+- **R10.3 device prefill attention -- CLOSED as a measured regression (2026-10-22,
+  decision 117).** The first cut ran the decode paged-attention kernel with one
   row per query token and a per-row prefix window built once per chunk
-  (`FERRUM_PF_ATTN=0` restores the Host fallback). A new kernel-level GPU gate
-  (`tests/paged_attention_kernel.rs`, 6 tokens, one query row each, bf16 output)
-  matches causal SDPA in 0.33 s, so the window/kernel mapping is right. The
-  integrated gate (`tests/prefill_attention_matches_host.rs`) is not yet
-  like-for-like: the cubin's output pointer is bf16 (decision 87) while the Host
-  fallback returns f32, and its exact-argmax assertion failed on random ids
-  (39543 vs 220) before the logit diff was measured. Next: make both arms one
-  dtype (or gate the real prompt's oracle token), then run the pp A/B. The
-  implementation is in `git stash` ("R10.3 paged prefill attention (bf16 kernel
-  gate green)"). No pp number exists yet.
+  (`FERRUM_PF_ATTN=0` restored the Host fallback). It is correct: the kernel
+  gates in `tests/paged_attention_kernel.rs` (synthetic prefix window + a real
+  `MhaPool` with scattered page ids) match causal SDPA, and the integrated gate
+  (`tests/prefill_attention_matches_host.rs`, chunks 9/12/16, both arms bf16)
+  lands the same argmax on every chunk (`max|dlogit|/scale` 8.70e-2 / 2.45e-2 /
+  7.84e-2 under the decision-80 0.2 bound; a per-layer probe matched the host
+  recomputation to <=8.8e-4). It is **slower**: order-balanced A/B (n=3/arm,
+  same binary, 1664 slots, 7190 MiB, bf16) gives pp paged vs host **260.6 vs
+  270.8 tok/s at 517 (-3.8%)** and **308.3 vs 382.6 at 2057 (-19.4%)**. The
+  decode kernel launches per `(row, q_head)`, re-reads each KV head for all 8 q
+  heads, and its per-chunk `[rows, window]` window is quadratic; libtorch's
+  GQA-aware SDPA is the better prefill kernel. The implementation, knob and
+  integrated gate are parked in `git stash`, not shipped. A revisit needs a
+  batched prefill kernel that shares K/V tiles, not this decode kernel. Logs
+  `/tmp/opencode/r10_3/`.
 - **R10.4 fused prefill `norm_in`** -- 0.87 ms/token; reuse the decode-side
-  `add_rmsnorm` pattern (decision 100) for the chunk rows.
+  `add_rmsnorm` pattern (decision 100) for the chunk rows. Now the only open
+  prefill slice.
 
-With R10.1 and R10.2 landed, the remaining arithmetic floor (R10.3 attention +
-R10.4 `norm_in`) is smaller than first estimated; the pp already reaches 392
-tok/s at 2057, mid-way to FreeToken's 725. Their marginal (R9 baselines, after
-~0.87 s of HTTP per request) is ~1086 tok/s, so further levers (larger chunks
-under the batched GEMM, scratch-budget tuning) may follow.
+With R10.1 and R10.2 landed and R10.3 closed, the remaining arithmetic floor is
+`norm_in`; the pp already reaches ~383 tok/s at 2057, mid-way to FreeToken's
+725. Their marginal (R9 baselines, after ~0.87 s of HTTP per request) is
+~1086 tok/s, so further levers (larger chunks under the batched GEMM,
+scratch-budget tuning) may follow.

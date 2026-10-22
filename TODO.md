@@ -99,9 +99,11 @@ Tool calling landed (decision 105) and the agentic tool-call prefix reuse is
 covered by hybrid_radix (decision 107), so a multi-turn tool loop only prefills
 the tool result. The open perf/eval items are now resolved: R9.2 rejected
 (-6.4% captured, reproducible), R8.5 rejected (size the KV pool instead of fp8),
-and slice 4 closed (GDN is 0.19 ms/token of prefill). The remaining prefill lever
-is the host attention fallback (~1.2 ms/token) and `norm_in` (0.87); the only
-open serving lever is item 11 (server-side batching).
+and slice 4 closed (GDN is 0.19 ms/token of prefill). R10.3 then measured the
+attention lever as a **regression** (the decode kernel -3.8%/-19.4% pp vs the
+host SDPA fallback, decision 117), so the only open prefill lever is `norm_in`
+(0.87 ms/token) and the only open serving lever is item 11 (server-side
+batching).
 
 FreeToken's two missing baselines are now measured (2026-10-20,
 `scripts/freetoken_probe/baselines.py`): its prefill pp is **366.2 +/- 1.3 tok/s
@@ -119,24 +121,23 @@ chunk. Order-balanced A/B (n=3/arm, same binary, `FERRUM_PF_GEMV=1` selects the
 old GEMV): pp **189.7 -> 267.4 tok/s at 517 (+41%)** and **217.5 -> 391.7 at 2057
 (+80%)**; `pf_gemm` at a 451-token chunk **1005 -> 278 ms (-72%)**, from 46% to
 ~14% of prefill. Decode keeps the M=1 GEMV; the R10 baselines still stand only
-for pp. R10.3 (device prefill attention) and R10.4 (fused `norm_in`) remain.
+for pp. R10.3 (device prefill attention) is closed as a measured regression
+(decision 117); R10.4 (fused `norm_in`) remains.
 Instruments: `FT_PROFILE=1`, `FT_SLOTS_REPORT=1`, `scripts/freetoken_probe/`.
 Build hygiene (2026-10-21, decision 113): the kernel artifacts are built by
 `nix/kernels.nix` and never committed; cargo runs in the devshell, which exports
-`FERRUM_KERNEL_DIR`. R10.3 also has a first paged-prefill implementation (the
-decode kernel driven by a per-row prefix window). CPU units and the kernel-level
-GPU gate (`tests/paged_attention_kernel.rs`, one query row per token, bf16
-output) are green. The end-to-end gate is now like-for-like: the Host fallback
-rounds its SDPA output to the activation dtype (decision 87), so both arms store
-bf16 instead of bf16-vs-f32. The integrated model gate
-(`tests/prefill_attention_matches_host.rs`) and the pp A/B are still **unrun**:
-the 2026-10-22 sandbox had a concurrent model load and `MemAvailable < 5 GiB`,
-so the checkpoint was not loaded. Parked in `git stash` (message "R10.3 paged
-prefill attention: one-dtype gate (CPU units + kernel GPU gate green); model gate
-and pp A/B pending"): run the integrated gate and the pp A/B, then land or
-record. The 2026-10-21 sandbox did expose a CUDA device (the earlier no-device
-note was wrong). The torch-less runtime is planned as M7 (decision 114).
-Progress history and the full decision log (numbers 1..116) live in `DONE.md`;
+`FERRUM_KERNEL_DIR`. **R10.3 is closed as a measured regression (decision 117):**
+the decode paged kernel driven one query row per token with a per-row prefix
+window is correct (3-chunk gate, same argmax; per-layer attention <=8.8e-4) but
+pp is **-3.8% at 517 and -19.4% at 2057** versus the Host SDPA fallback, because
+the decode kernel re-reads K/V per q head and its per-chunk window is quadratic.
+The implementation and integrated gate are parked in `git stash`, not shipped; a
+revisit needs a batched prefill attention kernel (shared K/V tiles), not the
+decode kernel. The two kernel-level gates stay in
+`tests/paged_attention_kernel.rs`. The 2026-10-21 sandbox did expose a CUDA
+device (the earlier no-device note was wrong). The torch-less runtime is planned
+as M7 (decision 114).
+Progress history and the full decision log (numbers 1..117) live in `DONE.md`;
 read that for the "why" behind any decision number referenced in code or tests.
 
 Goal: a **minimal, fast, single-GPU** Rust serving engine for **one model** --
@@ -816,8 +817,9 @@ performance work.
     now `pf_gemm` 3.53 ms/token (46%, the MoE/PCIe stream), `norm_in` 0.87, host
     `attn` fallback 0.77 + `attn_out` 0.43 + `attn_mem` 0.16, and **`gdn_recur`
     0.19 ms/token (2.5%)** -- so a `chunk_gated_delta_rule` port cannot move pp.
-    The remaining prefill levers are a device prefill attention (instead of the
-    Host SDPA fallback) and `norm_in`, not GDN.
+    The device prefill attention lever was then tried and measured slower than
+    the Host SDPA fallback (decision 117), so `norm_in` is the remaining prefill
+    lever, not GDN or this attention kernel.
 21. Expert cache growth (E4) -- **DONE (2026-10-17), decision 85.** The staging
      `lru_ensure` `BLOCK_C` ceiling is raised 512 -> 2048 (decision 84), so a
      config may grow the cache into the VRAM the FP8 slice freed. Measured on the
@@ -1029,18 +1031,19 @@ Findings in `OPTIMIZATION.md` R10. Prefill is 2.4-4.6x behind FreeToken
   (`_nvfp4_grouped_gemm`, bf16 `tl.dot`); decode stays on the M=1 gemv.
   `FERRUM_PF_GEMV=1` restores the old path. pp +41% at 517, +80% at 2057;
   `pf_gemm` -72%. Detail in `OPTIMIZATION.md` R10.2 and `DONE.md` decision 112.
-- [ ] **R10.3 Device prefill attention.** Replace the `CacheAccess::Host`
-  gather+SDPA fallback (`forward_torch.rs:1821/2424`), ~1.2 ms/token across
-  `attn`/`attn_out`/`attn_mem`. First implementation is parked in `git stash`
-  (decode kernel driven by a per-row prefix window built once per chunk;
-  `FERRUM_PF_ATTN=0` restores the fallback). CPU units green; the kernel-level
-  GPU gate is green (`tests/paged_attention_kernel.rs`: one query row per token
-  against its prefix window matches causal SDPA at bf16, 0.33 s). Both arms now
-  store bf16 (`attention_cached`/`attention_cached_pos` round their f32 SDPA
-  result to the activation dtype, decision 87), so the integrated gate
-  (`tests/prefill_attention_matches_host.rs`, argmax exact plus a 2e-2 bf16
-  budget) is ready. It and the pp A/B are **unrun** (2026-10-22: `MemAvailable`
-  under 5 GiB, a concurrent model load). Run both, then land or record.
+- [x] **R10.3 Device prefill attention -- CLOSED as a measured regression
+  (2026-10-22, decision 117).** The decode paged kernel driven one query row per
+  token with a per-row prefix window is correct (3-chunk integrated gate, same
+  argmax on every chunk; per-layer attention within 8.8e-4 of the host
+  recomputation) but **slower**: order-balanced A/B (n=3/arm, same binary, 1664
+  slots, 7190 MiB, bf16) gives pp **260.6 vs 270.8 tok/s at 517 (-3.8%)** and
+  **308.3 vs 382.6 at 2057 (-19.4%)**. The decode kernel launches per
+  `(row, q_head)` and re-reads each KV head for all 8 q heads, and the
+  `[rows, window]` window is quadratic; libtorch's GQA-aware SDPA is the better
+  prefill kernel. Implementation + integrated gate parked in `git stash`; a
+  revisit needs a batched prefill kernel that shares K/V tiles. The two
+  kernel-level gates stay in `tests/paged_attention_kernel.rs` (synthetic prefix
+  window + real `MhaPool` scattered-page window). Logs `/tmp/opencode/r10_3/`.
 - [ ] **R10.4 Fused prefill `norm_in`.** 0.87 ms/token at
   `forward_torch.rs:2490`; the Host path already calls the decode-side
   `add_rms_norm` for `residual=Some`, so re-profile before adding another

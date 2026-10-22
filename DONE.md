@@ -2997,6 +2997,41 @@ settled.
        pin the device path with their own bounds. The f32 KV pool and the
        cached-vs-re-fed comparison are unchanged.
 
+117. **R10.3 device prefill attention is closed as a measured regression**
+     (2026-10-22, `OPTIMIZATION.md` R10.3, `TODO.md` section 8). The decode
+     paged kernel driven one query row per token with a per-row prefix window is
+     correct but slower than the Host SDPA fallback, so the fallback decision
+     111 targeted is not the lever.
+     - **Correctness.** Both arms were put on one dtype first:
+       `attention_cached`/`attention_cached_pos` round their f32 SDPA result to
+       the activation dtype (decision 87), so the paged bf16 output is compared
+       against bf16 rather than f32. The integrated gate
+       (`tests/prefill_attention_matches_host.rs`, chunks 9/12/16, bf16 KV)
+       lands the same last-token argmax on every chunk with
+       `max|dlogit|/scale` 8.70e-2 / 2.45e-2 / 7.84e-2 under the decision-80
+       argmax-pinned 0.2 bound. A per-layer probe inside the paged arm matched
+       the host recomputation of the same layer to <=8.8e-4; the logit drift is
+       40 bf16 layers amplifying that reduction-order difference.
+     - **Kernel mapping.** `tests/paged_attention_kernel.rs` gained a second
+       gate that stores K/V into a real `MhaPool` at scattered page ids and pins
+       the paged window against causal SDPA, separating `kv_slab_ptrs` +
+       `[rows, window]` addressing from the model wiring. Both kernel gates stay.
+     - **Numbers** (order-balanced A/B, n=3 per arm, same binary, 1664 slots,
+       7190 MiB, bf16 KV, `FERRUM_SMOKE_TOKENS=2`): pp paged vs host
+       **260.6 vs 270.8 tok/s at 517 (-3.8%)** and **308.3 vs 382.6 at 2057
+       (-19.4%)**. The gap grows with the prefix. Logs `/tmp/opencode/r10_3/`.
+     - **Why.** The decode kernel launches one program per `(row, q_head)` and
+       scans the row's whole prefix, so with 16 q heads over 2 kv heads it reads
+       the same K/V eight times, and the per-chunk `[rows, window]` location
+       window is quadratic. The Host fallback is libtorch's fused, GQA-aware
+       SDPA (flash attention), which is simply the better prefill kernel.
+     - **Shipped/closed.** The implementation, the `FERRUM_PF_ATTN` knob and the
+       integrated gate are parked in `git stash` ("R10.3 paged prefill
+       attention: correct (3-chunk gate green) but pp -3.8% ..."), not shipped.
+       A revisit needs a batched prefill attention kernel that shares K/V tiles
+       across queries, not the decode kernel. R10.4 (`norm_in`) remains the open
+       prefill lever.
+
 ---
 
 
