@@ -1257,3 +1257,64 @@ With R10.1 and R10.2 landed and R10.3 closed, the remaining arithmetic floor is
 725. Their marginal (R9 baselines, after ~0.87 s of HTTP per request) is
 ~1086 tok/s, so further levers (larger chunks under the batched GEMM,
 scratch-budget tuning) may follow.
+
+### R10.5 pp parity ladder (2026-10-22, ordered retries)
+
+Arithmetic first. FreeToken's end-to-end pp carries ~0.87 s of fixed HTTP cost
+per request; subtracting it, their compute-side prefill is ~0.91-0.92 ms/token
+at both lengths (478: (1.306 - 0.87) / 478; 1878: (2.590 - 0.87) / 1878). Ours
+is in-process first-token time: **3.69 ms/token at 517** (270.8 tok/s) and
+**2.61 at 2057** (382.6), so the compute gap is ~4.0x / ~2.8x and shrinks with
+prompt length: our cost amortizes over the chunk, theirs does not. Ordered
+retries, biggest recorded lever first:
+
+0. **Re-profile at HEAD** (`FT_PROFILE` prefill split at 517/1024/2057). The
+   decision-111 split (pf_gemm 3.53, norm_in 0.87, attn 0.77 + attn_out 0.43 +
+   attn_mem 0.16, attn_proj 0.18, gdn 0.19) predates R10.2 and the shares have
+   shifted. Do not size anything below without this.
+1. **R10.4 fused `norm_in`** (0.87 ms/token recorded). The `residual=None`
+   first layer still runs the op chain; port the decode-side `add_rmsnorm`
+   (decision 100) to chunk rows. Bounded; gates: norm oracle + pp smoke.
+2. **Host attention slimming** (the recorded ~1.36 ms/token across
+   `attn`/`attn_out`/`attn_mem`), in rising effort:
+   - (a) Cut the fallback's per-layer overheads, not the kernel: the pool
+     gather is f32 today (doubling the bytes and forcing the f32 SDPA); gather
+     bf16 and let SDPA run bf16 natively; the causal mask depends only on
+     `q_offset`/window and is rebuilt per full-attention layer -- build it once
+     per chunk; and the GQA `expand + reshape` materializes an `[n, qh, hd]`
+     copy (expand in bf16, or switch to `enable_gqa` once the cross-check pins
+     the repeat-interleave pairing).
+   - (b) If (a) leaves attention expensive: the proper R10.3b, a **batched
+     prefill attention kernel** (BLOCK_M queries per program sharing K/V
+     tiles, GQA-aware, causal) -- the shape the rejected decode-kernel attempt
+     lacked (decision 117). The kernel-level and integrated gates from the
+     R10.3 stash can be reused.
+3. **Chunk-size sweep under the grouped GEMM.** R10.2 gained 41% at 517 but
+   80% at 2057, so bigger chunks amortize the expert stream further: sweep
+   `FERRUM_PF_CHUNK` 512 -> 1024/2048 and `max_prefill_length` 1024 ->
+   2048/4096 at 2057-8192-token prompts. Watch VRAM (7190/8151 MiB) and the
+   auto-slot drawdown.
+4. **MoE streaming floor** (pf_gemm 0.617 ms/token at a 451-token chunk):
+   - (a) audit the whole-layer prefill's hit accounting -- do the retained
+     LRU slots actually skip H2D copy rows for experts already resident?
+   - (b) free VRAM into slots by sizing the KV pool to the actual context
+     (R8.5: numerically free; the smoke's 4096 tokens is 2x its need), ~700
+     more slots -> fewer streamed bytes;
+   - (c) prefetch depth 2 (copy layer l+2 under layer l's compute) if the copy
+     is still the bound;
+   - (d) D2D reuse of resident experts (the `moe_prefill_hit_d2d` analog) if
+     the driver exposes the CUDA 13 batched-copy API.
+5. **Small-op fusion** (attn_proj 0.18, the embed gather, the q/k Gemma norms)
+   only if the re-profile still shows them.
+6. Speculative, largest change, last: a **fixed-shape captured prefill step**
+   (stage the chunk into fixed buffers the way decode does and capture a
+   512-token prefill graph). Only if 1-2 do not close the gap; the R9 finding
+   (the residual decode gap was launch count, not bytes) argues it would help
+   here too, but prefill addresses vary per request.
+
+Do not re-chase: the decode-kernel paged prefill (decision 117), the GDN chunk
+kernels (decision 111), R9.2's fused norms (stash, -6.4% captured), fp8 KV
+(R8.5). Working theory carried over from R9: the gap is launch count / op soup
+in eager mode, not bytes -- FreeToken's prefill is flashinfer attention over a
+handful of bf16 torch ops -- so a slice that removes launches (1, 2a, 5) is
+worth more per recorded ms than it looks.

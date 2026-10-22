@@ -1049,6 +1049,13 @@ Findings in `OPTIMIZATION.md` R10. Prefill is 2.4-4.6x behind FreeToken
   `add_rms_norm` for `residual=Some`, so re-profile before adding another
   kernel. The open piece is the first layer (`residual=None`), which still uses
   the op chain. Gate: norm oracle + pp smoke.
+- [ ] **R10.5 pp parity ladder (2026-10-22).** FreeToken's compute-side prefill
+  is ~0.92 ms/token (their table pp minus the ~0.87 s HTTP fixed cost); ours is
+  3.69 ms/token at 517 and 2.61 at 2057, so the gap is ~4.0x / ~2.8x. The
+  ordered retries (re-profile, R10.4 norm_in, host-attention slimming then a
+  batched prefill attention kernel, chunk-size sweep under the grouped GEMM,
+  MoE streaming floor, small-op fusion, and a speculative captured prefill
+  step) are recorded in `OPTIMIZATION.md` R10.5.
 
 ### State of play
 
