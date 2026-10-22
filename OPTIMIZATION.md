@@ -1147,8 +1147,8 @@ n=5 per metric, rounds order-balanced.
 
 | metric | ours (current) | FreeToken (2026-10-20) | ratio |
 |---|---|---|---|
-| pp @517 / 476-478 tok | 143 (dec 102) -> 150 (dec 103) -> **267.4** (R10.2) tok/s | **366.2 +/- 1.3** (n=5, min 364.4, max 368.0) | **0.73x** |
-| pp @2057 / 1878-1879 tok | **391.7** (R10.2; 156 in dec 103) tok/s | **725.0 +/- 3.1** (n=5, min 719.9, max 727.4) | **0.54x** |
+| pp @517 / 476-478 tok | 143 (dec 102) -> 150 (dec 103) -> **267.4** (R10.2) -> **271.3** (R10.6a) tok/s | **366.2 +/- 1.3** (n=5, min 364.4, max 368.0) | **0.74x** |
+| pp @2057 / 1878-1879 tok | **391.7** (R10.2) -> **462.1** (R10.6a; production chunk) tok/s | **725.0 +/- 3.1** (n=5, min 719.9, max 727.4) | **0.64x** |
 | K=4 aggregate, batched | **26.2** tok/s | **25.17 +/- 0.05** (n=5, min 25.09, max 25.21) | **1.04x** |
 | K=4 serial window | 16.6 tok/s | **11.70 +/- 0.01** (n=5, 8.19-8.21 s windows) | **1.42x** |
 | bs=1 captured decode | 28.3 tok/s | 30.3 tok/s (decision 76, unchanged) | **0.93x** |
@@ -1157,8 +1157,15 @@ The FreeToken prefill runs predate R10.2, so the `ours` column carries the
 post-R10.2 number (decision 112). A 2026-10-22 control on the same smoke config
 re-measured ours at 270.8 tok/s at 517 and 382.6 at 2057, within run-to-run noise
 of the R10.2 pair. R10.3's paged prefill attention was rejected (decision 117),
-so these pp values stand; the only open pp lever is `norm_in`.
+so the R10.2-era pp values stand (R10.4 later closed `norm_in`, decision 118).
 `ratio` is ours / FreeToken, so >1 means we are ahead.
+
+**R10.6a method correction (decision 119):** the earlier ours-side 2057 numbers
+(391.7, 382.6) were measured with the smoke's hardcoded `max_prefill_length =
+1024`, i.e. two forwards, while production defaults to 8192 and the FreeToken
+runs used one forward (`--max-seq-len-override 8216`). Ours now uses the
+production chunk cap, so the 2057 row above is **462.1 tok/s** and the ratio
+**0.64x**; the 517 control is unchanged (~271, one chunk either way).
 
 Method notes and caveats:
 
@@ -1370,3 +1377,33 @@ stream: one whole-layer pass is ~17.3 GiB per chunk at ~11 GB/s, and a 2057
 prompt pays it twice because `max_prefill_length` is 1024. FT's pp arithmetic is
 consistent with ~20 GB/s and one forward. R10.4 is closed; the next slices are
 (a) a larger prefill chunk and (b) a faster hit/miss copy.
+
+**R10.6a production prefill chunk -- LANDED (2026-10-22, decision 119).** The
+R10.4 correction above exposed a harness bug: the throughput smoke
+hardcoded `max_prefill_length = 1024`, so every recorded 2057-token pp ran as two
+forwards (1024 + 967) and paid the whole-layer expert copy twice. Production
+already defaults to 8192 (`DEFAULT_MAX_PREFILL_LENGTH`), and the FreeToken
+reference used one forward, so the old 2057 comparison was not like-for-like. The
+smoke now defaults its chunk cap to the production value; `FERRUM_SMOKE_PREFILL_CHUNK`
+drops it for an A/B, and `FERRUM_SMOKE_SEQ` pins `max_seq_len` when the chunk
+exceeds the smoke's 4096 context (the config requires
+`max_prefill_length <= max_seq_len`; the default context follows the chunk, a
+128 KiB captured decode window, and production is untouched). Order-balanced A/B
+(n=3/arm, same release binary, warm-up discarded, `FERRUM_SMOKE_TOKENS=2`,
+`FERRUM_SMOKE_CACHE=1664`, `--test-threads=1`):
+
+| prompt | cap 1024 (tok/s) | cap 8192 (tok/s) | delta |
+|---|---:|---:|---:|
+| 517 (control) | 272.1 +/- 1.2 | 271.3 +/- 0.3 | **-0.3%** |
+| 2057 | 383.3 +/- 1.7 | 462.1 +/- 0.9 | **+20.6%** |
+
+Raw 2057: 1024 = 382.3 / 382.4 / 385.2, 8192 = 462.1 / 461.2 / 462.9; 517:
+1024 = 272.9 / 272.7 / 270.8, 8192 = 271.1 / 271.1 / 271.6. Within-arm spread
+is <0.8%, so one round stands. VRAM after load is 7190 / 8151 MiB in both arms
+(961 MiB margin), so 8192 is safe at 2057; the expert-step count drops 360 ->
+320 (two forwards -> one). Correctness: the greedy ids are `[561, 3841]` in all
+12 measured runs and the warm-up, so the split does not change the computed
+tokens. Implication: the production default was never the problem; the
+previously recorded 2057 pp (382.6) was the two-forward number and should be
+read as ~462 under the production chunk. The remaining gap to FT's ~725 is now
+~1.57x, not ~1.9x. Logs `/tmp/opencode/r10_6a/`.

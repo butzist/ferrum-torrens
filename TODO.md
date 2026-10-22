@@ -122,7 +122,9 @@ old GEMV): pp **189.7 -> 267.4 tok/s at 517 (+41%)** and **217.5 -> 391.7 at 205
 (+80%)**; `pf_gemm` at a 451-token chunk **1005 -> 278 ms (-72%)**, from 46% to
 ~14% of prefill. Decode keeps the M=1 GEMV; the R10 baselines still stand only
 for pp. R10.3 (device prefill attention) is closed as a measured regression
-(decision 117); R10.4 (fused `norm_in`) remains.
+(decision 117); R10.4 (fused `norm_in`) is closed as an overlap artifact
+(decision 118), and the 2057 pp at the production prefill chunk is 462 tok/s
+(decision 119).
 Instruments: `FT_PROFILE=1`, `FT_SLOTS_REPORT=1`, `scripts/freetoken_probe/`.
 Build hygiene (2026-10-21, decision 113): the kernel artifacts are built by
 `nix/kernels.nix` and never committed; cargo runs in the devshell, which exports
@@ -137,7 +139,11 @@ decode kernel. The two kernel-level gates stay in
 `tests/paged_attention_kernel.rs`. The 2026-10-21 sandbox did expose a CUDA
 device (the earlier no-device note was wrong). The torch-less runtime is planned
 as M7 (decision 114).
-Progress history and the full decision log (numbers 1..117) live in `DONE.md`;
+**R10.6a (2026-10-22, decision 119):** the smoke's prefill cap was hardcoded to
+1024, so the recorded 2057 pp was two forwards; with the production 8192 cap it
+is **462.1 tok/s (+20.6%)** and the greedy ids are unchanged. Production was
+already 8192; only the benchmark was the outlier.
+Progress history and the full decision log (numbers 1..119) live in `DONE.md`;
 read that for the "why" behind any decision number referenced in code or tests.
 
 Goal: a **minimal, fast, single-GPU** Rust serving engine for **one model** --
@@ -1060,12 +1066,21 @@ re-profiled at HEAD: the GDN *bundle* is 42% (`gdn_qkvz` 0.85 + `gdn_ba`
 - [ ] **R10.6 MoE prefill copy (re-scoped 2026-10-22, decision 118).** The
   prefill gap is the expert stream, not the dense ops: non-MoE is 0.83
   ms/token, and one whole-layer pass is ~17.3 GiB per chunk at ~11 GB/s.
-  Slices: (a) raise `max_prefill_length` so the 2057 prompt is one forward
-  instead of two (the 517 case is a control: already one chunk); (b) raise the
-  hit/miss copy rate toward FT's ~20 GB/s (batched async memcpy, coalesced
-  runs, D2D gather of resident experts, overlap). A/B pp and watch VRAM. The
-  step-0 "GDN 42%" was the same overlap artifact; no GDN action unless it
-  reappears after the copy is fixed.
+  Slices: (a) production prefill chunk -- DONE (decision 119, below);
+  (b) raise the hit/miss copy rate toward FT's ~20 GB/s (batched async memcpy,
+  coalesced runs, D2D gather of resident experts, overlap). A/B pp and watch
+  VRAM. The step-0 "GDN 42%" was the same overlap artifact; no GDN action
+  unless it reappears after the copy is fixed.
+  - [x] **(a) production prefill chunk (2026-10-22, decision 119).** The 2057
+    pp we had been recording used the smoke's hardcoded 1024 cap, i.e. two
+    forwards, while production defaults to `max_prefill_length` 8192. The
+    smoke now defaults to `DEFAULT_MAX_PREFILL_LENGTH` (`FERRUM_SMOKE_PREFILL_CHUNK`
+    drops it for the A/B; `FERRUM_SMOKE_SEQ` pins the context when the chunk
+    exceeds 4096). Order-balanced A/B, n=3/arm, same binary, warm-up
+    discarded: pp **383.3 -> 462.1 tok/s at 2057 (+20.6%)** and **272.1 ->
+    271.3 at 517 (-0.3%, control)**, identical greedy ids `[561, 3841]`,
+    VRAM 7190/8151 MiB both arms. Production was already 8192; only the
+    benchmark was the outlier. Logs `/tmp/opencode/r10_6a/`.
 
 ### State of play
 

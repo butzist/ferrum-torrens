@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use ferrum_torrens::application::engine::{Engine, EngineError, load_engine};
 use ferrum_torrens::application::generation::{self, make_request};
-use ferrum_torrens::config::Config;
+use ferrum_torrens::config::{Config, DEFAULT_MAX_PREFILL_LENGTH};
 use ferrum_torrens::domain::sampling::SamplingParams;
 use ferrum_torrens::domain::scheduler::FinishReason;
 
@@ -214,9 +214,23 @@ fn config() -> Config {
     } else {
         slots
     };
+    // R10.6a: this used to be hardcoded to 1024, so a 2057-token prompt ran as
+    // two forwards and paid the whole-layer expert copy twice. Default to the
+    // production budget; `FERRUM_SMOKE_PREFILL_CHUNK` drops it for the A/B.
+    // `max_prefill_length <= max_seq_len` is a config invariant, so a chunk
+    // above the smoke's 4096 context raises the context (only the captured
+    // decode window grows); `FERRUM_SMOKE_SEQ` pins it for an A/B.
+    let prefill_chunk =
+        env_usize("FERRUM_SMOKE_PREFILL_CHUNK").unwrap_or(DEFAULT_MAX_PREFILL_LENGTH);
+    let max_seq_len = env_usize("FERRUM_SMOKE_SEQ").unwrap_or(4096.max(prefill_chunk));
+    assert!(
+        prefill_chunk <= max_seq_len,
+        "FERRUM_SMOKE_PREFILL_CHUNK ({prefill_chunk}) must be <= max_seq_len ({max_seq_len}); \
+         raise FERRUM_SMOKE_SEQ"
+    );
     format!(
-        "[model]\npath = \"{FTW_DIR}\"\ndevice = \"cuda\"\nmax_seq_len = 4096\n\
-         max_output_tokens = {}\nmax_prefill_length = 1024\n\
+        "[model]\npath = \"{FTW_DIR}\"\ndevice = \"cuda\"\nmax_seq_len = {max_seq_len}\n\
+         max_output_tokens = {}\nmax_prefill_length = {prefill_chunk}\n\
          max_running_requests = 4\ncuda_graph = {graph}\n\n\
          [kv]\nnum_tokens = {kv_tokens}\ndtype = \"{kv}\"\n\n\
          [moe]\ncache_size_slots = {slots}\nprefill_overlap = true\n\n\
@@ -264,6 +278,8 @@ struct Timing {
     decode_s: f64,
     /// Seconds between consecutive decoded tokens (`generated - 1` values).
     gaps: Vec<f64>,
+    /// Greedy ids, so a chunking A/B can assert the split did not change them.
+    tokens: Vec<u32>,
 }
 
 fn time_request(engine: &Engine, ids: Vec<u32>, max_tokens: u32) -> Timing {
@@ -293,6 +309,7 @@ fn time_request(engine: &Engine, ids: Vec<u32>, max_tokens: u32) -> Timing {
         first_s: first,
         decode_s: last - first,
         gaps,
+        tokens: g.tokens,
     }
 }
 
@@ -325,6 +342,7 @@ fn single_request_throughput_smoke() {
         first_s: prefill_s,
         decode_s,
         gaps,
+        tokens,
     } = t;
 
     let pp = pp_tokens as f64 / prefill_s;
@@ -332,6 +350,7 @@ fn single_request_throughput_smoke() {
     let tg = decoded as f64 / decode_s;
     eprintln!("pp: {pp_tokens} prompt tokens in {prefill_s:.2}s = {pp:.1} tok/s");
     eprintln!("tg: {tg_tokens} tokens, {decoded} decoded in {decode_s:.2}s = {tg:.1} tok/s");
+    eprintln!("generated ids: {tokens:?}");
     // Steady per-token cost means a fixed per-step cost (staging/graph); a
     // growing cost means decode is re-reading prefix state.
     let (min, max) = (

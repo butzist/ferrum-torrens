@@ -3572,3 +3572,37 @@ subsection names are kept verbatim.
        chunks (`max_prefill_length` 1024), so it pays that twice; FreeToken's
        pp arithmetic is consistent with ~20 GB/s and one forward, which is the
        next two slices (larger prefill chunk, faster hit/miss copy).
+
+119. **The throughput smoke's hardcoded prefill chunk made the recorded 2057 pp
+     a two-forward number; with the production 8192 cap it is 462.1 tok/s
+     (+20.6%)** (2026-10-22, `OPTIMIZATION.md` R10.6a, `TODO.md` section 8).
+     - **Harness bug.** `tests/throughput_smoke.rs` wrote
+       `max_prefill_length = 1024` into its config, so the 2057-token prompt ran
+       as two forwards (profile: 1024 + 967) and paid the whole-layer expert
+       copy (~17.3 GiB per chunk) twice. Production already defaulted to
+       `DEFAULT_MAX_PREFILL_LENGTH` 8192, and the FreeToken reference baseline
+       used one forward (`--max-seq-len-override 8216`), so the comparison was
+       not like-for-like. The smoke now defaults to the production value;
+       `FERRUM_SMOKE_PREFILL_CHUNK` overrides it for an A/B, and
+       `FERRUM_SMOKE_SEQ` pins `max_seq_len` when the chunk exceeds the smoke's
+       4096 context (the config requires `max_prefill_length <= max_seq_len`;
+       the default context follows the chunk, which only grows the captured
+       decode window by 128 KiB). Production config is untouched.
+     - **A/B.** Order-balanced, n=3 per arm, same release binary, warm-up
+       discarded, `FERRUM_SMOKE_TOKENS=2`, `FERRUM_SMOKE_CACHE=1664`,
+       `--test-threads=1`. pp 517 (control): 1024 = 272.9 / 272.7 / 270.8,
+       8192 = 271.1 / 271.1 / 271.6, mean **272.1 -> 271.3 (-0.3%)**. pp 2057:
+       1024 = 382.3 / 382.4 / 385.2, 8192 = 462.1 / 461.2 / 462.9, mean
+       **383.3 -> 462.1 (+20.6%)**. Within-arm spread <0.8%, so one round
+       stands. VRAM after load 7190 / 8151 MiB in both arms (961 MiB margin);
+       8192 does not OOM at 2057. Expert steps drop 360 -> 320, i.e. two
+       forwards -> one.
+     - **Correctness.** The greedy ids are `[561, 3841]` in all 12 measured
+       runs and the warm-up, so the chunk split does not change the computed
+       tokens (the chunked path already had a unit test pinning sampler
+       invariance).
+     - **Implication.** Production was never the outlier; the benchmark was.
+       The recorded 2057 pp (382.6) is the two-forward number, and under the
+       production chunk it is ~462. The remaining gap to FreeToken's ~725 is
+       ~1.57x, not ~1.9x, so R10.6 (b) (the hit/miss copy rate) is still the
+       open MoE stream lever. Logs `/tmp/opencode/r10_6a/`.
