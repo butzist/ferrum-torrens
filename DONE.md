@@ -3672,3 +3672,61 @@ subsection names are kept verbatim.
      - **Gates.** `cargo fmt --check`, `cargo clippy --all-targets` and
        `--features cuda`, `cargo test` (342), `cargo test --features cuda
        --lib` (453). Logs `/tmp/opencode/r10_6b/`.
+
+121. **The prefill MoE chunk is one launch per forward; production
+     `PREFILL_CHUNK_TOKENS` is 2048** (2026-10-22, `OPTIMIZATION.md` R10.7,
+     `TODO.md` section 8).
+     - **What.** `PREFILL_CHUNK_TOKENS` (the token slice of a whole-layer
+       prefill's MoE launches) goes 512 -> 2048. The chunk is a launch
+       granularity, not a numerics change: `build_grouped_csr` buckets each
+       chunk's routes by slot, so the CSR and the grouped GEMM compute the same
+       per-route math for any chunk size. `FERRUM_PF_CHUNK` stays as the
+       measurement override.
+     - **Why.** With the R10.6b DMA copy hidden, a 2057-token prompt is
+       compute-bound (`pf_wait` 0.016 ms/token). A 512-token chunk makes the
+       1991-token MoE forward four chunks per layer, and each 512-token chunk's
+       4096 routes cover essentially all 256 experts, so each expert's weight is
+       read from the device bank four times per forward instead of once.
+     - **Sweep** (order-balanced, n=3/arm, same release binary, warm-up
+       discarded, `FERRUM_SMOKE_PREFILL=2057`, `FERRUM_SMOKE_PREFILL_CHUNK=8192`,
+       `FERRUM_SMOKE_TOKENS=2`, `FERRUM_SMOKE_CACHE=1664`, `--test-threads=1`):
+       pp 512 = 588.7/580.3/580.5 (mean **583.2**), 1024 =
+       636.3/633.4/631.2 (**633.6**, +8.6%), one chunk =
+       667.6/663.5/662.6 (**664.6**, +4.9% over 1024, +14.0% over 512). The 517
+       control is one chunk in both arms and flat: 512 =
+       400.8/401.1/400.8, one chunk = 401.0/401.1/400.5 (mean 400.9 both). A
+       production-default check (2048, no override) measures 668.9 tok/s. VRAM
+       after load is 7190/8151 MiB in every run. Logs `/tmp/opencode/r10_7/`.
+     - **Profile attribution.** `FT_PROFILE` at 2057, no graph, 40 decode
+       tokens: the 1991-token step is **3542.0 -> 3096.7 ms** and `pf_gemm`
+       **1464.9 -> 1037.8 ms (0.736 -> 0.521 ms/token, -29.2%)**. Every other
+       stage is flat (GDN bundle 1436.7 -> 1420.0 ms, attention 533.2 -> 531.8,
+       `pf_wait` 32.1 -> 32.1), so the win is the per-chunk expert stream and
+       not an overlap artifact. `pp` in the same run is 663.8 tok/s.
+     - **Production value.** 2048 is the smallest fixed power-of-two ceiling
+       that captures the one-chunk plateau for the measured prompt; it uses
+       ~130 MiB transient scratch at 2048 tokens x top_k 8, and a longer
+       `max_prefill_length` is split into 2048-token chunks, which bounds that
+       scratch. The constant comment records the measurement.
+     - **Correctness.** The greedy ids are `[561, 3841]` in all 15 measured
+       runs, the warm-up, and the production-default check, so the chunk split
+       does not change the computed tokens. The grouped path still matches the
+       host plan to the bf16 budget.
+     - **Gates.** `cargo fmt --check`, `cargo clippy --all-targets` and
+       `--features cuda`, `cargo test` (342), `cargo test --features cuda
+       --lib` (453), and the gated
+       `a_whole_layer_prefill_overlap_matches_the_host_plan` (default grouped
+       arm and `FERRUM_PF_GEMV=1` bit-exact arm) and
+       `a_prefill_retains_the_decode_expert_cache`.
+     - **Risk.** Low: prefill-only launch granularity, decode untouched, VRAM
+       flat after load, and `FERRUM_PF_CHUNK=512` restores the old split. The
+       only new exposure is that a single 2048-token chunk allocates ~130 MiB
+       of transient scratch; the 961 MiB post-load margin absorbs it and the
+       planner already caps `max_prefill_length`.
+     - **Follow-up.** `pf_gemm` is still 0.521 ms/token, above the 0.45 target,
+       so the next slice is a tile/grid tune, not a chunk change. Measured
+       facts: `BLOCK_M=32`, `BLOCK_N=32`, `BLOCK_KW=16`, 4 warps; grid
+       `(slots=1664, N/32)` = 53,248 CTAs gate_up (N=1024) and 106,496 down
+       (N=2048) per layer; 62 routes per expert at 1991 tokens, so ~90% of the
+       grid is an empty segment. Proposal: a compacted nonempty-segment launch
+       list, then `BLOCK_M=64`/`BLOCK_N=64`/8 warps, then a `BLOCK_KW` sweep.

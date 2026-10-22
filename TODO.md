@@ -151,7 +151,13 @@ ids unchanged, VRAM flat. At 517 prefill is now copy-bound at 14.1 GB/s (max
 PCIe Gen4 x8 is ~15.75); at 2057 the copy is hidden and prefill is
 compute-bound. `FERRUM_PF_DMA=0` or a driver without the optional batch symbol
 keeps the `index_copy` fallback (one log). Decode is unchanged.
-Progress history and the full decision log (numbers 1..120) live in `DONE.md`;
+**R10.7 (2026-10-22, decision 121):** the prefill MoE chunk is now one launch
+per 1991-token forward (`PREFILL_CHUNK_TOKENS` 512 -> 2048): pp **583.2 ->
+633.6 -> 664.6 tok/s** at 512/1024/one chunk (+14.0% total), 517 control flat,
+and `pf_gemm` **1464.9 -> 1037.8 ms (-29.2%)** at 1991 tokens. `pf_gemm` is
+still 0.521 ms/token, so the next slice is the grouped-GEMM tile/grid (proposal
+in `OPTIMIZATION.md` R10.7).
+Progress history and the full decision log (numbers 1..121) live in `DONE.md`;
 read that for the "why" behind any decision number referenced in code or tests.
 
 Goal: a **minimal, fast, single-GPU** Rust serving engine for **one model** --
@@ -1095,6 +1101,18 @@ re-profiled at HEAD: the GDN *bundle* is 42% (`gdn_qkvz` 0.85 + `gdn_ba`
     VRAM flat, greedy ids unchanged, decode neutral. `FERRUM_PF_DMA=0` restores
     the `index_copy` kernel, and so does a driver without the optional batch
     symbol. Logs `/tmp/opencode/r10_6b/`.
+- [x] **R10.7 prefill chunk under the grouped GEMM (2026-10-22, decision 121).**
+  With the DMA copy hidden, a 1991-token prefill is compute-bound and the 512
+  token GEMM chunk re-reads each routed expert once per chunk. Order-balanced
+  sweep (n=3/arm, `FERRUM_SMOKE_PREFILL=2057`, `FERRUM_SMOKE_PREFILL_CHUNK=8192`):
+  pp **583.2 -> 633.6 -> 664.6 tok/s** at 512 -> 1024 -> one chunk (+8.6%,
+  +4.9%, +14.0%); 517 control flat (400.9 both); `pf_gemm` at 1991 tokens
+  **1464.9 -> 1037.8 ms (0.736 -> 0.521 ms/token, -29.2%)** and total forward
+  3542.0 -> 3096.7 ms. Production `PREFILL_CHUNK_TOKENS` is 2048 (the plateau is
+  one chunk; ~130 MiB scratch), `FERRUM_PF_CHUNK` stays as the override. Greedy
+  ids `[561, 3841]` in every run, VRAM flat. `pf_gemm` is still above the 0.45
+  ms/token target, so the next slice is a tile/grid tune; facts and a proposal
+  are in `OPTIMIZATION.md` R10.7. Logs `/tmp/opencode/r10_7/`.
 
 ### State of play
 

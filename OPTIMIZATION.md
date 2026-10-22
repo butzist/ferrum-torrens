@@ -1148,7 +1148,7 @@ n=5 per metric, rounds order-balanced.
 | metric | ours (current) | FreeToken (2026-10-20) | ratio |
 |---|---|---|---|
 | pp @517 / 476-478 tok | 143 (dec 102) -> 150 (dec 103) -> **267.4** (R10.2) -> **271.3** (R10.6a) -> **401.0** (R10.6b) tok/s | **366.2 +/- 1.3** (n=5, min 364.4, max 368.0) | **1.10x** |
-| pp @2057 / 1878-1879 tok | **391.7** (R10.2) -> **462.1** (R10.6a) -> **585.0** (R10.6b) tok/s | **725.0 +/- 3.1** (n=5, min 719.9, max 727.4) | **0.81x** |
+| pp @2057 / 1878-1879 tok | **391.7** (R10.2) -> **462.1** (R10.6a) -> **585.0** (R10.6b) -> **664.6** (R10.7) tok/s | **725.0 +/- 3.1** (n=5, min 719.9, max 727.4) | **0.92x** |
 | K=4 aggregate, batched | **26.2** tok/s | **25.17 +/- 0.05** (n=5, min 25.09, max 25.21) | **1.04x** |
 | K=4 serial window | 16.6 tok/s | **11.70 +/- 0.01** (n=5, 8.19-8.21 s windows) | **1.42x** |
 | bs=1 captured decode | 28.3 tok/s | 30.3 tok/s (decision 76, unchanged) | **0.93x** |
@@ -1170,7 +1170,9 @@ production chunk cap, so the 2057 row above is **462.1 tok/s** and the ratio
 now **401.0 at 517 (1.10x FreeToken, the first prefill point ahead of it)** and
 **585.0 at 2057 (0.81x)**. The 517 prefill is copy-bound at the PCIe Gen4 x8
 line rate; the 2057 one is compute-bound with the copy hidden. Decode is
-unchanged.
+unchanged. **R10.7 (decision 121)** then raises the production MoE chunk to
+2048, making the 1991-token prefill one GEMM chunk: **664.6 at 2057 (0.92x)**,
+517 flat (400.9).
 
 Method notes and caveats:
 
@@ -1302,11 +1304,10 @@ retries, biggest recorded lever first:
      tiles, GQA-aware, causal) -- the shape the rejected decode-kernel attempt
      lacked (decision 117). The kernel-level and integrated gates from the
      R10.3 stash can be reused.
-3. **Chunk-size sweep under the grouped GEMM.** R10.2 gained 41% at 517 but
-   80% at 2057, so bigger chunks amortize the expert stream further: sweep
-   `FERRUM_PF_CHUNK` 512 -> 1024/2048 and `max_prefill_length` 1024 ->
-   2048/4096 at 2057-8192-token prompts. Watch VRAM (7190/8151 MiB) and the
-   auto-slot drawdown.
+3. **Chunk-size sweep under the grouped GEMM -- LANDED as R10.7 (decision
+   121).** 512 -> 1024 -> one 1991-token chunk raised pp 583.2 -> 633.6 ->
+   664.6 tok/s; production `PREFILL_CHUNK_TOKENS` is now 2048. The remaining
+   `pf_gemm` inefficiency is tile/grid, not chunk size (R10.7 below).
 4. **MoE streaming floor** (pf_gemm 0.617 ms/token at a 451-token chunk):
    - (a) audit the whole-layer prefill's hit accounting -- do the retained
      LRU slots actually skip H2D copy rows for experts already resident?
@@ -1441,3 +1442,50 @@ being starved by its SM occupancy; at 1991 tokens `pf_wait` is 32 / 3542 ms, so
 the copy is hidden and prefill is compute-bound again. Decode is unchanged (a
 4-run control at 517 with 64 decode tokens: tg 30.05 kernel vs 30.30 DMA tok/s).
 Logs `/tmp/opencode/r10_6b/`.
+
+**R10.7 prefill chunk under the grouped GEMM -- LANDED (2026-10-22, decision
+121).** The DMA copy is hidden at 2057 (`pf_wait` 0.016 ms/token), so prefill is
+compute-bound and the 512-token GEMM chunk re-reads each routed expert's weight
+once per chunk: four chunks per 1991-token forward, and each 512-token chunk's
+4096 routes cover essentially all 256 experts. Order-balanced sweep (n=3/arm,
+same release binary, warm-up discarded, `FERRUM_SMOKE_PREFILL=2057`,
+`FERRUM_SMOKE_PREFILL_CHUNK=8192`, `FERRUM_SMOKE_TOKENS=2`,
+`FERRUM_SMOKE_CACHE=1664`, `--test-threads=1`; C = `FERRUM_PF_CHUNK` 512, M =
+1024, F = 8192 = one chunk):
+
+| prompt / arm | raw runs (tok/s) | mean | delta |
+|---|---|---:|---:|
+| 2057 C=512 | 588.7 / 580.3 / 580.5 | 583.2 | - |
+| 2057 M=1024 | 636.3 / 633.4 / 631.2 | 633.6 | **+8.6%** |
+| 2057 F=one chunk | 667.6 / 663.5 / 662.6 | 664.6 | **+4.9%** (vs M), **+14.0%** (vs C) |
+| 517 C=512 (control) | 400.8 / 401.1 / 400.8 | 400.9 | - |
+| 517 F=one chunk | 401.0 / 401.1 / 400.5 | 400.9 | -0.01% |
+
+The 517 control is one chunk in both arms, hence flat; within-arm spread is
+<1.5%. VRAM after load is 7190/8151 MiB in every run and the greedy ids are
+`[561, 3841]` in all 15 measured runs. A production-default check (2048, no
+`FERRUM_PF_CHUNK`) measures 668.9 tok/s with the same ids, i.e. the F arm.
+`FT_PROFILE` at 2057 (`FERRUM_SMOKE_NOGRAPH=1`, 40 decode tokens, skip 8) on the
+winning arm: the 1991-token step goes **3542.0 -> 3096.7 ms** and `pf_gemm`
+**1464.9 -> 1037.8 ms (0.736 -> 0.521 ms/token, -29.2%)**; every other stage is
+flat (GDN bundle 1436.7 -> 1420.0, attention 533.2 -> 531.8, `pf_wait` 32.1 ->
+32.1), so the win is entirely the MoE expert stream. Production
+`PREFILL_CHUNK_TOKENS` is now 2048: it captures the one-chunk plateau for the
+measured prompt (~130 MiB transient scratch) and bounds a longer
+`max_prefill_length` to 2048-token chunks. `FERRUM_PF_CHUNK` remains the
+diagnostic override.
+
+`pf_gemm` is still **0.521 ms/token**, above the 0.45 target, so this closes the
+chunk lever, not the kernel. Measured launch facts for the next slice
+(`_grouped_gemm` config): `BLOCK_M=32`, `BLOCK_N=32`, `BLOCK_KW=16` (128
+k-values/iter), 4 warps; grid is `(slots, cdiv(N, BLOCK_N))`, i.e. 1664 x 32 =
+53,248 CTAs for gate_up (N=1024) and 1664 x 64 = 106,496 for down (N=2048) per
+layer. At 1991 tokens there are 15,928 routes over 256 experts = **62 routes per
+expert**, so the segment loop runs 2 M-tiles and ~90% of the grid (slots with no
+routes) retires after loading `seg`. Proposal, in rising effort: (a) launch over
+the nonempty segment list (a compacted `seg_ids` indirection) instead of all
+slots, ~6x fewer CTAs; (b) raise `BLOCK_M` to 64 and `BLOCK_N` to 64 with 8
+warps, so one tile covers a whole expert's 62 routes and the N tiles halve; (c)
+sweep `BLOCK_KW` 16/32. Gate with the existing
+`a_whole_layer_prefill_overlap_matches_the_host_plan` (bf16 budget), the kernel
+compile check and the 2057 A/B. Logs `/tmp/opencode/r10_7/`.

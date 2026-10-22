@@ -1676,24 +1676,22 @@ fn staged_chunk_tokens(block_k: usize, top_k: usize) -> usize {
     (block_k / top_k).max(1)
 }
 
-/// Tokens one grouped GEMV launch of the whole-layer prefill path covers.
+/// Tokens one grouped GEMM launch of the whole-layer prefill path covers.
 ///
 /// That path never runs `lru_ensure`, so the committed `BLOCK_K` (a route cap
 /// for the device LRU) does not apply; only the scratch and the route list are
-/// bounded. It wants to be large: the GEMV reads one expert's weight per route,
-/// so at the decode-shaped 16-token chunk nearly every route names a distinct
-/// expert and each weight is streamed from HBM once per route, while at 256
-/// tokens an expert's 8-ish routes share one resident read (L2 reuse). Measured
-/// on the RTX 5060 Laptop, 517-token prompt: 16 -> 512 tokens took the MoE GEMV
-/// 2.32 -> 1.50 s, and the returns flatten past ~256 -- yet the end-to-end pp
-/// A/B (R10.1, 2026-10-20, n=3 per arm, order-balanced) still gained **+2.8% at
-/// 517 and +3.2% at 2057** going 256 -> 512 (149.0 -> 153.2 and 156.9 ->
-/// 161.9 tok/s, run-to-run sd ~0.5), at identical VRAM (7190 MiB), so 512 is
-/// the default. The scratch doubles to ~16 MiB transient. Capped so a long
-/// `max_prefill_length` cannot balloon it. `FERRUM_PF_CHUNK` overrides both
-/// for measurement (a diagnostic knob from R10.1's A/B, never needed in
-/// serving).
-const PREFILL_CHUNK_TOKENS: usize = 512;
+/// bounded. The chunk is a launch granularity, not a numerics change: the CSR
+/// buckets a chunk's routes by slot, so every chunk re-reads each routed
+/// expert's weight from HBM. R10.7 measured a 1991-token prefill with the DMA
+/// copy hidden: 512 -> 1024 -> one chunk moved pp 583.2 -> 633.6 -> 664.6
+/// tok/s (+8.6%, +4.9%, +14.0% total) and dropped `pf_gemm` 1464.9 -> 1037.8
+/// ms (-29.2%) for one chunk. The win is the per-chunk expert stream, so the
+/// plateau is one chunk for the measured prompt; 2048 captures it with ~130
+/// MiB of transient scratch at 2048 tokens x top_k 8. A longer
+/// `max_prefill_length` splits into 2048-token chunks, which keeps that bound.
+/// `FERRUM_PF_CHUNK` overrides for measurement (a diagnostic knob, never
+/// needed in serving).
+const PREFILL_CHUNK_TOKENS: usize = 2048;
 
 /// The live prefill chunk ceiling: `FERRUM_PF_CHUNK` when it parses to a
 /// non-zero token count, else the default.
