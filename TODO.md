@@ -1,6 +1,12 @@
 # FerrumTorrens -- FreeToken MVP port to Rust: TODO
 
-Status (2026-10-18): M2 (API) current, late M3 in practice. The heavy M3
+Status (2026-10-22): M2 (API) current, late M3 in practice; **prefill pp is at
+FreeToken parity** after R10.6a/b, R10.7 and R10.8: 401.0 tok/s at 517 (FT 366.2,
+1.10x) and 717.1 at 2057 (FT 725.0, 0.99x, within the reference's +/-3.1 spread).
+The wins were the harness chunk cap (462), the DMA copy-engine prefetch (585),
+one grouped-GEMM chunk per prompt (665), and a 64-column grouped tile (717).
+Decode is unchanged; the remaining gap is bs=1 decode (0.93x) and optional
+compute slices at 2057 (GDN qkvz, attention). The heavy M3
 infrastructure is landed and gated on the real checkpoint: driver-API kernels
 (NVFP4 MoE + paged GQA decode), device-staged offload, engine-owned per-batch-size
 decode graphs, and bf16 KV by default so a default config fits the 8 GiB target.
