@@ -3606,3 +3606,69 @@ subsection names are kept verbatim.
        production chunk it is ~462. The remaining gap to FreeToken's ~725 is
        ~1.57x, not ~1.9x, so R10.6 (b) (the hit/miss copy rate) is still the
        open MoE stream lever. Logs `/tmp/opencode/r10_6a/`.
+
+120. **The whole-layer prefill prefetch is six DMA runs through the copy engine,
+     so it overlaps compute: pp 271.8 -> 401.0 tok/s at 517 (+47.5%) and
+     464.6 -> 585.0 at 2057 (+25.9%)** (2026-10-22, R10.6b,
+     `OPTIMIZATION.md` R10, `TODO.md` section 8).
+     - **What.** `prefetch_half` launched the committed `index_copy` cubin once
+       per `BLOCK_K`-row group; its CTAs occupied all 26 SMs while stalled on
+       PCIe, so the "overlapped" copy serialized with the compute stream (the
+       R3b/decision-97 effect). The prefetch is now one `cuMemcpyBatchAsync_v2`
+       of six runs, one per bank, on the existing non-blocking copy stream,
+       through the copy engine (no SMs). New driver wrappers `copy_d2d_async`
+       and `copy_batch_async` use CUDA 13's 8-argument `_v2` ABI (12.8/12.9 had
+       an extra `failIdx`) with one `CUmemcpyAttributes` whose
+       `srcAccessOrder` is STREAM; the symbol is optional and its absence
+       selects the kernel. `FERRUM_PF_DMA=0` restores the kernel, which stays
+       in use for `copy_missing` and as the fallback.
+     - **Why one run per bank.** The buffer slots were the globally coldest
+       `2E`, a scattered set, so a DMA plan would need one entry per expert
+       (1536 per layer) and the small banks (64-128 KiB rows) would trip the
+       driver's documented small-entry synchronous degradation (a batch mixing
+       large and sub-256 KiB entries blocks the host for the whole transfer;
+       FreeToken hit the same floor). Instead the buffer is now the contiguous
+       `2E`-slot window with the lowest total usage (`pick_window`, `usage`
+       read once on prefill entry), so each bank's whole layer is one
+       contiguous source and one contiguous destination: six entries per layer,
+       each 512 KiB-256 MiB. This also matches FreeToken's whole-layer `copy_`.
+       The window can evict a slightly warmer set than the global coldest `2E`
+       did, but decision 94's retention gate stays green (256 residents before
+       and after) and the decode arm is neutral.
+     - **Numbers.** Order-balanced A/B, n=3 per arm, same release binary,
+       warm-up discarded, `FERRUM_SMOKE_TOKENS=2`, `FERRUM_SMOKE_CACHE=1664`,
+       `--test-threads=1`: 517 kernel = 272.1/271.7/271.6, DMA =
+       400.9/401.0/401.0, mean **271.8 -> 401.0 (+47.5%)**; 2057 kernel =
+       466.3/463.8/463.6, DMA = 585.4/583.4/586.1, mean
+       **464.6 -> 585.0 (+25.9%)**. VRAM 7190/8151 MiB in both arms and the
+       greedy ids are `[561, 3841]` in all 12 measured runs and the warm-up.
+     - **Copy rate and overlap.** The copy is 40 x 6 x 256 expert rows =
+       18.18 GB per chunk. At 517 the prefill is now copy-bound at 1.29 s, i.e.
+       **14.1 GB/s** (the kernel path was ~11.9 GB/s / 1.53 s); NVML reports max
+       PCIe Gen4 x8 (~15.75 GB/s theoretical), so this is ~90% of line rate and
+       the rate lever is closed. `FT_PROFILE` at a 451-token chunk: total 1904
+       -> 1292 ms and `pf_wait` 34 -> 566 ms, i.e. the compute stream now
+       genuinely waits for the copy instead of being starved by its SM
+       occupancy; `pf_prefetch` is 0.48 ms of host enqueue over 40 layers. At
+       1991 tokens `pf_wait` is 32 ms of 3542 ms, so the copy is fully hidden
+       and prefill is compute-bound again.
+     - **Decode impact.** None. A 4-run control at 517 with 64 decode tokens
+       gives tg 30.05 (kernel) vs 30.30 (DMA) tok/s, and the greedy path is
+       identical. The change is prefill-only (`prefetch_half`); it frees SMs
+       rather than consuming them.
+     - **Correctness.** `a_whole_layer_prefill_overlap_matches_the_host_plan`
+       passes in both the DMA and kernel arms with `FERRUM_PF_GEMV=1` (bit-exact
+       f32 against the host plan over both layers) and with the default grouped
+       GEMM (bf16 budget); `a_prefill_retains_the_decode_expert_cache` passes
+       both arms. New CPU units cover the run/plan builder, the window picker
+       and the env knob. An H2D arm using the host pointer measured the same
+       (401.0 vs 401.1), so the device-alias source is kept.
+     - **Risk.** `cuMemcpyBatchAsync_v2` is resolved as an optional export: a
+       driver without it opens and serves normally, selects the `index_copy`
+       prefetch once at harness construction, and logs that fallback once
+       (`FERRUM_PF_DMA=0` is the same path). The victim window can evict a
+       slightly warmer set than the global coldest `2E`, but the retention gate
+       and the decode control are green. No production config changes.
+     - **Gates.** `cargo fmt --check`, `cargo clippy --all-targets` and
+       `--features cuda`, `cargo test` (342), `cargo test --features cuda
+       --lib` (453). Logs `/tmp/opencode/r10_6b/`.

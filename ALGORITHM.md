@@ -330,9 +330,11 @@ release_prefill_layer(layer_id)        # record release event so the copy stream
                                        # can reuse the buffer next parity pass
 ```
 
-- Uses the slot cache's first `2 * num_experts` slots as a
-  `[2, num_experts]` double buffer (parity = layer_id % 2), so overlap needs
-  `cache_size >= 2 * num_experts`.
+- Uses `2 * num_experts` cache slots as a `[2, num_experts]` double buffer
+  (parity = layer_id % 2), so overlap needs `cache_size >= 2 * num_experts`.
+  FreeToken borrows the first `2E` slots; our engine picks the coldest
+  contiguous window of that size and copies each bank's whole layer as one DMA
+  run (decision 120).
 - No overlap fallback: `materialize_layer(layer_id)` + synchronous copy.
 - Decode never overlaps; its GEMMs must not read slots the prefill copy stream is
   about to overwrite -- `begin_prefill` orders the boundaries.

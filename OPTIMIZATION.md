@@ -1147,8 +1147,8 @@ n=5 per metric, rounds order-balanced.
 
 | metric | ours (current) | FreeToken (2026-10-20) | ratio |
 |---|---|---|---|
-| pp @517 / 476-478 tok | 143 (dec 102) -> 150 (dec 103) -> **267.4** (R10.2) -> **271.3** (R10.6a) tok/s | **366.2 +/- 1.3** (n=5, min 364.4, max 368.0) | **0.74x** |
-| pp @2057 / 1878-1879 tok | **391.7** (R10.2) -> **462.1** (R10.6a; production chunk) tok/s | **725.0 +/- 3.1** (n=5, min 719.9, max 727.4) | **0.64x** |
+| pp @517 / 476-478 tok | 143 (dec 102) -> 150 (dec 103) -> **267.4** (R10.2) -> **271.3** (R10.6a) -> **401.0** (R10.6b) tok/s | **366.2 +/- 1.3** (n=5, min 364.4, max 368.0) | **1.10x** |
+| pp @2057 / 1878-1879 tok | **391.7** (R10.2) -> **462.1** (R10.6a) -> **585.0** (R10.6b) tok/s | **725.0 +/- 3.1** (n=5, min 719.9, max 727.4) | **0.81x** |
 | K=4 aggregate, batched | **26.2** tok/s | **25.17 +/- 0.05** (n=5, min 25.09, max 25.21) | **1.04x** |
 | K=4 serial window | 16.6 tok/s | **11.70 +/- 0.01** (n=5, 8.19-8.21 s windows) | **1.42x** |
 | bs=1 captured decode | 28.3 tok/s | 30.3 tok/s (decision 76, unchanged) | **0.93x** |
@@ -1166,6 +1166,11 @@ so the R10.2-era pp values stand (R10.4 later closed `norm_in`, decision 118).
 runs used one forward (`--max-seq-len-override 8216`). Ours now uses the
 production chunk cap, so the 2057 row above is **462.1 tok/s** and the ratio
 **0.64x**; the 517 control is unchanged (~271, one chunk either way).
+**R10.6b (decision 120)** moves the prefill MoE copy to the DMA engine: pp is
+now **401.0 at 517 (1.10x FreeToken, the first prefill point ahead of it)** and
+**585.0 at 2057 (0.81x)**. The 517 prefill is copy-bound at the PCIe Gen4 x8
+line rate; the 2057 one is compute-bound with the copy hidden. Decode is
+unchanged.
 
 Method notes and caveats:
 
@@ -1310,8 +1315,10 @@ retries, biggest recorded lever first:
      more slots -> fewer streamed bytes;
    - (c) prefetch depth 2 (copy layer l+2 under layer l's compute) if the copy
      is still the bound;
-   - (d) D2D reuse of resident experts (the `moe_prefill_hit_d2d` analog) if
-     the driver exposes the CUDA 13 batched-copy API.
+   - (d) D2D reuse of resident experts (the `moe_prefill_hit_d2d` analog).
+     The batched-copy API landed for the whole-layer copy (R10.6b, decision
+     120); a hit/miss split would now only save the resident rows' PCIe bytes
+     and needs `cache_size > 2 * num_experts`.
 5. **Small-op fusion** (attn_proj 0.18, the embed gather, the q/k Gemma norms)
    only if the re-profile still shows them.
 6. Speculative, largest change, last: a **fixed-shape captured prefill step**
@@ -1407,3 +1414,30 @@ tokens. Implication: the production default was never the problem; the
 previously recorded 2057 pp (382.6) was the two-forward number and should be
 read as ~462 under the production chunk. The remaining gap to FT's ~725 is now
 ~1.57x, not ~1.9x. Logs `/tmp/opencode/r10_6a/`.
+
+**R10.6b prefill copy on the DMA engine -- LANDED (2026-10-22, decision 120).**
+The whole-layer prefetch was the committed `index_copy` grid, whose CTAs sat on
+every SM while stalled on PCIe (the R3b/decision-97 effect), so the "overlap"
+serialized with compute from the SM side. It is now one `cuMemcpyBatchAsync` of
+six runs (one per bank) on the existing non-blocking copy stream, through the
+copy engine. The buffer slots are the contiguous `2E`-slot window with the
+lowest total usage, so each bank's whole layer is one contiguous run in both
+directions and every batch entry is 512 KiB-256 MiB, above the driver's
+small-entry synchronous floor. `cuMemcpyBatchAsync_v2` is optional: a driver
+without it selects the `index_copy` path once with one log, and
+`FERRUM_PF_DMA=0` forces the same path (otherwise kept for `copy_missing`).
+Order-balanced A/B, n=3/arm, same binary,
+warm-up discarded, `FERRUM_SMOKE_TOKENS=2`, `FERRUM_SMOKE_CACHE=1664`: pp
+**271.8 -> 401.0 tok/s at 517 (+47.5%; raw 272.1/271.7/271.6 ->
+400.9/401.0/401.0)** and **464.6 -> 585.0 at 2057 (+25.9%; 466.3/463.8/463.6 ->
+585.4/583.4/586.1)**. VRAM is 7190/8151 MiB in both arms and the greedy ids are
+`[561, 3841]` in all 12 runs. The copy is 40 x 6 x 256 expert rows = 18.18 GB
+per chunk; at 517 the prefill is now copy-bound at 1.29 s, i.e. **14.1 GB/s**
+(the kernel path was ~11.9 GB/s / 1.53 s). NVML reports max PCIe Gen4 x8
+(~15.75 GB/s theoretical), so 14.1 is ~90% of line rate and the rate lever is
+closed. `FT_PROFILE` at 451 tokens: total 1904 -> 1292 ms and `pf_wait` 34 ->
+566 ms, i.e. the compute stream now genuinely waits for the copy instead of
+being starved by its SM occupancy; at 1991 tokens `pf_wait` is 32 / 3542 ms, so
+the copy is hidden and prefill is compute-bound again. Decode is unchanged (a
+4-run control at 517 with 64 decode tokens: tg 30.05 kernel vs 30.30 DMA tok/s).
+Logs `/tmp/opencode/r10_6b/`.

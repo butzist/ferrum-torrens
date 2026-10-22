@@ -517,22 +517,27 @@ the pinned banks carrying across, so prefill uses the same device path as decode
 **Whole-layer prefill overlap `[core]`** (decision 67). When the config enables
 it and the cache holds `2 * num_experts` slots (`enable_prefill_overlap`), a
 prefill-shaped step (routes > `BLOCK_K`) switches the `Residency` state machine
-to `Prefill`: the cache's first `2 * num_experts` slots become two full-layer
-buffers, the router's ids pass through as slot ids offset by the half, and there
-is one streamed copy of the layer plus one GEMV pass instead of a per-chunk
-`lru_ensure`. Layer `l+1` is copied into the other half on a non-blocking copy
-stream while layer `l` computes (`begin`/`ready`/`release` events order the two
-streams; the copy reuses `index_copy` in `BLOCK_K`-row groups with static index
-tensors). The GEMV still runs per route chunk only to bound the `[routes, ...]`
-scratch. Since R10.2 (decision 112) the whole-layer path launches the batched
-grouped GEMM (`launch_grouped`, one program per (slot segment, N tile) over a
-per-chunk slot CSR) instead of the per-route GEMV, so each expert's weight is
-read once per chunk; decode keeps the GEMV and `FERRUM_PF_GEMV=1` forces it for
-the A/B. A step that drops back below the cap returns to `Decode`; the buffer's
-slots are the `2 * num_experts` **coldest** (chosen by `usage.argsort` on entry,
-freed there, with the per-half copy rows and the `(half, expert) -> slot` map
-rebuilt from them), so the decode LRU's hot set survives the prefill
-(decision 94). `PrefillHarness` (the copy stream, its events and the row
+to `Prefill`: a contiguous window of `2 * num_experts` cache slots becomes two
+full-layer buffers, the router's ids pass through as slot ids offset by the
+half, and there is one streamed copy of the layer plus one GEMV pass instead of
+a per-chunk `lru_ensure`. Layer `l+1` is copied into the other half on a
+non-blocking copy stream while layer `l` computes (`begin`/`ready`/`release`
+events order the two streams). Since R10.6b (decision 120) that copy is one
+`cuMemcpyBatchAsync` of six contiguous runs (one per bank) through the copy
+engine, so it occupies no SMs; the batch symbol is optional, so
+`FERRUM_PF_DMA=0` or a driver without it restores the `index_copy` cubin
+(`BLOCK_K`-row groups over static index tensors), which `copy_missing` still
+uses for decode misses. The GEMV still runs per route chunk only to bound
+the `[routes, ...]` scratch. Since R10.2 (decision 112) the whole-layer path
+launches the batched grouped GEMM (`launch_grouped`, one program per (slot
+segment, N tile) over a per-chunk slot CSR) instead of the per-route GEMV, so
+each expert's weight is read once per chunk; decode keeps the GEMV and
+`FERRUM_PF_GEMV=1` forces it for the A/B. A step that drops back below the cap
+returns to `Decode`; the buffer's slots are the **coldest contiguous window**
+(chosen by minimum total usage on entry, freed there, with the per-half copy
+rows and the `(half, expert) -> slot` map rebuilt from them), so the decode
+LRU's hot set survives the prefill (decision 94) and each bank's whole layer is
+one DMA run. `PrefillHarness` (the copy stream, its events and the row
 indices) is retained across transitions; the driver exposes it through owned
 `OwnedStream`/`OwnedEvent` handles that destroy themselves on drop. The blocks
 are the cache's own slots, so this adds no expert VRAM.

@@ -143,7 +143,15 @@ as M7 (decision 114).
 1024, so the recorded 2057 pp was two forwards; with the production 8192 cap it
 is **462.1 tok/s (+20.6%)** and the greedy ids are unchanged. Production was
 already 8192; only the benchmark was the outlier.
-Progress history and the full decision log (numbers 1..119) live in `DONE.md`;
+**R10.6b (2026-10-22, decision 120):** the whole-layer prefill copy now runs as
+one `cuMemcpyBatchAsync` of six contiguous runs (one per bank) through the copy
+engine instead of the SM `index_copy`, so it overlaps compute: pp **271.8 ->
+401.0 tok/s at 517 (+47.5%)** and **464.6 -> 585.0 at 2057 (+25.9%)**, greedy
+ids unchanged, VRAM flat. At 517 prefill is now copy-bound at 14.1 GB/s (max
+PCIe Gen4 x8 is ~15.75); at 2057 the copy is hidden and prefill is
+compute-bound. `FERRUM_PF_DMA=0` or a driver without the optional batch symbol
+keeps the `index_copy` fallback (one log). Decode is unchanged.
+Progress history and the full decision log (numbers 1..120) live in `DONE.md`;
 read that for the "why" behind any decision number referenced in code or tests.
 
 Goal: a **minimal, fast, single-GPU** Rust serving engine for **one model** --
@@ -1063,14 +1071,12 @@ re-profiled at HEAD: the GDN *bundle* is 42% (`gdn_qkvz` 0.85 + `gdn_ba`
   batched prefill attention kernel, chunk-size sweep under the grouped GEMM,
   MoE streaming floor, small-op fusion, and a speculative captured prefill
   step) are recorded in `OPTIMIZATION.md` R10.5.
-- [ ] **R10.6 MoE prefill copy (re-scoped 2026-10-22, decision 118).** The
-  prefill gap is the expert stream, not the dense ops: non-MoE is 0.83
-  ms/token, and one whole-layer pass is ~17.3 GiB per chunk at ~11 GB/s.
-  Slices: (a) production prefill chunk -- DONE (decision 119, below);
-  (b) raise the hit/miss copy rate toward FT's ~20 GB/s (batched async memcpy,
-  coalesced runs, D2D gather of resident experts, overlap). A/B pp and watch
-  VRAM. The step-0 "GDN 42%" was the same overlap artifact; no GDN action
-  unless it reappears after the copy is fixed.
+- [x] **R10.6 MoE prefill copy (re-scoped 2026-10-22, decision 118).** The
+  prefill gap was the expert stream, not the dense ops. Both slices landed:
+  (a) the production prefill chunk (decision 119) and (b) the copy on the DMA
+  engine (decision 120). The whole-layer pass is 18.18 GB per chunk; the copy
+  now runs at 14.1 GB/s (PCIe Gen4 x8 line rate is ~15.75) and is hidden at
+  2057, where prefill is compute-bound again.
   - [x] **(a) production prefill chunk (2026-10-22, decision 119).** The 2057
     pp we had been recording used the smoke's hardcoded 1024 cap, i.e. two
     forwards, while production defaults to `max_prefill_length` 8192. The
@@ -1081,6 +1087,14 @@ re-profiled at HEAD: the GDN *bundle* is 42% (`gdn_qkvz` 0.85 + `gdn_ba`
     271.3 at 517 (-0.3%, control)**, identical greedy ids `[561, 3841]`,
     VRAM 7190/8151 MiB both arms. Production was already 8192; only the
     benchmark was the outlier. Logs `/tmp/opencode/r10_6a/`.
+  - [x] **(b) prefill copy on the DMA engine (2026-10-22, decision 120).** The
+    prefetch is one `cuMemcpyBatchAsync` of six contiguous runs (one per bank)
+    on the existing copy stream, through the copy engine; the buffer slots are
+    the coldest contiguous window, so each bank's layer is one run. pp
+    **271.8 -> 401.0 at 517 (+47.5%)** and **464.6 -> 585.0 at 2057 (+25.9%)**,
+    VRAM flat, greedy ids unchanged, decode neutral. `FERRUM_PF_DMA=0` restores
+    the `index_copy` kernel, and so does a driver without the optional batch
+    symbol. Logs `/tmp/opencode/r10_6b/`.
 
 ### State of play
 

@@ -64,6 +64,25 @@ pub const MEMHOSTALLOC_DEVICEMAP: u32 = 0x02;
 /// concurrently with the compute stream, ordered only by explicit events.
 pub const STREAM_NON_BLOCKING: u32 = 0x01;
 
+/// `CU_MEMCPY_SRC_ACCESS_ORDER_STREAM`: the batch copy reads its sources in
+/// stream order. A resident pinned bank is rewritten only between prefills, so
+/// the driver may overlap the copy with the compute stream's later work.
+pub const MEMCPY_SRC_ACCESS_ORDER_STREAM: i32 = 0x01;
+
+/// `CUmemcpyAttributes` (the CUDA 13 `_v1` layout): a source access order, two
+/// location hints and a flag word, all 32-bit fields. A zeroed hint means "no
+/// location", which is what a device pointer and a device-mapped host bank want.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct MemcpyAttributes {
+    pub src_access_order: i32,
+    pub src_type: i32,
+    pub src_id: i32,
+    pub dst_type: i32,
+    pub dst_id: i32,
+    pub flags: u32,
+}
+
 /// `libcuda.so.1` is the SONAME every NVIDIA driver ships under, and the stub
 /// `libcuda.so` only exists with the toolkit installed. The devshell puts the
 /// driver's own mount first on `LD_LIBRARY_PATH`.
@@ -105,6 +124,19 @@ type MemAllocFn = unsafe extern "C" fn(*mut CUdeviceptr, usize) -> CUresult;
 type MemFreeFn = unsafe extern "C" fn(CUdeviceptr) -> CUresult;
 type MemcpyHtoDFn = unsafe extern "C" fn(CUdeviceptr, *const c_void, usize) -> CUresult;
 type MemcpyDtoHFn = unsafe extern "C" fn(*mut c_void, CUdeviceptr, usize) -> CUresult;
+/// CUDA 13's 8-argument batch signature: 12.8/12.9 carried an extra `failIdx`
+/// pointer before the stream, so the versioned `_v2` name is the only safe one
+/// to resolve.
+type MemcpyBatchAsyncFn = unsafe extern "C" fn(
+    *mut CUdeviceptr,
+    *mut CUdeviceptr,
+    *mut usize,
+    usize,
+    *mut MemcpyAttributes,
+    *mut usize,
+    usize,
+    CUstream,
+) -> CUresult;
 type MemHostAllocFn = unsafe extern "C" fn(*mut *mut c_void, usize, u32) -> CUresult;
 type MemGetInfoFn = unsafe extern "C" fn(*mut usize, *mut usize) -> CUresult;
 type MemHostGetDevicePointerFn =
@@ -139,6 +171,9 @@ struct Fns {
     cu_mem_free: MemFreeFn,
     cu_memcpy_htod: MemcpyHtoDFn,
     cu_memcpy_dtoh: MemcpyDtoHFn,
+    /// Optional: the engine falls back to the `index_copy` kernel when a
+    /// pre-CUDA-13 driver does not export the batch copy.
+    cu_memcpy_batch_async: Option<MemcpyBatchAsyncFn>,
     cu_mem_host_alloc: MemHostAllocFn,
     cu_mem_host_get_device_pointer: MemHostGetDevicePointerFn,
     cu_mem_free_host: MemFreeHostFn,
@@ -173,9 +208,10 @@ unsafe impl Send for Driver {}
 unsafe impl Sync for Driver {}
 
 impl Driver {
-    /// dlopen `libcuda` and resolve every symbol below. The only fallible part
-    /// of the whole boundary that is not a `CUresult`: everything else goes
-    /// through `check`.
+    /// dlopen `libcuda` and resolve the symbols below. The batch copy is the
+    /// one optional export (CUDA 13's `cuMemcpyBatchAsync_v2`); everything else
+    /// must resolve. This is the only fallible part of the boundary that is not
+    /// a `CUresult`: every later call goes through `check`.
     pub fn open() -> Result<Self, CudaError> {
         let lib_name = CString::new(LIB).expect("no NUL in the library name");
         // SAFETY: a NUL-terminated name. The handle is kept for the life of the
@@ -214,6 +250,23 @@ impl Driver {
             }};
         }
 
+        // An optimization, not a requirement: a driver that predates CUDA 13
+        // keeps serving through the `index_copy` kernel.
+        macro_rules! sym_opt {
+            ($name:literal, $ty:ty) => {{
+                let c = CString::new($name).expect("no NUL in a symbol name");
+                // SAFETY: as `sym!`; a null result is the absent-symbol case.
+                let p = unsafe { dlsym(lib, c.as_ptr()) };
+                if p.is_null() {
+                    None
+                } else {
+                    // SAFETY: `p` points at an `extern "C"` export whose
+                    // signature is the CUDA header's for `$name`.
+                    Some(unsafe { std::mem::transmute::<*mut c_void, $ty>(p) })
+                }
+            }};
+        }
+
         let fns = Fns {
             cu_init: sym!("cuInit", InitFn),
             cu_driver_get_version: sym!("cuDriverGetVersion", DriverVersionFn),
@@ -232,6 +285,9 @@ impl Driver {
             cu_mem_free: sym!("cuMemFree_v2", MemFreeFn),
             cu_memcpy_htod: sym!("cuMemcpyHtoD_v2", MemcpyHtoDFn),
             cu_memcpy_dtoh: sym!("cuMemcpyDtoH_v2", MemcpyDtoHFn),
+            // The whole-layer prefill prefetches through the copy engine rather
+            // than an SM `index_copy`, which is what lets it overlap compute.
+            cu_memcpy_batch_async: sym_opt!("cuMemcpyBatchAsync_v2", MemcpyBatchAsyncFn),
             // The host allocation is mapped into the device address space
             // (`CU_MEMHOSTALLOC_DEVICEMAP`), so the copy kernel can read the
             // pinned expert banks directly.
@@ -295,6 +351,12 @@ impl Driver {
     pub fn init(&self) -> Result<(), CudaError> {
         // SAFETY: no arguments, no output.
         self.check(unsafe { (self.fns.cu_init)(0) })
+    }
+
+    /// Whether the driver exports `cuMemcpyBatchAsync_v2` (CUDA 13). When it
+    /// does not, the whole-layer prefill keeps the `index_copy` kernel.
+    pub fn batch_copy_available(&self) -> bool {
+        self.fns.cu_memcpy_batch_async.is_some()
     }
 
     pub fn driver_version(&self) -> Result<i32, CudaError> {
@@ -687,6 +749,63 @@ impl Driver {
     pub unsafe fn copy_d2h(&self, dst: &mut [u8], src: CUdeviceptr) -> Result<(), CudaError> {
         // SAFETY: the caller guarantees `src` holds at least `dst.len()` bytes.
         self.check(unsafe { (self.fns.cu_memcpy_dtoh)(dst.as_mut_ptr().cast(), src, dst.len()) })
+    }
+
+    /// Enqueue every `(dst, src, bytes)` triple as one `cuMemcpyBatchAsync`.
+    /// Entries must be pairwise independent (the driver may run them in any
+    /// order), which the whole-layer prefetch's one-run-per-bank plan is.
+    /// One attribute covers the batch: sources are read in stream order, which
+    /// a resident pinned bank allows.
+    ///
+    /// # Safety
+    /// Every triple must be a live, non-overlapping copy range, and `stream`
+    /// must be a stream of the current context (never the legacy null stream,
+    /// which the driver would treat as a synchronous call).
+    pub unsafe fn copy_batch_async(
+        &self,
+        dsts: &[CUdeviceptr],
+        srcs: &[CUdeviceptr],
+        sizes: &[usize],
+        stream: CUstream,
+    ) -> Result<(), CudaError> {
+        if dsts.len() != srcs.len() || dsts.len() != sizes.len() {
+            return Err(CudaError::Driver(
+                "copy_batch_async: array lengths differ".into(),
+            ));
+        }
+        if dsts.is_empty() {
+            return Ok(());
+        }
+        if stream.is_null() {
+            return Err(CudaError::Driver(
+                "copy_batch_async on the legacy stream".into(),
+            ));
+        }
+        let Some(copy) = self.fns.cu_memcpy_batch_async else {
+            return Err(CudaError::Driver(
+                "cuMemcpyBatchAsync_v2 is not available in this driver".into(),
+            ));
+        };
+        let mut attrs = [MemcpyAttributes {
+            src_access_order: MEMCPY_SRC_ACCESS_ORDER_STREAM,
+            ..MemcpyAttributes::default()
+        }];
+        let mut attr_idx = [0usize];
+        // SAFETY: the arrays are same-length live slices for the call's
+        // duration, the driver only reads the pointer/size arrays, and one
+        // attribute at index 0 is the documented whole-batch spelling.
+        self.check(unsafe {
+            copy(
+                dsts.as_ptr().cast_mut(),
+                srcs.as_ptr().cast_mut(),
+                sizes.as_ptr().cast_mut(),
+                dsts.len(),
+                attrs.as_mut_ptr(),
+                attr_idx.as_mut_ptr(),
+                attrs.len(),
+                stream,
+            )
+        })
     }
 }
 
@@ -1293,6 +1412,20 @@ mod tests {
             assert!(matches!(e, CudaError::Load { .. }), "{e}");
             assert!(e.to_string().contains(LIB), "{e}");
         }
+    }
+
+    /// The hand-written batch attribute must match CUDA 13's
+    /// `CUmemcpyAttributes_v1` layout, or the driver reads the flags word where
+    /// a location hint belongs. This is pure `repr(C)` arithmetic, no device.
+    #[test]
+    fn the_batch_attribute_layout_matches_cuda_13() {
+        use std::mem::{offset_of, size_of};
+
+        assert_eq!(size_of::<MemcpyAttributes>(), 24);
+        assert_eq!(offset_of!(MemcpyAttributes, src_access_order), 0);
+        assert_eq!(offset_of!(MemcpyAttributes, src_id), 8);
+        assert_eq!(offset_of!(MemcpyAttributes, dst_id), 16);
+        assert_eq!(offset_of!(MemcpyAttributes, flags), 20);
     }
 
     /// A `CudaError` from `check` must carry the driver's own string, because

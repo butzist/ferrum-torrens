@@ -23,7 +23,8 @@ use tch::Tensor;
 
 use crate::domain::expert_kernel::{
     BANKS, ExpertGemm, ExpertShapes, ExpertSlabSource, ExpertSlotStore, MoEDeviceGroup,
-    MoEDeviceRequest, MoEError, MoEGroup, MoETensor, Part, PinnedBankSource, Slab, route_lists,
+    MoEDeviceRequest, MoEError, MoEGroup, MoETensor, Part, PinnedBank, PinnedBankSource, Slab,
+    route_lists,
 };
 use crate::infrastructure::cuda_driver::{
     CUstream, CudaError, CudaKernels, Driver, OwnedEvent, OwnedStream, STREAM_NON_BLOCKING,
@@ -230,8 +231,8 @@ enum Residency {
 }
 
 /// The prefill's ordering machinery and static copy plan (item 8 slice 2). The
-/// two halves are the cache's own slots `[0, 2*experts)`, so this owns no expert
-/// memory -- only the non-blocking copy stream, five events and the row-index
+/// two halves borrow `2 * experts` of the cache's own slots, so this owns no
+/// expert memory -- only the non-blocking copy stream, five events and the row-index
 /// tensors, all retained across prefill/decode transitions.
 ///
 /// A prefetch copies a whole layer from the pinned host banks into its half on
@@ -240,9 +241,12 @@ enum Residency {
 /// the half waits the release. `begin` fences the copy stream behind everything
 /// already enqueued on the compute stream when a prefill starts.
 ///
-/// The copy reuses the committed `index_copy` cubin, whose grid takes one
-/// `BLOCK_K`-row plan, so a whole layer is copied in `BLOCK_K`-row groups with
-/// precomputed row indices -- the prefetch does no per-layer host work.
+/// The default copy is one `cuMemcpyBatchAsync` of six runs through the copy
+/// engine (R10.6b): the buffer is a contiguous slot window, so each bank's
+/// whole layer is one contiguous source and one contiguous destination run, and
+/// the copy occupies no SMs. `FERRUM_PF_DMA=0` restores the committed
+/// `index_copy` cubin, whose grid takes one `BLOCK_K`-row plan and therefore
+/// copies a whole layer in `BLOCK_K`-row groups.
 struct PrefillHarness {
     copy_stream: OwnedStream,
     begin: OwnedEvent,
@@ -256,11 +260,30 @@ struct PrefillHarness {
     dst_idx: [Vec<Tensor>; 2],
     /// Group size (rows), one int64 scalar each.
     num: Vec<Tensor>,
-    /// The `2 * experts` cache slots this prefill's buffer owns, chosen coldest
-    /// first so the hottest decode experts stay resident.
+    /// The `2 * experts` cache slots this prefill's buffer owns, chosen as the
+    /// coldest contiguous window so the hottest decode experts stay resident.
     victims: Tensor,
     /// The layer each half currently holds, `-1` when empty.
     half_layer: [i64; 2],
+    /// Host copy plan: the pinned banks' device aliases and the device banks'
+    /// base pointers. Both are stable for the adapter's life, so a whole-layer
+    /// run is pure host arithmetic at prefetch time.
+    banks: [PinnedBank; BANKS.len()],
+    dst_base: [u64; BANKS.len()],
+    /// First slot of the contiguous `2 * experts` buffer window.
+    window_start: usize,
+    /// How the prefetch copies a layer (`FERRUM_PF_DMA=0` forces the
+    /// `index_copy` kernel).
+    dma: PrefillDma,
+}
+
+/// The whole-layer prefetch engine.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PrefillDma {
+    /// The committed `index_copy` cubin, for the A/B and as a fallback.
+    Off,
+    /// `cuMemcpyBatchAsync` through the copy engine.
+    On,
 }
 
 impl CudaMoE {
@@ -503,8 +526,8 @@ impl CudaMoE {
 
     /// Build the whole-layer prefill harness (item 8 slice 2): a non-blocking
     /// copy stream, its ordering events and the static row-index tensors. The
-    /// slot cache's first `2 * experts` slots become the two buffers, so this
-    /// allocates no expert memory and only changes how those slots are read.
+    /// two buffers borrow `2 * experts` of the cache's slots, so this allocates
+    /// no expert memory and only changes how those slots are read.
     ///
     /// Refused unless the cache holds `2 * experts` slots, which is exactly the
     /// condition the config gates `prefill_overlap` on.
@@ -559,6 +582,23 @@ impl CudaMoE {
             }
         }
         let victims = Tensor::arange((2 * experts) as i64, (tch::Kind::Int, dev));
+        let banks = self
+            .pinned
+            .as_ref()
+            .ok_or_else(|| MoEError::Bad("enable_prefill_overlap before the pinned banks".into()))?
+            .banks()?;
+        let dst_base = self.bank_ptrs()?;
+        // Decide the copy engine once, here: the batch symbol is optional, so a
+        // pre-CUDA-13 driver keeps the `index_copy` path. Say so once, not per
+        // layer.
+        let requested = std::env::var("FERRUM_PF_DMA").ok();
+        let available = lib.batch_copy_available();
+        let dma = prefill_dma_from(requested.as_deref(), available);
+        if !available && dma == PrefillDma::Off && requested.as_deref() != Some("0") {
+            eprintln!(
+                "[moe] prefill DMA copy unavailable (cuMemcpyBatchAsync_v2); using index_copy"
+            );
+        }
         self.prefill = Some(PrefillHarness {
             copy_stream,
             begin,
@@ -571,6 +611,10 @@ impl CudaMoE {
             num,
             victims,
             half_layer: [-1, -1],
+            banks,
+            dst_base,
+            window_start: 0,
+            dma,
         });
         Ok(())
     }
@@ -1281,11 +1325,13 @@ impl CudaMoE {
         Ok(())
     }
 
-    /// Pick the `2 * num_experts` slots the whole-layer double buffer owns:
-    /// the coldest by usage, so free slots go first and a warm cache loses only
-    /// its genuinely least-recently-used experts (the MFU set stays resident).
-    /// Those slots are freed from the reverse map and the per-half copy row
-    /// lists are rebuilt from them; every other slot's LRU state is untouched.
+    /// Pick the `2 * num_experts` slots the whole-layer double buffer owns. The
+    /// buffer has to be a contiguous slot window so each prefetched bank is one
+    /// DMA run (R10.6b), so this picks the window with the lowest total usage:
+    /// free slots go first and a warm cache loses as little of its LRU as a
+    /// contiguous window can. Those slots are freed from the reverse map and the
+    /// per-half copy row lists are rebuilt from them; every other slot's LRU
+    /// state is untouched.
     fn select_buffer_slots(&mut self) -> Result<(), MoEError> {
         let buffer = {
             let st = self
@@ -1295,11 +1341,22 @@ impl CudaMoE {
             2 * st.experts
         };
         let dev = self.device.to_tch();
-        let victims = {
+        let start = {
+            let st = self.device_staging.as_ref().expect("checked above");
+            let usage: Vec<i64> = st
+                .usage
+                .to_kind(tch::Kind::Int64)
+                .to_device(tch::Device::Cpu)
+                .try_into()
+                .map_err(|e| {
+                    MoEError::Bad(format!("select_buffer_slots cannot read usage: {e}"))
+                })?;
+            pick_window(&usage, buffer)
+        };
+        let victims =
+            Tensor::arange_start(start as i64, (start + buffer) as i64, (tch::Kind::Int, dev));
+        {
             let st = self.device_staging.as_mut().expect("checked above");
-            // Ascending usage: free slots (0) first, then the LRU tail.
-            let order = st.usage.argsort(0, false);
-            let victims = order.narrow(0, 0, buffer as i64).to_kind(tch::Kind::Int);
             let victims_i64 = victims.to_kind(tch::Kind::Int64);
             let old = st.id_of_slot.index_select(0, &victims_i64);
             let ids = old.masked_select(&old.ge(0)).to_kind(tch::Kind::Int64);
@@ -1311,8 +1368,7 @@ impl CudaMoE {
             let _ = st.id_of_slot.index_put_(&[Some(&victims_i64)], &neg, false);
             let zero = Tensor::from_slice(&vec![0i64; buffer]).to(dev);
             let _ = st.usage.index_put_(&[Some(&victims_i64)], &zero, false);
-            victims
-        };
+        }
         let experts = self
             .device_staging
             .as_ref()
@@ -1325,13 +1381,14 @@ impl CudaMoE {
             .ok_or_else(|| MoEError::Bad("select_buffer_slots without a harness".into()))?;
         for (half, dsts) in pf.dst_idx.iter_mut().enumerate() {
             for (g, dst) in dsts.iter_mut().enumerate() {
-                let start = g * block_k;
-                let n = (experts - start).min(block_k);
-                let off = (half * experts + start) as i64;
+                let row_start = g * block_k;
+                let n = (experts - row_start).min(block_k);
+                let off = (half * experts + row_start) as i64;
                 *dst = victims.narrow(0, off, n as i64).contiguous();
             }
         }
         pf.victims = victims;
+        pf.window_start = start;
         Ok(())
     }
 
@@ -1339,6 +1396,14 @@ impl CudaMoE {
     /// waiting for that half's release event first, then record the ready event
     /// the compute stream waits on. The caller owns the `half_layer` bookkeeping.
     fn prefetch_half(&mut self, layer: usize, half: usize) -> Result<(), MoEError> {
+        let dma = self
+            .prefill
+            .as_ref()
+            .map(|pf| pf.dma)
+            .unwrap_or(PrefillDma::Off);
+        if dma != PrefillDma::Off {
+            return self.prefetch_half_dma(layer, half);
+        }
         let (src, dst_ptrs, feat_bytes) = {
             let st = self
                 .device_staging
@@ -1381,6 +1446,54 @@ impl CudaMoE {
             // this kernel's manifest entry, launched on the copy stream.
             unsafe { self.staging.launch(copy, &mut params, copy_stream) }.map_err(driver)?;
         }
+        // SAFETY: the copy stream is this harness's own live stream.
+        unsafe { pf.ready[half].record(copy_stream) }.map_err(driver)?;
+        pf.ready_armed[half] = true;
+        Ok(())
+    }
+
+    /// Whole-layer prefetch through the copy engine (R10.6b). The buffer window
+    /// is contiguous and the pinned layer is contiguous, so each bank is exactly
+    /// one `(dst, src, bytes)` run: six batch entries per layer instead of
+    /// `6 * experts` `index_copy` CTAs that would occupy the SMs and stall the
+    /// compute stream on PCIe. Every run is a whole layer (hundreds of KiB and
+    /// up), far above the driver's small-entry floor that makes a batch degrade
+    /// to a synchronous copy.
+    fn prefetch_half_dma(&mut self, layer: usize, half: usize) -> Result<(), MoEError> {
+        let experts = self
+            .device_staging
+            .as_ref()
+            .ok_or_else(|| MoEError::Bad("prefetch_half_dma before device staging".into()))?
+            .experts;
+        let lib = self.kernels.driver();
+        let pf = self
+            .prefill
+            .as_mut()
+            .ok_or_else(|| MoEError::Bad("prefetch_half_dma without a harness".into()))?;
+        let copy_stream = pf.copy_stream.raw();
+        if pf.release_armed[half] {
+            // SAFETY: the copy stream is this harness's own live stream.
+            unsafe { pf.release[half].wait_on(copy_stream) }.map_err(driver)?;
+        }
+        let runs = whole_layer_runs(
+            &pf.banks,
+            &pf.dst_base,
+            experts,
+            layer,
+            pf.window_start,
+            half,
+        );
+        let mut dsts = [0u64; BANKS.len()];
+        let mut srcs = [0u64; BANKS.len()];
+        let mut sizes = [0usize; BANKS.len()];
+        for (i, run) in runs.iter().enumerate() {
+            dsts[i] = run.dst;
+            srcs[i] = run.src;
+            sizes[i] = run.bytes;
+        }
+        // SAFETY: every run is a live range of the pinned source's layer window
+        // and this half's slots, and `copy_stream` is the harness's own stream.
+        unsafe { lib.copy_batch_async(&dsts, &srcs, &sizes, copy_stream) }.map_err(driver)?;
         // SAFETY: the copy stream is this harness's own live stream.
         unsafe { pf.ready[half].record(copy_stream) }.map_err(driver)?;
         pf.ready_armed[half] = true;
@@ -1606,6 +1719,64 @@ fn prefill_grouped_from(value: Option<&str>) -> bool {
     value != Some("1")
 }
 
+/// Resolve the whole-layer prefetch engine once: `FERRUM_PF_DMA=0` forces the
+/// committed `index_copy` kernel (the A/B and the fallback), and a driver
+/// without `cuMemcpyBatchAsync_v2` takes it too because DMA is an optimization.
+fn prefill_dma_from(value: Option<&str>, batch_available: bool) -> PrefillDma {
+    if batch_available && value != Some("0") {
+        PrefillDma::On
+    } else {
+        PrefillDma::Off
+    }
+}
+
+/// One DMA run of a whole-layer prefetch, in raw device addresses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CopyRun {
+    dst: u64,
+    src: u64,
+    bytes: usize,
+}
+
+/// The whole-layer copy plan: one run per bank, because the source (every
+/// expert of `layer` in id order) and the destination (the half's contiguous
+/// slot window) are both contiguous. Absolute addresses are stable for the
+/// adapter's life, so this is pure host arithmetic per prefetch.
+fn whole_layer_runs(
+    banks: &[PinnedBank; BANKS.len()],
+    dst_base: &[u64; BANKS.len()],
+    experts: usize,
+    layer: usize,
+    window_start: usize,
+    half: usize,
+) -> [CopyRun; BANKS.len()] {
+    std::array::from_fn(|i| {
+        let row = banks[i].row_bytes;
+        CopyRun {
+            dst: dst_base[i] + ((window_start + half * experts) * row) as u64,
+            src: banks[i].addr + (layer * experts * row) as u64,
+            bytes: experts * row,
+        }
+    })
+}
+
+/// Start of the contiguous `buffer`-slot window with the lowest total usage.
+/// Free slots (usage 0) naturally win, so the buffer only takes slots the decode
+/// LRU has not touched recently. Contiguity is what makes one DMA run per bank
+/// cover a whole layer.
+fn pick_window(usage: &[i64], buffer: usize) -> usize {
+    assert!(buffer > 0 && usage.len() >= buffer);
+    let mut sum: i64 = usage[..buffer].iter().sum();
+    let mut best = (sum, 0usize);
+    for i in buffer..usage.len() {
+        sum += usage[i] - usage[i - buffer];
+        if sum < best.0 {
+            best = (sum, i - buffer + 1);
+        }
+    }
+    best.1
+}
+
 /// Bucket the prefill's routes per slot into a CSR the grouped launches read:
 /// `seg[s]..seg[s + 1]` indexes `route_idx`, which holds the original route
 /// ids in stable per-slot order, so the segment index is the slot id. Prefill
@@ -1762,6 +1933,72 @@ mod tests {
         assert!(prefill_grouped_from(Some("0")));
         assert!(prefill_grouped_from(Some("garbage")));
         assert!(!prefill_grouped_from(Some("1")));
+    }
+
+    /// The whole-layer prefetch uses the copy engine by default (R10.6b);
+    /// `FERRUM_PF_DMA=0` restores the `index_copy` kernel for the A/B.
+    #[test]
+    fn a_prefill_dma_env_override_parses() {
+        assert_eq!(prefill_dma_from(None, true), PrefillDma::On);
+        assert_eq!(prefill_dma_from(Some("1"), true), PrefillDma::On);
+        assert_eq!(prefill_dma_from(Some("garbage"), true), PrefillDma::On);
+        assert_eq!(prefill_dma_from(Some("0"), true), PrefillDma::Off);
+    }
+
+    /// The batch copy is an optimization: a driver without the symbol keeps the
+    /// `index_copy` kernel whatever the env asks for, so the engine still opens
+    /// and serves decode plus prefill on a pre-CUDA-13 driver.
+    #[test]
+    fn a_driver_without_the_batch_copy_falls_back_to_the_kernel() {
+        assert_eq!(prefill_dma_from(None, false), PrefillDma::Off);
+        assert_eq!(prefill_dma_from(Some("1"), false), PrefillDma::Off);
+        assert_eq!(prefill_dma_from(Some("0"), false), PrefillDma::Off);
+    }
+
+    /// The buffer is the coldest *contiguous* window, because contiguity is what
+    /// makes one DMA run per bank cover a whole layer. A warm cache must lose as
+    /// little as a window can avoid, and ties keep the lowest start.
+    #[test]
+    fn the_buffer_window_is_the_coldest_contiguous_run() {
+        assert_eq!(pick_window(&[9, 9, 0, 0, 0, 0, 9, 9], 4), 2);
+        assert_eq!(pick_window(&[9, 9, 1, 1, 0, 0], 2), 4);
+        assert_eq!(pick_window(&[1, 1, 1, 1], 2), 0);
+        assert_eq!(pick_window(&[7, 3, 5], 3), 0);
+    }
+
+    /// A whole-layer DMA plan is exactly six contiguous runs: each bank's layer
+    /// window (every expert in id order) into the half's contiguous slot window.
+    /// The two halves abut, so the buffer is one contiguous slot range.
+    #[test]
+    fn a_whole_layer_dma_plan_is_one_run_per_bank() {
+        let banks: [PinnedBank; BANKS.len()] = std::array::from_fn(|i| PinnedBank {
+            addr: 0x1_0000 + (i as u64) * 0x10_0000,
+            row_bytes: 1024 << i,
+            rows: 8 * 4,
+        });
+        let dst_base: [u64; BANKS.len()] =
+            std::array::from_fn(|i| 0x1_0000_0000 + (i as u64) * 0x100_0000);
+        let (experts, layer, window, half) = (8usize, 3usize, 100usize, 1usize);
+
+        let runs = whole_layer_runs(&banks, &dst_base, experts, layer, window, half);
+        for (i, run) in runs.iter().enumerate() {
+            let row = banks[i].row_bytes;
+            assert_eq!(run.src, banks[i].addr + (layer * experts * row) as u64);
+            assert_eq!(
+                run.dst,
+                dst_base[i] + ((window + half * experts) * row) as u64
+            );
+            assert_eq!(run.bytes, experts * row);
+        }
+
+        let first = whole_layer_runs(&banks, &dst_base, experts, layer, window, 0);
+        for i in 0..BANKS.len() {
+            assert_eq!(
+                first[i].dst + (experts * banks[i].row_bytes) as u64,
+                runs[i].dst,
+                "the halves must abut in bank {i}"
+            );
+        }
     }
 
     /// The CSR the grouped launches read: bucketed per slot in stable route
