@@ -492,17 +492,16 @@ any port.
   the FTW bytes, reports 2.80 GiB logical / 3059 MiB VRAM, and asserts a
   cudarc-only process maps no libtorch. `domain::dequant` stays the host
   transform.
-- [ ] **M7.3 forward -- PARTIAL (2026-10-23, decision 130).**
-  `models/qwen3_6/forward_cudarc.rs` ports the first dense primitives
-  (`rms_norm`, `sigmoid`, `softplus`, `linear`, `topk_renorm`); they are
-  bit-exact against the `tch` formulations on the serving hidden size
-  (`tests/cudarc_forward.rs`). The adapter gained the elementwise/scalar/
-  column-scale/reduction/softmax/top-k/f32-GEMM surface they need, and the
-  rope tables/apply plus the GDN gate, L2 norm and GQA expand are ported
-  (decision 131): rope and the head expand are bit-exact, the gates within
-  2.4e-7. Still to port: the GDN/attention/MoE kernel hand-offs (M7.4), the
-  cache path, the prefill chunked recurrence, and wiring the ops into the
-  serving forward; the scalar oracle stays the gate.
+- [ ] **M7.3 forward -- PARTIAL (2026-10-23, decisions 130, 131).**
+  `models/qwen3_6/forward_cudarc.rs` now carries the complete torch-less text
+  tower: embedding, the residual/norm stream, full attention (stateless bf16
+  SDPA and cached f32 SDPA over the host-cache pool), GDN with the fused
+  per-token conv/decode kernels, the inline MoE and the packed lm_head. It
+  implements `Model` and `CachedModel`, and the gated real-checkpoint test
+  (`tests/cudarc_model.rs`) matches the scalar oracle's argmax/logit on the
+  prompt and decodes from a cached prefill. The f32 causal-SDPA cubin joined
+  the linear manifest. Still open: registry wiring, the captured decode path
+  and making it the serving forward; the scalar oracle stays the gate.
 - [ ] **M7.4 kernels/capture.** Launchers take the candle stream and raw storage;
   disable event tracking for capture; delete `shim/c10_graph_shim.cpp`.
 - [ ] **M7.5 remove libtorch.** Drop `tch`, `torch-sys`, the C++ build script and

@@ -827,7 +827,7 @@ reaches the oracle token through the captured graph.
 | Library / tool | Kind | Used by | Purpose |
 |---|---|---|---|
 | `libtorch` (via `tch`) | runtime, `cuda` feature | `infrastructure/torch.rs`, `models/qwen3_6/forward_torch.rs`, `infrastructure/kvcache_dev.rs`, `infrastructure/cuda_moe.rs`, `infrastructure/decode_graph.rs` | All dense compute (GEMMs, norms, rope, attention, GDN), device tensors, the KV/state slabs, and the MoE slot banks |
-| `cudarc` 0.19.10 | runtime, non-default `cudarc` feature | `infrastructure/cudarc.rs`, `models/qwen3_6/{load_cudarc,forward_cudarc}.rs`, `tests/cudarc_{adapter,load,forward}.rs` | M7 torch-less tensor adapter: owned bf16/f32/i32/i64/u8 buffers, cuBLAS BF16/f32 GEMM, committed cubins, capture, and the elementwise/unary/scalar/col-scale/reduction/softmax/top-k/rope/head-repeat kernels; M7.2 loads the dense text tower with the serving storage policy, M7.3 ports the dense math, rope and GDN primitives. Not on the serving path |
+| `cudarc` 0.19.10 | runtime, non-default `cudarc` feature | `infrastructure/cudarc.rs`, `models/qwen3_6/{load_cudarc,forward_cudarc}.rs`, `tests/cudarc_{adapter,load,forward}.rs` | M7 torch-less tensor adapter: owned bf16/f32/i32/i64/u8 buffers, cuBLAS BF16/f32 GEMM, committed cubins, capture, and the elementwise/unary/scalar/col-scale/reduction/softmax/top-k/rope/head-repeat kernels; M7.2 loads the dense text tower with the serving storage policy, M7.3 runs the complete text-tower forward and cache path. Not on the serving path |
 | CUDA driver API (`libcuda.so.1`) | runtime, hand-rolled FFI | `infrastructure/cuda_driver.rs` | Load and launch the cubins, allocate device + page-locked memory, capture and replay CUDA graphs |
 | Triton (cubins) | build-time authoring; artifacts embedded at compile time | `python/ferrum_kernel/*`, `nix/kernels.nix` | The hand-written NVFP4 grouped-MoE GEMV, the silu/sum-reduce, the two offload staging kernels, and the paged GQA decode attention kernel. Authored and AOT-compiled in Python; launched by `cuda_driver` with no interpreter at runtime |
 | `c10_cuda` (torch C++) | runtime, via `build.rs` shim | `shim/c10_graph_shim.cpp`, `infrastructure/cuda_graph.rs`, `infrastructure/decode_graph.rs` | The torch current-stream set and the graph memory pool that `tch` does not expose; needed for CUDA-graph capture of torch ops |
@@ -846,11 +846,13 @@ behind the non-default `cudarc` feature (decision 126). It owns device tensors
 the stream the driver launches on; its capture/parity gates are green, and
 M7.2's `models/qwen3_6/load_cudarc.rs` loads the dense tower through it with
 the serving storage policy (decision 129), and M7.3's
-`models/qwen3_6/forward_cudarc.rs` ports the dense math primitives, rope and
-the GDN gates/L2 norm/GQA expand (decisions 130, 131). It is not on the serving
-path:
-`forward_torch.rs` still uses `tch` until M7.3, and `shim/c10_graph_shim.cpp`
-disappears with libtorch in M7.5.
+`models/qwen3_6/forward_cudarc.rs` now carries the complete text-tower forward
+over the driver launchers: `Model` and `CachedModel`, the dense/attention/GDN
+math, the inline MoE and the packed head, with a bf16 stateless and an f32
+cached causal SDPA (decisions 130, 131; `tests/cudarc_model.rs`). It is not on
+the serving path yet:
+`forward_torch.rs` still uses `tch`, and `shim/c10_graph_shim.cpp` disappears
+with libtorch in M7.5.
 
 ---
 

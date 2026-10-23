@@ -440,6 +440,12 @@ LINEAR_KERNELS: dict[str, dict] = {
         "constexprs": causal_sdpa_constexprs(),
         "num_warps": 4,
     },
+    "causal_sdpa_f32": {
+        "fn": _causal_sdpa_kernel,
+        "signature": causal_sdpa("fp32"),
+        "constexprs": causal_sdpa_constexprs(),
+        "num_warps": 4,
+    },
     "repeat_heads_bf16": {
         "fn": _repeat_heads_kernel,
         "signature": repeat_heads("bf16"),

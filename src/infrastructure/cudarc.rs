@@ -31,11 +31,12 @@ use crate::domain::expert_kernel::MoEError;
 use crate::infrastructure::cuda_driver::{CUstream, CudaError, Driver, GdnKernels};
 use crate::infrastructure::kernel_abi::{
     ADD_BF16, ADD_F32, ADD_RMSNORM, AddRmsnormArgs, ArgPack, CAST_BF16_F32, CAST_F32_BF16,
-    CAUSAL_SDPA_BF16, COL_MUL_BF16, COL_MUL_F32, COPY_STRIDED_BF16, COPY_STRIDED_F32,
-    COPY_STRIDED_I32, COPY_STRIDED_I64, COPY_STRIDED_U8, GATHER_ROWS_BF16, GATHER_ROWS_F32,
-    INDEX_SELECT_BF16, LinearAbi, MAX_ALL_F32, MUL_BF16, MUL_F32, REPEAT_HEADS_BF16, ROPE_BF16,
-    SCALAR_BF16, SCALAR_F32, SCATTER_ROWS_BF16, SCATTER_ROWS_F32, SOFTMAX_LAST_F32, SUM_ALL_F32,
-    SUM_LAST_F32, TOPK_LAST_F32, UNARY_BF16, UNARY_F32, add_rmsnorm_args, add_rmsnorm_grid,
+    CAUSAL_SDPA_BF16, CAUSAL_SDPA_F32, COL_MUL_BF16, COL_MUL_F32, COPY_STRIDED_BF16,
+    COPY_STRIDED_F32, COPY_STRIDED_I32, COPY_STRIDED_I64, COPY_STRIDED_U8, GATHER_ROWS_BF16,
+    GATHER_ROWS_F32, INDEX_SELECT_BF16, LinearAbi, MAX_ALL_F32, MUL_BF16, MUL_F32,
+    REPEAT_HEADS_BF16, ROPE_BF16, SCALAR_BF16, SCALAR_F32, SCATTER_ROWS_BF16, SCATTER_ROWS_F32,
+    SOFTMAX_LAST_F32, SUM_ALL_F32, SUM_LAST_F32, TOPK_LAST_F32, UNARY_BF16, UNARY_F32,
+    add_rmsnorm_args, add_rmsnorm_grid,
 };
 
 fn bad(e: impl std::fmt::Display) -> MoEError {
@@ -1511,15 +1512,30 @@ impl Tensor {
     /// `q_offset + i`.
     #[allow(clippy::too_many_arguments)]
     pub fn causal_sdpa(&self, k: &Tensor, v: &Tensor, q_offset: usize) -> Result<Tensor, MoEError> {
-        if self.dtype() != TensorDType::Bf16 || self.dim() != 3 {
-            return Err(bad("causal_sdpa wants a bf16 [qt, q_heads, d]"));
+        let name = match self.dtype() {
+            TensorDType::Bf16 => CAUSAL_SDPA_BF16,
+            TensorDType::F32 => CAUSAL_SDPA_F32,
+            other => {
+                return Err(bad(format!(
+                    "causal_sdpa wants bf16 or f32, got {}",
+                    other.name()
+                )));
+            }
+        };
+        if self.dim() != 3 {
+            return Err(bad("causal_sdpa wants a [qt, q_heads, d]"));
         }
         let (qt, q_heads, d) = (self.shape[0], self.shape[1], self.shape[2]);
         let kv_heads = k.shape.get(1).copied().unwrap_or(0);
-        if k.shape != [k.shape[0], kv_heads, d] || v.shape != k.shape || k.shape[0] < qt {
-            return Err(bad("causal_sdpa k/v shape mismatch"));
+        if k.dtype() != self.dtype()
+            || v.dtype() != self.dtype()
+            || k.shape != [k.shape[0], kv_heads, d]
+            || v.shape != k.shape
+            || k.shape[0] < qt
+        {
+            return Err(bad("causal_sdpa k/v shape or dtype mismatch"));
         }
-        let kernel = self.rt.kernels().abi.kernel(CAUSAL_SDPA_BF16)?;
+        let kernel = self.rt.kernels().abi.kernel(name)?;
         let c = |n: &str| kernel.constexpr(n);
         if c("NUM_Q_HEADS")? as usize != q_heads
             || c("NUM_KV_HEADS")? as usize != kv_heads
@@ -1530,12 +1546,13 @@ impl Tensor {
         let q = self.contiguous()?;
         let k = k.contiguous()?;
         let v = v.contiguous()?;
-        let out = self.rt.zeros(&self.shape, TensorDType::Bf16)?;
+        let out = self.rt.zeros(&self.shape, self.dtype())?;
         if qt == 0 {
             return Ok(out);
         }
         self.rt.kernels().causal_sdpa(
             self.rt.raw_stream(),
+            name,
             q.device_ptr(),
             k.device_ptr(),
             v.device_ptr(),
@@ -1851,6 +1868,7 @@ impl LinearKernels {
     fn causal_sdpa(
         &self,
         stream: CUstream,
+        name: &str,
         q: u64,
         k: u64,
         v: u64,
@@ -1862,7 +1880,7 @@ impl LinearKernels {
         kv_heads: usize,
         d: usize,
     ) -> Result<(), MoEError> {
-        let kernel = self.abi.kernel(CAUSAL_SDPA_BF16)?;
+        let kernel = self.abi.kernel(name)?;
         let mut pack = ArgPack::for_linear(kernel);
         pack.ptr(q)?;
         pack.ptr(k)?;
@@ -1878,12 +1896,7 @@ impl LinearKernels {
         pack.u32((kv_heads * d) as u32)?;
         pack.u32(d as u32)?;
         let mut params = pack.kernel_params()?;
-        self.launch(
-            CAUSAL_SDPA_BF16,
-            (qt as u32, q_heads as u32, 1),
-            &mut params,
-            stream,
-        )
+        self.launch(name, (qt as u32, q_heads as u32, 1), &mut params, stream)
     }
 
     #[allow(clippy::too_many_arguments)]
