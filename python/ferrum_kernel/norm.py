@@ -1,6 +1,6 @@
 """Fused residual-add + GemmaRMSNorm for the bf16 activation stream.
 
-The decode tower ran every norm as a libtorch op soup: an `f32_` cast, a
+The old decode tower ran every norm as a tensor-op soup: an `f32_` cast, a
 `pow` + `mean` for the variance, a `sqrt`, a `reciprocal`, two `mul`s and a
 `to_kind`, plus the separate `x + r` residual add -- about ten tiny kernels per
 site and 80 sites per cached decode step (40 `norm_in` with a residual, 40

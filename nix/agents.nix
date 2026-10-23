@@ -14,12 +14,8 @@ let
   atb = agent-toolbox.lib;
 
   devshellEnv = [
-    "LIBTORCH"
-    "LIBTORCH_INCLUDE"
-    "LIBTORCH_LIB"
     "CUDA_HOME"
     "CUDARC_CUDA_VERSION"
-    "CXX"
     "LD_LIBRARY_PATH"
     "PYTHONPATH"
     "TRITON_LIBCUDA_PATH"

@@ -65,23 +65,21 @@ flowchart TB
 
     subgraph Models["models/qwen3_6/ -- arch-specific"]
       Scalar["forward.rs\nscalar CPU oracle"]
-      Torch["forward_torch.rs\nlibtorch serving forward"]
+      Cudarc["forward_cudarc.rs\ncudarc serving forward"]
     end
 
     subgraph Infra["infrastructure/ -- adapters"]
       Ftw["ftw\nO_DIRECT pread reader + index"]
       Banks["banks\nhost + pinned expert banks"]
-      TorchRt["torch\ndevice + tensor helpers"]
+      TorchRt["torch\ndevice resolution"]
+      CudarcRt["cudarc\ntensor runtime + cuBLAS"]
       CudaDrv["cuda_driver\nlibcuda FFI, cubin launch, pinned mem"]
       CudaMoe["cuda_moe\nNVFP4 slot cache + grouped GEMM"]
       CudaAttn["cuda_attention\npaged GQA decode launcher"]
       CudaGdn["cuda_gdn\nfused GDN decode launcher"]
       CudaLin["cuda_linear\ndense NVFP4 lm_head GEMV"]
       Abi["kernel_abi\ncubin manifest + arg packing"]
-      Graph["cuda_graph\ntorch stream + graph pool bridge"]
       KvcDev["kvcache_dev\nMHA pool + GDN state slabs"]
-      DecBuf["decode_buffers\nfixed-address decode staging"]
-      DecGraph["decode_graph\nper-size graphs + engine service"]
       Prof["profile\nFT_PROFILE stage timer (dev)"]
       Http["http\naxum routes + SSE"]
       Toker["tokenizers_hf\nHF tokenizer + chat template"]
@@ -90,7 +88,6 @@ flowchart TB
 
   subgraph Ext["external, at runtime"]
     FTW[(".model-cache/*.ftw")]
-    LibTorch[["libtorch (via tch)"]]
     LibCuda[["libcuda.so.1 (driver)"]]
     Cubins[("kernel/*.cubin\n(Nix build output)")]
   end
@@ -102,31 +99,28 @@ flowchart TB
   Gen --> Ports
   Registry --> Models
   Registry --> CudaMoe
-  Registry --> DecGraph
   Scalar -.-> Ports
-  Torch -.-> Ports
+  Cudarc -.-> Ports
   Models --> TorchRt
+  Cudarc --> CudarcRt
   Engine --> Ftw --> FTW
   Banks --> FTW
   RunExp --> Ports
   RunExp --> CudaMoe
   CudaMoe --> Abi --> Cubins
   CudaMoe --> CudaDrv --> LibCuda
-  CudaMoe --> TorchRt
+  CudaMoe --> CudarcRt
   CudaAttn --> Abi
   CudaAttn --> CudaDrv
-  Graph --> CudaDrv
-  DecGraph --> Graph
-  DecBuf --> TorchRt
-  Torch --> KvcDev
-  Torch --> CudaAttn
-  Torch --> TorchRt --> LibTorch
+  Cudarc --> KvcDev
+  Cudarc --> CudaAttn
+  CudarcRt --> LibCuda
   Http --> Toker
 ```
 
 Reading the graph: requests enter through `http`, the `generation` loop drives
 the `engine`, which dispatches once through the `registry` to an arch `Model`.
-The model runs its forward via `torch` (serving) or the scalar oracle. The MoE
+The model runs its forward via `cudarc` (serving) or the scalar oracle. The MoE
 block is not part of the model: the model hands its routing decision to the
 core `MoEExecutor` port, implemented by `run_experts::CachedExperts` over the
   `cuda_moe` adapter and the cubins. Everything the domain sees is a
@@ -134,7 +128,7 @@ core `MoEExecutor` port, implemented by `run_experts::CachedExperts` over the
 
 ### 1.1 Host/device split (one process, one GPU)
 
-The serving build (`cuda` feature, `model.device = "cuda"`) keeps the heavy,
+The serving build (`cudarc` feature, `model.device = "cuda"`) keeps the heavy,
 stateful work on the device and the control plane on the host. The domain core
 stays pure: `Tensor` and CUDA handles never cross it (section 4).
 
@@ -146,29 +140,27 @@ stays pure: `Tensor` and CUDA handles never cross it (section 4).
 | Generation loop + KV page-table bookkeeping (`SequenceCache`) | Host | `domain/kvcache.rs`, `application/engine.rs` |
 | FTW index parse + O_DIRECT pread of the checkpoint | Host | `infrastructure/ftw.rs` |
 | Pinned expert banks (17.3 GiB, page-locked, device-mapped) | Host memory | `infrastructure/banks.rs` (`FtwPinnedBanks`) |
-| Dense weights: embedding + all projections + `lm_head` (4.51 GiB bf16; the lm_head kept packed NVFP4 on CUDA) | Device | `models/qwen3_6/forward_torch.rs` |
-| Embedding gather, RMSNorm, RoPE, attention (GQA), GDN recurrence, `lm_head` | Device | `models/qwen3_6/forward_torch.rs` (libtorch) + `infrastructure/cuda_linear.rs` (dense NVFP4 head) |
-| Router: gate matmul + softmax + top-8 | Device | `forward_torch.rs::moe` (ids stay device) |
+| Dense weights: embedding + all projections + `lm_head` (4.51 GiB bf16; the lm_head kept packed NVFP4 on CUDA) | Device | `models/qwen3_6/forward_cudarc.rs`, `models/qwen3_6/load_cudarc.rs` |
+| Embedding gather, RMSNorm, RoPE, attention (GQA), GDN recurrence, `lm_head` | Device | `models/qwen3_6/forward_cudarc.rs` (cudarc) + `infrastructure/cuda_linear.rs` (dense NVFP4 head) |
+| Router: gate matmul + softmax + top-8 | Device | `forward_cudarc.rs` (ids stay device) |
 | Routed experts: slot cache + grouped GEMV | Device | `infrastructure/cuda_moe.rs` (cudarc storage + driver-API cubins) |
 | Slot residency plan (`lru_ensure` / whole-layer) | Device (host plan fallback) | `python/ferrum_kernel/offload.py`, `application/run_experts.rs` |
 | KV pool, GDN state slabs, paged GQA attention | Device | `infrastructure/kvcache_dev.rs`, `infrastructure/cuda_attention.rs` |
-| CUDA-graph capture/replay, torch graph pool | Device | `infrastructure/decode_graph.rs`, `infrastructure/cuda_graph.rs`, `infrastructure/cuda_driver.rs` |
+| CUDA-graph capture/replay | parked | not ported to the cudarc runtime; decode stays eager |
 | Decode stage profile (dev only, `FT_PROFILE=1`) | Device timing events | `infrastructure/profile.rs`; reference probe in `scripts/freetoken_probe/` |
 
 Crossings per step: token ids H2D, streamed expert rows H2D (misses only), logits
 D2H (for host sampling). The pinned expert banks and the dense weights are set up
-once at load. A build without the `cuda` feature, or with `model.device = "cpu"`,
+once at load. A build without the `cudarc` feature, or with `model.device = "cpu"`,
 takes the scalar oracle instead and runs every stage on the host
 (`models/qwen3_6/forward.rs`, decision 12).
 
-**Profiling (dev only).** `FT_PROFILE=1` opens timing events on the forward's
-torch stream and labels stages in `forward_torch.rs` (`embed`, `norm_in`,
-`attn`/`gdn`, `norm_post`, `head`, `router`, `shared`) and `cuda_moe.rs`
-(`moe_lru`, `moe_copy`, `moe_gemm`), dumping `/tmp/ft_profile.{txt,json}` after N
-decode steps. It needs `cuda_graph = false` (a captured graph has no Python-side
-stage boundary); `single_request_throughput_smoke` with `FERRUM_SMOKE_NOGRAPH=1`
-drives it. `scripts/freetoken_probe/` times the read-only reference the same way
-by monkeypatch (decision 88), which is how the per-stage comparison was made.
+**Profiling (dev only).** `FT_PROFILE=1` records CUDA-event stage timings around
+`cuda_moe.rs` (`moe_lru`, `moe_copy`, `moe_gemm`, prefill stages) and dumps
+`/tmp/ft_profile.{txt,json}` after N decode steps. The timer is compiled away on
+a default build. `scripts/freetoken_probe/` times the read-only reference the
+same way by monkeypatch (decision 88), which is how the per-stage comparison was
+made.
 
 ---
 
@@ -179,15 +171,15 @@ Two builds, plus an offline kernel step.
 ```mermaid
 flowchart LR
   subgraph CPUBuild["cargo build / test (default features, no GPU)"]
-    C1["no tch, no C++ compiler"] --> C2["scalar oracle forward only\n(registry::build_scalar)"]
+    C1["no torch, no C++ compiler"] --> C2["scalar oracle forward only\n(registry::build_scalar)"]
     C2 --> C3["fast, portable unit suite"]
   end
 
-  subgraph CudaBuild["cargo build --features cuda (devshell)"]
+  subgraph CudaBuild["cargo build --features cudarc (devshell)"]
     direction TB
-    G1["tch -> torch-sys\nlinks libtorch (roots via LIBTORCH*)"]
-    G2["build.rs\ncc compiles shim/c10_graph_shim.cpp\n+-lc10_cuda, +CUDA_HOME/include"]
-    G3["torch forward + CUDA adapters"]
+    G1["cudarc -> CUDA driver + cuBLAS\n(CUDA_HOME, CUDARC_CUDA_VERSION)"]
+    G2["build.rs stages kernel/*.cubin"]
+    G3["cudarc forward + CUDA adapters"]
     G1 --> G3
     G2 --> G3
   end
@@ -204,24 +196,22 @@ elementwise.py"]
   K3 -. "loaded at runtime by\ncuda_driver via kernel_abi" .-> G3
 ```
 
-- **`cuda` is a cargo feature, not a build-time fact.** `tch` is optional, so
-  the default CPU build needs no libtorch and no C++ compiler. With the feature
-  off, the registry hands back the scalar oracle; with it on, the libtorch
-  forward. `cargo fmt` + `cargo clippy` + `cargo test` stay green without the
-  feature and must be re-run with it in the devshell.
-- **`cudarc` is a separate non-default feature.** It builds the M7.1 adapter
-  without `tch`, so it can be compiled and tested without libtorch. The NVFP4
-  MoE adapter (`cuda_moe.rs`) is on this storage too under `feature = "cudarc"`;
-  its gate is the real-hardware `tests/cuda_moe_matches_reference.rs`. The
+- **`cudarc` is a cargo feature, not a build-time fact.** The default CPU build
+  needs no CUDA toolkit and no C++ compiler; the registry hands back the scalar
+  oracle. With `--features cudarc` the registry builds the cudarc forward on a
+  CUDA device and still falls back to the scalar oracle on a CPU device.
+  `cargo fmt` + `cargo clippy` + `cargo test` stay green without the feature and
+  must be re-run with it in the devshell.
+- **No torch/libtorch in the runtime.** The cudarc adapter, the NVFP4 MoE
+  adapter (`cuda_moe.rs`) and the dense launchers share one CUDA context. The
   devshell points `CUDA_HOME` at a merged root whose `libcublas` is CUDA 13.4
   (the 12.9 copy is the M7.0 prefill slowdown) and sets
-  `CUDARC_CUDA_VERSION=13040`; Triton keeps the 12.9 `ptxas`.
-- **`build.rs` stages the cubins and compiles the capture bridge.** Every build
-  copies `$FERRUM_KERNEL_DIR/kernel` (the `kernels` Nix derivation,
-  `nix/kernels.nix`) into `OUT_DIR/kernel`; under `--features cuda` it also
-  invokes `cc` on `shim/c10_graph_shim.cpp` (the torch CUDA current-stream and
-  graph-mempool facilities `tch` does not expose) and adds
-  `-L$LIBTORCH_LIB/lib -lc10_cuda`.
+  `CUDARC_CUDA_VERSION=13040`; Triton keeps the 12.9 `ptxas`. The gates are the
+  real-hardware `tests/cuda_moe_matches_reference.rs` and
+  `tests/cudarc_engine_generate.rs`.
+- **`build.rs` stages the cubins.** Every build copies
+  `$FERRUM_KERNEL_DIR/kernel` (the `kernels` Nix derivation, `nix/kernels.nix`)
+  into `OUT_DIR/kernel`. There is no C++ bridge any more; capture is parked.
 - **Kernels are authored in Triton and compiled ahead of time by Nix.**
   `python/ferrum_kernel/aot.py` emits `kernel/*.cubin`, `*.ptx` and
   `manifest.json` in the `kernels` derivation; nothing is committed. The engine
@@ -290,7 +280,7 @@ sequenceDiagram
   Eng->>FTW: parse freetoken_weight.json + O_DIRECT pread shards
   Eng->>Dev: resolve_compute_device (probe_cuda)
   Eng->>Reg: build(config_json, index, reader, device, config)
-  Note over Reg: reads architectures[0],<br/>builds MoE port + KV cache,<br/>then TorchQwen3_6::load
+  Note over Reg: reads architectures[0],<br/>builds MoE port + KV cache,<br/>then CudarcQwen3_6::load
   Reg-->>Eng: Box<dyn CachedModel>
   Eng->>Eng: load tokenizer, eos list, limits
   Eng-->>Main: Engine
@@ -320,7 +310,7 @@ classDiagram
   class MoETensor { <<trait>> +numel() +to_host_f32() +as_any() }
 
   class Qwen3_6
-  class TorchQwen3_6
+  class CudarcQwen3_6
   class HfTokenizer
   class FtwReader
   class DeviceCache
@@ -328,11 +318,10 @@ classDiagram
   class FtwPinnedBanks
   class CudaMoE
   class CachedExperts
-  class DevTensor
-  class EngineDecodeGraphs
+  class Tensor
 
   Qwen3_6 ..|> CachedModel
-  TorchQwen3_6 ..|> CachedModel
+  CudarcQwen3_6 ..|> CachedModel
   HfTokenizer ..|> Tokenizer
   FtwReader ..|> WeightsReader
   DeviceCache ..|> KvCache
@@ -341,8 +330,7 @@ classDiagram
   CudaMoE ..|> ExpertGemm
   CudaMoE ..|> ExpertSlotStore
   CachedExperts ..|> MoEExecutor
-  DevTensor ..|> MoETensor
-  EngineDecodeGraphs ..|> CapturedDecode
+  Tensor ..|> MoETensor
 ```
 
 Note the two deliberate non-obvious shapes:
@@ -364,7 +352,7 @@ flowchart LR
   Idx["FtwIndex\nparse freetoken_weight.json"] --> Ent["TensorDesc\nname/kind/dtype/shape/off"]
   Mm["FtwReader"] -- "WeightsReader::read_range" --> Shards[("shards, O_DIRECT pread")]
   Ent --> Mm
-  Mm --> PWiden["Loader (forward_torch)\ndense widen: NVFP4/FP8/bf16 -> resident bf16"]
+  Mm --> PWiden["Loader (load_cudarc)\ndense widen: NVFP4/FP8/bf16 -> resident bf16"]
   Mm --> FtwBanks["FtwBanks (ExpertSlabSource)\nper-expert slab reads"]
   Mm --> Pin["FtwPinnedBanks (PinnedBankSource)\npage-locked, device-mapped, filled once"]
 ```
@@ -384,7 +372,7 @@ populates the page cache and stays disk-bound; on a filesystem without `O_DIRECT
 ```mermaid
 sequenceDiagram
   participant Reg as registry::build
-  participant Ld as TorchQwen3_6::load
+  participant Ld as CudarcQwen3_6::load
   participant Rd as FtwReader
   participant Dev as device
   participant MoE as registry::moe_port
@@ -403,16 +391,17 @@ sequenceDiagram
 ### 3.4 Model tower `[core]`
 
 **Static.** `models/qwen3_6/` owns the arch: `config.rs` (text_config ->
-`ModelParams`), `weights.rs` (tensor names), `forward.rs` (scalar oracle) and
-`forward_torch.rs` (serving). Both implement `CachedModel`, so the engine cannot
-tell which is loaded (decision 12/21).
+`ModelParams`), `weights.rs` (tensor names), `forward.rs` (scalar oracle),
+`load_cudarc.rs` (dense tower load) and `forward_cudarc.rs` (serving). Both
+forwards implement `CachedModel`, so the engine cannot tell which is loaded
+(decision 12/21).
 
 ```mermaid
 flowchart TB
   MP["ModelParams\n(from text_config)"] --> T
   subgraph T["tower (one impl chosen by feature + registry)"]
     S["Qwen3_6 (forward.rs)\nscalar CPU, panics on weight error"]
-    G["TorchQwen3_6 (forward_torch.rs)\nlibtorch, resident bf16 + KV cache"]
+    G["CudarcQwen3_6 (forward_cudarc.rs)\ncudarc, resident bf16 + KV cache"]
   end
   G --> Mix["layers: 10 full-attention GQA\n+ 30 GatedDeltaNet"]
   Mix --> MoEPort["MoEExecutor port\n(routed experts)"]
@@ -425,7 +414,7 @@ kernel question, not a scheduling one).
 ```mermaid
 sequenceDiagram
   participant Eng as Engine::run_forward_cached
-  participant M as TorchQwen3_6::forward_cached
+  participant M as CudarcQwen3_6::forward_cached
   participant KV as DeviceCache / MhaPool
   participant ST as LinearStateSlabs
   participant P as MoEExecutor (CachedExperts)
@@ -457,7 +446,7 @@ the logits back; `forward_decode_into(bufs)` reads them from the device
 device path gathers attention over a **fixed-length window** (`DecodeBuffers::
 window`, staged per row by `stage_window`): the lagging slots are dropped by the
 step-position mask and carry only a valid pool index, so the gather keeps the
-same shape and addresses every step -- the precondition for a captured graph.
+same shape and addresses every step -- the precondition for the cubin launchers.
 
 ### 3.5 MoE offload `[core]` (whole-layer prefill overlap `[core]`)
 
@@ -495,7 +484,7 @@ flowchart TB
 ```
 
 **Dynamic -- device-staged layer step** (`grouped_moe_staged`). This is the path
-a captured graph needs: the residency plan never crosses to the host.
+the launchers need: the residency plan never crosses to the host.
 
 ```mermaid
 sequenceDiagram
@@ -519,7 +508,7 @@ is a route cap, and its committed `BLOCK_C = 2048` caps the slot cache it can
 address (decision 85). The slot count itself is `moe.cache_size_slots`: an
 integer or `"auto"` (default), where auto sizes it from the free device memory
 once the tower and KV pool are resident, reserving 512 MiB for the prefill
-scratch and graphs (item 12, decisions 90, 127, `registry::resolve_cache_slots`). `CudaMoE::grouped_moe_staged` chunks a larger list by tokens
+scratch and transient activations (item 12, decisions 90, 127, `registry::resolve_cache_slots`). `CudaMoE::grouped_moe_staged` chunks a larger list by tokens
 (`staged_chunk_tokens`) and repeats the sequence per chunk, the device LRU and
 the pinned banks carrying across, so prefill uses the same device path as decode
 (decision 66). `CachedExperts` without device staging still takes the host plan
@@ -684,8 +673,8 @@ scope.
 
 **Dynamic -- a streaming request.** Handlers never call the model directly: they
 tokenize, submit a `Job` to the `Dispatcher`, and await its reply. The dispatcher
-worker coalesces the queued jobs into one `run_batch` (one captured decode step
-for every live row), which is both the batching lever (item 11) and what keeps
+worker coalesces the queued jobs into one `run_batch` (one forward over the live
+rows), which is both the batching lever (item 11) and what keeps
 the single CUDA stream / MoE slot cache / prefix tree free of concurrent
 access.
 
@@ -703,7 +692,7 @@ sequenceDiagram
   H->>D: submit Job{request, sink, reply}
   D->>G: drain queue (<= max_running) -> run_batch
   loop until stop
-    G->>E: prefill: run_prefill_cached (non-final chunk) / run_forward_cached (final) / decode: replay captured graphs (or run_forward_cached)
+    G->>E: prefill: run_prefill_cached (non-final chunk) / run_forward_cached (final) / decode: run_forward_cached
     E-->>G: sampled token per live row (final prefill chunk and decode only)
     G->>T: decode token
     G->>Sink: token(uid, piece) -> SSE frame
@@ -719,163 +708,49 @@ channel and a per-request sink returns `false` when it is full, which aborts
 only that request instead of stalling the batch. `Request` carries its own seed,
 so co-batching never changes a lone request's tokens.
 
-### 3.9 CUDA-graph decode capture `[core]`
+### 3.9 CUDA-graph decode capture -- parked
 
-One captured executable per decode batch size, over the whole forward, with the
-MoE launches inside it (decision 40). The composition root builds the side
-stream, the buffers and the graphs at load and hands the engine the
-`CapturedDecode` service; the generation loop replays the smallest captured size
-that fits a decode step (decision 61).
-
-```mermaid
-flowchart TB
-  subgraph Done["done"]
-    B1["cuda_driver\nstream + graph capture FFI\n(begin/end/instantiate/launch)"]
-    B2["cuda_moe split\nstage / launch / collect\n(launch is capture-safe)"]
-    B3["cuda_graph + shim\ntorch current stream + graph pool"]
-    DB["decode_buffers\nfixed-address batch metadata +\nfixed-length KV window"]
-    B4["device-logits tail\nforward_cached_into writes the\nlm_head pass into a device buffer"]
-    B5["device-addressed step\nforward_decode_into reads\nids/positions/slots off buffer\n(gated device == re-fed forward)"]
-    N1["MoE staging split\nresident E2M1 + on-device rope\n(no host upload in the step)"]
-    N2["decode_graph\nDecodeGraph capture/replay with a\nprivate pool + DecodeGraphSet\nper-size plan and dummy padding"]
-    N3["engine-owned capture\nregistry builds the side stream + graphs,\nEngine::with_captured owns the service"]
-  end
-```
-
-**Dynamic -- capture at load (composition root) and replay (engine).**
-
-```mermaid
-sequenceDiagram
-  participant Root as registry (composition root)
-  participant Eng as engine
-  participant DB as DecodeBuffers
-  participant GP as GraphPool (shim)
-  participant DR as cuda_driver
-  participant MoE as cuda_moe launch
-  participant Torch as torch ops
-  Note over Root: at load, decision 61
-  Root->>DR: create side stream, set current stream
-  Root->>DB: reserve padding row (slot + page)
-  Root->>DB: warmup uncaptured step
-  Root->>GP: begin pool
-  Root->>DR: begin_capture(side stream)
-  Root->>Torch: forward ops (recorded)
-  Root->>MoE: launch (recorded)
-  Root->>DR: end_capture -> graph_instantiate
-  Root->>Eng: Engine::with_captured(service)
-  loop each decode step
-    Eng->>DB: overwrite staging in place (pad with the dummy row)
-    Eng->>DR: graph_launch(exec, side stream)
-    Eng->>DB: read logits rows
-  end
-```
-
-Contracts already fixed: capture runs only on a flags-0 side stream (never the
-legacy stream); a `StagedGroup` and the pinned banks must outlive every graph
-captured over them; a captured grid pins the batch shape; `stage_into` is the
-only writer between replays. The whole step is now capture-shaped *and*
-batch-generic: `forward_decode_into` runs every row of `DecodeBuffers`, with the
-`CacheAccess::Device` arms of `full_attention_cached` / `gdn_cached` reading
-batched pool and state accessors (`MhaPool::gather_rows`,
-`LinearStateSlabs::{conv,recurrent}_state_rows`) and additive batched peers
-(`conv1d_silu_step_batch`, `gdn_recurrence_step_batch`, `gdn_core_batch`) beside
-the untouched single-row host helpers; only the tower tail branches (prefill
-normalizes the last token, decode normalizes all rows). The device attention arm
-runs the paged GQA kernel through `infrastructure/cuda_attention.rs`
-(`PagedAttention`): it loads the `attention` manifest section and launches the
-AOT cubin on the capture's stream, reading the row's KV straight out of the
-`MhaPool` slabs (`kv_slab_ptrs`) through the staged `DecodeBuffers` location
-window; when the launcher is absent or the pool is not f32 the arm falls back to
-the dense padded-window gather (decision 55). The device GDN arm runs the fused
-decode kernel through `infrastructure/cuda_gdn.rs` (`GdnDecode`): it loads the
-`linear` manifest section and launches the AOT cubin on the capture's
-stream, folding the gating, the q/k L2-norm and the delta-rule update into one
-launch per layer and reading/writing the row's `LinearStateSlabs` recurrent state
-in place; when the launcher is absent (CPU, decision 21) the arm keeps the
-op-by-op `gdn_core_batch` (decision 77). The same launcher's `tri_solve` runs the
-prefill chunked recurrence's triangular solve (`gdn_tri_solve`, decision 103),
-with the libtorch row loop as the fallback. The forward's tail is
-device-local: `TorchQwen3_6::forward_cached_into` writes the `lm_head` block pass
-straight into a caller-owned `[rows, vocab]` device logits buffer with no host
-round-trip, and `forward_decode_into` addresses the same forward entirely from a
-`DecodeBuffers` row (ids, positions, state slots, fixed KV window). The
-device-staged MoE port (`routed_via_port` -> `grouped_moe_staged`) reads its
-activations, router ids and route weights off device buffers, keeps its `E2M1`
-decode table resident, and builds the rope table on the device, so no step
-uploads a host tensor. `infrastructure/decode_graph.rs` then captures one
-`DecodeGraph` per batch size -- each with its own private torch graph pool and
-its fixed-address `DecodeBuffers` -- and a `DecodeGraphSet` picks the smallest
-captured size that fits a step and pads the tail with dummy rows (decision 59).
-`tests/decode_graph_capture.rs` captures one whole real decode step and replays
-it equal to the uncaptured twin, and its batch gate replays `{1,2,4}` equal to
-the uncaptured twin. The composition root (`application/registry.rs`) now owns
-the allocation: with `model.cuda_graph` on, it creates the side stream, builds
-the MoE and attention ports on it, reserves the dummy padding row (which needs
-one extra state slot, hence the `state_slots(N, padding)` pool), records the
-graphs for `graph_batch_sizes(max_running)` and returns them in
-`BuiltModel::captured`, which `load_engine` passes to `Engine::with_captured`
-(decision 61). A captured build keeps torch on the side stream: `run_step` binds
-it before staging and `TorchQwen3_6::bind_stream` binds it for every forward, so
-prefill's torch ops do not race the driver-API MoE and attention launches. The
-gated `tests/engine_real_generate.rs::a_captured_engine_decodes_on_its_graphs`
-reaches the oracle token through the captured graph.
-
----
+Decode capture is not ported to the cudarc runtime. The engine keeps the
+`CapturedDecode` port and the `BuiltModel.captured` field (always `None`), so
+the generation loop keeps its captured branch, but the composition root builds
+no graphs and `cuda_graph = true` only warns. The previous engine-owned capture
+implementation (torch stream + graph memory pool, `decode_graph`,
+`decode_buffers`) was removed with libtorch (decision 132). Porting capture is
+future work; the measured numbers that came from it remain history in
+`OPTIMIZATION.md`/`DONE.md`.
 
 ## 4. External libraries and where they are used
 
 | Library / tool | Kind | Used by | Purpose |
 |---|---|---|---|
-| `libtorch` (via `tch`) | runtime, `cuda` feature | `infrastructure/torch.rs`, `models/qwen3_6/forward_torch.rs`, `infrastructure/kvcache_dev.rs`, `infrastructure/cuda_moe.rs`, `infrastructure/decode_graph.rs` | All dense compute (GEMMs, norms, rope, attention, GDN), device tensors, the KV/state slabs, and the MoE slot banks |
-| `cudarc` 0.19.10 | runtime, non-default `cudarc` feature | `infrastructure/cudarc.rs`, `models/qwen3_6/{load_cudarc,forward_cudarc}.rs`, `tests/cudarc_{adapter,load,forward}.rs` | M7 torch-less tensor adapter: owned bf16/f32/i32/i64/u8 buffers, cuBLAS BF16/f32 GEMM, committed cubins, capture, and the elementwise/unary/scalar/col-scale/reduction/softmax/top-k/rope/head-repeat kernels; M7.2 loads the dense text tower with the serving storage policy, M7.3 runs the complete text-tower forward and cache path. Not on the serving path |
-| CUDA driver API (`libcuda.so.1`) | runtime, hand-rolled FFI | `infrastructure/cuda_driver.rs` | Load and launch the cubins, allocate device + page-locked memory, capture and replay CUDA graphs |
+| `cudarc` 0.19.10 | runtime, non-default `cudarc` feature | `infrastructure/cudarc.rs`, `models/qwen3_6/{load_cudarc,forward_cudarc}.rs`, `infrastructure/kvcache_dev.rs`, `infrastructure/cuda_moe.rs` | The serving tensor runtime: owned bf16/f32/i32/i64/u8 buffers, cuBLAS BF16/f32 GEMM, committed cubins, the KV/state slabs and the elementwise/unary/scalar/col-scale/reduction/softmax/top-k/rope/head-repeat kernels |
+| CUDA driver API (`libcuda.so.1`) | runtime, hand-rolled FFI | `infrastructure/cuda_driver.rs` | Load and launch the cubins, allocate device + page-locked memory, stream and event ordering |
 | Triton (cubins) | build-time authoring; artifacts embedded at compile time | `python/ferrum_kernel/*`, `nix/kernels.nix` | The hand-written NVFP4 grouped-MoE GEMV, the silu/sum-reduce, the two offload staging kernels, and the paged GQA decode attention kernel. Authored and AOT-compiled in Python; launched by `cuda_driver` with no interpreter at runtime |
-| `c10_cuda` (torch C++) | runtime, via `build.rs` shim | `shim/c10_graph_shim.cpp`, `infrastructure/cuda_graph.rs`, `infrastructure/decode_graph.rs` | The torch current-stream set and the graph memory pool that `tch` does not expose; needed for CUDA-graph capture of torch ops |
 | `axum` + `tokio` | runtime | `infrastructure/http.rs`, `main.rs` | HTTP server, SSE streaming, and the async runtime that offloads forwards to blocking threads |
 | `tokenizers` + `minijinja` | runtime | `infrastructure/tokenizers_hf.rs` | HF byte-level BPE tokenizer and the checkpoint's chat template (Python string methods rewritten to filters; `json` feature for the template's `tojson`) |
 | Python + `uv` (FreeToken venv) | build-time only | `scripts/convert_hf_to_ftw.py`, `FreeToken/` | The one-time HF -> FTW conversion via `ft checkpoint`; never in the serving process |
 
-Boundary note: `tch`/`Tensor` and the CUDA driver handles live entirely in
+Boundary note: the cudarc `Tensor` and the CUDA driver handles live entirely in
 `infrastructure`; the domain sees only `MoETensor`, counts and opaque bytes.
-
-**Planned boundary `[partial]`: torch-less tensor runtime (M7).** Replace
-`tch` with a Rust tensor runtime behind the same `cuda` adapter boundary.
-M7.0 chose a minimal `cudarc` layer over candle (decision 124); M7.1 built it
-behind the non-default `cudarc` feature (decision 126). It owns device tensors
-(bf16/f32/i32/i64/u8), cuBLAS BF16 GEMM, the committed cubins, raw pointers and
-the stream the driver launches on; its capture/parity gates are green, and
-M7.2's `models/qwen3_6/load_cudarc.rs` loads the dense tower through it with
-the serving storage policy (decision 129), and M7.3's
-`models/qwen3_6/forward_cudarc.rs` now carries the complete text-tower forward
-over the driver launchers: `Model` and `CachedModel`, the dense/attention/GDN
-math, the inline MoE and the packed head, with a bf16 stateless and an f32
-cached causal SDPA (decisions 130, 131; `tests/cudarc_model.rs`). It is not on
-the serving path yet:
-`forward_torch.rs` still uses `tch`, and `shim/c10_graph_shim.cpp` disappears
-with libtorch in M7.5.
+There is no torch/libtorch dependency anywhere in the tree (decision 132).
 
 ---
 
 ## 5. Cross-cutting invariants
 
-- **One allocator, one CUDA context.** The slot banks are libtorch tensors and
-  the driver launches read their raw pointers, so there is a single context and
-  a single allocator behind both paths.
-- **Stable addresses for capture.** Dense weights, MoE banks and pinned host
-  banks are allocated once and never move; that is a precondition for a captured
-  graph to bake their pointers.
-- **A captured build follows one stream.** When the composition root captures, the
-  driver-API MoE and attention launches and every torch op of a forward run on the
-  capture's flags-0 side stream: `EngineDecodeGraphs::run_step` binds it before
-  staging and `TorchQwen3_6::bind_stream` binds it for each forward, so the
-  staged H2D copies, the recorded ops and the replay are ordered on one stream.
+- **One allocator, one CUDA context.** The slot banks and the dense tensors are
+  cudarc allocations and the driver launches read their raw pointers, so there is
+  a single context behind both paths.
+- **Stable addresses for the launchers.** Dense weights, MoE banks and pinned
+  host banks are allocated once and never move; the cubin launches bake their
+  pointers.
 - **Least-lock, `&self` ports.** The device slot cache is process-wide, so the
   store/gemm ports take `&self` and `Mutex<CudaMoE>` is passed as both.
 - **Host/device boundary.** The serving forward is device-resident except
   tokenization, scheduling and sampling, which run on the host; only token ids,
   streamed expert rows (H2D) and logits (D2H) cross the boundary (section 1.1).
 - **The scalar forward is an oracle.** It stays behind the same `Model` trait,
-  is what runs in the CPU build, and is what the libtorch path is checked
+  is what runs in the CPU build, and is what the CUDA path is checked
   against (plus the pinned FreeToken token oracle).
 - **Gated tests.** GPU-only work is `--ignored` and run under
   `scripts/run-gated.sh` (serial, address-space capped); CPU-only units run in

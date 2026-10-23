@@ -8,8 +8,8 @@
 # mount) turns "host dies" into "malloc returns null and the test fails".
 #
 # The cap has to clear address space, not resident bytes: RLIMIT_AS counts the
-# 20.3 GiB shard mapping, the CUDA device VA, libtorch's own mappings and the
-# 4.51 GiB of resident tower weights (decision 40). The cap is 64 GiB: it still
+# 20.3 GiB shard mapping, the CUDA device VA and the 4.51 GiB of resident tower
+# weights (decision 40). The cap is 64 GiB: it still
 # catches an accidental whole-bank widening (16.9 GiB of anonymous growth)
 # without mistaking mapped file and device memory for a leak. It was lowered from
 # a measured 42 GiB VmPeak (VmRSS 5.8 GiB) to 48 GiB in decision 41, then raised
@@ -18,12 +18,12 @@
 #
 # Usage: scripts/run-gated.sh [--release] [--features <list>] <test-name> [-- args]
 #   scripts/run-gated.sh --release one_token_prediction_matches_the_oracle
-#   scripts/run-gated.sh --release --features cuda one_token_prediction_matches_the_oracle
+#   scripts/run-gated.sh --release --features cudarc one_token_prediction_matches_the_oracle
 #   scripts/run-gated.sh logit_lens_locates_the_first_bad_layer
 #
-# --features matters: without it the build has no libtorch and the engine runs
-# the scalar reference forward, which is ~100x slower and is not the path M1b is
-# gating.
+# --features matters: without it the build has no CUDA runtime and the engine
+# runs the scalar reference forward, which is ~100x slower and is not the path
+# the serving gates cover.
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."

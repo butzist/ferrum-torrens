@@ -764,7 +764,7 @@ pub(crate) fn topk_renorm(p: &[f32], n: usize, e: usize, k: usize) -> (Vec<usize
 
 /// One contiguous sequence through the whole tower.
 /// Stage-level l2/absmax trace, gated on `FT_TRACE=1`. The scalar reference and
-/// the libtorch path print the same lines so a real-checkpoint run can diff them
+/// the CUDA path print the same lines so a real-checkpoint run can diff them
 /// layer by layer and localise the first divergence.
 pub(crate) fn trace(stage: &str, layer: usize, l2: f64, amax: f64) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

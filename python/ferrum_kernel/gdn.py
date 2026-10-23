@@ -1,6 +1,6 @@
 """Fused GDN (gated-delta-net) decode kernel (TODO.md section 8 item 15).
 
-The libtorch decode path ran the linear-attention mixer as a dozen-plus ops per
+The old decode path ran the linear-attention mixer as a dozen-plus ops per
 layer: separate `softplus`/`sigmoid`/`exp` gating, a `pow`/`sum`/`sqrt`/`recip`
 L2-norm on q and k, `exp` decay, a `sum_dim` for `kv_mem`, an outer product, a
 second `sum_dim` for the output, each with an `f32_` cast of a bf16 operand. Over

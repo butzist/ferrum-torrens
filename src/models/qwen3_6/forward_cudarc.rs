@@ -1,13 +1,11 @@
 // M7.3: the torch-less Qwen3.6 text-tower forward.
 //
 // The dense primitives (`linear`, the GDN gates, the RMSNorm, rope and the
-// router's top-k) are gated against the `tch` formulations in
+// router's top-k) are gated against host references in
 // `tests/cudarc_forward.rs`. `CudarcQwen3_6` composes them with the driver
 // launchers into the full tower: `Model` for the stateless path and
 // `CachedModel` for the host-cache prefill/decode path over `DeviceCache`.
-//
-// It is not wired into the serving path yet: `forward_torch.rs` still drives
-// the engine until the registry and captured decode follow-ups land.
+// It is the serving forward behind the `cudarc` feature.
 
 use std::sync::Arc;
 
@@ -82,7 +80,7 @@ pub fn softplus(x: &Tensor) -> Result<Tensor> {
 /// `x @ w.T * row_scale`, the shape every quantized projection takes.
 ///
 /// `w` is `[out, in]` bf16 and `row_scale` the f32 `[out]` factor (None for a
-/// bf16 weight). Matches `forward_torch::linear`: bf16 GEMM, f32 scale, bf16
+/// bf16 weight). Matches the serving storage policy: bf16 GEMM, f32 scale, bf16
 /// storage for the activation stream.
 pub fn linear(x: &Tensor, w: &Tensor, row_scale: Option<&Tensor>) -> Result<Tensor> {
     let y = x
@@ -108,8 +106,8 @@ pub fn topk_renorm(probs: &Tensor, k: usize) -> Result<(Tensor, Tensor)> {
 /// Partial-NeoX rope tables: `cos`/`sin` f32 `[max_len, rotary_dim / 2]`.
 ///
 /// The angle is `pos * base^(-2i/rotary_dim)` computed in f64 and rounded once
-/// to f32, matching `forward_torch::precompute_rope_cache`; the trig runs on the
-/// device so it uses the same CUDA `cosf`/`sinf` as the `tch` path.
+/// to f32, matching the serving rope tables; the trig runs on the
+/// device so it uses the same CUDA `cosf`/`sinf` as the rope kernel.
 pub fn rope_tables(
     rt: &Runtime,
     max_len: usize,

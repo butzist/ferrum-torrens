@@ -1,5 +1,9 @@
 # Torch-less runtime: candle re-evaluation (2026-10-21)
 
+> **Status: closed (decision 132).** Candle was rejected (decision 124); the
+> minimal cudarc runtime became the serving path and libtorch was removed. This
+> document is history for the evaluation, not an open plan.
+
 Status: evaluation + spike plan. No code from this plan is on the serving path yet.
 Decision: `DONE.md` 114.
 
@@ -98,14 +102,14 @@ tensor layer (same shape, less code) rather than abandoning the milestone.
   `infrastructure/torch.rs` helpers and `Device`.
 - **M7.2 Weights and load.** FTW dense widening/upload through candle; keep
   `domain::dequant` as the host transform.
-- **M7.3 Forward.** Port `forward_torch.rs` off `tch::Tensor`; keep the scalar
-  oracle as the gate.
-- **M7.4 Kernels and capture.** Point every launcher at the candle stream and
-  raw storage; disable event tracking for capture; move the C++ graph shim out
-  (`shim/c10_graph_shim.cpp` goes away with libtorch).
-- **M7.5 Remove libtorch.** Drop `tch`, `torch-sys`, the `cuda` C++ build
-  script, the shim and the libtorch closure; keep `--features cuda` as the
-  runtime gate or rename it to match the new adapter.
+- **M7.3 Forward.** Done: `forward_cudarc.rs` replaced `forward_torch.rs`; the
+  scalar oracle stays the gate.
+- **M7.4 Kernels and capture.** Done for kernels: every launcher is on the
+  cudarc stream and raw storage, and the C++ graph shim is gone. Capture is
+  parked, not ported.
+- **M7.5 Remove libtorch.** Done: `tch`, `torch-sys`, the C++ build script, the
+  shim and the libtorch closure are removed; the runtime gate is
+  `--features cudarc`.
 
 Gates per slice: the existing unit suite, the kernel interpreter selftest, and
 one at a time of the real-checkpoint GPU gates. The end state is the same gate
@@ -160,7 +164,7 @@ only kernel authoring path.
 The devshell now provides `cudaPackages_13_4.libcublas` (13.8.0.4) through a
 merged `CUDA_HOME`, sets `CUDARC_CUDA_VERSION=13040`, and puts the 13.4
 `libcublas.so.13` first on `LD_LIBRARY_PATH`. Triton keeps the 12.9 `ptxas`;
-the default and `--features cuda` builds keep their previous headers. The
+the default build keeps its previous headers. The
 merged root was validated with `nix develop` (`libcublas.so.13` resolves to
 the 13.4 store path) and the gates below.
 

@@ -1,13 +1,12 @@
 // M7.2: the Qwen3.5/3.6 text tower loaded into cudarc tensors.
 //
-// This mirrors `forward_torch::Loader`'s storage policy without `tch`:
+// This carries the serving storage policy without a torch runtime:
 // bf16 weights stay bf16, FP8 projections keep the checkpoint's e4m3 bytes and
 // per-row scale (the W8A16 kernel reads them), the NVFP4 shared expert keeps
 // its K-major banks and also gets the widened bf16 weight prefill needs, and
 // the NVFP4 lm_head stays packed. `domain::dequant` is still the only host
 // widening path, and the FTW reader is unchanged.
 //
-// The consumer is the M7.3 forward; nothing here is on the serving path yet.
 
 use half::bf16;
 use std::sync::Arc;
@@ -33,7 +32,7 @@ pub enum LoadError {
 type Result<T> = std::result::Result<T, LoadError>;
 
 /// Rows widened per window while a projection is pulled out of the checkpoint,
-/// so the host never holds a whole 2 GB tensor. Matches the tch loader.
+/// so the host never holds a whole 2 GB tensor. Matches the serving loader policy.
 const LOAD_BLOCK_ROWS: usize = 4_096;
 
 /// The K-major NVFP4 banks the dense GEMV/GEMM reads: `packed [K/8, N]` i32,
@@ -59,7 +58,7 @@ pub enum DenseWeight {
 pub struct Dense {
     pub w: DenseWeight,
     /// Per-row f16 global for an NVFP4 weight widened to bf16; applied after
-    /// the matmul, exactly like the tch path's `row_scale`.
+    /// the matmul, exactly like the serving path's `row_scale`.
     pub row_scale: Option<Tensor>,
     /// The packed decode banks, for an NVFP4 weight (shared expert only).
     pub nvfp4: Option<Nvfp4Banks>,
@@ -413,7 +412,7 @@ impl Loader<'_> {
                 let (packed, scale, global) = self.nvfp4_kmajor(name, rows, cols)?;
                 // The widened bf16 weight for prefill, in LOAD_BLOCK_ROWS
                 // windows; the row global is held out and applied after the
-                // matmul, matching the tch path.
+                // matmul, matching the serving path.
                 let mut values = Vec::with_capacity(rows * cols);
                 let mut globals = Vec::with_capacity(rows);
                 let (pack_per, scale_per) = (cols / 2, cols / 16);

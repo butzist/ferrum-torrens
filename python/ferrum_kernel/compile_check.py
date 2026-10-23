@@ -104,7 +104,7 @@ def check(name: str, fn, signature: dict, constexprs: dict) -> None:
 
 def main() -> int:
     failures = 0
-    # f32 activations out of libtorch would be fp32; bf16 activations are the
+    # f32 activations out of ATen would be fp32; bf16 activations are the
     # serving shape, so check both and the bf16 store path.
     tl_dtypes = {"fp32": tl.float32, "bf16": tl.bfloat16}
     for a_dtype in tl_dtypes:

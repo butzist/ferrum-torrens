@@ -5,11 +5,11 @@
 // the existing decision-69/71 commits already provide the tool-call anchor, so no
 // extra mid-decode snapshot is needed.
 //
-//   cargo test --release --features cuda --test tool_call_anchor -- --ignored --nocapture
+//   cargo test --release --features cudarc --test tool_call_anchor -- --ignored --nocapture
 //
 // (needs .model-cache/Qwen3.6-35B-A3B-NVFP4.ftw and a CUDA device)
 
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cudarc")]
 
 use serial_test::serial;
 use std::str::FromStr;
@@ -127,7 +127,7 @@ fn generate_greedy(
 #[ignore = "requires the converted checkpoint and a cuda device"]
 fn a_tool_call_turn_is_reused_by_the_follow_up() {
     let m = model();
-    let cache = m.cache().expect("the libtorch forward carries a kv cache");
+    let cache = m.cache().expect("the cudarc forward carries a kv cache");
     let tok = HfTokenizer::from_file(&format!("{FTW_DIR}/tokenizer.json")).unwrap();
     let eos = eos_ids_from_ftw_dir(std::path::Path::new(FTW_DIR)).unwrap();
     let tools = tools();

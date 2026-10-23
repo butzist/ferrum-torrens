@@ -746,7 +746,7 @@ impl CudaMoE {
         };
         let pack = lru_ensure_args(&self.staging_abi, &args).map_err(bad_abi)?;
         let mut params = pack.kernel_params().map_err(bad_abi)?;
-        // SAFETY: every pointer in `args` is a live libtorch allocation in the
+        // SAFETY: every pointer in `args` is a live cudarc allocation in the
         // context made current at construction, `params` was built from this
         // kernel's manifest entry, and `stream` is this adapter's stream.
         unsafe { self.staging.launch(lru, &mut params, self.stream) }.map_err(driver)
@@ -1027,7 +1027,7 @@ impl CudaMoE {
         ] {
             let kernel = self.abi.kernel(name).map_err(bad_abi)?;
             let mut params = pack.kernel_params().map_err(bad_abi)?;
-            // SAFETY: every pointer in `args` is a live libtorch allocation in
+            // SAFETY: every pointer in `args` is a live cudarc allocation in
             // the context made current at construction, `pack` was built from
             // this kernel's manifest entry, and `stream` is the stream this
             // adapter was built for (the capture stream when one is used).

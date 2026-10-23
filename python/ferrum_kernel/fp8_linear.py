@@ -9,7 +9,7 @@ running cuBLAS bf16 GEMV was "the dominant decode cost (~54% of the step)"
 because it reads 2x the bytes of the resident FP8 weight. Keeping the weight
 FP8 and reading it directly halves that traffic.
 
-We dropped the W8A8 `torch._scaled_mm` path: it is a libtorch op `tch` does not
+We dropped the W8A8 `torch._scaled_mm` path: it is available only through the
 expose, and FreeToken's own numbers put W8A16 at M=1 within ~0.5% of W8A8, so one
 scheme runs every M. We also declare the weight pointer `fp8e4nv` directly
 (sm_120 has native fp8) instead of the `e4m3_compat` u8 shim, matching our other

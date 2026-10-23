@@ -2,7 +2,7 @@
 `causal_conv1d_decode` FreeToken delegates to sgl_kernel / its own Triton
 fallback; vendored shape only, written against our f32 activation stream).
 
-The decode path built the conv from libtorch ops per layer: an `f32_` cast, a
+The old decode path built the conv from tensor ops per layer: an `f32_` cast, a
 `cat` with the `[rows, conv_dim, K-1]` state, a `w.repeat([rows, 1, 1])`
 materializing `[rows * conv_dim, 1, K]`, a grouped `conv1d`, a `silu` and the
 state narrow. This kernel does the same depthwise causal conv and silu in one

@@ -1,11 +1,11 @@
 // Weight dequantization to f32, the storage-format half of a forward pass.
 //
-// libtorch has no e4m3 `mm` and no NVFP4 GEMM on any backend, so every
+// the tensor runtime has no e4m3 `mm` and no NVFP4 GEMM on any backend, so every
 // checkpoint tensor is widened to f32 once at load (or per expert, for the
 // banks) and the math runs on plain dense tensors. The packing rules here are
 // the ones the converter wrote and FreeToken's Triton kernels read; they are the
 // numerically delicate part of the port, so they live in the domain where they
-// are unit-tested without libtorch.
+// are unit-tested without a GPU runtime.
 
 use crate::domain::numerics::{bf16_to_f32, e4m3fn_to_f32, f16_to_f32, fp4_nibble};
 

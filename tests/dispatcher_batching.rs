@@ -2,9 +2,9 @@
 // requests at once through the dispatcher and compares the aggregate decode
 // throughput with running the same K one at a time. Needs the checkpoint and a
 // CUDA device:
-//   cargo test --release --features cuda --test dispatcher_batching -- --ignored --nocapture
+//   cargo test --release --features cudarc --test dispatcher_batching -- --ignored --nocapture
 
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cudarc")]
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -25,7 +25,7 @@ fn config() -> Config {
     format!(
         "[model]\npath = \"{FTW_DIR}\"\ndevice = \"cuda\"\nmax_seq_len = 2048\n\
          max_output_tokens = 64\nmax_prefill_length = 1024\n\
-         max_running_requests = {BATCH}\ncuda_graph = true\n\n\
+         max_running_requests = {BATCH}\ncuda_graph = false\n\n\
          [kv]\nnum_tokens = 2048\ndtype = \"bf16\"\n\n\
          [moe]\ncache_size_slots = \"auto\"\nprefill_overlap = true\n\n\
          [kernel]\ntriton = true\n"

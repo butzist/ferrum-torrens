@@ -1138,7 +1138,7 @@ impl ArgPack {
 }
 
 /// Device addresses and shapes for one layer's four launches. Everything is a
-/// raw address: the caller owns the memory (libtorch tensors, or the slot cache),
+/// raw address: the caller owns the memory (cudarc tensors, or the slot cache),
 /// and this module never allocates.
 ///
 /// `Default` is all zeroes so a caller that runs one kernel of the six only has

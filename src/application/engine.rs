@@ -195,9 +195,9 @@ pub fn resolve_compute_device(config: &crate::config::Config) -> Result<Device, 
     if matches!(config.model.device, crate::config::ComputeDevice::Cpu) {
         return Ok(Device::Cpu);
     }
-    #[cfg(any(feature = "cuda", feature = "cudarc"))]
+    #[cfg(feature = "cudarc")]
     let probe = crate::infrastructure::torch::probe_cuda();
-    #[cfg(all(not(feature = "cuda"), not(feature = "cudarc")))]
+    #[cfg(not(feature = "cudarc"))]
     let probe = match config.model.device {
         crate::config::ComputeDevice::Cuda => {
             return Err(LoadError::Device(
@@ -1192,7 +1192,7 @@ mod tests {
     /// but an explicit `cuda` must fail rather than quietly run somewhere the
     /// operator did not choose.
     #[test]
-    #[cfg(all(not(feature = "cuda"), not(feature = "cudarc")))]
+    #[cfg(not(feature = "cudarc"))]
     fn without_a_compute_backend_only_cpu_is_loadable() {
         for d in ["auto", "cpu"] {
             assert_eq!(
@@ -1206,7 +1206,7 @@ mod tests {
                 resolve_compute_device(&device_config("cuda", 0)),
                 Err(LoadError::Device(DeviceError::CudaRequestedUnavailable))
             ),
-            "device = \"cuda\" must be rejected in a build without libtorch"
+            "device = \"cuda\" must be rejected in a build without a compute backend"
         );
     }
 }

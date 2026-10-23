@@ -1,6 +1,10 @@
 # FerrumTorrens -- FreeToken MVP port to Rust: TODO
 
-Status (2026-10-23): M2 (API) current, late M3 in practice; **prefill pp is
+Status (2026-10-23): **M7 is complete: the cudarc runtime is the serving path
+and libtorch/tch/candle are gone from the dependency tree and devshell
+(decision 132).** Decode CUDA-graph capture is parked, not ported. The gates are
+`tests/cudarc_engine_generate.rs` and the broader
+`tests/engine_real_generate.rs` on the real checkpoint. Prior M2/M3 status: M2 (API) current, late M3 in practice; **prefill pp is
 ahead of FreeToken** after R10.6a/b, R10.7, R10.8, R10.9 and R10.10: 400.9 tok/s
 at 517 (FT 366.2, 1.10x) and 958.5 at 2057 (FT 725.0, 1.32x). The wins were the
 harness chunk cap (462), the DMA copy-engine prefetch (585), one grouped-GEMM
@@ -60,7 +64,7 @@ bf16, both correct and throughput neutral (the substrate matches FreeToken; the
 cost is elsewhere). Slice 4's FLA kernels are now closed as not worth it
 (decision 111: the GDN recurrence is 0.19 ms/token; the prefill bound is the MoE
 stream and the host attention fallback). Remaining serving lever: item 11
-(server-side batching); libtorch stays the generic/CPU fallback.
+(server-side batching); the scalar oracle stays the CPU fallback (decision 132).
 **The two NVFP4 GEMVs were rewritten marlin-style (decision 89, OPTIMIZATION.md
 R1/R2):** int32 wide loads + a deferred K reduction + the fp16-bitcast dequant
 (`_split8` register activation split), and the lm_head is now resident K-major.
@@ -175,16 +179,15 @@ tok/s at 2057 (+30.3%)**, 517 flat (400.9), and `gdn_qkvz` **718.8 -> 269.3 ms**
 (-62.5%) / total 1991-token step 2890 -> 2239 ms. The next grouped-MoE lever is
 still the compacted nonempty-segment grid (proposal in `OPTIMIZATION.md`
 R10.8).
-M7.1 landed the torch-less `cudarc` tensor adapter behind the non-default
-`cudarc` feature (decision 126): GEMM/rms_norm/gather/elementwise parity and
-capture replay are gated, and the devshell links CUDA 13.4 cuBLAS. M7.2 now
-loads the dense tower through cudarc with the serving storage policy and no
-libtorch in the process (decision 129), and M7.3 has started: the dense math
-primitives (`rms_norm`, `linear`, `sigmoid`, `softplus`, `topk_renorm`) are
-ported and bit-exact (decision 130), followed by rope, the GDN gates/L2 norm
-and the GQA head expand (decision 131). None is on the serving path yet.
+M7 is complete: the cudarc tensor adapter (decision 126), the cudarc dense
+tower load (decision 129), the ported dense math (decisions 130, 131) and the
+whole text tower now form the serving forward, wired through the registry
+(decision 132). `tests/cudarc_engine_generate.rs` and
+`tests/engine_real_generate.rs` both reach the oracle token on the real
+checkpoint. `tch`, `torch-sys`, `candle-*`, the C++ capture shim and the
+libtorch devshell closure are removed; decode CUDA-graph capture is parked.
 
-Progress history and the full decision log (numbers 1..126) live in `DONE.md`;
+Progress history and the full decision log (numbers 1..132) live in `DONE.md`;
 read that for the "why" behind any decision number referenced in code or tests.
 
 Goal: a **minimal, fast, single-GPU** Rust serving engine for **one model** --
@@ -227,11 +230,12 @@ with `--text-model-only`). Known-good bf16/Fp8 siblings: `Qwen/Qwen3.6-35B-A3B`,
 - Explicit sizing in a config file. **No `memory_ratio`**; the one auto planner is
   `moe.cache_size_slots = "auto"` (item 12, decision 90), which takes the free
   VRAM after the tower and KV pool as the cache budget.
-- All dense compute via libtorch (`tch`); the NVFP4 expert GEMV is the one
-  hand-written Triton kernel (decision 2). No build-time `nvcc`/fatbin step, no
-  cubin loading, no runtime JIT.
+- All dense compute via the cudarc tensor runtime (decision 132); the NVFP4
+  expert kernels and their staging/attention peers are the hand-written Triton
+  kernels (decision 2). No build-time `nvcc`/fatbin step and no runtime JIT.
 - Prefill: chunked (default budget 8192), strict prefill-priority scheduling.
-- Decode: batched, CUDA-graph captured per batch size up to `max_running_req`, one model step per token.
+- Decode: one eager model step per token; CUDA-graph capture is parked on the
+  cudarc runtime (decision 132), not part of the current serving path.
 - Sampling: temperature / top_k / top_p / greedy (argmax) only. EOS + stop-strings + max-tokens.
 - OpenAI-compatible HTTP API (the whole MVP surface; Anthropic is out, decision 38).
 - Function/tool calling on `/v1/chat/completions` (request `tools`, streamed
@@ -261,7 +265,7 @@ forks the engine.
 
 ```
 ferrum-torrens/
-  Cargo.toml                      # `cuda` feature gates the libtorch adapter
+  Cargo.toml                      # `cudarc` feature gates the CUDA runtime
   src/
     main.rs                     # CLI: serve, params
     config.rs                   # TOML config -> typed structs (see §4); no model fields
@@ -278,7 +282,8 @@ ferrum-torrens/
         config.rs               #   parse checkpoint text_config
         weights.rs              #   tensor-name scheme -> (layer, expert, part)
         forward.rs              #   scalar CPU reference: the golden oracle (decision 12)
-        forward_torch.rs        #   libtorch forward: the serving path (feature = "cuda")
+        load_cudarc.rs          #   dense tower load into cudarc tensors
+        forward_cudarc.rs       #   cudarc forward: the serving path (feature = "cudarc")
     application/                # use-cases orchestrating domain ports
       registry.rs               # FTW dir config.json architectures[0] -> ModelFactory
       engine.rs                 # load weights, schedule_next_batch, run_forward
@@ -287,9 +292,9 @@ ferrum-torrens/
     infrastructure/             # adapters implement the domain ports
       ftw.rs                    # FreeTokenWeight index parser + mmap reader (generic)
       banks.rs                  # per-layer expert host banks (pinned; QuantFormat-driven)
-      torch.rs                  # libtorch compute runtime: device, tensors, streams, graphs
+      torch.rs                  # device resolution (CPU/CUDA) over the driver probe
       cuda_driver.rs            # hand-rolled libcuda FFI: load cubins, launch, copy
-      cuda_graph.rs             # torch current-stream + graph-mempool bridge for capture
+      cudarc.rs                 # tensor runtime: buffers, cuBLAS GEMM, committed cubins
       kernel_abi.rs             # the cubin ABI manifest, argument packing
       cuda_moe.rs               # NVFP4 expert GEMV adapter over the driver API (the one kernel)
       kvcache_dev.rs            # mha_pool + gdn state slabs + the DeviceCache port impl
@@ -297,9 +302,7 @@ ferrum-torrens/
       tokenizers_hf.rs          # HF `tokenizers` crate + minijinja chat template
   scripts/
     convert_hf_to_ftw.py        # one-time wrapper over FreeToken `ft checkpoint`
-  shim/
-    c10_graph_shim.cpp          # torch current-stream + graph-pool bridge (cuda feature)
-  build.rs                      # compiles the shim; no-op without the cuda feature
+  build.rs                      # stages the cubins into OUT_DIR
   python/
     ferrum_kernel/               # the one hand-written GPU kernel (decision 24)
       nvfp4_moe.py              #   grouped MoE GEMV + silu-mul + top-k reduce
@@ -307,13 +310,11 @@ ferrum-torrens/
       compile_check.py          #   PTX compile check, no GPU needed
 ```
 
-Superseded by decision 2 (libtorch): the `build.rs` + `sources/csrc/` nvcc
-fatbin step, `infrastructure/gpu.rs` (cudarc wrapper) and
-`infrastructure/kernels/mod.rs` (FFI to a hand-built `libferrum_kernels`).
-`torch.rs` + `cuda_moe.rs` take their place. `moe_offload.rs` is folded into
-`cuda_moe.rs` + `run_experts.rs`. `build.rs` does return, but only as the
-compiler of decision 50's tiny capture bridge (`shim/c10_graph_shim.cpp`), not
-the fatbin step.
+Superseded by decision 2: the `build.rs` + `sources/csrc/` nvcc fatbin step,
+`infrastructure/gpu.rs` and `infrastructure/kernels/mod.rs` (FFI to a hand-built
+`libferrum_kernels`). `cudarc.rs` + `cuda_moe.rs` take their place.
+`moe_offload.rs` is folded into `cuda_moe.rs` + `run_experts.rs`. `build.rs`
+only stages the Nix-built cubins (decision 132).
 
 Model boundary contract:
 - `ModelParams` (from FTW `meta` + checkpoint config) is what the engine uses to
@@ -492,20 +493,21 @@ any port.
   the FTW bytes, reports 2.80 GiB logical / 3059 MiB VRAM, and asserts a
   cudarc-only process maps no libtorch. `domain::dequant` stays the host
   transform.
-- [ ] **M7.3 forward -- PARTIAL (2026-10-23, decisions 130, 131).**
-  `models/qwen3_6/forward_cudarc.rs` now carries the complete torch-less text
-  tower: embedding, the residual/norm stream, full attention (stateless bf16
-  SDPA and cached f32 SDPA over the host-cache pool), GDN with the fused
-  per-token conv/decode kernels, the inline MoE and the packed lm_head. It
-  implements `Model` and `CachedModel`, and the gated real-checkpoint test
-  (`tests/cudarc_model.rs`) matches the scalar oracle's argmax/logit on the
-  prompt and decodes from a cached prefill. The f32 causal-SDPA cubin joined
-  the linear manifest. Still open: registry wiring, the captured decode path
-  and making it the serving forward; the scalar oracle stays the gate.
-- [ ] **M7.4 kernels/capture.** Launchers take the candle stream and raw storage;
-  disable event tracking for capture; delete `shim/c10_graph_shim.cpp`.
-- [ ] **M7.5 remove libtorch.** Drop `tch`, `torch-sys`, the C++ build script and
-  the libtorch closure; keep the same gate set.
+- [x] **M7.3 forward -- DONE (2026-10-23, decisions 130, 131, 132).**
+  `models/qwen3_6/forward_cudarc.rs` carries the complete text tower and is the
+  serving forward wired through `application/registry.rs`; the scalar oracle
+  stays the CPU fallback and the gate. `tests/cudarc_engine_generate.rs` and
+  `tests/engine_real_generate.rs` both reach the oracle token on the cudarc
+  runtime.
+- [x] **M7.4 kernels -- DONE; capture PARKED (2026-10-23, decision 132).**
+  The launchers take the cudarc stream and raw storage, and the C++ capture
+  shim is deleted. Decode CUDA-graph capture was not ported: the engine keeps
+  `CapturedDecode` and `BuiltModel.captured` (always `None`), and
+  `cuda_graph = true` only warns. Revisit when the capture path is ported.
+- [x] **M7.5 remove libtorch -- DONE (2026-10-23, decision 132).**
+  `tch`, `torch-sys`, `candle-*`, the C++ build script, `shim/`, the torch
+  forward and the libtorch devshell closure are gone. The same gate set runs
+  on `cudarc`; `cargo tree` contains no torch/tch/candle package.
 
 ## 7. Decisions
 
@@ -531,8 +533,12 @@ history.
   and speed on the real prefill shapes, capture/replay of candle ops on our
   stream, and raw-pointer interop with one cubin. If it fails, the fallback is a
   minimal cudarc tensor layer. The domain, scalar oracle, FTW reader and every
-  Triton cubin stay put; only `infrastructure/torch.rs` and
-  `models/qwen3_6/forward_torch.rs` move.
+  Triton cubin stay put; only `infrastructure/torch.rs` and the model forward
+  move.
+- **132** -- **the torchless cudarc runtime is the serving path and libtorch is
+  removed.** The deliberate implementation detail, gate numbers and the parked
+  capture decision live in `DONE.md` decision 132. Capture may return only as a
+  new ported feature; nothing may reintroduce `tch`, `torch-sys` or `candle`.
 
 - **94** -- the whole-layer prefill's buffer is the `2 * num_experts` **coldest**
   slots chosen by `usage.argsort` (`select_buffer_slots`); it frees exactly those
@@ -958,7 +964,7 @@ next steps:
    `head` 12.6 -> 1.06 (ref 3.5 / 0.82); captured tg **10.6 -> 16.7 at 512** and
    **11.5 -> 18.1 at 1536**. Gates green.
 2. **R3 -- withdrawn (decision 89).** A decoder's MoE is the last op of its
-   layer (`forward_torch.rs::run_sequence`), so layer l+1's expert ids are not
+   layer (`forward_cudarc.rs`), so layer l+1's expert ids are not
    known during layer l's compute; there is nothing to prefetch across layers,
    and the reference is serialized the same way. The only sound overlap is the
    routed copy against the same layer's shared expert (~3 ms), folded into R6.
@@ -1200,9 +1206,9 @@ re-profiled at HEAD: the GDN *bundle* is 42% (`gdn_qkvz` 0.85 + `gdn_ba`
 
 ### State of play
 
-The hardest infrastructure -- GPU-graph capture over the full MoE forward,
-driver-API kernel launching (MoE GEMM + paged GQA attention), device-staged
-offload, per-batch-size executables -- is done and gated on the real checkpoint.
+The hardest infrastructure -- driver-API kernel launching (MoE GEMM + paged GQA
+attention), device-staged offload and the cudarc serving forward -- is done and
+gated on the real checkpoint. Decode CUDA-graph capture is parked (decision 132).
 The milestone label says M2 but the reality is late M3: most M3 performance work
 landed before the API cleanup, so the milestone accounting is a little lagged.
 The serving blocker is now memory, not speed: the resident tower plus an f32 KV
@@ -1215,7 +1221,7 @@ default do not fit the 8 GiB device (item 6).
   alongside packed/scale, so `grouped_moe_staged` reads a real global per
   resident expert.
 - **GDN fp32 params (`A_log`, `dt_bias`)**: the FTW stores both as `bfloat16`;
-  `forward_torch` loads them with `bf16_vec` and upcasts to f32 in the GDN math.
+  `load_cudarc` loads them with `bf16_vec` and upcasts to f32 in the GDN math.
   There are no fp32 params to preserve; the f32 dtype belongs to the state
   (`mamba_ssm_dtype`), not the params.
 - **Abort handling**: the drain semantics are implemented and now pinned by
@@ -1232,5 +1238,5 @@ moe_cache_size_slots = "auto"  # auto sizes from free VRAM (decisions 90, 127); 
 max_running_requests = 4
 max_prefill_length = 8192
 prefill_overlap = true         # takes effect only when cache_size_slots >= 512
-cuda_graph = false             # opt in; needs kernel.triton + a CUDA device
+cuda_graph = false             # parked: warns and stays eager on cudarc
 ```

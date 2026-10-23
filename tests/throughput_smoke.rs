@@ -1,6 +1,6 @@
 // Gated throughput smoke against the real checkpoint on a CUDA device. Run in a
-// devshell (or with LIBTORCH and the driver on LD_LIBRARY_PATH) with:
-//   cargo test --release --features cuda --test throughput_smoke -- --ignored --nocapture
+// devshell (which has the driver on LD_LIBRARY_PATH) with:
+//   cargo test --release --features cudarc --test throughput_smoke -- --ignored --nocapture
 // (needs .model-cache/Qwen3.6-35B-A3B-NVFP4.ftw and a free GPU.)
 //
 // llama.cpp-style pp/tg for a single request: pp is the prompt-processing rate
@@ -197,12 +197,9 @@ impl Sampler {
 
 fn config() -> Config {
     // The serving shape: bf16 KV (the default), the committed NVFP4 cubins via
-    // `kernel.triton`, whole-layer prefill overlap, captured decode graphs.
-    let graph = if std::env::var_os("FERRUM_SMOKE_NOGRAPH").is_some() {
-        "false"
-    } else {
-        "true"
-    };
+    // `kernel.triton`, whole-layer prefill overlap. Decode capture is parked on
+    // the cudarc runtime, so the graph is always off.
+    let graph = "false";
     let kv = std::env::var("FERRUM_SMOKE_KV").unwrap_or_else(|_| "bf16".into());
     let kv_tokens = std::env::var("FERRUM_SMOKE_KVTOK").unwrap_or_else(|_| "4096".into());
     // The config default is `auto` (item 12); `FERRUM_SMOKE_CACHE` pins a slot
@@ -317,8 +314,8 @@ fn time_request(engine: &Engine, ids: Vec<u32>, max_tokens: u32) -> Timing {
 #[ignore = "requires the converted checkpoint and a cuda device"]
 #[serial]
 fn single_request_throughput_smoke() {
-    if !cfg!(feature = "cuda") {
-        panic!("this smoke needs --features cuda; without it there is no GPU forward");
+    if !cfg!(feature = "cudarc") {
+        panic!("this smoke needs --features cudarc; without it there is no GPU forward");
     }
     let engine = load_engine(&config()).unwrap();
     eprintln!("captured decode graph: {}", engine.captured().is_some());

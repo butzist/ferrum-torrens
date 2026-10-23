@@ -40,8 +40,8 @@ Instructions for AI coding agents working in this repository.
 
 - Clean architecture, hexagonal, domain-driven. `TODO.md` section 3 groups code
   into a pure domain core (no CUDA, no IO), an application layer of use-cases
-  (scheduler, generation, `run_experts`), and infrastructure adapters (libtorch
-  compute runtime, the CUDA driver-API MoE adapter, FTW reader, axum
+  (scheduler, generation, `run_experts`), and infrastructure adapters (the
+  cudarc compute runtime, the CUDA driver-API MoE adapter, FTW reader, axum
   server) that implement domain ports.
 - Ports are Rust traits defined in the domain core. Adapters depend on the core;
   the core never imports an adapter. Keep infra types (device tensors, mmap
@@ -121,9 +121,10 @@ Instructions for AI coding agents working in this repository.
   runtime (node/bun/deno were intentionally removed from the flake).
 - Rust is the only language at runtime. Python is used for the one-time HF -> FTW
   conversion via FreeToken's `ft` CLI (see below) and as the kernel toolchain:
-  the NVFP4 grouped-MoE kernel is authored in Triton (libtorch has no CUDA NVFP4
-  GEMM, and neither does upstream FreeToken, which is why it hand-writes the
-  kernel in Triton), compiled ahead of time by `python/ferrum_kernel/aot.py` in
+  the NVFP4 grouped-MoE kernel is authored in Triton (no Rust tensor runtime
+  ships a CUDA NVFP4 GEMM, and neither does upstream FreeToken, which is why it
+  hand-writes the kernel in Triton), compiled ahead of time by
+  `python/ferrum_kernel/aot.py` in
   the `kernels` Nix derivation (`nix/kernels.nix`) into `kernel/*.cubin`, and
   launched by the driver-API adapter (`infrastructure/cuda_driver.rs`,
   `infrastructure/cuda_moe.rs`). The artifacts are never committed: `build.rs`
@@ -143,14 +144,14 @@ Instructions for AI coding agents working in this repository.
   sm_120) and in `ALGORITHM.md` section 0.
 - **The sandbox has a working CUDA device** (the driver is at
   `/run/opengl-driver/lib/libcuda.so.1` and `cuInit` succeeds), so the gated GPU
-  tests run here. The agent jail inherits `LIBTORCH*`, `CUDA_HOME`, `CXX`
+  tests run here. The agent jail inherits `CUDA_HOME`, `CUDARC_CUDA_VERSION`,
   `LD_LIBRARY_PATH`, `PYTHONPATH` and the `TRITON_*` knobs from the devshell
   (`fwdEnv` in `nix/agents.nix`, jail.nix `try-fwd-env`), so launching the agent from
   a `nix develop` shell needs no manual export; from elsewhere, export them (see
   below). The compute runtime still auto-detects and falls back to CPU, which is
-  what keeps `cargo test --features cuda` meaningful on a box with no device
-  (`DONE.md` decision 21). `model.device = "cuda"` forces the GPU. CUDA-graph
-  capture is still asked for explicitly rather than discovered by a red test.
+  what keeps `cargo test --features cudarc` meaningful on a box with no device
+  (`DONE.md` decision 21). `model.device = "cuda"` forces the GPU. Decode capture
+  is parked on the cudarc runtime; `cuda_graph = true` only warns.
 - The jailed opencode gets its **own** config, baked into the package by
   `agent-toolbox` from the toolbox's default opencode settings plus the
   project's model and provider; no host config or state dirs are bound. The
@@ -185,14 +186,13 @@ Instructions for AI coding agents working in this repository.
    --out .model-cache/Qwen3.6-35B-A3B-NVFP4.ftw --moe-backend offload --shard-gib 8`
 - Verify with: `cargo fmt --check`, `cargo clippy --all-targets`, `cargo test`,
   all inside `nix develop`. These are the CPU-only path and must stay green with
-  no libtorch; the devshell supplies the `kernels` derivation through
-  `FERRUM_KERNEL_DIR`, which `build.rs` requires. The libtorch
-  adapter is behind the non-default `cuda` feature, so additionally run
-  `cargo clippy --all-targets --features cuda` inside the devshell (the flake
-  exports `LIBTORCH`, `LIBTORCH_INCLUDE`, `LIBTORCH_LIB`, `CXX`; see
-  `DONE.md` decision 19 -- they must be libtorch **roots**). The gated
-  oracle tests (`tests/engine_real_generate.rs`) need a GPU, so the agent sandbox
-  cannot run them; hand them to a devshell run. Run a gated test with
+  no CUDA toolkit; the devshell supplies the `kernels` derivation through
+  `FERRUM_KERNEL_DIR`, which `build.rs` requires. The cudarc adapter is behind
+  the non-default `cudarc` feature, so additionally run
+  `cargo clippy --all-targets --features cudarc` inside the devshell (the flake
+  exports `CUDA_HOME` and `CUDARC_CUDA_VERSION`). The gated oracle tests
+  (`tests/engine_real_generate.rs`, `tests/cudarc_engine_generate.rs`) need a
+  GPU; run them one at a time under `prlimit`. Run a gated test with
   `... -- --ignored --nocapture 2>&1 | tee log`: cargo captures a failing test's
   panic text on stderr, so a plain `| tee` log reads as an empty failure.
 - Any change under `python/ferrum_kernel/` must pass

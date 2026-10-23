@@ -1,6 +1,6 @@
 """Generic bf16/f32 elementwise kernels for the cudarc tensor adapter (M7.1).
 
-The libtorch path runs these as ATen ops. The torch-less adapter needs the same
+The old tensor-runtime path ran these as ATen ops. The cudarc adapter needs the same
 small set on its own buffers: add/mul on the activation stream, the bf16<->f32
 casts the dense path takes around every GEMM, a row gather for the embedding,
 and a strided copy for `contiguous()` on a view. Each launch is a flat 1D grid
@@ -221,7 +221,7 @@ def _col_mul_kernel(x_ptr, scale_ptr, out_ptr, cols, OP, BLOCK: tl.constexpr):
     """`out[r, c] = x[r, c] * (OP == 1 ? scale[0] : scale[c])`.
 
     The per-output-column weight scale is applied after the GEMM exactly like
-    the `tch` path; `OP == 1` is the broadcast form for a single scale.
+    the old tensor-runtime path; `OP == 1` is the broadcast form for a single scale.
     """
     row = tl.program_id(0)
     col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)

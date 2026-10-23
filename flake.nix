@@ -41,14 +41,6 @@
           ];
         };
 
-        # libtorch, CUDA build. nixpkgs ships the official binary distribution as
-        # `libtorch-bin`, which statically links the CUDA toolkit (cu13); its
-        # cudaSupport argument selects the CUDA variant over the CPU one. Scoped
-        # to this one derivation instead of setting config.cudaSupport globally so
-        # the rest of the package set (notably pkgs.cudatoolkit, used by the FTW
-        # conversion) keeps its existing resolution.
-        libtorchCuda = pkgs.libtorch-bin.override {cudaSupport = true;};
-
         # Python for the kernel toolchain, from nixpkgs rather than a venv: the
         # harness that compiles the cubins (`aot.py`, run by the `kernels`
         # derivation below) and checks the kernels against the torch reference
@@ -61,21 +53,17 @@
         # No CUDA override is needed and none exists to write: `torch` takes
         # `cudaSupport`, which defaults to config.cudaSupport, which defaults to
         # true ("build packages with CUDA support by default"), so this is
-        # already the CUDA build. That is a different mechanism from the
-        # `cudaSupport` argument `libtorch-bin` above takes, which is a per
-        # package switch between nixpkgs' CPU and CUDA *distributions*. If the
-        # source build ever becomes the bottleneck, `ps.torch-bin` is the same
-        # package off the official +cu130 wheel.
+        # already the CUDA build. If the source build ever becomes the
+        # bottleneck, `ps.torch-bin` is the same package off the official
+        # +cu130 wheel.
         #
         # This is deliberately NOT the FreeToken environment. FreeToken pins
-        # torch>=2.11,<2.12 plus sglang-kernel 0.4.5, which links libtorch
-        # symbols only 2.11 has, while nixpkgs ships 2.13. The `ft checkpoint`
+        # torch>=2.11,<2.12 plus sglang-kernel 0.4.5, which links torch symbols
+        # only 2.11 has, while nixpkgs ships 2.13. The `ft checkpoint`
         # conversion therefore keeps using FreeToken/.venv (decision 35).
         #
-        # `import triton` does not pull torch in (verified on 3.7.1 as well as
-        # the venv's 3.6), which is what let the engine's kernel path drop torch
-        # and keep exactly one libtorch in the process (decision 30). Torch stays
-        # in this env for the selftest's reference side.
+        # The Rust runtime never imports Python or torch; this env is the
+        # compile-time kernel toolchain and the selftest's reference side.
         pythonEnv = pkgs.python3.withPackages (ps: [
           ps.torch
           ps.triton
@@ -91,11 +79,10 @@
         # nix/kernels.nix.
         kernels = pkgs.callPackage ./nix/kernels.nix {inherit pythonEnv;};
 
-        # M7.1 (cudarc) links a CUDA 13 cuBLAS: the devshell's CUDA 12.9
-        # libcublas is the 16-44% prefill slowdown M7.0 blamed on candle, while
-        # 13.8.0.4 matches ATen. Keep the Triton assembler on 12.9: only the
-        # cudarc feature sees this merged root, and the default/`cuda` builds
-        # still point at the cudatoolkit headers.
+        # The serving runtime (cudarc) links a CUDA 13 cuBLAS: the devshell's
+        # CUDA 12.9 libcublas is 16-44% slower on prefill, while 13.8.0.4
+        # matches ATen. Keep the Triton assembler on 12.9; it uses its own
+        # ptxas path and does not consume this merged root.
         cudaCublas = pkgs.cudaPackages_13_4.libcublas;
         cudarcCudaHome = pkgs.runCommand "cudarc-cuda-home" {} ''
           mkdir -p $out/lib
@@ -143,11 +130,6 @@
           pkgs.uv
           pythonEnv
           cudarcCudaHome
-          libtorchCuda
-          # Headers for `--features cuda` builds. The `.dev` output is not in
-          # the default output's runtime closure, so it must be listed here to
-          # reach the jail (which binds only its packages' closures).
-          libtorchCuda.dev
           # CUDA profiling for the decode-throughput work (the expert staging
           # copy is ~81% of decode time, see TODO.md section 8). `nsys` gives the
           # copy/compute/wait timeline; `ncu` gives kernel-level counters (needs
@@ -181,32 +163,14 @@
 
           inputsFrom = [config.flake-root.devShell];
 
-          # Store-path half of the loader path: cudatoolkit (libcudart), libtorch
-          # and zlib (triton's libtriton.so links libz.so.1, which nothing else
-          # here puts on the loader path). The shellHook below adds the two parts
-          # that are not store paths: the driver's mount point and a matching
+          # Store-path half of the loader path: cudatoolkit (libcudart) and
+          # zlib (triton's libtriton.so links libz.so.1, which nothing else here
+          # puts on the loader path). The shellHook below adds the two parts that
+          # are not store paths: the driver's mount point and a matching
           # libstdc++.
-          LD_LIBRARY_PATH = "${cudarcCudaHome}/lib:${pkgs.cudatoolkit}/lib:${libtorchCuda}/lib:${pkgs.zlib}/lib";
+          LD_LIBRARY_PATH = "${cudarcCudaHome}/lib:${pkgs.cudatoolkit}/lib:${pkgs.zlib}/lib";
 
-          # tch build-script configuration: link the nix-provided libtorch instead
-          # of downloading one (hence default-features = false in Cargo.toml).
-          # nixpkgs splits the distribution across two outputs, and torch-sys
-          # appends "/include" and "/lib" to these itself, so all three point at
-          # *roots*, not at the include/lib dirs:
-          #   LIBTORCH         -> required, or the build script bails asking for a
-          #                       manual install because download-libtorch is off.
-          #   LIBTORCH_INCLUDE -> the .dev output (headers).
-          #   LIBTORCH_LIB     -> the main output (shared objects).
-          # Do NOT set LIBTORCH_USE_PYTORCH: that makes the build script query the
-          # pip torch in FreeToken/.venv, which is a different version.
-          LIBTORCH = "${libtorchCuda}";
-          LIBTORCH_INCLUDE = "${libtorchCuda.dev}";
-          LIBTORCH_LIB = "${libtorchCuda}";
-          CXX = "${pkgs.stdenv.cc.cc}/bin/c++";
-          # The CUDA toolkit root: the C++ bridge build.rs compiles for the
-          # capture mempool needs `<CUDA_HOME>/include` (cuda_runtime_api.h),
-          # which libtorch's own headers pull in but its `include` dir does not
-          # ship.
+          # cudarc's build script reads the CUDA toolkit root from CUDA_HOME.
           CUDA_HOME = "${cudarcCudaHome}";
           # cudarc's `cuda-version-from-build-system` knob. The library it
           # actually loads is the 13.4 cuBLAS above.

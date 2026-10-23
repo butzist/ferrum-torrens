@@ -3,7 +3,7 @@
 // adopts that prompt's KV pages and GDN state, and its next-token logits must
 // equal re-feeding the whole sequence cold.
 //
-//   cargo test --release --features cuda --test kvcache_cross_request_reuse -- --ignored --nocapture
+//   cargo test --release --features cudarc --test kvcache_cross_request_reuse -- --ignored --nocapture
 //
 // (needs .model-cache/Qwen3.6-35B-A3B-NVFP4.ftw)
 //
@@ -15,7 +15,7 @@
 // lossless, so the tolerance is the same reshaped-reduction slack the
 // incremental-decode gate uses.
 
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cudarc")]
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -82,7 +82,7 @@ fn argmax(logits: &[f32]) -> usize {
 #[ignore = "requires converted checkpoint in .model-cache"]
 fn extending_a_committed_prompt_adopts_and_matches_a_cold_refeed() {
     let m = model();
-    let cache = m.cache().expect("the libtorch forward carries a kv cache");
+    let cache = m.cache().expect("the cudarc forward carries a kv cache");
 
     // Request A: prefill its prompt whole, then commit the prompt-end boundary
     // (finished=false), donating a COW snapshot of the GDN state.

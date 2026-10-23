@@ -9,44 +9,14 @@ name = "ferrum-torrens"
 path = "src/main.rs"
 
 [[example]]
-name = "m7_0_gemm"
-path = "examples/m7_0_gemm.rs"
-required-features = ["cuda", "candle", "candle-nn"]
-
-[[example]]
-name = "m7_0_load_tch"
-path = "examples/m7_0_load_tch.rs"
-required-features = ["cuda"]
-
-[[example]]
-name = "m7_0_load_candle"
-path = "examples/m7_0_load_candle.rs"
-required-features = ["candle"]
-
-[[example]]
-name = "m7_1a_gemm"
-path = "examples/m7_1a_gemm.rs"
-required-features = ["cuda", "cudarc"]
-
-[[example]]
 name = "m7_2_load_cudarc"
 path = "examples/m7_2_load_cudarc.rs"
 required-features = ["cudarc"]
 
 [features]
 default = []
-# GPU compute backend. Off by default because tch's build script needs
-# libtorch at build time, which would break the CPU-only unit suite; enable
-# inside the devshell, where the flake supplies LIBTORCH_INCLUDE/LIBTORCH_LIB.
-# default-features = false drops `download-libtorch` so nothing is fetched.
-cuda = ["dep:tch"]
-# M7.0 spike: candle as the torch-less tensor runtime. Deliberately independent
-# of `cuda` so a candle-only process links neither tch nor libtorch.
-candle = ["dep:candle-core", "dep:half"]
-# The capture gate's fused rms_norm op; only the spike example needs it.
-candle-nn = ["dep:candle-nn"]
-# M7.1a spike: the minimal cudarc tensor layer. Independent of `cuda` so the
-# layer can be built and exercised without libtorch.
+# The GPU serving backend: the cudarc tensor runtime plus the driver-API
+# kernels. Off by default so the CPU-only unit suite needs no CUDA toolkit.
 cudarc = ["dep:cudarc", "dep:half"]
 
 [dependencies]
@@ -58,10 +28,7 @@ tokenizers = "0.21"
 axum = "0.8"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync"] }
 futures-core = "0.3"
-tch = { version = "0.22", default-features = false, optional = true }
 minijinja = { version = "2.24.0", features = ["serde", "json"] }
-candle-core = { version = "=0.11.0", default-features = false, features = ["cuda"], optional = true }
-candle-nn = { version = "=0.11.0", default-features = false, features = ["cuda"], optional = true }
 cudarc = { version = "=0.19.10", default-features = false, features = ["std", "cublas", "driver", "f16", "cuda-version-from-build-system", "dynamic-linking"], optional = true }
 half = { version = "2", optional = true }
 
@@ -70,9 +37,6 @@ mockall = "0.13"
 # `#[serial]` only; the async/logging features pull tokio-duplicated deps.
 serial_test = { version = "4.0.1", default-features = false }
 tower = { version = "0.5", features = ["util"] }
-
-[build-dependencies]
-cc = "1"
 
 [profile.release]
 lto = "thin"

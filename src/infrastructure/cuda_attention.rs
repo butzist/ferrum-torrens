@@ -11,7 +11,7 @@
 // Like `CudaMoE`, this is an infrastructure adapter that owns its driver handle
 // and its cubin handles. Unlike the MoE adapter there is no port in the domain:
 // paged attention is internal to one model's forward, not an engine-orchestrated
-// step, so `TorchQwen3_6` holds it directly and the domain never sees it.
+// step, so `CudarcQwen3_6` holds it directly and the domain never sees it.
 
 use std::sync::Arc;
 
@@ -38,8 +38,7 @@ fn bad_abi(e: MoEError) -> MoEError {
 ///
 /// The stream matters: a captured decode step records on a side stream, so the
 /// launcher must be built with that same stream or its launches would be
-/// recorded outside the graph (`cuda_graph::set_current_stream` sets torch's
-/// stream to match).
+/// recorded outside the graph on the same stream.
 pub struct PagedAttention {
     kernels: AttentionKernels,
     abi: AttentionAbi,
@@ -65,7 +64,7 @@ impl PagedAttention {
             ));
         };
         // The launcher owns a cudarc runtime so its tensors and cubin launches
-        // share one primary context and stream; no libtorch backend is needed.
+        // share one primary context and stream; no extra runtime is needed.
         let rt = Runtime::open(ordinal)?;
         let lib = Driver::open().map_err(driver)?;
         lib.init().map_err(driver)?;

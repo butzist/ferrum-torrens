@@ -1,6 +1,6 @@
 // Gated validation of the M1 engine loop's prediction path against the real
 // converted checkpoint. Run with:
-//   cargo test --release --test engine_real_generate -- --ignored --nocapture
+//   cargo test --release --features cudarc --test engine_real_generate -- --ignored --nocapture
 // (needs .model-cache/Qwen3.6-35B-A3B-NVFP4.ftw)
 //
 // The CPU reference forward is deliberately simple, not fast: scalar
@@ -10,6 +10,10 @@
 // `ORACLE_FIRST_TOKEN` was read off the FreeToken reference server (0.1.3, GPU,
 // port 1919) for the same prompt: "The capital of France is" -> " Paris, a" with
 // greedy sampling. Use the same oracle to re-check after touching the forward.
+//
+// The registry now serves the cudarc model, so this file is gated on `cudarc`.
+
+#![cfg(feature = "cudarc")]
 
 use serial_test::serial;
 use std::time::Instant;
@@ -94,7 +98,7 @@ fn one_token_prediction_matches_the_oracle() {
 /// catches a template rendered to the wrong thing. The token is a pin rather than
 /// an oracle, see `CHAT_PIN_FIRST_TOKEN`.
 ///
-///   cargo test --release --features cuda --test engine_real_generate -- \
+///   cargo test --release --features cudarc --test engine_real_generate -- \
 ///     a_chat_request_answers_from_the_rendered_template --ignored --nocapture
 #[test]
 #[ignore = "requires converted checkpoint in .model-cache"]
@@ -131,16 +135,16 @@ fn a_chat_request_answers_from_the_rendered_template() {
 /// token alone cannot show: the inline host path answers with the same logits,
 /// so a silently dropped port would pass a token-only check.
 ///
-///   cargo test --release --features cuda --test engine_real_generate -- \
+///   cargo test --release --features cudarc --test engine_real_generate -- \
 ///     one_token_through_the_kernel_matches_the_oracle --ignored --nocapture
 #[test]
 #[ignore = "requires the converted checkpoint and a cuda device"]
 #[serial]
 fn one_token_through_the_kernel_matches_the_oracle() {
-    // Without the `cuda` feature there is no libtorch forward, so no MoE port,
-    // and the gate would quietly measure the inline host path instead.
-    if !cfg!(feature = "cuda") {
-        panic!("this gate needs --features cuda; without it there is no kernel in the loop");
+    // Without `cudarc` there is no GPU forward, so no MoE port, and the gate
+    // would quietly measure the inline host path instead.
+    if !cfg!(feature = "cudarc") {
+        panic!("this gate needs --features cudarc; without it there is no kernel in the loop");
     }
     let mut cfg = config(1);
     cfg.kernel.triton = true;
@@ -173,45 +177,6 @@ fn one_token_through_the_kernel_matches_the_oracle() {
         g.tokens[0], ORACLE_FIRST_TOKEN,
         "the kernel path must reach the same oracle token, got {:?} ({:?})",
         g.tokens[0], g.text
-    );
-}
-
-#[test]
-#[ignore = "requires the converted checkpoint and a cuda device"]
-#[serial]
-fn a_captured_engine_decodes_on_its_graphs() {
-    if !cfg!(feature = "cuda") {
-        panic!("this gate needs --features cuda; without it there is no capture");
-    }
-    let mut cfg = config(1);
-    cfg.kernel.triton = true;
-    cfg.model.device = ferrum_torrens::config::ComputeDevice::Cuda;
-    cfg.model.cuda_graph = true;
-    let engine = load_engine(&cfg).unwrap();
-    assert!(
-        engine.captured().is_some(),
-        "the composition root must build the captured decode service"
-    );
-    eprintln!(
-        "captured decode: max_batch {}, window {}",
-        engine.captured().unwrap().max_batch(),
-        engine.captured().unwrap().window()
-    );
-
-    let ids = engine.encode(PROMPT).unwrap();
-    let request = make_request(&engine, 1, ids, greedy(1), 0).unwrap();
-    let start = Instant::now();
-    let g = generation::generate(&engine, request).unwrap();
-    eprintln!("1 token in {:.1}s", start.elapsed().as_secs_f64());
-    assert_eq!(g.tokens.len(), 1);
-    assert_eq!(
-        g.tokens[0], ORACLE_FIRST_TOKEN,
-        "the captured path must reach the same oracle token, got {:?} ({:?})",
-        g.tokens[0], g.text
-    );
-    assert!(
-        engine.expert_steps() > 0,
-        "the offload ran through the kernel"
     );
 }
 

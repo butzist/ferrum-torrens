@@ -5,7 +5,7 @@
 //! dlopen'd and its entry points resolved by name rather than linked, for two
 //! reasons: the crate then builds and tests with no CUDA at all, and the exact
 //! version of the driver that ends up loaded is the one already on
-//! `LD_LIBRARY_PATH` next to the libtorch this engine is using.
+//! `LD_LIBRARY_PATH` next to the CUDA runtime this engine is using.
 //!
 //! Only what the MoE launch path needs is bound. Anything the driver reports as
 //! a `CUresult` is an error: a launch that silently failed would show up as
@@ -383,8 +383,8 @@ impl Driver {
     }
 
     /// Retain the primary context of `device` and make it current on this
-    /// thread. Retaining (not creating) is what libtorch does too, so a launch
-    /// here and a launch from a libtorch op land in the same context.
+    /// thread. Retaining (not creating) keeps a launch here in the same context
+    /// as the cudarc compute runtime.
     pub fn attach_primary_context(&self, device: CUdevice) -> Result<CUcontext, CudaError> {
         let mut ctx: CUcontext = std::ptr::null_mut();
         // SAFETY: `ctx` is a live pointer-sized slot for the duration of the call.
@@ -473,8 +473,8 @@ impl Driver {
     ///
     /// Flags are 0 (`CU_STREAM_DEFAULT`), so the stream keeps the legacy
     /// stream's implicit ordering: work enqueued here waits for stream-0 work
-    /// (libtorch's staging) and stream-0 work waits for this stream's, which is
-    /// what lets a captured replay read buffers libtorch wrote without an
+    /// (the staging path) and stream-0 work waits for this stream's, which is
+    /// what lets a captured replay read buffers written elsewhere without an
     /// explicit event.
     ///
     /// # Safety
@@ -653,7 +653,7 @@ impl Driver {
 
     /// `cuGraphInstantiateWithFlags` with explicit flags. The M7.0 spike uses
     /// `CU_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH (1)` for a graph whose
-    /// candle ops allocated graph memory nodes: without it the allocations are
+    /// a captured graph allocated memory nodes: without it the allocations are
     /// not returned at the end of a launch, so a second launch of the same
     /// instance fails with `CUDA_ERROR_INVALID_VALUE`.
     ///
@@ -714,7 +714,7 @@ impl Driver {
     }
 
     /// A device allocation, freed on drop. Used by the tests and by the slot
-    /// cache's first slice; the steady state is libtorch tensors.
+    /// cache's first slice; the steady state is cudarc tensors.
     pub fn alloc<'d>(&'d self, bytes: usize) -> Result<DeviceBuf<'d>, CudaError> {
         let mut ptr: CUdeviceptr = 0;
         // SAFETY: `ptr` is a live slot; the length is the whole allocation.
@@ -1037,7 +1037,7 @@ unsafe impl Sync for CudaKernels {}
 
 impl CudaKernels {
     /// Load every kernel in `abi` from the committed cubins. The driver is
-    /// shared, because the caller launches on libtorch's streams too and there
+    /// shared, because the caller launches on the runtime's streams too and there
     /// must be exactly one driver handle in the process.
     pub fn load(driver: Arc<Driver>, abi: Abi) -> Result<Self, CudaError> {
         let mut loaded = Vec::new();

@@ -1,21 +1,19 @@
 //! M7.1 adapter: the minimal `cudarc` tensor layer.
 //!
-//! Behind the non-default `cudarc` feature. It is the direct replacement for
-//! the `tch::Tensor` plumbing the dense forward uses: an owned bf16/f32/i32/i64
-//! buffer with shape and strides, cuBLAS BF16 matmul on ATen's layouts, the
-//! committed normalization cubins, and the generic elementwise kernels the
-//! activation stream needs. It is the seed of the M7.3 port, not part of the
-//! serving path.
+//! Behind the non-default `cudarc` feature. It is the tensor plumbing the
+//! dense forward uses: an owned bf16/f32/i32/i64 buffer with shape and strides,
+//! cuBLAS BF16 matmul on ATen's layouts, the committed normalization cubins,
+//! and the generic elementwise kernels the activation stream needs. It is the
+//! serving tensor runtime.
 //!
 //! `CudaContext::new` retains the primary context, the same one
 //! `Driver::attach_primary_context` retains, so a cuBLAS call here and a cubin
 //! launch through the driver share one context and one address space.
 //!
 //! The speed gate is a function of the cuBLAS version, not of the tensor
-//! layer: linked against the devshell's CUDA 12.9 `libcublas.so.12` this path
-//! reproduces candle's 16-44% prefill slowdown, while the CUDA 13.8 cuBLAS that
-//! libtorch already bundles matches ATen within ~1%. M7.1 therefore links
-//! cudarc against CUDA 13, the same version the model runs today.
+//! layer: linked against CUDA 12.9 `libcublas.so.12` this path is 16-44%
+//! slower on prefill, while the CUDA 13.8 cuBLAS matches ATen within ~1%. The
+//! engine therefore links cudarc against CUDA 13.
 
 use std::sync::Arc;
 
@@ -2031,7 +2029,7 @@ impl LinearKernels {
     }
 
     /// `add_rmsnorm` on raw addresses: the same cubin, grid and argument pack
-    /// as `GdnDecode::add_rmsnorm`, minus the `tch::Tensor` shape checks.
+    /// as `GdnDecode::add_rmsnorm`, minus the tensor shape checks.
     ///
     /// # Safety
     /// Every pointer must be a live device allocation in `stream`'s context,

@@ -10,7 +10,7 @@
 // streamed once per step.
 //
 // Like `GdnDecode`, this is an infrastructure adapter with no domain port: the
-// lm_head is internal to one model's forward, so `TorchQwen3_6` holds it
+// lm_head is internal to one model's forward, so `CudarcQwen3_6` holds it
 // directly.
 
 use std::sync::Arc;

@@ -6,12 +6,12 @@ FreeToken's converted FTW checkpoint and serves it with FreeToken's `offload`
 expert strategy. No benchmarks, no multimodal, no runtime cache management, no
 multi-GPU.
 
-The target is an RTX 5060 Mobile (8 GB, sm_120). Dense compute is libtorch via
-the `cuda` feature; the one hand-written GPU kernel (NVFP4 grouped-MoE GEMV,
-plus its staging and paged-attention peers) is authored in Triton and
-AOT-compiled by the `kernels` Nix derivation into `kernel/*.cubin`; the Rust
-build copies that tree in and launches it through the CUDA driver API. There is
-no Python at runtime and no committed binary artifact.
+The target is an RTX 5060 Mobile (8 GB, sm_120). Dense compute is the cudarc
+tensor runtime via the `cudarc` feature; the hand-written GPU kernels (NVFP4
+grouped-MoE GEMV, plus their staging and paged-attention peers) are authored in
+Triton and AOT-compiled by the `kernels` Nix derivation into `kernel/*.cubin`;
+the Rust build copies that tree in and launches it through the CUDA driver API.
+There is no Python or libtorch at runtime and no committed binary artifact.
 
 ## Documentation map
 
@@ -30,7 +30,7 @@ no Python at runtime and no committed binary artifact.
 
 ## Build and test
 
-The CPU-only path needs no libtorch and must stay green. The cubins now come
+The CPU-only path needs no CUDA toolkit and must stay green. The cubins come
 from the `kernels` flake derivation (`FERRUM_KERNEL_DIR`, set by the devshell),
 so run cargo inside `nix develop`:
 
@@ -40,12 +40,12 @@ cargo clippy --all-targets
 cargo test
 ```
 
-The libtorch adapter is behind the non-default `cuda` feature. Inside the
-devshell (which exports `LIBTORCH`/`LIBTORCH_INCLUDE`/`LIBTORCH_LIB`/`CXX`):
+The GPU serving adapter is behind the non-default `cudarc` feature. Inside the
+devshell (which exports `CUDA_HOME` and `CUDARC_CUDA_VERSION`):
 
 ```sh
-cargo clippy --all-targets --features cuda
-cargo test --features cuda
+cargo clippy --all-targets --features cudarc
+cargo test --features cudarc --lib
 ```
 
 The gated real-checkpoint tests need the converted checkpoint in
@@ -53,7 +53,7 @@ The gated real-checkpoint tests need the converted checkpoint in
 wrapper (it serializes and applies `RLIMIT_AS`):
 
 ```sh
-scripts/run-gated.sh --release --features cuda <test_name>
+scripts/run-gated.sh --release --features cudarc <test_name>
 ```
 
 Kernel work has a CPU inner loop in the devshell (`kernel-selftest`,

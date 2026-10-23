@@ -13,13 +13,15 @@
 //! `/tmp/ft_profile.json` / `.txt` by default. Nothing here runs unless the env
 //! var is set, so the normal path has no event overhead.
 
-#![cfg(any(feature = "cuda", feature = "cudarc"))]
-
+#[cfg(feature = "cudarc")]
 use std::collections::{HashMap, HashSet};
+#[cfg(feature = "cudarc")]
 use std::sync::{Arc, Mutex, OnceLock};
 
+#[cfg(feature = "cudarc")]
 use crate::infrastructure::cuda_driver::{CUstream, Driver, OwnedEvent};
 
+#[cfg(feature = "cudarc")]
 struct Rec {
     step: u64,
     decode: bool,
@@ -29,6 +31,7 @@ struct Rec {
     end: OwnedEvent,
 }
 
+#[cfg(feature = "cudarc")]
 struct Inner {
     driver: Arc<Driver>,
     device: usize,
@@ -45,10 +48,13 @@ struct Inner {
 
 // SAFETY: the `CUstream` is only read/written under the `Mutex`, and the timer
 // is only touched from the forward's own thread; the driver is thread-safe.
+#[cfg(feature = "cudarc")]
 unsafe impl Send for Inner {}
 
+#[cfg(feature = "cudarc")]
 static P: OnceLock<Mutex<Inner>> = OnceLock::new();
 
+#[cfg(feature = "cudarc")]
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
@@ -61,40 +67,9 @@ pub fn enabled() -> bool {
     std::env::var("FT_PROFILE").is_ok_and(|v| !v.is_empty() && v != "0" && v != "false")
 }
 
-/// Dev-only routing trace: when `FT_ROUTE_TRACE` is set, append one line
-/// `{"layer": L, "ids": [...]}` for every routed layer to that file. This is a
-/// device-to-host read per layer, so it forces a sync and must run eager
-/// (`FERRUM_SMOKE_NOGRAPH=1`); it exists to collect routing traces for the
-/// speculative-prefetch study (OPTIMIZATION.md R3b), never in serving.
-#[cfg(feature = "cuda")]
-pub fn trace_routes(layer: usize, ids: &tch::Tensor) {
-    static PATH: OnceLock<Option<std::ffi::OsString>> = OnceLock::new();
-    let Some(path) = PATH
-        .get_or_init(|| std::env::var_os("FT_ROUTE_TRACE"))
-        .as_ref()
-    else {
-        return;
-    };
-    use std::io::Write;
-    let vals: Vec<i64> = ids
-        .flatten(0, -1)
-        .to_kind(tch::Kind::Int64)
-        .to_device(tch::Device::Cpu)
-        .try_into()
-        .unwrap_or_default();
-    let line = format!("{{\"layer\":{layer},\"ids\":{vals:?}}}\n");
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        let _ = f.write_all(line.as_bytes());
-    }
-}
-
 /// Open the driver and install the timer. Idempotent; `false` when disabled or
 /// the driver/context cannot be set up, in which case every `begin` is a no-op.
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cudarc")]
 pub fn init(device: usize) -> bool {
     if !enabled() {
         return false;
@@ -109,7 +84,7 @@ pub fn init(device: usize) -> bool {
     if driver.init().is_err() || driver.attach_primary_context(device as i32).is_err() {
         return false;
     }
-    let stream = unsafe { crate::infrastructure::cuda_graph::current_stream(device) };
+    let stream = std::ptr::null_mut();
     let inner = Inner {
         driver,
         device,
@@ -126,24 +101,14 @@ pub fn init(device: usize) -> bool {
     P.set(Mutex::new(inner)).is_ok()
 }
 
-#[cfg(not(feature = "cuda"))]
-pub fn init(_device: usize) -> bool {
-    false
-}
-
-#[cfg(feature = "cuda")]
-fn current(g: &Inner) -> CUstream {
-    // SAFETY: torch owns this thread-local stream; the timer only reads it.
-    unsafe { crate::infrastructure::cuda_graph::current_stream(g.device) }
-}
-
-#[cfg(not(feature = "cuda"))]
+#[cfg(feature = "cudarc")]
 fn current(_g: &Inner) -> CUstream {
     std::ptr::null_mut()
 }
 
 /// A fresh timing event recorded on the model's current stream. `None` when the
 /// timer is off or no step is open.
+#[cfg(feature = "cudarc")]
 pub fn begin(_label: &'static str) -> Option<OwnedEvent> {
     let mut g = P.get()?.lock().ok()?;
     if g.done || !g.open {
@@ -160,6 +125,7 @@ pub fn begin(_label: &'static str) -> Option<OwnedEvent> {
 
 /// Record `end` on the same stream and keep the pair. A `None` start (timer
 /// off) makes this a no-op.
+#[cfg(feature = "cudarc")]
 pub fn end(label: &'static str, start: Option<OwnedEvent>) {
     let Some(start) = start else {
         return;
@@ -195,6 +161,7 @@ pub fn end(label: &'static str, start: Option<OwnedEvent>) {
 /// Open one forward's step. A step is a decode step when it processes one
 /// token; prefill steps are kept with their token count so their split is
 /// visible too (a chunked prefill is several steps of different sizes).
+#[cfg(feature = "cudarc")]
 pub fn begin_step(tokens: i64) {
     let Some(mutex) = P.get() else {
         return;
@@ -222,6 +189,7 @@ pub fn begin_step(tokens: i64) {
 }
 
 /// Close one forward's step; dump once enough decode steps were recorded.
+#[cfg(feature = "cudarc")]
 pub fn end_step() {
     let Some(mutex) = P.get() else {
         return;
@@ -261,6 +229,7 @@ pub fn end_step() {
     }
 }
 
+#[cfg(feature = "cudarc")]
 fn dump(g: &mut Inner) {
     g.done = true;
     // SAFETY: torch's current stream on this context; waits for every recorded
@@ -433,3 +402,26 @@ fn dump(g: &mut Inner) {
     eprintln!("[ft-profile] wrote {out}.txt and {out}.json");
     g.records.clear();
 }
+
+#[cfg(not(feature = "cudarc"))]
+mod noop {
+    /// Marker for a timer event on a build with no CUDA runtime.
+    pub struct Event;
+
+    pub fn init(_device: usize) -> bool {
+        false
+    }
+
+    pub fn begin(_label: &'static str) -> Option<Event> {
+        None
+    }
+
+    pub fn end(_label: &'static str, _start: Option<Event>) {}
+
+    pub fn begin_step(_tokens: i64) {}
+
+    pub fn end_step() {}
+}
+
+#[cfg(not(feature = "cudarc"))]
+pub use noop::{Event, begin, begin_step, end, end_step, init};

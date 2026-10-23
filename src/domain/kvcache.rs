@@ -849,7 +849,7 @@ impl LinearStatePool {
 ///
 /// Pure indices. The device slabs behind them belong to the compute adapter
 /// (`infrastructure::kvcache_dev`), which is handed `filled()` to read and
-/// `tail()` to write, so this type stays testable without libtorch.
+/// `tail()` to write, so this type stays testable without a GPU runtime.
 pub struct SequenceCache {
     /// `pages[i]` is the pool location of the request's token `i`. `page_size`
     /// is 1, so this doubles as the token-location row the radix tree stores.

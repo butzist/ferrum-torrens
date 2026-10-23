@@ -8,13 +8,20 @@ decision-88 verification and the remediation plan to FreeToken parity. `TODO.md`
 section 8 holds the open-item numbering; this file holds the measured facts and
 the ordered plan.
 
+> **Runtime note (2026-10-23, decision 132).** Every "captured" number below was
+> measured on the engine-owned CUDA-graph path over the libtorch forward. That
+> path was removed with libtorch: the serving runtime is now cudarc and decode
+> capture is parked, so captured numbers are history, not reproducible, until a
+> capture path is ported. Eager numbers and all prefill numbers remain the
+> measured reference for the current runtime.
+
 ## Why
 
 At bs=1 a decode step is ~200 ms/token on the RTX 5060 Laptop, of which **GDN is
 ~68 ms (35%)** -- the largest single block (attention ~49 ms, MoE ~17 ms, rest
-~59 ms). Our GDN decode (`gdn_core_batch`, `src/models/qwen3_6/forward_torch.rs`)
-is ~15 libtorch ops per layer, run 30 times per token, including per-step `f32_`
-casts of weights and activations. FreeToken does the same layer in **two fused
+~59 ms). The historical GDN decode (`gdn_core_batch`, then in
+`forward_torch.rs`) was ~15 libtorch ops per layer, run 30 times per token,
+including per-step `f32_` casts of weights and activations. FreeToken does the same layer in **two fused
 kernels** (conv + recurrence) and is ~4.8x faster end to end (decision 76).
 
 ## FreeToken facts (this model, sm_120)

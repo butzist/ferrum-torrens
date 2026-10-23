@@ -1,6 +1,6 @@
 // Driver-API launcher for the fused GDN decode kernel (TODO.md M5 item 15).
 //
-// The linear-attention mixer ran as a dozen-plus libtorch ops per layer: separate
+// The linear-attention mixer ran as a dozen-plus separate ops per layer:
 // gating, the q/k L2-norm, the decay, a `kv_mem` reduction, an outer product and
 // a second reduction for the output, each an allocation and an `f32_` cast over a
 // bf16 operand, thirty times a decode step. This launcher swaps in one fused
@@ -9,7 +9,7 @@
 //
 // Like `PagedAttention`, this is an infrastructure adapter with no domain port:
 // GDN decode is internal to one model's forward, not an engine-orchestrated step,
-// so `TorchQwen3_6` holds it directly and the domain never sees it.
+// so `CudarcQwen3_6` holds it directly and the domain never sees it.
 
 use std::sync::Arc;
 
@@ -37,8 +37,7 @@ fn bad_abi(e: MoEError) -> MoEError {
 ///
 /// The stream matters: a captured decode step records on a side stream, so the
 /// launcher must be built with that same stream or its launches would be
-/// recorded outside the graph (`cuda_graph::set_current_stream` sets torch's
-/// stream to match).
+/// recorded outside the graph on the same stream.
 pub struct GdnDecode {
     kernels: GdnKernels,
     abi: LinearAbi,
@@ -75,7 +74,7 @@ impl GdnDecode {
             ));
         };
         // The launcher owns a cudarc runtime so its tensors and cubin launches
-        // share one primary context and stream; no libtorch backend is needed.
+        // share one primary context and stream; no extra runtime is needed.
         // A caller-provided stream is the model's, and the launcher's own ops
         // must land there too or a launch can read a tensor mid-write.
         let lib = Arc::new(Driver::open().map_err(driver)?);

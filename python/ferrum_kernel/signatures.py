@@ -470,8 +470,8 @@ def nvfp4_dense_gemv() -> dict:
 
     `a` is bf16 activations `[M, K]`, the weight is NVFP4 (packed read as int32,
     e4m3 block scales, f16 row global) and `c` is fp32 `[M, N]`. The scale
-    pointer is declared `*fp8e4nv` but carries a uint8 tensor: libtorch cannot
-    build an fp8 view from a host slice through tch, so the kernel reinterprets
+    pointer is declared `*fp8e4nv` but carries a uint8 tensor: the old runtime cannot
+    build an fp8 view from a host slice, so the kernel reinterprets
     the address, the same contract the MoE scale banks use.
     """
     return {

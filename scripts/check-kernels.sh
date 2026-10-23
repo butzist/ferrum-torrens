@@ -17,10 +17,10 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-# A devShell that also builds `--features cuda` puts the C++ libtorch on
-# LD_LIBRARY_PATH. The toolchain's python torch must load its *own*
-# `libtorch_*.so`, so drop those entries for the check; triton still finds
-# libcuda (`/run/opengl-driver/lib`) and libstdc++ from the remaining entries.
+# The runtime has no libtorch, but a host that still has one on
+# LD_LIBRARY_PATH must not shadow the toolchain python's own torch. Drop those
+# entries for the check; triton still finds libcuda (`/run/opengl-driver/lib`)
+# and libstdc++ from the remaining entries.
 clean_ld=""
 IFS=':' read -r -a ld_entries <<< "${LD_LIBRARY_PATH:-}"
 for p in "${ld_entries[@]}"; do

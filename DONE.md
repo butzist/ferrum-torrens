@@ -4118,3 +4118,57 @@ subsection names are kept verbatim.
      - **Remaining M7.3**: the prefill chunked recurrence (cumsum, masked
        triangular masks, batched matmul, permute), the GDN/attention/MoE hand-off
        and cache wiring, finally the forward file itself.
+
+132. **The torchless cudarc runtime is the serving path; libtorch is removed**
+     (2026-10-23). M7 is closed. `models/qwen3_6/forward_cudarc.rs` is wired
+     through `application::registry` under the `cudarc` feature, and every
+     `tch`, `torch-sys`, `candle-core`/`candle-nn` dependency, the `cuda`/
+     `candle*` cargo features, the torch forward, the C++ capture shim and the
+     libtorch devshell closure are gone.
+     - **Removed.** `src/models/qwen3_6/forward_torch.rs` (plus its test
+       module), `src/infrastructure/{candle,decode_graph,cuda_graph}.rs`,
+       `shim/c10_graph_shim.cpp`, `[build-dependencies] cc`, the four
+       pre-M7 examples, and the tch/capture-only tests
+       (`cuda_graph_moe_smoke`, `cuda_graph_torch_probe`,
+       `decode_graph_capture`, `device_decode_matches_refeed`,
+       `kernel_cubin_smoke`, `ftw_cross_check`). `build.rs` now only stages the
+       Nix-built cubins. `torch.rs` keeps device resolution (`Device`,
+       `DeviceRequest`, `probe_cuda`, `resolve_device`, `auto_device`) over
+       `cuda_driver`; `profile.rs` compiles as a no-op off `cudarc`.
+       `infrastructure/decode_buffers.rs` stays as cudarc-only, ported code,
+       though nothing wires it until capture returns.
+     - **Capture is parked, not ported.** The engine keeps `CapturedDecode`,
+       `Engine::with_captured` and `BuiltModel.captured` (always `None`); the
+       registry emits a warning when `cuda_graph = true` and decode stays eager.
+       This is deliberate: reopening it is a new port, not a re-enable.
+     - **No torch in the tree.** `cargo tree --features cudarc -i tch`,
+       `-i torch-sys` and `-i candle-core` all fail with "did not match any
+       packages"; a full `cargo tree --features cudarc` has no
+       torch/tch/candle node. The public half from `tests/cudarc_adapter.rs`
+       and `tests/cudarc_forward.rs` now compares against host references
+       instead of tch, and keeps the cudarc-only capture/replay invariant.
+     - **Gates** (`FERRUM_KERNEL_DIR="$PWD"`): `cargo fmt --check`; default
+       `cargo build`; `cargo clippy --all-targets` clean; `cargo test` **342
+       passed / 0 failed / 4 ignored**; `cargo build --release --features
+       cudarc --bin ferrum-torrens`; `cargo clippy --all-targets --features
+       cudarc` clean; `cargo test --features cudarc --lib` **415 passed**;
+       `env -u LD_LIBRARY_PATH bash scripts/check-kernels.sh` **PASS**.
+     - **Real-checkpoint gates** (one process at a time, under
+       `prlimit --as=68719476736`):
+       `cudarc_engine_generate` loaded in 22.54 s on `cuda:0` (40 layers),
+       ran 40 expert steps and generated **11751 (" Paris")** for
+       "The capital of France is" in 0.34 s;
+       `engine_real_generate::one_token_prediction_matches_the_oracle`
+       generated 11751 in 24.0 s on the inline host-MoE path;
+       `one_token_through_the_kernel_matches_the_oracle` generated 11751 in
+       0.3 s with 40 expert steps; the chat-template gate passed.
+       `throughput_smoke` with `FERRUM_SMOKE_TOKENS=8
+       FERRUM_SMOKE_PREFILL=128`: captured graph false, VRAM 7574 MiB,
+       **pp 132 tokens / 1.28 s = 103.5 tok/s**, **tg 8 tokens / 7 decoded /
+       0.18 s = 39.9 tok/s**, 640 expert steps, GPU 99% busy.
+       Logs `/tmp/opencode/{gate-cudarc-engine,gate-engine-real-generate,
+       gate-engine-real-kernel,gate-engine-real-chat,gate-throughput}.log`.
+     - **Docs.** README/AGENTS build lines use `--features cudarc`;
+       ARCHITECTURE describes the cudarc runtime and marks capture parked;
+       OPTIMIZATION keeps the measured numbers as history and states they came
+       from the removed path.
