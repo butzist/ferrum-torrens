@@ -4181,3 +4181,41 @@ subsection names are kept verbatim.
        ARCHITECTURE describes the cudarc runtime and marks capture parked;
        OPTIMIZATION keeps the measured numbers as history and states they came
        from the removed path.
+
+133. **The torchless eager prefill recovered to libtorch parity** (2026-10-23).
+     Post-M7 optimization of the cudarc serving path. Everything is eager (no
+     CUDA graph); one model load at a time on the RTX 5060 Laptop, bf16 KV.
+     - **Progression at a 2057-token prefill** (pp tok/s): 512 (M7 exit) ->
+       658 (tiled causal SDPA with `tl.dot`) -> 825 (bf16 KV attention instead
+       of the f32 pool/SDPA path, plus one fused causal-conv prefill per layer
+       instead of 61k per-token launches) -> 910-935 (slot mapping and the
+       grouped-MoE CSR moved onto the device with `moe_csr_count/prefix/scatter`,
+       and the prefill scratch reused across layers instead of ~126 MB of
+       `cudaMalloc` per layer). 517-token pp went 399 -> 402. The final 2057
+       number is within 2.4% of the removed libtorch path (958) and the 517
+       number matches it (401); decode at a 517 prefix is 32.3 tg vs 32.8.
+     - **GDN.** The chunked recurrence was restored in cudarc
+       (`bmm`/`cumsum_dim0`/`gdn_ratio_masks`/`mul_mid`/`scale_heads` + the
+       committed `tri_solve`), with the fused per-token `gdn_decode` kept as the
+       alternative. Measured A/B: chunked 935 vs fused 929 at 2057 and 402.2 vs
+       402.8 at 517, so the chunked path stays the default (it is also the
+       reference algorithm); the fused path is behind `FERRUM_GDN_CHUNKED=0`.
+       `FT_PROFILE=1` now attributes an instrumented 1991-token prefill:
+       `gdn_recur` 37.6%, `gdn_qkvz` 22.3%, `attn_sdpa` 14.6%, `gdn_tail`
+       11.4%, `attn_proj` 7.9%, `gdn_conv` 2.8%.
+     - **Negative result: paged attention for eager decode is not a win.** The
+       old path used `gdn`-style paged decode; the current eager decode gathers
+       the prefix and runs the (tiled) one-row causal SDPA. Wiring the paged
+       kernel over the pool was neutral at 517 and ~1% slower at 2057 (the
+       one-query kernel serializes over the window; the dense gather reads
+       contiguously). Reverted after the A/B. Revisit only with a split-K paged
+       kernel or with capture.
+     - **Capture remains the decode lever.** Eager decode at a 2057 prefix is
+       ~29 tg with 1664 slots (auto 1920 OOMs a 2057 prefill with the 2048
+       scratch here); the old 32.8 came from a 1920-slot captured graph. The
+       launch chain, not the math, is the remaining gap.
+     - **Gates at the end of the slice**: `cargo fmt --check`; clippy default /
+       `cudarc`; `cargo test` 345 / 4 ignored; `cudarc --lib` 419; the real
+       `cuda_moe_matches_reference` eight-test gate; `cudarc_model` oracle
+       (argmax 11751) and the GDN/paged differentials; `cudarc_engine_generate`
+       (11751, " Paris"); `check-kernels.sh` and `selftest --interp`.

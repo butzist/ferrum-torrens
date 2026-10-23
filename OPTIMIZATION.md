@@ -15,14 +15,16 @@ the ordered plan.
 > capture path is ported. Eager numbers and all prefill numbers remain the
 > measured reference for the current runtime.
 >
-> **Torchless eager baseline (2026-10-23, decision 132).** RTX 5060 Laptop,
-> bf16 KV, 512-slot explicit cache, 7574 MiB at load: **517-token pp 399.2
-> tok/s, tg 31.8 tok/s; 2057-token pp 512.2 tok/s, tg 29.9 tok/s.** The 517
-> pp matches the old libtorch path; the 2057 pp is 47% below it because the
-> port runs the GDN prefill token-at-a-time through `gdn_decode` (no chunked
-> recurrence) and uses the naive causal SDPA. Those two are the next levers,
-> in that order; restore the chunked recurrence and a tiled causal attention
-> before re-running R10/R11 comparisons.
+> **Torchless eager baseline after the recovery slice (2026-10-23, decision
+> 133).** RTX 5060 Laptop, bf16 KV, eager: **517-token pp ~402 tok/s, tg ~32.3;
+> 2057-token pp ~935 tok/s** (with a 1664-slot cache; auto 1920 OOMs the 2057
+> prefill with the 2048-token MoE scratch), **tg ~29 at a 2057 prefix**. The
+> old libtorch path was 401/32.8 and 958. 517 is at parity; 2057 prefill is
+> within 2.4%. The gains came from the tiled causal SDPA, bf16 KV attention,
+> one fused conv prefill per layer, and the device-side MoE slot/CSR plan. The
+> remaining decode gap is the missing CUDA-graph capture; paged attention for
+> eager decode was a measured no-win and is reverted. Do not re-chase those
+> without a split-K paged kernel or a capture port.
 
 ## Why
 
