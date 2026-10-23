@@ -14,22 +14,15 @@
 # driver mount to the loader path. `CUDA_HOME`/`CUDARC_CUDA_VERSION` are only
 # build-time knobs for cudarc's build script.
 let
-  src = lib.cleanSourceWith {
-    src = ../.;
-    filter =
-      path: type:
-      let
-        root = toString ../.;
-        rel = lib.removePrefix (root + "/") (toString path);
-      in
-      rel == root
-      || rel == "Cargo.toml"
-      || rel == "Cargo.lock"
-      || rel == "build.rs"
-      || rel == "src"
-      || lib.hasPrefix "src/" rel
-      || rel == "examples"
-      || lib.hasPrefix "examples/" rel;
+  src = lib.fileset.toSource {
+    root = ../.;
+    fileset = lib.fileset.unions [
+      ../Cargo.toml
+      ../Cargo.lock
+      ../build.rs
+      ../src
+      ../examples
+    ];
   };
 in
 pkgs.rustPlatform.buildRustPackage {

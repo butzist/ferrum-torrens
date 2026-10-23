@@ -4283,7 +4283,12 @@ subsection names are kept verbatim.
        `nix/model.nix`) checks for `<model.path>/freetoken_weight.json`, creates
        a private FreeToken venv under the state dir with the repository's tested
        `uv pip install -e ... [accel]` line (`FREETOKEN_ALLOW_CUDA_MISMATCH=1`,
-       the toolkit's nvcc against the wheel's cu130 torch), downloads
+       the toolkit's nvcc against the wheel's cu130 torch). The converter source
+       is the pinned `freetoken` flake input (`github:FlashML-org/FreeToken` at
+       the submodule commit), not `./FreeToken`: a git flake does not fetch
+       submodule contents, and this keeps the helper's closure small. The
+       helper copies that input to the state dir before installing, then
+       downloads
        `nvidia/Qwen3.6-35B-A3B-NVFP4` with `huggingface_hub` (or uses
        `MODEL_SOURCE`), runs `ft checkpoint --moe-backend offload --shard-gib 8`
        into a temp sibling, and renames it only after the FTW index exists. A

@@ -6,6 +6,10 @@
     flake-root.url = "github:srid/flake-root";
     rust-overlay.url = "github:oxalica/rust-overlay";
     agent-toolbox.url = "github:butzist/agent-toolbox";
+    # The reference converter is also a flake input: a git flake does not fetch
+    # submodule contents, and `ferrum-torrens-model` needs the Python source.
+    freetoken.url = "github:FlashML-org/FreeToken/d3512b43affe981465e03ee28cbd88f49c39b9aa";
+    freetoken.flake = false;
   };
 
   outputs =
@@ -94,24 +98,10 @@
           # First-run HF download + FTW conversion. It packages the vendored
           # FreeToken converter; the venv itself is bootstrapped under the state
           # dir on first use (the same tested install line as AGENTS.md).
-          freetokenSrc = pkgs.lib.cleanSourceWith {
-            src = ./FreeToken;
-            filter =
-              path: type:
-              let
-                root = toString ./FreeToken;
-                rel = pkgs.lib.removePrefix (root + "/") (toString path);
-              in
-              rel == root
-              || rel == "setup.py"
-              || rel == "pyproject.toml"
-              || rel == "LICENSE"
-              || rel == "README.md"
-              || pkgs.lib.hasPrefix "python/" rel
-              || pkgs.lib.hasPrefix "freetoken-kernel-cache/" rel;
-          };
+          freetokenSrc = inputs.freetoken;
           ferrum-torrens-model = pkgs.callPackage ./nix/model.nix {
-            inherit cudarcCudaHome freetokenSrc;
+            cudaToolkit = pkgs.cudatoolkit;
+            inherit freetokenSrc;
           };
 
           # The serving runtime (cudarc) links a CUDA 13 cuBLAS: the devshell's

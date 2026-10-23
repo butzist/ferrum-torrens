@@ -1,7 +1,7 @@
 {
   pkgs,
   lib,
-  cudarcCudaHome,
+  cudaToolkit,
   freetokenSrc,
 }:
 #
@@ -22,13 +22,14 @@ pkgs.writeShellApplication {
     pkgs.gnutar
     pkgs.gzip
     pkgs.util-linux
+    pkgs.ninja
   ];
   text =
     builtins.replaceStrings
       [ "@FREETOKEN_SRC@" "@CUDA_HOME@" "@PYTHON312@" "@STDENV_CC@" "@STDENV_CC_LIB@" ]
       [
         "${freetokenSrc}"
-        "${cudarcCudaHome}"
+        "${cudaToolkit}"
         "${pkgs.python312}"
         "${pkgs.stdenv.cc}"
         "${pkgs.stdenv.cc.cc.lib}"
