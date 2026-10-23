@@ -20,6 +20,7 @@ use crate::infrastructure::cuda_linear::{DenseGemv, Fp8Linear};
 use crate::infrastructure::cudarc::{Runtime, Tensor, TensorDType, Unary};
 use crate::infrastructure::ftw::FtwIndex;
 use crate::infrastructure::kvcache_dev::{DeviceCache, KvDType, LinearStateSlabs};
+use crate::infrastructure::profile::{substep_begin, substep_end, substep_report};
 use crate::infrastructure::torch::Device;
 
 use super::load_cudarc::{Dense, DenseWeight, HeadWeight, Layer, Mixer, Tower};
@@ -522,32 +523,52 @@ impl CudarcQwen3_6 {
         positions: &[u32],
         access: &Access<'_>,
     ) -> Result<Tensor> {
+        let s = substep_begin(&self.rt);
         let (q, k, v, gate) = self.project_attention(layer, x, positions)?;
+        substep_end(&self.rt, "attn_proj", s);
         let t = x.shape()[0];
         let q_dim = self.params.num_q_heads * self.params.head_dim;
         let attn = match access {
-            Access::Stateless => q.causal_sdpa(&k, &v, 0)?,
+            Access::Stateless => {
+                let s = substep_begin(&self.rt);
+                let attn = q.causal_sdpa(&k, &v, 0)?;
+                substep_end(&self.rt, "attn_sdpa", s);
+                attn
+            }
             Access::Cached { cache, .. } => {
+                let s = substep_begin(&self.rt);
                 let q_offset = cache.cached() - t;
                 let pool = self.cache.mha();
                 pool.store(li, cache.tail(t), &k, &v);
-                if pool.dtype() == KvDType::BFloat16 {
+                let (k_all, v_all, native) = if pool.dtype() == KvDType::BFloat16 {
                     let (k_all, v_all) = pool.gather_native(li, cache.filled());
-                    q.causal_sdpa(&k_all, &v_all, q_offset)?
+                    (k_all, v_all, true)
                 } else {
                     let (k_all, v_all) = pool.gather(li, cache.filled());
+                    (k_all, v_all, false)
+                };
+                substep_end(&self.rt, "attn_store_gather", s);
+                let s = substep_begin(&self.rt);
+                let attn = if native {
+                    q.causal_sdpa(&k_all, &v_all, q_offset)?
+                } else {
                     q.cast(TensorDType::F32)?
                         .causal_sdpa(&k_all, &v_all, q_offset)?
                         .cast(TensorDType::Bf16)?
-                }
+                };
+                substep_end(&self.rt, "attn_sdpa", s);
+                attn
             }
         }
         .reshape(&[t, q_dim])?;
-        let gated = attn.mul(&sigmoid(&gate)?)?;
         let Mixer::Full { o, .. } = &layer.mixer else {
             return Err(moe_bad("not a full-attention layer"));
         };
-        self.apply_dense(o, &gated)
+        let s = substep_begin(&self.rt);
+        let gated = attn.mul(&sigmoid(&gate)?)?;
+        let out = self.apply_dense(o, &gated);
+        substep_end(&self.rt, "attn_out", s);
+        out
     }
 
     fn gdn_layer(
@@ -578,13 +599,17 @@ impl CudarcQwen3_6 {
         let k = p.linear_conv_kernel_dim;
         let t = x.shape()[0];
 
+        let s = substep_begin(&self.rt);
         let projected = self.apply_dense(qkvz, x)?;
+        substep_end(&self.rt, "gdn_qkvz", s);
         let conv_in = projected.narrow(1, 0, conv_dim)?.contiguous()?;
         let z = projected.narrow(1, conv_dim, value_dim)?;
+        let s = substep_begin(&self.rt);
         let ba = x
             .cast(TensorDType::F32)?
             .matmul_nt_f32(&ba.cast(TensorDType::F32)?)?
             .cast(TensorDType::Bf16)?;
+        substep_end(&self.rt, "gdn_ba", s);
 
         let (conv_state, rec_state) = match access {
             Access::Stateless => (
@@ -596,6 +621,7 @@ impl CudarcQwen3_6 {
                 (state.conv_state(slot, li), state.recurrent_state(slot, li))
             }
         };
+        let s = substep_begin(&self.rt);
         let conv_w = conv.reshape(&[conv_dim, k])?;
         let mixed = self.rt.zeros(&[t, conv_dim], TensorDType::Bf16)?;
         let new_state = self.rt.zeros(&[conv_dim, k - 1], TensorDType::F32)?;
@@ -606,6 +632,7 @@ impl CudarcQwen3_6 {
         if let Access::Cached { cache, state } = access {
             state.set_conv_state(cache.state_slot(), li, new_state);
         }
+        substep_end(&self.rt, "gdn_conv", s);
         let q = mixed
             .narrow(1, 0, key_dim)?
             .contiguous()?
@@ -624,6 +651,7 @@ impl CudarcQwen3_6 {
         // per-token kernel.
         let use_chunked =
             gdn_chunked_enabled() && t >= GDN_PREFILL_MIN && dv == 128 && vb % kb == 0;
+        let s = substep_begin(&self.rt);
         let core = if use_chunked {
             let q_exp = q.repeat_heads(kb, vb / kb)?;
             let k_exp = k.repeat_heads(kb, vb / kb)?;
@@ -664,9 +692,13 @@ impl CudarcQwen3_6 {
                 Tensor::stack(&core_rows)?
             }
         };
+        substep_end(&self.rt, "gdn_recur", s);
+        let s = substep_begin(&self.rt);
         let core_n = rms_norm_last(&core, norm, p.rms_norm_eps)?.reshape(&[t, value_dim])?;
         let out = core_n.mul(&z.silu()?)?;
-        self.apply_dense(o, &out)
+        let out = self.apply_dense(o, &out);
+        substep_end(&self.rt, "gdn_tail", s);
+        out
     }
 
     fn moe(&self, li: usize, x_post: &Tensor) -> Result<Tensor> {
@@ -842,6 +874,17 @@ impl CudarcQwen3_6 {
     }
 
     fn run_tower(&self, ids: &[u32], positions: &[u32], access: &Access<'_>) -> Result<Vec<f32>> {
+        let out = self.run_tower_inner(ids, positions, access);
+        substep_report(ids.len());
+        out
+    }
+
+    fn run_tower_inner(
+        &self,
+        ids: &[u32],
+        positions: &[u32],
+        access: &Access<'_>,
+    ) -> Result<Vec<f32>> {
         let p = &self.params;
         let t = ids.len();
         if t == 0 {

@@ -67,6 +67,78 @@ pub fn enabled() -> bool {
     std::env::var("FT_PROFILE").is_ok_and(|v| !v.is_empty() && v != "0" && v != "false")
 }
 
+/// Host-clock sub-step timer for the eager prefill path.
+///
+/// Unlike the CUDA-event timer above, this one brackets each sub-step with a
+/// stream synchronize, so it attributes host plus device time inside one mixer
+/// on the uncaptured path. It is off unless `FT_PROFILE` is set.
+#[cfg(feature = "cudarc")]
+mod substep {
+    use std::collections::BTreeMap;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+
+    use crate::infrastructure::cudarc::Runtime;
+
+    fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(super::enabled)
+    }
+
+    fn acc() -> &'static Mutex<BTreeMap<&'static str, u64>> {
+        static ACC: OnceLock<Mutex<BTreeMap<&'static str, u64>>> = OnceLock::new();
+        ACC.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    /// Synchronize, then start the clock. `None` when the timer is off.
+    pub fn begin(rt: &Runtime) -> Option<Instant> {
+        if !on() {
+            return None;
+        }
+        let _ = rt.synchronize();
+        Some(Instant::now())
+    }
+
+    /// Synchronize, then add the elapsed span under `name`.
+    pub fn end(rt: &Runtime, name: &'static str, start: Option<Instant>) {
+        let Some(start) = start else {
+            return;
+        };
+        let _ = rt.synchronize();
+        let ns = start.elapsed().as_nanos() as u64;
+        if let Ok(mut m) = acc().lock() {
+            *m.entry(name).or_insert(0) += ns;
+        }
+    }
+
+    /// Print one line per sub-step plus their sum, then clear for the next
+    /// top-level forward.
+    pub fn report(tokens: usize) {
+        if !on() {
+            return;
+        }
+        let Ok(mut m) = acc().lock() else {
+            return;
+        };
+        let mut total = 0u64;
+        for (name, ns) in m.iter() {
+            total += *ns;
+            eprintln!("[profile] {name}={:.3}ms", *ns as f64 / 1e6);
+        }
+        eprintln!(
+            "[profile] total={:.3}ms tokens={tokens}",
+            total as f64 / 1e6
+        );
+        m.clear();
+    }
+}
+
+#[cfg(feature = "cudarc")]
+pub use substep::{begin as substep_begin, end as substep_end, report as substep_report};
+
+#[cfg(not(feature = "cudarc"))]
+pub fn substep_report(_tokens: usize) {}
+
 /// Open the driver and install the timer. Idempotent; `false` when disabled or
 /// the driver/context cannot be set up, in which case every `begin` is a no-op.
 #[cfg(feature = "cudarc")]
