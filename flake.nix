@@ -6,10 +6,6 @@
     flake-root.url = "github:srid/flake-root";
     rust-overlay.url = "github:oxalica/rust-overlay";
     agent-toolbox.url = "github:butzist/agent-toolbox";
-    # The reference converter is also a flake input: a git flake does not fetch
-    # submodule contents, and `ferrum-torrens-model` needs the Python source.
-    freetoken.url = "github:FlashML-org/FreeToken/d3512b43affe981465e03ee28cbd88f49c39b9aa";
-    freetoken.flake = false;
   };
 
   outputs =
@@ -68,8 +64,8 @@
           #
           # This is deliberately NOT the FreeToken environment. FreeToken pins
           # torch>=2.11,<2.12 plus sglang-kernel 0.4.5, which links torch symbols
-          # only 2.11 has, while nixpkgs ships 2.13. The `ft checkpoint`
-          # conversion therefore keeps using FreeToken/.venv (decision 35).
+          # only 2.11 has, while nixpkgs ships 2.13. The FTW conversion is the
+          # Rust converter now, so only the reference probes still use a venv.
           #
           # The Rust runtime never imports Python or torch; this env is the
           # compile-time kernel toolchain and the selftest's reference side.
@@ -95,13 +91,21 @@
             inherit cudarcCudaHome kernels;
           };
 
-          # First-run HF download + FTW conversion. It packages the vendored
-          # FreeToken converter; the venv itself is bootstrapped under the state
-          # dir on first use (the same tested install line as AGENTS.md).
-          freetokenSrc = inputs.freetoken;
+          # The CPU-only HF -> FTW converter. It shares the library with the
+          # server, so the build still stages the cubins, but it never loads a
+          # CUDA device.
+          ferrum-torrens-convert = pkgs.callPackage ./nix/convert.nix {
+            inherit kernels;
+          };
+
+          # The FTW checkpoint as a store path: the HF snapshot is a
+          # fixed-output derivation and the converter runs over it at build
+          # time. Override `hash` to follow a new revision, or pass `source` to
+          # convert a local snapshot without a download.
           ferrum-torrens-model = pkgs.callPackage ./nix/model.nix {
-            cudaToolkit = pkgs.cudatoolkit;
-            inherit freetokenSrc;
+            converter = ferrum-torrens-convert;
+            hash = "sha256-JTcnVrnwsMBjPzBouRPPQKya4CGjHMkZJYFmdvnzg4U=";
+            source = null;
           };
 
           # The serving runtime (cudarc) links a CUDA 13 cuBLAS: the devshell's
@@ -123,8 +127,8 @@
           '';
 
           # Rust is the production language, and the only one at runtime. Python
-          # is used for the one-time HF -> FTW conversion via FreeToken's `ft
-          # checkpoint` and for the kernel toolchain (see AGENTS.md).
+          # is only the kernel toolchain; the HF -> FTW conversion is the Rust
+          # converter (see AGENTS.md).
           basePackages = [
             rustNightly
             pkgs.stdenv.cc
@@ -176,7 +180,12 @@
         in
         {
           packages = {
-            inherit kernels ferrum-torrens ferrum-torrens-model;
+            inherit
+              kernels
+              ferrum-torrens
+              ferrum-torrens-convert
+              ferrum-torrens-model
+              ;
             default = ferrum-torrens;
           };
           devShells.default = pkgs.mkShell {

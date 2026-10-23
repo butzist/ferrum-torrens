@@ -90,23 +90,6 @@
         "type": "github"
       }
     },
-    "freetoken": {
-      "flake": false,
-      "locked": {
-        "lastModified": 1790899185,
-        "narHash": "sha256-niR+YXb1PR+kZPk8p+lyHRPsui/7DrR99XlESEoqIsk=",
-        "owner": "FlashML-org",
-        "repo": "FreeToken",
-        "rev": "d3512b43affe981465e03ee28cbd88f49c39b9aa",
-        "type": "github"
-      },
-      "original": {
-        "owner": "FlashML-org",
-        "repo": "FreeToken",
-        "rev": "d3512b43affe981465e03ee28cbd88f49c39b9aa",
-        "type": "github"
-      }
-    },
     "jail-nix": {
       "locked": {
         "lastModified": 1788928033,
@@ -260,7 +243,6 @@
         "agent-toolbox": "agent-toolbox",
         "flake-parts": "flake-parts",
         "flake-root": "flake-root",
-        "freetoken": "freetoken",
         "nixpkgs": "nixpkgs_3",
         "rust-overlay": "rust-overlay"
       }

@@ -9,7 +9,19 @@ let
   cfg = config.services.ferrum-torrens;
   system = pkgs.stdenv.hostPlatform.system;
   defaultPackage = self.packages.${system}.ferrum-torrens;
-  modelPackage = self.packages.${system}.ferrum-torrens-model;
+
+  modelPackage = pkgs.callPackage ./model.nix {
+    converter = self.packages.${system}.ferrum-torrens-convert;
+    inherit (cfg.model)
+      repo
+      revision
+      source
+      shardGiB
+      hash
+      ;
+  };
+
+  modelPath = if cfg.model.path != null then cfg.model.path else "${modelPackage}";
 
   configFile = pkgs.writeText "ferrum-torrens.toml" ''
     [serve]
@@ -18,7 +30,7 @@ let
     served_model_name = "${cfg.servedModelName}"
 
     [model]
-    path = "${cfg.model.path}"
+    path = "${modelPath}"
     device = "cuda"
     gpu = ${toString cfg.gpu}
     max_seq_len = ${toString cfg.maxSeqLen}
@@ -41,17 +53,6 @@ let
 
     ${cfg.extraConfig}
   '';
-
-  modelEnvironment = [
-    "MODEL_REPO=${cfg.model.repo}"
-    "MODEL_FTW=${cfg.model.path}"
-    "MODEL_REVISION=${cfg.model.revision}"
-    "STATE_DIR=${cfg.stateDir}"
-    "CACHE_DIR=${cfg.cacheDir}"
-    "SHARD_GIB=${toString cfg.model.shardGiB}"
-    "MODEL_KEEP_SOURCE=${if cfg.model.keepSource then "1" else "0"}"
-  ]
-  ++ lib.optional (cfg.model.source != null) "MODEL_SOURCE=${cfg.model.source}";
 in
 {
   options.services.ferrum-torrens = {
@@ -66,25 +67,25 @@ in
     user = lib.mkOption {
       type = lib.types.str;
       default = "ferrum-torrens";
-      description = "User the server and the first-run converter run as.";
+      description = "User the server runs as.";
     };
 
     group = lib.mkOption {
       type = lib.types.str;
       default = "ferrum-torrens";
-      description = "Group the server and the first-run converter run as.";
+      description = "Group the server runs as.";
     };
 
     stateDir = lib.mkOption {
       type = lib.types.str;
       default = "/var/lib/ferrum-torrens";
-      description = "Persistent state (the FTW checkpoint, conversion venv and source copy).";
+      description = "Persistent state directory.";
     };
 
     cacheDir = lib.mkOption {
       type = lib.types.str;
       default = "/var/cache/ferrum-torrens";
-      description = "Download/cache directory for Hugging Face, uv and pip.";
+      description = "Cache directory.";
     };
 
     host = lib.mkOption {
@@ -174,13 +175,6 @@ in
       description = "Extra TOML appended to the generated config (for keys the options do not cover).";
     };
 
-    environmentFile = lib.mkOption {
-      type = lib.types.nullOr lib.types.path;
-      default = null;
-      example = "/etc/ferrum-torrens/hf-token";
-      description = "Optional EnvironmentFile (HF_TOKEN=...) for the first-run download.";
-    };
-
     extraEnvironment = lib.mkOption {
       type = lib.types.attrsOf lib.types.str;
       default = { };
@@ -191,7 +185,7 @@ in
       repo = lib.mkOption {
         type = lib.types.str;
         default = "nvidia/Qwen3.6-35B-A3B-NVFP4";
-        description = "Hugging Face repo to download when autoConvert is on.";
+        description = "Hugging Face repo to convert.";
       };
 
       revision = lib.mkOption {
@@ -200,10 +194,16 @@ in
         description = "Hugging Face revision.";
       };
 
-      path = lib.mkOption {
+      hash = lib.mkOption {
         type = lib.types.str;
-        default = "${config.services.ferrum-torrens.stateDir}/models/Qwen3.6-35B-A3B-NVFP4.ftw";
-        description = "FTW checkpoint directory the server loads.";
+        default = "sha256-JTcnVrnwsMBjPzBouRPPQKya4CGjHMkZJYFmdvnzg4U=";
+        description = "NAR hash of the downloaded HF snapshot; update it with the repo/revision (ignored when model.source is set).";
+      };
+
+      path = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "An existing FTW checkpoint; when null the build-time conversion is used.";
       };
 
       source = lib.mkOption {
@@ -215,19 +215,13 @@ in
       autoConvert = lib.mkOption {
         type = lib.types.bool;
         default = true;
-        description = "Download and convert the model into model.path on first start.";
-      };
-
-      keepSource = lib.mkOption {
-        type = lib.types.bool;
-        default = false;
-        description = "Keep the downloaded HF snapshot after a successful conversion.";
+        description = "Build the FTW checkpoint from the HF source. Required when model.path is null.";
       };
 
       shardGiB = lib.mkOption {
         type = lib.types.float;
         default = 8.0;
-        description = "FTW shard size limit passed to ft checkpoint.";
+        description = "FTW shard size limit passed to the converter.";
       };
     };
   };
@@ -237,6 +231,10 @@ in
       {
         assertion = cfg.maxPrefillLength <= cfg.maxSeqLen;
         message = "services.ferrum-torrens.maxPrefillLength must be <= maxSeqLen";
+      }
+      {
+        assertion = cfg.model.path != null || cfg.model.autoConvert;
+        message = "services.ferrum-torrens needs model.path, or model.autoConvert = true to build the FTW checkpoint";
       }
     ];
 
@@ -261,47 +259,13 @@ in
       "d ${cfg.cacheDir} 0750 ${cfg.user} ${cfg.group} -"
     ];
 
-    systemd.services.ferrum-torrens-model = lib.mkIf cfg.model.autoConvert {
-      description = "FerrumTorrens model download and FTW conversion (first run)";
-      wantedBy = [ "multi-user.target" ];
-      unitConfig = {
-        ConditionPathExists = "!${cfg.model.path}/freetoken_weight.json";
-      };
-      serviceConfig = {
-        Type = "oneshot";
-        RemainAfterExit = true;
-        User = cfg.user;
-        Group = cfg.group;
-        SupplementaryGroups = [
-          "video"
-          "render"
-        ];
-        WorkingDirectory = cfg.stateDir;
-        ExecStart = "${modelPackage}/bin/ferrum-torrens-model";
-        Environment = modelEnvironment;
-        EnvironmentFile = lib.optional (cfg.environmentFile != null) cfg.environmentFile;
-        TimeoutStartSec = "infinity";
-        Restart = "no";
-        PrivateTmp = true;
-        ProtectHome = "read-only";
-        ProtectSystem = "strict";
-        ReadWritePaths = [
-          cfg.stateDir
-          cfg.cacheDir
-        ];
-        NoNewPrivileges = true;
-      };
-    };
-
     systemd.services.ferrum-torrens = {
       description = "FerrumTorrens inference server";
       wantedBy = [ "multi-user.target" ];
       after = [
         "network-online.target"
-      ]
-      ++ lib.optional cfg.model.autoConvert "ferrum-torrens-model.service";
+      ];
       wants = [ "network-online.target" ];
-      requires = lib.optional cfg.model.autoConvert "ferrum-torrens-model.service";
       serviceConfig = {
         Type = "simple";
         User = cfg.user;

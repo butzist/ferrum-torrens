@@ -4314,3 +4314,74 @@ subsection names are kept verbatim.
        without network, a GPU and ~50 GiB of disk; its shell is
        `bash -n`-clean and the venv/convert commands are the ones
        `AGENTS.md` documents.
+
+
+136. **The model is baked at build time, not converted on first boot** (2026-10-23).
+     Deployment packaging, not a serving change.
+     - **Converter package.** `nix/convert.nix` builds `ferrum-torrens-convert`
+       (the CPU-only Rust HF -> FTW converter) with the same filtered source as
+       `nix/package.nix`, `--bin ferrum-torrens-convert`, no `cudarc` feature and
+       `doCheck = false`. It still needs the `kernels` derivation because the
+       shared library's `kernel_abi` includes the cubins, but the converter
+       never links or loads CUDA.
+     - **Snapshot FOD.** `nix/model.nix` downloads the HF snapshot as a
+       fixed-output derivation with `huggingface_hub`: `repo` and `revision`
+       default to `nvidia/Qwen3.6-35B-A3B-NVFP4@main`, `hash` is the recursive
+       NAR hash (pinned at
+       `sha256-JTcnVrnwsMBjPzBouRPPQKya4CGjHMkZJYFmdvnzg4U=`), `.cache/` is
+       removed after the download, and `HF_TOKEN`/proxy variables are impure
+       build inputs. A non-null `source` converts a local snapshot instead.
+     - **FTW derivation.** A `stdenvNoCC` build runs
+       `ferrum-torrens-convert --model <snapshot> --out $out --shard-gib 8` with
+       `dontFixup = true`; the output is the ~21 GB FTW directory. The build
+       needs ~22 GB of download, ~21 GB of store space and roughly 90 s of CPU.
+       There is no runtime Python, uv, FreeToken or `freetoken_weight.json`
+       gate.
+     - **Flake and module.** `packages.ferrum-torrens-convert` and
+       `packages.ferrum-torrens-model` are exposed; `default` stays
+       `ferrum-torrens`. The `freetoken` input and `nix/fetch-model.sh` are
+       gone, so the lock has no FreeToken node. The module builds the model
+       derivation from `model.repo`/`revision`/`hash`/`source`/`shardGiB`; the
+       serve unit is the only service (no oneshot, no `ConditionPathExists`, no
+       `requires`/`after` on a model unit), and the generated config's
+       `[model] path` is `model.path` when set, else the derivation output. A
+       null path with `autoConvert = false` is an assertion error. To follow a
+       new model, change `repo`/`revision` and the matching NAR `hash`; use
+       `source` for a local HF snapshot or `path` for an existing FTW.
+     - **Validation.** `nixfmt --check` is clean. The flake and module evaluate
+       against nixpkgs 26.11 in a mock store: the serve `ExecStart`, the
+       generated config path (the FTW derivation), user creation and firewall
+       are correct, and `systemd.services.ferrum-torrens-model` no longer
+       exists. `cargo fmt --check`, `cargo test` and `cargo clippy
+       --all-targets` stay green; no Rust changed. The 22 GB download and the
+       21 GB conversion were not run.
+
+
+137. **The HF -> FTW converter is reimplemented in Rust** (2026-10-23). The
+     serving path no longer depends on FreeToken's Python converter.
+     - **Code.** `src/converter/` implements a minimal safetensors reader
+       (`U8`, `F8_E4M3`, `F16`, `F32`, `BF16`), an FTW writer with the same
+       4096-aligned/sharded layout as `ftw.py`, and the Qwen3.6-35B-A3B-NVFP4
+       mapping: wrapper-prefix stripping, the Gemma `(1 + weight)` bake, FP8
+       scalar-scale expansion, NVFP4 `weight_scale_2` -> f16 `weight_global`,
+       the qkv/qkvz/gate_up/in_proj_ba fusions, the per-layer routed-expert
+       banks, and the metadata copy. `src/bin/convert.rs` is the CPU-only
+       `ferrum-torrens-convert` binary (`--model`, `--out`, `--shard-gib`,
+       plus `--layers`/`--limit-tensors` for fast gates).
+     - **Correctness.** The ignored real-checkpoint gate converts the 22 GB HF
+       snapshot (`.model-cache/hf/Qwen3.6-35B-A3B-NVFP4`) and compares every
+       tensor against the existing golden FTW by name, shape, dtype and bytes:
+       **1,388 tensors (1,148 weights + 240 banks), 21,785,153,536 bytes, 0
+       mismatches**, matching `total_bytes`, `shard_limit`, counts,
+       `copied_metadata`, fingerprint and side files. The full run is ~88-98 s
+       of conversion plus ~80 s of comparison on CPU. The engine then served
+       the independently converted FTW through the real binary with
+       `cuda_graph = true` and answered "The capital of France is" with
+       " Paris, a city".
+     - **Deployment.** `nix/convert.nix` builds the converter. `nix/model.nix`
+       downloads the snapshot as a fixed-output derivation and runs the
+       converter at build time (decision 136), removing the runtime uv/FreeToken
+       bootstrap entirely.
+     - **Gates.** `cargo test` (9 converter unit tests), clippy default and
+       `cudarc`, `cargo fmt --check`, the subset gate (50 tensors byte-exact)
+       and the full golden gate.

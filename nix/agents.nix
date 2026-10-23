@@ -1,4 +1,8 @@
-{pkgs, agent-toolbox, basePackages}:
+{
+  pkgs,
+  agent-toolbox,
+  basePackages,
+}:
 #
 # The jailed opencode the devshell launches.
 #
@@ -47,7 +51,8 @@ let
     fi
   '';
 
-  jailPermissions = c:
+  jailPermissions =
+    c:
     atb.defaultOpencodePermissions c
     ++ [
       # The project toolchain: rust, clang/mold, CUDA, python and the
@@ -65,7 +70,7 @@ let
       # jail.nix `gpu`: ro-binds the PCI GPU dirs in /sys/devices, mounts
       # /sys/dev/char + /run/opengl-driver(-32) and --dev-binds /dev/dri.
       c.gpu
-      (c.unsafe-add-raw-args ''--dev-bind /dev dev'')
+      (c.unsafe-add-raw-args "--dev-bind /dev dev")
     ]
     ++ map (name: c.try-fwd-env name) devshellEnv;
 in

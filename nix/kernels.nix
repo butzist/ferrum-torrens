@@ -1,4 +1,8 @@
-{pkgs, lib, pythonEnv}:
+{
+  pkgs,
+  lib,
+  pythonEnv,
+}:
 #
 # The sm_120 cubins the engine launches, built from the Triton sources under
 # python/ferrum_kernel/ rather than committed. `aot.py` is pure and CPU-only:
@@ -20,14 +24,15 @@ pkgs.stdenv.mkDerivation (finalAttrs: {
   # Rust) cannot change the cubins, so they do not invalidate this build.
   src = lib.cleanSourceWith {
     src = ../.;
-    filter = path: type:
+    filter =
+      path: type:
       let
         rel = lib.removePrefix (toString ../. + "/") (toString path);
       in
       rel == "python" || lib.hasPrefix "python/" rel;
   };
 
-  nativeBuildInputs = [pythonEnv];
+  nativeBuildInputs = [ pythonEnv ];
 
   # `TRITON_PTXAS_*`: nixpkgs' triton ships no assembler and the wheel's
   # manylinux ptxas has no working ELF interpreter here, so point triton at the
@@ -52,6 +57,6 @@ pkgs.stdenv.mkDerivation (finalAttrs: {
 
   meta = {
     description = "NVFP4/GDN sm_120 cubins built from the Triton sources";
-    platforms = ["x86_64-linux"];
+    platforms = [ "x86_64-linux" ];
   };
 })

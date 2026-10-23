@@ -28,23 +28,27 @@ module that runs it as a systemd service:
 
   services.ferrum-torrens = {
     enable = true;
-    # HF token for the first-run download; create the file with HF_TOKEN=hf_...
-    environmentFile = "/etc/ferrum-torrens/hf-token";
-    # Defaults: nvidia/Qwen3.6-35B-A3B-NVFP4 -> /var/lib/ferrum-torrens/models/....ftw,
-    # port 1919 on 127.0.0.1, cuda_graph = true, kv 16384 tokens.
+    # Defaults: nvidia/Qwen3.6-35B-A3B-NVFP4 at revision main, the pinned
+    # snapshot hash, port 1919 on 127.0.0.1, cuda_graph = true, kv 16384.
   };
 }
 ```
 
-On first boot `ferrum-torrens-model.service` downloads the HF snapshot and runs
-FreeToken's `ft checkpoint` to make the FTW dir (it bootstraps a private
-conversion venv under the state dir; network, a CUDA device and roughly 50 GiB
-of free disk are required). Follow it with
-`journalctl -u ferrum-torrens-model -f`; `ferrum-torrens.service` starts after
-it. To skip the download/convert, set `model.autoConvert = false` and point
-`model.path` at an existing FTW checkpoint (`model.source` supplies a local HF
-snapshot instead of downloading one). The service runs as a system user in the
-`video` and `render` groups and reads the FTW dir read-only.
+The flake also exposes `ferrum-torrens-convert`, the CPU-only Rust HF -> FTW
+converter, and `ferrum-torrens-model`, the converted FTW checkpoint as a store
+path. The latter downloads the HF snapshot as a fixed-output derivation
+(~22 GB) and runs the converter over it at build time (~21 GB in the store,
+roughly 90 s of CPU). Nothing Python, uv or FreeToken reaches run time: the
+serving process is the only runtime.
+
+`model.hash` is the recursive NAR hash of the downloaded snapshot and must
+match `model.repo`/`model.revision`; update all three together (with `nix
+build` to obtain the new hash). To convert a local snapshot instead, set
+`model.source`; to serve an existing FTW checkpoint and skip the build
+entirely, set `model.path` (and optionally `model.autoConvert = false`). A
+null `model.path` with `autoConvert = false` is a configuration error. The
+service runs as a system user in the `video` and `render` groups and reads the
+FTW dir read-only.
 
 ## Documentation map
 

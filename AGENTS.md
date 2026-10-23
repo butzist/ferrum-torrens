@@ -119,9 +119,9 @@ Instructions for AI coding agents working in this repository.
   its reason in `DONE.md` when it changes behaviour.
 - Keep everything GPU-only single-process in-process. This repo has no JS
   runtime (node/bun/deno were intentionally removed from the flake).
-- Rust is the only language at runtime. Python is used for the one-time HF -> FTW
-  conversion via FreeToken's `ft` CLI (see below) and as the kernel toolchain:
-  the NVFP4 grouped-MoE kernel is authored in Triton (no Rust tensor runtime
+- Rust is the only language at runtime. The HF -> FTW conversion is the Rust
+  converter; Python is the kernel toolchain: the NVFP4 grouped-MoE kernel is
+  authored in Triton (no Rust tensor runtime
   ships a CUDA NVFP4 GEMM, and neither does upstream FreeToken, which is why it
   hand-writes the kernel in Triton), compiled ahead of time by
   `python/ferrum_kernel/aot.py` in
@@ -143,16 +143,25 @@ Instructions for AI coding agents working in this repository.
   `kernel/` tree, so the executable carries its cubins and needs no Python,
   torch, libtorch or `FERRUM_KERNEL_DIR` at run time. The wrapper only adds the
   CUDA 13.4 cuBLAS root and the driver mount to `LD_LIBRARY_PATH`.
+- `nix/convert.nix` builds `ferrum-torrens-convert`, the CPU-only Rust HF -> FTW
+  converter. It shares `nix/package.nix`'s source filter, stages the `kernels`
+  output for `build.rs` (the library's `kernel_abi` includes the cubins), and
+  never links or loads CUDA.
+- `nix/model.nix` is the FTW checkpoint as a store path. The HF snapshot is a
+  fixed-output derivation (`model.hash` is its recursive NAR hash, `repo` and
+  `revision` select it, and `HF_TOKEN` is an impure build input) downloaded with
+  `huggingface_hub`; the converter then runs over it into a `stdenvNoCC` output.
+  Expect ~22 GB of download, ~21 GB in the store and roughly 90 s of CPU. A
+  non-null `source` converts a local snapshot without a download.
 - `flake.nixosModules.default` (`nix/module.nix`) adds
-  `services.ferrum-torrens`: a serving unit plus a first-run
-  `ferrum-torrens-model.service` that downloads the HF checkpoint and converts it
-  to FTW with the packaged `ferrum-torrens-model` helper (`nix/fetch-model.sh`,
-  which bootstraps FreeToken's conversion venv under the state dir). The model
-  unit is gated by `model.autoConvert` and
-  `ConditionPathExists=!<model.path>/freetoken_weight.json`.
+  `services.ferrum-torrens`: a single serving unit that loads the FTW
+  derivation, or `model.path` when set. There is no first-run service, no
+  state-dir conversion and no `ConditionPathExists` gate. `model.path = null`
+  selects the derivation, so `autoConvert = false` requires a non-null path
+  (asserted). The flake no longer has a `freetoken` input.
 - Keep the converter out of the runtime: the serving process still links only
-  Rust/cudarc; Python exists only inside the one-shot conversion venv and the
-  kernel build.
+  Rust/cudarc; Python exists only in the kernel toolchain (the `kernels`
+  derivation) and the FreeToken reference venv used by the probe scripts.
 
 ## Reference and tooling
 
@@ -176,11 +185,12 @@ Instructions for AI coding agents working in this repository.
   opencode-go credential is read on the host from its file (following any
   symlink) by `envFromFile` and forwarded as `OPENCODE_GO_API_KEY`, so the
   value never reaches the nix store.
-- The FTW checkpoint is served from the Nix store: add it with
-  `nix store add-path <dir> --name qwen3.6-35b-a3b-nvfp4`. The jail binds only
-  the runtime closure of `basePackages` (decision 52), not the whole `/nix/store`,
-  so the one-time conversion runs in a devshell; agents mmap the converted `.ftw`
-  turned out into the r/w-mounted `$FLAKE_ROOT`, not the store copy.
+- The FTW checkpoint is served from the Nix store: `nix build
+  .#ferrum-torrens-model` downloads and converts it at build time, and the
+  module uses that derivation when `model.path` is null. The jail binds only the
+  runtime closure of `basePackages` (decision 52), not the whole `/nix/store`,
+  so for the gated tests agents run the Rust converter into the r/w-mounted
+  `$FLAKE_ROOT` (`.model-cache/`), not the store copy.
 - Python venv (flake provides python312 + uv), already installed:
   `cd FreeToken && uv venv --python 3.12 && FREETOKEN_ALLOW_CUDA_MISMATCH=1 uv pip install -e ".[accel]"`.
   Outside the devshell, export the loader path *before* the install too: uv's
@@ -197,11 +207,14 @@ Instructions for AI coding agents working in this repository.
   The loader path is read at process start, so export it before `cargo` launches
   anything. The devShell also provides the kernel toolchain (torch + triton from
   nixpkgs) with `kernel-selftest`, `kernel-compile-check` and `kernel-aot`
-  aliases; the venv is only needed for the FTW conversion.
-- One-time HF -> FTW conversion (needs CUDA device access; run in a devshell,
-  which already has the loader path):
-  `FreeToken/.venv/bin/ft checkpoint --model /nix/store/mpwkgysbh8dyxz8jlrwkhzcsp01v6my3-qwen3.6-35b-a3b-nvfp4 \
-   --out .model-cache/Qwen3.6-35B-A3B-NVFP4.ftw --moe-backend offload --shard-gib 8`
+  aliases; the venv is only needed to run the FreeToken reference/probe scripts.
+- HF -> FTW conversion is the Rust converter (CPU only, inside the devshell so
+  `FERRUM_KERNEL_DIR` is set):
+  `cargo run --release --bin ferrum-torrens-convert -- \
+   --model .model-cache/hf/Qwen3.6-35B-A3B-NVFP4 \
+   --out .model-cache/Qwen3.6-35B-A3B-NVFP4.ftw --shard-gib 8`
+  The deployment does the same in `nix/model.nix` (`nix build
+  .#ferrum-torrens-model`, or `source`/`model.path` for a local snapshot).
 - Verify with: `cargo fmt --check`, `cargo clippy --all-targets`, `cargo test`,
   all inside `nix develop`. These are the CPU-only path and must stay green with
   no CUDA toolkit; the devshell supplies the `kernels` derivation through
