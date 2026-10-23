@@ -2,7 +2,9 @@
 
 Status (2026-10-23): **M7 is complete: the cudarc runtime is the serving path
 and libtorch/tch/candle are gone from the dependency tree and devshell
-(decision 132).** Decode CUDA-graph capture is parked, not ported. The gates are
+(decision 132).** Decode CUDA-graph capture is parked, not ported, but its
+eager prerequisite is restored: `CudarcQwen3_6::forward_decode_into` runs the
+batched device-addressed step. The gates are
 `tests/cudarc_engine_generate.rs` and the broader
 `tests/engine_real_generate.rs` on the real checkpoint. Prior M2/M3 status: M2 (API) current, late M3 in practice; **prefill pp is
 ahead of FreeToken** after R10.6a/b, R10.7, R10.8, R10.9 and R10.10: 400.9 tok/s
@@ -503,7 +505,10 @@ any port.
   The launchers take the cudarc stream and raw storage, and the C++ capture
   shim is deleted. Decode CUDA-graph capture was not ported: the engine keeps
   `CapturedDecode` and `BuiltModel.captured` (always `None`), and
-  `cuda_graph = true` only warns. Revisit when the capture path is ported.
+  `cuda_graph = true` only warns. The eager prerequisite is back:
+  `forward_decode_into` runs the batched device-addressed step, and
+  `DecodeBuffers::with_runtime` allocates on the model's stream
+  (`tests/device_decode_matches_refeed.rs`). Revisit when capture is ported.
 - [x] **M7.5 remove libtorch -- DONE (2026-10-23, decision 132).**
   `tch`, `torch-sys`, `candle-*`, the C++ build script, `shim/`, the torch
   forward and the libtorch devshell closure are gone. The same gate set runs

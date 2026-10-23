@@ -15,9 +15,11 @@ use crate::domain::expert_kernel::{MoEDeviceRequest, MoEError, MoEExecutor};
 use crate::domain::kvcache::{CachedModel, KvCache, KvcacheError, SequenceCache};
 use crate::domain::model::{ForwardInput, Model, ModelParams};
 use crate::domain::weights::{TensorKind, WeightsReader};
+use crate::infrastructure::cuda_attention::PagedAttention;
 use crate::infrastructure::cuda_gdn::GdnDecode;
 use crate::infrastructure::cuda_linear::{DenseGemv, Fp8Linear};
 use crate::infrastructure::cudarc::{Runtime, Tensor, TensorDType, Unary};
+use crate::infrastructure::decode_buffers::DecodeBuffers;
 use crate::infrastructure::ftw::FtwIndex;
 use crate::infrastructure::kvcache_dev::{DeviceCache, KvDType, LinearStateSlabs};
 use crate::infrastructure::profile::{substep_begin, substep_end, substep_report};
@@ -361,6 +363,22 @@ enum Access<'a> {
         cache: &'a SequenceCache,
         state: &'a LinearStateSlabs,
     },
+    /// A batched device decode step: the K/V store location, attention window
+    /// and GDN state slot come from fixed-address device tensors so a captured
+    /// graph never reads a host value.
+    Device {
+        out_locs: &'a Tensor,
+        kv_locs: &'a Tensor,
+        slots: &'a Tensor,
+    },
+}
+
+/// The absolute rope positions for the tokens of one step, as host values for
+/// the cached prefill and as a device `[rows]` i32 tensor for a captured step.
+#[derive(Clone, Copy)]
+enum Positions<'a> {
+    Host(&'a [u32]),
+    Device(&'a Tensor),
 }
 
 /// The torch-less Qwen3.6 text tower over the cudarc adapter.
@@ -375,6 +393,7 @@ pub struct CudarcQwen3_6 {
     head_gemv: Option<Arc<DenseGemv>>,
     fp8: Option<Arc<Fp8Linear>>,
     gdn: Arc<GdnDecode>,
+    attention: PagedAttention,
     cache: Arc<DeviceCache>,
     rope_cos: Tensor,
     rope_sin: Tensor,
@@ -394,6 +413,7 @@ impl CudarcQwen3_6 {
     ) -> Result<Self> {
         let device = Device::Cuda(rt.context().ordinal());
         let gdn = Arc::new(GdnDecode::new(device, &params, rt.raw_stream())?);
+        let attention = PagedAttention::new(device, &params, rt.raw_stream())?;
         let tower = Tower::load(params.clone(), rt.clone(), index.clone(), reader.clone())
             .map_err(moe_bad)?;
         let max_len = params.max_position_embeddings.max(4096);
@@ -409,10 +429,18 @@ impl CudarcQwen3_6 {
             head_gemv,
             fp8,
             gdn,
+            attention,
             cache,
             rope_cos,
             rope_sin,
         })
+    }
+
+    /// The runtime that owns this model's stream and buffers. A caller staging
+    /// `DecodeBuffers` must allocate them here or a captured step would read
+    /// buffers from another stream.
+    pub fn runtime(&self) -> &Runtime {
+        &self.rt
     }
 
     pub fn attach_moe(&mut self, moe: Option<Arc<dyn MoEExecutor>>) {
@@ -464,11 +492,22 @@ impl CudarcQwen3_6 {
         ))
     }
 
+    fn rope_for_device(&self, positions: &Tensor) -> Result<(Tensor, Tensor)> {
+        if self.params.rotary_dim == 0 || self.rope_cos.shape()[0] == 0 {
+            let empty = self.rt.from_slice_f32(&[], &[0, 0])?;
+            return Ok((empty.clone(), empty));
+        }
+        Ok((
+            self.rope_cos.gather_rows(positions)?,
+            self.rope_sin.gather_rows(positions)?,
+        ))
+    }
+
     fn project_attention(
         &self,
         layer: &Layer,
         x: &Tensor,
-        positions: &[u32],
+        positions: &Positions<'_>,
     ) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
         let p = &self.params;
         let Mixer::Full {
@@ -501,7 +540,10 @@ impl CudarcQwen3_6 {
         if p.rotary_dim == 0 {
             return Ok((q.reshape(&[t, qh, hd])?, k.reshape(&[t, kvh, hd])?, v, gate));
         }
-        let (cos, sin) = self.rope_for(positions)?;
+        let (cos, sin) = match positions {
+            Positions::Host(positions) => self.rope_for(positions)?,
+            Positions::Device(positions) => self.rope_for_device(positions)?,
+        };
         let q = apply_rope(&q, qh, hd, p.rotary_dim, &cos, &sin)?.reshape(&[t, qh, hd])?;
         let k = apply_rope(
             &k.reshape(&[t, kvh * hd])?,
@@ -520,7 +562,7 @@ impl CudarcQwen3_6 {
         li: usize,
         layer: &Layer,
         x: &Tensor,
-        positions: &[u32],
+        positions: &Positions<'_>,
         access: &Access<'_>,
     ) -> Result<Tensor> {
         let s = substep_begin(&self.rt);
@@ -558,6 +600,29 @@ impl CudarcQwen3_6 {
                 };
                 substep_end(&self.rt, "attn_sdpa", s);
                 attn
+            }
+            Access::Device {
+                out_locs, kv_locs, ..
+            } => {
+                let Positions::Device(positions) = positions else {
+                    return Err(moe_bad("device attention needs device positions"));
+                };
+                let s = substep_begin(&self.rt);
+                let pool = self.cache.mha();
+                pool.store_at(li, out_locs, &k, &v);
+                let (qh, hd) = (self.params.num_q_heads, self.params.head_dim);
+                let out = self.rt.zeros(&[t, qh, hd], TensorDType::Bf16)?;
+                let (k_ptr, v_ptr) = pool.kv_slab_ptrs(li);
+                let kv_bf16 = pool.dtype() == KvDType::BFloat16;
+                // SAFETY: every address is a live device allocation in the
+                // launcher's context (the pool, the model's weights and this
+                // step's own buffers), and `kv_locs` names tokens the pool holds.
+                unsafe {
+                    self.attention
+                        .decode(&q, &out, k_ptr, v_ptr, kv_locs, positions, kv_bf16)
+                }?;
+                substep_end(&self.rt, "attn_sdpa", s);
+                out
             }
         }
         .reshape(&[t, q_dim])?;
@@ -611,6 +676,50 @@ impl CudarcQwen3_6 {
             .cast(TensorDType::Bf16)?;
         substep_end(&self.rt, "gdn_ba", s);
 
+        if let Access::Device { slots, .. } = access {
+            let state = self.cache.state();
+            let s = substep_begin(&self.rt);
+            let conv_w = conv.reshape(&[conv_dim, k])?;
+            let conv_state = state.conv_state_rows(slots, li);
+            let rec_state = state.recurrent_state_rows(slots, li);
+            let mixed = self.rt.zeros(&[t, conv_dim], TensorDType::Bf16)?;
+            // SAFETY: all four tensors are live device allocations in this
+            // model's context and the gathered state is `[rows, ..]`, the shape
+            // the batched conv cubin was built for; it updates the state rows.
+            unsafe { self.gdn.conv_decode(&conv_in, &conv_w, &conv_state, &mixed) }?;
+            substep_end(&self.rt, "gdn_conv", s);
+            let q = mixed
+                .narrow(1, 0, key_dim)?
+                .contiguous()?
+                .reshape(&[t, kb, dk])?;
+            let k = mixed
+                .narrow(1, key_dim, key_dim)?
+                .contiguous()?
+                .reshape(&[t, kb, dk])?;
+            let v = mixed
+                .narrow(1, 2 * key_dim, value_dim)?
+                .contiguous()?
+                .reshape(&[t, vb, dv])?;
+            let s = substep_begin(&self.rt);
+            let core = self.rt.zeros(&[t, vb, dv], TensorDType::Bf16)?;
+            // SAFETY: the state rows are contiguous f32 device tensors and every
+            // other operand is a live tensor of the geometry the launcher
+            // checks; the kernel updates `rec_state` in place and fills `core`.
+            unsafe {
+                self.gdn
+                    .decode(&ba, a_log, dt_bias, &q, &k, &v, &rec_state, &core)
+            }?;
+            state.set_conv_state_rows(slots, li, &conv_state);
+            state.set_recurrent_state_rows(slots, li, &rec_state);
+            substep_end(&self.rt, "gdn_recur", s);
+            let s = substep_begin(&self.rt);
+            let core_n = rms_norm_last(&core, norm, p.rms_norm_eps)?.reshape(&[t, value_dim])?;
+            let out = core_n.mul(&z.silu()?)?;
+            let out = self.apply_dense(o, &out);
+            substep_end(&self.rt, "gdn_tail", s);
+            return out;
+        }
+
         let (conv_state, rec_state) = match access {
             Access::Stateless => (
                 self.rt.zeros(&[conv_dim, k - 1], TensorDType::F32)?,
@@ -619,6 +728,9 @@ impl CudarcQwen3_6 {
             Access::Cached { cache, state } => {
                 let slot = cache.state_slot();
                 (state.conv_state(slot, li), state.recurrent_state(slot, li))
+            }
+            Access::Device { .. } => {
+                return Err(moe_bad("the device gdn path returned early"));
             }
         };
         let s = substep_begin(&self.rt);
@@ -879,23 +991,56 @@ impl CudarcQwen3_6 {
         out
     }
 
-    fn run_tower_inner(
-        &self,
-        ids: &[u32],
-        positions: &[u32],
-        access: &Access<'_>,
-    ) -> Result<Vec<f32>> {
-        let p = &self.params;
-        let t = ids.len();
-        if t == 0 {
-            return Ok(Vec::new());
+    /// `lm_head` straight into a `[rows, vocab]` f32 device buffer, with no
+    /// host round trip. The device decode path requires the packed NVFP4 head
+    /// and its gemv launcher, because the bf16 fallback would have to read the
+    /// logits back to concatenate blocks.
+    fn lm_head_into_device(&self, x: &Tensor, out: &Tensor) -> Result<()> {
+        let head = &self.tower.lm_head;
+        let HeadWeight::Nvfp4(banks) = &head.weight else {
+            return Err(moe_bad(
+                "the device decode path needs the packed NVFP4 lm_head",
+            ));
+        };
+        let gemv = self.head_gemv.as_ref().ok_or_else(|| {
+            moe_bad("the device decode path needs the dense gemv launcher for the lm_head")
+        })?;
+        if out.shape() != [x.shape()[0], head.rows].as_slice() {
+            return Err(moe_bad(format!(
+                "the logits buffer is {:?}, not [{}, {}]",
+                out.shape(),
+                x.shape()[0],
+                head.rows
+            )));
         }
-        let idx: Vec<i32> = ids.iter().map(|i| *i as i32).collect();
-        let idx = self.rt.from_slice_i32(&idx, &[t])?;
+        // SAFETY: the head banks, the activation and the logits are live device
+        // allocations in this launcher's context; the launcher checks the
+        // geometry before launching and fully overwrites `out`.
+        unsafe {
+            gemv.gemv(
+                &x.cast(TensorDType::Bf16)?,
+                &banks.packed,
+                &banks.scale,
+                &banks.global,
+                out,
+            )
+        }
+    }
+
+    /// The transformer stack shared by every path: embedding through the final
+    /// residual, returning the `[t, hidden]` stream before the final norm.
+    fn tower_stream(
+        &self,
+        idx: &Tensor,
+        t: usize,
+        positions: &Positions<'_>,
+        access: &Access<'_>,
+    ) -> Result<Tensor> {
+        let p = &self.params;
         let DenseWeight::Bf16(embed) = &self.tower.embed.w else {
             return Err(moe_bad("the embedding is not bf16"));
         };
-        let mut x = embed.gather_rows(&idx)?;
+        let mut x = embed.gather_rows(idx)?;
         let mut residual: Option<Tensor> = None;
 
         for (li, layer) in self.tower.layers.iter().enumerate() {
@@ -928,10 +1073,26 @@ impl CudarcQwen3_6 {
             residual = Some(sum2);
         }
 
-        let stream = match residual.take() {
-            Some(r) => x.add(&r)?,
-            None => x,
-        };
+        match residual.take() {
+            Some(r) => x.add(&r),
+            None => Ok(x),
+        }
+    }
+
+    fn run_tower_inner(
+        &self,
+        ids: &[u32],
+        positions: &[u32],
+        access: &Access<'_>,
+    ) -> Result<Vec<f32>> {
+        let p = &self.params;
+        let t = ids.len();
+        if t == 0 {
+            return Ok(Vec::new());
+        }
+        let idx: Vec<i32> = ids.iter().map(|i| *i as i32).collect();
+        let idx = self.rt.from_slice_i32(&idx, &[t])?;
+        let stream = self.tower_stream(&idx, t, &Positions::Host(positions), access)?;
         let last = stream.narrow(0, t - 1, 1)?;
         let normed = rms_norm(&last, &self.tower.final_norm, p.rms_norm_eps)?;
         if ablated("head") {
@@ -1006,5 +1167,71 @@ impl CachedModel for CudarcQwen3_6 {
         };
         self.run_tower(&input.input_ids, &input.positions, &access)
             .map_err(|e| KvcacheError::MisalignedCache { why: e.to_string() })
+    }
+}
+
+impl CudarcQwen3_6 {
+    /// One batched decode step with every input already staged on the device:
+    /// the tokens, rope positions, GDN state slots, K/V store locations and
+    /// attention windows all come from `bufs`, and the `[max_bs, vocab]` logits
+    /// go straight back into it. Nothing here reads a host value, copies host
+    /// memory to the device or synchronizes, so the step can be captured into a
+    /// CUDA graph once the caller stages a new batch between replays.
+    ///
+    /// The routed MoE must be the device port: the inline fallback widens
+    /// experts on the host and would break that contract. The head must be the
+    /// packed NVFP4 form with its gemv launcher, and the paged attention and
+    /// fused GDN launchers are part of the model.
+    pub fn forward_decode_into(&self, bufs: &DecodeBuffers) -> Result<()> {
+        let t = bufs.max_bs();
+        let one = [t];
+        let ids = bufs.input_ids();
+        let positions = bufs.positions();
+        let slots = bufs.state_slots();
+        let out_locs = bufs.out_locs();
+        for (name, tensor) in [
+            ("input ids", ids),
+            ("positions", positions),
+            ("state slots", slots),
+            ("out locs", out_locs),
+        ] {
+            if tensor.shape() != one {
+                return Err(moe_bad(format!(
+                    "the decode {name} are {:?}, not [{t}]",
+                    tensor.shape()
+                )));
+            }
+        }
+        let kv = bufs.kv_locs();
+        if kv.shape() != [t, bufs.window()].as_slice() {
+            return Err(moe_bad(format!(
+                "the decode kv window is {:?}, not [{t}, {}]",
+                kv.shape(),
+                bufs.window()
+            )));
+        }
+        if bufs.logits().shape() != [t, bufs.vocab()].as_slice() {
+            return Err(moe_bad(format!(
+                "the decode logits are {:?}, not [{t}, {}]",
+                bufs.logits().shape(),
+                bufs.vocab()
+            )));
+        }
+        if self.moe.is_none() {
+            return Err(moe_bad(
+                "the device decode path needs the MoE device port attached",
+            ));
+        }
+        let access = Access::Device {
+            out_locs,
+            kv_locs: kv,
+            slots,
+        };
+        let stream = self.tower_stream(ids, t, &Positions::Device(positions), &access)?;
+        let normed = rms_norm(&stream, &self.tower.final_norm, self.params.rms_norm_eps)?;
+        if ablated("head") {
+            return Ok(());
+        }
+        self.lm_head_into_device(&normed, bufs.logits())
     }
 }

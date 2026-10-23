@@ -66,6 +66,20 @@ impl DecodeBuffers {
             Device::Cpu => 0,
         };
         let rt = Runtime::open(ordinal).expect("open the cudarc compute runtime");
+        Self::with_runtime(&rt, max_bs, vocab, window, device)
+    }
+
+    /// The same set allocated on a caller's runtime and stream. A captured step
+    /// must read buffers on the model's stream, so the capture harness stages
+    /// into these rather than a second runtime.
+    pub fn with_runtime(
+        rt: &Runtime,
+        max_bs: usize,
+        vocab: usize,
+        window: usize,
+        device: Device,
+    ) -> Self {
+        assert!(max_bs > 0 && vocab > 0 && window > 0);
         Self {
             input_ids: rt
                 .zeros(&[max_bs], TensorDType::I32)
@@ -306,6 +320,19 @@ mod tests {
         assert_eq!(b.input_ids().shape(), vec![4]);
         assert_eq!(b.logits().shape(), vec![4, 8]);
         assert_eq!(i32_vec(b.out_locs()), vec![0; 4]);
+    }
+
+    #[test]
+    fn with_runtime_allocates_on_the_callers_stream() {
+        let rt = Runtime::open(0).expect("open the cudarc compute runtime");
+        let b = DecodeBuffers::with_runtime(&rt, 2, 8, 4, dev());
+        assert_eq!(b.max_bs(), 2);
+        assert_eq!(
+            b.input_ids().runtime().raw_stream(),
+            rt.raw_stream(),
+            "the buffers must land on the caller's stream, not a fresh runtime"
+        );
+        assert_eq!(b.logits().shape(), vec![2, 8]);
     }
 
     #[test]

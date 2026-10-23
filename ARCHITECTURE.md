@@ -715,16 +715,20 @@ channel and a per-request sink returns `false` when it is full, which aborts
 only that request instead of stalling the batch. `Request` carries its own seed,
 so co-batching never changes a lone request's tokens.
 
-### 3.9 CUDA-graph decode capture -- parked
+### 3.9 CUDA-graph decode capture -- parked (eager device decode restored)
 
 Decode capture is not ported to the cudarc runtime. The engine keeps the
 `CapturedDecode` port and the `BuiltModel.captured` field (always `None`), so
 the generation loop keeps its captured branch, but the composition root builds
-no graphs and `cuda_graph = true` only warns. The previous engine-owned capture
-implementation (torch stream + graph memory pool, `decode_graph`,
-`decode_buffers`) was removed with libtorch (decision 132). Porting capture is
-future work; the measured numbers that came from it remain history in
-`OPTIMIZATION.md`/`DONE.md`.
+no graphs and `cuda_graph = true` only warns. Its prerequisite is back:
+`CudarcQwen3_6::forward_decode_into(&DecodeBuffers)` runs every staged row with
+device rope positions, paged attention over the staged KV windows, batched GDN
+state rows, the MoE device port and the NVFP4 head writing straight into
+`bufs.logits()`; `DecodeBuffers::with_runtime` allocates those buffers on the
+model's stream. The previous engine-owned graph capture (torch stream + graph
+memory pool, `decode_graph`) was removed with libtorch (decision 132). Porting
+capture is future work; the measured numbers that came from it remain history
+in `OPTIMIZATION.md`/`DONE.md`.
 
 ## 4. External libraries and where they are used
 
