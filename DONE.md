@@ -3850,3 +3850,40 @@ subsection names are kept verbatim.
        rows for tiny M, but the weight traffic per CTA is unchanged and the
        measured batched aggregate is at its old 1.57x.
      - **Logs.** `/tmp/opencode/r10_9/`.
+
+124. **M7.0 is a no-go for candle 0.11; the torch-less runtime takes the
+     minimal-cudarc fallback** (2026-10-23, branch `m7-torchless`,
+     `plans/2026-10-21-torchless-runtime-candle-eval.md`). The spike added
+     candle behind non-default `candle`/`candle-nn` features and ran the four
+     gates on the real GPU; no serving path changed.
+     - **Gate 1 (GEMM parity/speed): parity green, speed red.** Every shape is
+       argmax-equal, but at M=512/2057 the per-layer projections are 14-20%
+       slower than `tch`'s cuBLAS path (`H->H` 0.131/0.624 vs 0.150/0.749 ms,
+       `I->H` 0.162 vs 0.194 at 2057). Only the large `lm_head` GEMM is faster
+       (-9..-10%). Candle's per-call Tensor/allocation overhead plus a different
+       cuBLAS layout path is the visible cause; disabling its event tracking did
+       not change it.
+     - **Gate 2 (capture/replay): red.** A matmul-only capture replays
+       bit-exact, but adding `rms_norm` makes replay-to-replay differ
+       (`max|d|` 0.37, new-input 6.19) because candle's stream-ordered
+       allocator/graph memory nodes own the intermediates. Candle has no `out=`
+       API, so a captured candle-op graph cannot use engine-owned fixed buffers
+       without bypassing its op layer.
+     - **Gate 3 (pointer/stream interop): green.** `add_rmsnorm` on a candle
+       tensor pointer + `cu_stream()` is bit-exact against the tch-fed launch
+       (1048576/1048576 elements, `max|d|` 0).
+     - **Gate 4 (memory/load): green.** 815 dense tensors load into candle,
+       the pinned expert banks attach, auto resolves the 2048-slot ceiling,
+       VRAM is 6237 MiB vs tch 6617, and the process maps no libtorch/libc10/
+       libpython (only `libcuda`).
+     - **Build.** candle-kernels 0.11 does not compile unmodified against the
+       CUDA 12.9 headers here (host-pass redefinitions, `__CUDA_ARCH__` guards,
+       GCC 16 vs 14, missing cudart include); the spike regenerates a patched
+       crate via `scripts/m7-0-candle-patch.sh` rather than vendoring it.
+     - **Consequence.** M7.1 is re-scoped to a minimal `cudarc` tensor layer:
+       direct cuBLAS BF16 GEMM on the same shapes and ATen-matching layouts,
+       the proven raw-pointer/same-context interop, and engine-owned buffers
+       for capture. The candle code stays on `m7-torchless` behind non-default
+       features as the evidence; it is never on the serving path. Logs
+       `/tmp/opencode/m7_0/`.
+

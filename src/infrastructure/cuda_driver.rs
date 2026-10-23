@@ -646,9 +646,29 @@ impl Driver {
     /// # Safety
     /// `graph` must be a live graph of the current context.
     pub unsafe fn graph_instantiate(&self, graph: CUgraph) -> Result<CUgraphExec, CudaError> {
+        // SAFETY: as `graph_instantiate_with_flags`; flags 0 is the plain
+        // instantiation the serving path's fixed-buffer graphs use.
+        unsafe { self.graph_instantiate_with_flags(graph, 0) }
+    }
+
+    /// `cuGraphInstantiateWithFlags` with explicit flags. The M7.0 spike uses
+    /// `CU_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH (1)` for a graph whose
+    /// candle ops allocated graph memory nodes: without it the allocations are
+    /// not returned at the end of a launch, so a second launch of the same
+    /// instance fails with `CUDA_ERROR_INVALID_VALUE`.
+    ///
+    /// # Safety
+    /// `graph` must be a live graph of the current context and `flags` must be
+    /// the driver's `CUgraphInstantiate_flags` bit set.
+    pub unsafe fn graph_instantiate_with_flags(
+        &self,
+        graph: CUgraph,
+        flags: u64,
+    ) -> Result<CUgraphExec, CudaError> {
         let mut exec: CUgraphExec = std::ptr::null_mut();
-        // SAFETY: `exec` is a live out slot; flags 0 is the plain instantiation.
-        self.check(unsafe { (self.fns.cu_graph_instantiate)(&raw mut exec, graph, 0) })?;
+        // SAFETY: `exec` is a live out slot and `graph` is the caller's live
+        // graph.
+        self.check(unsafe { (self.fns.cu_graph_instantiate)(&raw mut exec, graph, flags) })?;
         Ok(exec)
     }
 

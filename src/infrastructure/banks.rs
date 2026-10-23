@@ -5,12 +5,12 @@
 // Bank tensors are `[experts, ...]` row-major, so expert `e` is one contiguous
 // window: one `read_range` per field, no whole-layer map.
 
-#[cfg(any(feature = "cuda", test))]
+#[cfg(any(feature = "cuda", feature = "candle", test))]
 use crate::domain::expert_kernel::BANKS;
 use crate::domain::expert_kernel::{
     Bank, ExpertShapes, ExpertSlabSource, Field, MoEError, Part, Slab,
 };
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "candle"))]
 use crate::domain::expert_kernel::{PinnedBank, PinnedBankSource};
 use crate::domain::weights::{TensorDesc, TensorKind, WeightsReader};
 use std::sync::Arc;
@@ -174,13 +174,13 @@ impl ExpertSlabSource for FtwBanks {
 /// region per bank, holding every expert of every layer, filled once from the
 /// FTW checkpoint. The copy kernel's `src_ptrs` are these regions' device
 /// aliases, so the buffers outlive every launch and every captured graph.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "candle"))]
 pub struct FtwPinnedBanks {
     banks: [PinnedBank; BANKS.len()],
     _buffers: Vec<crate::infrastructure::cuda_driver::PinnedBuf>,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "candle"))]
 impl FtwPinnedBanks {
     /// Allocate and fill the six banks, `layers * experts` rows each. The copy
     /// kernel's `src_idx` is the flat `layer * experts + expert`.
@@ -230,7 +230,7 @@ impl FtwPinnedBanks {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "candle"))]
 impl PinnedBankSource for FtwPinnedBanks {
     fn banks(&self) -> Result<[PinnedBank; BANKS.len()], MoEError> {
         Ok(self.banks)

@@ -127,3 +127,13 @@ set on a process that links neither libtorch nor Python.
 - Re-implementing NVFP4, GDN, or paged attention in candle.
 - Replacing the Triton/Triton-free kernel pipeline in this milestone.
 - Dropping `forward.rs` or the CPU-only unit path.
+
+## M7.0 result (2026-10-23): no-go for candle, take the cudarc fallback
+
+See `DONE.md` 124. Gate 1 (speed) and gate 2 (capture replay) failed; gates 3
+(raw pointer/stream interop) and 4 (load/VRAM/no libtorch) passed. The candle
+code stays behind non-default features on `m7-torchless` as evidence. M7.1
+becomes the minimal cudarc tensor layer: direct cuBLAS BF16 GEMM, engine-owned
+buffers for capture, and the same kernel ABI. Re-run the gate-1 shape table
+before porting anything.
+

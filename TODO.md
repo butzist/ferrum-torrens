@@ -452,13 +452,15 @@ and graph capture is engine-owned; candle 0.11 has a primary-context cudarc
 backend, raw pointers, cuBLAS BF16 GEMM and a public stream. Do the spike before
 any port.
 
-- [ ] **M7.0 spike.** Candle BF16 GEMM parity/speed on the real projection
-  shapes; capture/replay of a candle op sequence on a cudarc side stream; one
-  cubin fed by a candle tensor pointer/stream; FTW load + VRAM + no libtorch.
-  Gates: argmax-equal and at most 5% slower on prefill shapes; replay equal and
-  no host sync; pointer gate exact where deterministic.
-- [ ] **M7.1 runtime adapter.** `ComputeRuntime` over candle; port
-  `infrastructure/torch.rs` and `Device`.
+- [x] **M7.0 spike -- CLOSED as a no-go for candle (2026-10-23, decision 124).**
+  Candle BF16 GEMM is argmax-equal but 14-20% slower on the per-layer prefill
+  projections, and a captured graph containing `rms_norm` is not replay-exact
+  because candle owns the intermediate buffers. The kernel-ABI and memory/load
+  gates passed. The torch-less runtime takes the minimal-`cudarc` fallback.
+- [ ] **M7.1 runtime adapter (cudarc).** Minimal tensor layer over `cudarc`
+  (device/owned buffer/stream/GEMM/cast/slice/gather), direct cuBLAS BF16 GEMM
+  on the real shapes, engine-owned buffers for capture; port
+  `infrastructure/torch.rs` and `Device`. Prove the GEMM speed gate first.
 - [ ] **M7.2 weights/load.** FTW dense widening and upload through candle;
   `domain::dequant` stays the host transform.
 - [ ] **M7.3 forward.** Port `forward_torch.rs` off `tch::Tensor`; the scalar

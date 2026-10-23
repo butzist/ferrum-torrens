@@ -2,9 +2,11 @@
 // CUDA and HTTP types; never imported by the domain core.
 
 pub mod banks;
+#[cfg(feature = "candle")]
+pub mod candle;
 #[cfg(feature = "cuda")]
 pub mod cuda_attention;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "candle"))]
 pub mod cuda_driver;
 #[cfg(feature = "cuda")]
 pub mod cuda_gdn;
