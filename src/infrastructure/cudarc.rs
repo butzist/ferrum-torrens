@@ -1574,6 +1574,7 @@ impl Tensor {
         if c("NUM_Q_HEADS")? as usize != q_heads
             || c("NUM_KV_HEADS")? as usize != kv_heads
             || c("D")? as usize != d
+            || c("BLOCK_M")? == 0
         {
             return Err(bad("causal_sdpa cubin geometry mismatch"));
         }
@@ -1915,6 +1916,7 @@ impl LinearKernels {
         d: usize,
     ) -> Result<(), MoEError> {
         let kernel = self.abi.kernel(name)?;
+        let block_m = kernel.constexpr("BLOCK_M")?.max(1) as usize;
         let mut pack = ArgPack::for_linear(kernel);
         pack.ptr(q)?;
         pack.ptr(k)?;
@@ -1930,7 +1932,8 @@ impl LinearKernels {
         pack.u32((kv_heads * d) as u32)?;
         pack.u32(d as u32)?;
         let mut params = pack.kernel_params()?;
-        self.launch(name, (qt as u32, q_heads as u32, 1), &mut params, stream)
+        let grid = (qt.div_ceil(block_m) as u32, q_heads as u32, 1);
+        self.launch(name, grid, &mut params, stream)
     }
 
     #[allow(clippy::too_many_arguments)]

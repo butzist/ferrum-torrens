@@ -13,7 +13,15 @@ baked into the cubin rather than passed at launch.
 from __future__ import annotations
 
 from .conv import CONV_BLOCK_N
-from .elementwise import COPY_BLOCK, ELEM_BLOCK, SELECT_BLOCK
+from .elementwise import (
+    COPY_BLOCK,
+    ELEM_BLOCK,
+    SELECT_BLOCK,
+    SDPA_BLOCK_D,
+    SDPA_BLOCK_M,
+    SDPA_BLOCK_N,
+    SDPA_BLOCK_N_F32,
+)
 from .gdn import GDN_BV, GDN_SOLVE_BV, GDN_SOLVE_N
 from .fp8_linear import (
     GEMM_BLOCK_K as FP8_GEMM_BLOCK_K,
@@ -824,12 +832,26 @@ def causal_sdpa(dtype: str = SERVING_DTYPE) -> dict:
         "NUM_Q_HEADS": "constexpr",
         "NUM_KV_HEADS": "constexpr",
         "D": "constexpr",
+        "BLOCK_M": "constexpr",
         "BLOCK_N": "constexpr",
         "BLOCK_D": "constexpr",
     }
 
 
 def causal_sdpa_constexprs(
+    q_heads: int = 16, kv_heads: int = 2, d: int = 256, block_n: int = SDPA_BLOCK_N
+) -> dict:
+    return {
+        "NUM_Q_HEADS": q_heads,
+        "NUM_KV_HEADS": kv_heads,
+        "D": d,
+        "BLOCK_M": SDPA_BLOCK_M,
+        "BLOCK_N": block_n,
+        "BLOCK_D": SDPA_BLOCK_D,
+    }
+
+
+def causal_sdpa_f32_constexprs(
     q_heads: int = 16, kv_heads: int = 2, d: int = 256
 ) -> dict:
-    return {"NUM_Q_HEADS": q_heads, "NUM_KV_HEADS": kv_heads, "D": d, "BLOCK_N": 64, "BLOCK_D": d}
+    return causal_sdpa_constexprs(q_heads, kv_heads, d, block_n=SDPA_BLOCK_N_F32)

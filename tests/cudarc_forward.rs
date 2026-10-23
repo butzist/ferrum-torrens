@@ -152,30 +152,48 @@ fn causal_sdpa_host(
     kvh: usize,
     d: usize,
     offset: usize,
+    round_bf16: bool,
 ) -> Vec<f32> {
+    let r = |x: f32| if round_bf16 { bf16_of(x) } else { x };
+    let qr: Vec<f32> = q.iter().map(|x| r(*x)).collect();
+    let kr: Vec<f32> = k.iter().map(|x| r(*x)).collect();
+    let vr: Vec<f32> = v.iter().map(|x| r(*x)).collect();
     let rep = qh / kvh;
     let mut out = vec![0.0f32; qt * qh * d];
+    let mut scores = vec![0.0f32; kt];
+    let mut probs = vec![0.0f32; kt];
+    let mut acc = vec![0.0f32; d];
     for t in 0..qt {
         let pos = offset + t;
         for h in 0..qh {
             let kh = h / rep;
-            let mut scores = vec![f32::NEG_INFINITY; kt];
-            for j in 0..=pos.min(kt - 1) {
+            let limit = pos.min(kt - 1);
+            for j in 0..=limit {
                 let mut dot = 0.0f32;
                 for e in 0..d {
-                    dot += bf16_of(q[(t * qh + h) * d + e]) * bf16_of(k[(j * kvh + kh) * d + e]);
+                    dot += qr[(t * qh + h) * d + e] * kr[(j * kvh + kh) * d + e];
                 }
                 scores[j] = dot / (d as f32).sqrt();
             }
-            let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let denom: f32 = scores.iter().map(|s| (s - max).exp()).sum();
-            for e in 0..d {
-                let mut acc = 0.0f32;
-                for j in 0..=pos.min(kt - 1) {
-                    let p = (scores[j] - max).exp() / denom;
-                    acc += p * bf16_of(v[(j * kvh + kh) * d + e]);
+            let max = scores[..=limit]
+                .iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, f32::max);
+            let mut denom = 0.0f32;
+            for j in 0..=limit {
+                probs[j] = (scores[j] - max).exp();
+                denom += probs[j];
+            }
+            acc.fill(0.0);
+            for (j, pj) in probs[..=limit].iter().enumerate() {
+                let p = pj / denom;
+                let base = (j * kvh + kh) * d;
+                for e in 0..d {
+                    acc[e] += p * vr[base + e];
                 }
-                out[(t * qh + h) * d + e] = bf16_of(acc);
+            }
+            for e in 0..d {
+                out[(t * qh + h) * d + e] = r(acc[e]);
             }
         }
     }
@@ -344,12 +362,69 @@ fn sdpa_and_shape_ops_match_host_reference() -> Res<()> {
     let k = rt.from_slice_bf16(&k_bits, &[kt, kvh, d])?;
     let v = rt.from_slice_bf16(&v_bits, &[kt, kvh, d])?;
     let offset = 1usize;
-    let want = causal_sdpa_host(&q_host, &k_host, &v_host, qt, kt, qh, kvh, d, offset);
+    let want = causal_sdpa_host(&q_host, &k_host, &v_host, qt, kt, qh, kvh, d, offset, true);
     close(
         &q.causal_sdpa(&k, &v, offset)?.to_host_f32()?,
         &want,
         2e-2,
         "causal sdpa",
+    );
+
+    // Full 2057-token prefill: one causal pass with no cache and one cached
+    // pass where only the last eight queries run against the whole key history.
+    for (tq, tkv, off, what) in [
+        (2057usize, 2057usize, 0usize, "causal sdpa 2057"),
+        (8usize, 2057usize, 2049usize, "causal sdpa cached"),
+    ] {
+        let q_host = values(tq * qh * d, 79, -1.0, 1.0);
+        let k_host = values(tkv * kvh * d, 83, -1.0, 1.0);
+        let v_host = values(tkv * kvh * d, 89, -1.0, 1.0);
+        let q_bits: Vec<bf16> = q_host.iter().map(|v| bf16::from_f32(*v)).collect();
+        let k_bits: Vec<bf16> = k_host.iter().map(|v| bf16::from_f32(*v)).collect();
+        let v_bits: Vec<bf16> = v_host.iter().map(|v| bf16::from_f32(*v)).collect();
+        let q = rt.from_slice_bf16(&q_bits, &[tq, qh, d])?;
+        let k = rt.from_slice_bf16(&k_bits, &[tkv, kvh, d])?;
+        let v = rt.from_slice_bf16(&v_bits, &[tkv, kvh, d])?;
+        let want = causal_sdpa_host(&q_host, &k_host, &v_host, tq, tkv, qh, kvh, d, off, true);
+        close(
+            &q.causal_sdpa(&k, &v, off)?.to_host_f32()?,
+            &want,
+            2e-2,
+            what,
+        );
+    }
+
+    // The cached f32 path stays close to a full-f32 host reference.
+    let (fq, fkv) = (64usize, 64usize);
+    let q_host = values(fq * qh * d, 97, -1.0, 1.0);
+    let k_host = values(fkv * kvh * d, 101, -1.0, 1.0);
+    let v_host = values(fkv * kvh * d, 103, -1.0, 1.0);
+    let q = rt.from_slice_f32(&q_host, &[fq, qh, d])?;
+    let k = rt.from_slice_f32(&k_host, &[fkv, kvh, d])?;
+    let v = rt.from_slice_f32(&v_host, &[fkv, kvh, d])?;
+    let want = causal_sdpa_host(&q_host, &k_host, &v_host, fq, fkv, qh, kvh, d, 0, false);
+    close(
+        &q.causal_sdpa(&k, &v, 0)?.to_host_f32()?,
+        &want,
+        1e-4,
+        "causal sdpa f32",
+    );
+
+    // The cached f32 shape a decode step takes: one row below the tile, the
+    // whole key history behind it.
+    let (fq, fkv, foff) = (8usize, 2057usize, 2049usize);
+    let q_host = values(fq * qh * d, 107, -1.0, 1.0);
+    let k_host = values(fkv * kvh * d, 109, -1.0, 1.0);
+    let v_host = values(fkv * kvh * d, 113, -1.0, 1.0);
+    let q = rt.from_slice_f32(&q_host, &[fq, qh, d])?;
+    let k = rt.from_slice_f32(&k_host, &[fkv, kvh, d])?;
+    let v = rt.from_slice_f32(&v_host, &[fkv, kvh, d])?;
+    let want = causal_sdpa_host(&q_host, &k_host, &v_host, fq, fkv, qh, kvh, d, foff, false);
+    close(
+        &q.causal_sdpa(&k, &v, foff)?.to_host_f32()?,
+        &want,
+        1e-4,
+        "causal sdpa f32 cached",
     );
 
     let a_host = values(2 * 3, 67, -1.0, 1.0);

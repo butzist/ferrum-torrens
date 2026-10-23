@@ -114,6 +114,7 @@ from .signatures import (
     rope_constexprs,
     causal_sdpa,
     causal_sdpa_constexprs,
+    causal_sdpa_f32_constexprs,
     repeat_heads,
     repeat_heads_constexprs,
     unary,
@@ -443,7 +444,7 @@ LINEAR_KERNELS: dict[str, dict] = {
     "causal_sdpa_f32": {
         "fn": _causal_sdpa_kernel,
         "signature": causal_sdpa("fp32"),
-        "constexprs": causal_sdpa_constexprs(),
+        "constexprs": causal_sdpa_f32_constexprs(),
         "num_warps": 4,
     },
     "repeat_heads_bf16": {

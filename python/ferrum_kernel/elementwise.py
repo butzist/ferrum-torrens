@@ -410,6 +410,17 @@ def launch_repeat_heads(x: torch.Tensor, out: torch.Tensor, kb: int, rep: int) -
     )
 
 
+# The flash-attention tile: query rows per program, keys per step, and the
+# head-dim chunk the `tl.dot` scores run over. All three are constexpr, so the
+# launch grid must agree with the committed cubin.
+SDPA_BLOCK_M = 16
+SDPA_BLOCK_N = 64
+# The f32 value tile is twice as wide as bf16's, so the f32 cubin steps half as
+# many keys to keep its dynamic shared memory under the 48 KiB default.
+SDPA_BLOCK_N_F32 = 32
+SDPA_BLOCK_D = 64
+
+
 @triton.jit
 def _causal_sdpa_kernel(
     q_ptr,
@@ -428,54 +439,119 @@ def _causal_sdpa_kernel(
     NUM_Q_HEADS: tl.constexpr,
     NUM_KV_HEADS: tl.constexpr,
     D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    """Causal GQA attention for one query row: `q` is `[q_t, q_heads, D]`,
-    `k`/`v` are `[kv_t, kv_heads, D]`, and query `i` may read keys up to
-    `q_offset + i`. Online softmax in f32, store in the activation dtype."""
-    i_t = tl.program_id(0)
+    """Causal GQA attention: `q` is `[q_t, q_heads, D]`, `k`/`v` are
+    `[kv_t, kv_heads, D]`, and query `i` may read keys up to `q_offset + i`.
+
+    Prefill runs a `BLOCK_M`-row tile of one q-head: scores and the value
+    accumulation are `tl.dot`s, the softmax is online in f32, and the store
+    follows the activation dtype. A decode step (fewer rows than one tile)
+    instead runs the old one-row recurrence, because a 16-row tile spends
+    fifteen sixteenths of every dot on masked lanes."""
+    start_m = tl.program_id(0)
     i_h = tl.program_id(1)
     i_kv = i_h // (NUM_Q_HEADS // NUM_KV_HEADS)
-    pos = q_offset + i_t
-    o_d = tl.arange(0, BLOCK_D)
-    mask_d = o_d < D
-    q = tl.load(
-        q_ptr + i_t * stride_qt + i_h * stride_qh + o_d, mask=mask_d, other=0.0
-    ).to(tl.float32)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, BLOCK_D)
+    offs_do = tl.arange(0, D)
     scale = 1.0 / (D ** 0.5)
 
-    m = -float("inf")
-    l = 0.0
-    acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
-    for start in range(0, kv_t, BLOCK_N):
-        n = start + tl.arange(0, BLOCK_N)
-        mask_n = (n < kv_t) & (n <= pos)
-        k = tl.load(
-            k_ptr
-            + n[:, None] * stride_kt
-            + i_kv * stride_kh
-            + o_d[None, :],
-            mask=mask_n[:, None] & mask_d[None, :],
-            other=0.0,
-        ).to(tl.float32)
-        s = tl.sum(q[None, :] * k, 1) * scale
-        s = tl.where(mask_n, s, -float("inf"))
-        m_new = tl.maximum(m, tl.max(s, 0))
-        p = tl.exp(s - m_new)
-        l = l * tl.exp(m - m_new) + tl.sum(p, 0)
-        v = tl.load(
-            v_ptr
-            + n[:, None] * stride_vt
-            + i_kv * stride_vh
-            + o_d[None, :],
-            mask=mask_n[:, None] & mask_d[None, :],
-            other=0.0,
-        ).to(tl.float32)
-        acc = acc * tl.exp(m - m_new) + tl.sum(p[:, None] * v, 0)
-        m = m_new
-    out = acc / l
-    tl.store(out_ptr + i_t * (NUM_Q_HEADS * D) + i_h * D + o_d, out, mask=mask_d)
+    if q_t < BLOCK_M:
+        for t in range(q_t):
+            pos = q_offset + t
+            qr = tl.load(
+                q_ptr + t * stride_qt + i_h * stride_qh + offs_do
+            ).to(tl.float32)
+            m = -float("inf")
+            l = 0.0
+            accr = tl.zeros((D,), dtype=tl.float32)
+            for start_n in range(0, kv_t, BLOCK_N):
+                n = start_n + offs_n
+                mask_n = (n < kv_t) & (n <= pos)
+                k = tl.load(
+                    k_ptr
+                    + n[:, None] * stride_kt
+                    + i_kv * stride_kh
+                    + offs_do[None, :],
+                    mask=mask_n[:, None],
+                    other=0.0,
+                ).to(tl.float32)
+                s = tl.sum(qr[None, :] * k, 1) * scale
+                s = tl.where(mask_n, s, -float("inf"))
+                m_new = tl.maximum(m, tl.max(s, 0))
+                p = tl.exp(s - m_new)
+                l = l * tl.exp(m - m_new) + tl.sum(p, 0)
+                v = tl.load(
+                    v_ptr
+                    + n[:, None] * stride_vt
+                    + i_kv * stride_vh
+                    + offs_do[None, :],
+                    mask=mask_n[:, None],
+                    other=0.0,
+                ).to(tl.float32)
+                accr = accr * tl.exp(m - m_new) + tl.sum(p[:, None] * v, 0)
+                m = m_new
+            out = accr / l
+            tl.store(out_ptr + t * (NUM_Q_HEADS * D) + i_h * D + offs_do, out)
+    else:
+        offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        mask_m = offs_m < q_t
+        q_ptrs = (
+            q_ptr + offs_m[:, None] * stride_qt + i_h * stride_qh + offs_d[None, :]
+        )
+        v_ptrs = (
+            v_ptr + offs_n[:, None] * stride_vt + i_kv * stride_vh + offs_do[None, :]
+        )
+        m_i = tl.full((BLOCK_M,), -float("inf"), tl.float32)
+        l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
+        acc = tl.zeros((BLOCK_M, D), dtype=tl.float32)
+
+        for start_n in range(0, kv_t, BLOCK_N):
+            n = start_n + offs_n
+            mask_n = n < kv_t
+            causal = n[None, :] <= (q_offset + offs_m)[:, None]
+            mask_s = mask_n[None, :] & causal & mask_m[:, None]
+
+            s = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+            for d0 in range(0, D, BLOCK_D):
+                d = d0 + offs_d
+                mask_d = d < D
+                q = tl.load(
+                    q_ptrs + d0,
+                    mask=mask_m[:, None] & mask_d[None, :],
+                    other=0.0,
+                )
+                k = tl.load(
+                    k_ptr + n[:, None] * stride_kt + i_kv * stride_kh + d[None, :],
+                    mask=mask_n[:, None] & mask_d[None, :],
+                    other=0.0,
+                )
+                # input_precision only affects f32 inputs; bf16 uses the tensor core.
+                s += tl.dot(q, tl.trans(k), input_precision="ieee")
+            s = tl.where(mask_s, s * scale, -float("inf"))
+
+            m_new = tl.maximum(m_i, tl.max(s, 1))
+            alpha = tl.exp(m_i - m_new)
+            p = tl.exp(s - m_new[:, None])
+            l_i = l_i * alpha + tl.sum(p, 1)
+            acc = acc * alpha[:, None]
+
+            v = tl.load(
+                v_ptrs + start_n * stride_vt,
+                mask=mask_n[:, None],
+                other=0.0,
+            )
+            acc += tl.dot(p.to(v.dtype), v, input_precision="ieee")
+            m_i = m_new
+
+        out = acc / l_i[:, None]
+        out_ptrs = (
+            out_ptr + offs_m[:, None] * (NUM_Q_HEADS * D) + i_h * D + offs_do[None, :]
+        )
+        tl.store(out_ptrs, out, mask=mask_m[:, None])
 
 
 def launch_causal_sdpa(
@@ -489,9 +565,11 @@ def launch_causal_sdpa(
     head_dim: int,
 ) -> None:
     q_t, kv_t = q.shape[0], k.shape[0]
-    _causal_sdpa_kernel[(q_t, q_heads)](
+    block_n = SDPA_BLOCK_N_F32 if q.dtype == torch.float32 else SDPA_BLOCK_N
+    _causal_sdpa_kernel[(triton.cdiv(q_t, SDPA_BLOCK_M), q_heads)](
         q, k, v, out, q_offset, q_t, kv_t,
         q.stride(0), q.stride(1), k.stride(0), k.stride(1), v.stride(0), v.stride(1),
         NUM_Q_HEADS=q_heads, NUM_KV_HEADS=kv_heads, D=head_dim,
-        BLOCK_N=64, BLOCK_D=triton.next_power_of_2(head_dim), num_warps=4,
+        BLOCK_M=SDPA_BLOCK_M, BLOCK_N=block_n, BLOCK_D=SDPA_BLOCK_D,
+        num_warps=4,
     )
