@@ -54,6 +54,8 @@ from .elementwise import (
     _unary_kernel,
     _copy_strided_kernel,
     _index_select_rows_kernel,
+    _gather_rows_kernel,
+    _scatter_rows_kernel,
 )
 from .gdn import _gdn_decode_kernel, _gdn_tri_solve_kernel
 from .norm import _add_rmsnorm_kernel
@@ -118,6 +120,10 @@ from .signatures import (
     unary_constexprs,
     index_select,
     index_select_constexprs,
+    gather_rows,
+    gather_rows_constexprs,
+    scatter_rows,
+    scatter_rows_constexprs,
     down_constexprs,
     gate_up_constexprs,
     gdn_decode,
@@ -344,6 +350,30 @@ LINEAR_KERNELS: dict[str, dict] = {
         "constexprs": index_select_constexprs(),
         "num_warps": 4,
     },
+    "gather_rows_bf16": {
+        "fn": _gather_rows_kernel,
+        "signature": gather_rows("bf16"),
+        "constexprs": gather_rows_constexprs(),
+        "num_warps": 4,
+    },
+    "gather_rows_f32": {
+        "fn": _gather_rows_kernel,
+        "signature": gather_rows("fp32"),
+        "constexprs": gather_rows_constexprs(),
+        "num_warps": 4,
+    },
+    "scatter_rows_bf16": {
+        "fn": _scatter_rows_kernel,
+        "signature": scatter_rows("bf16"),
+        "constexprs": scatter_rows_constexprs(),
+        "num_warps": 4,
+    },
+    "scatter_rows_f32": {
+        "fn": _scatter_rows_kernel,
+        "signature": scatter_rows("fp32"),
+        "constexprs": scatter_rows_constexprs(),
+        "num_warps": 4,
+    },
     "unary_bf16": {
         "fn": _unary_kernel,
         "signature": unary("bf16"),
@@ -437,6 +467,12 @@ LINEAR_KERNELS: dict[str, dict] = {
     "copy_strided_f32": {
         "fn": _copy_strided_kernel,
         "signature": copy_strided("fp32"),
+        "constexprs": copy_strided_constexprs(),
+        "num_warps": 4,
+    },
+    "copy_strided_i32": {
+        "fn": _copy_strided_kernel,
+        "signature": copy_strided("i32"),
         "constexprs": copy_strided_constexprs(),
         "num_warps": 4,
     },

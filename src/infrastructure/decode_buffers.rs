@@ -14,8 +14,7 @@
 // because the staging is a host H2D copy outside any capture -- the graph only
 // ever reads them.
 
-use tch::{Kind, Tensor};
-
+use crate::infrastructure::cudarc::{Runtime, Tensor, TensorDType};
 use crate::infrastructure::torch::Device;
 
 /// Re-export the row type so callers that stage buffers get it from one place.
@@ -62,20 +61,34 @@ impl DecodeBuffers {
     /// captured step will ever serve, because a graph pins the gather length.
     pub fn new(max_bs: usize, vocab: usize, window: usize, device: Device) -> Self {
         assert!(max_bs > 0 && vocab > 0 && window > 0);
-        let i32_dev = (Kind::Int, device.to_tch());
-        let f32_dev = (Kind::Float, device.to_tch());
+        let ordinal = match device {
+            Device::Cuda(ordinal) => ordinal,
+            Device::Cpu => 0,
+        };
+        let rt = Runtime::open(ordinal).expect("open the cudarc compute runtime");
         Self {
-            input_ids: Tensor::zeros([max_bs as i64], i32_dev),
-            positions: Tensor::zeros([max_bs as i64], i32_dev),
-            state_slots: Tensor::zeros([max_bs as i64], i32_dev),
-            out_locs: Tensor::zeros([max_bs as i64], i32_dev),
+            input_ids: rt
+                .zeros(&[max_bs], TensorDType::I32)
+                .expect("allocate decode input ids"),
+            positions: rt
+                .zeros(&[max_bs], TensorDType::I32)
+                .expect("allocate decode positions"),
+            state_slots: rt
+                .zeros(&[max_bs], TensorDType::I32)
+                .expect("allocate decode state slots"),
+            out_locs: rt
+                .zeros(&[max_bs], TensorDType::I32)
+                .expect("allocate decode out locs"),
             // Every window entry starts at pool location 0. The padding value is
             // irrelevant to the arithmetic -- the device mask drops every entry
             // past the step's position -- but it must be a *valid* pool index,
-            // because the gather is an `index_select` and libtorch's CUDA kernel
-            // asserts on an out-of-range index.
-            kv_locs: Tensor::zeros([max_bs as i64, window as i64], i32_dev),
-            logits: Tensor::zeros([max_bs as i64, vocab as i64], f32_dev),
+            // because the gather reads it as a pool location.
+            kv_locs: rt
+                .zeros(&[max_bs, window], TensorDType::I32)
+                .expect("allocate decode kv locs"),
+            logits: rt
+                .zeros(&[max_bs, vocab], TensorDType::F32)
+                .expect("allocate decode logits"),
             max_bs,
             vocab,
             window,
@@ -131,7 +144,7 @@ impl DecodeBuffers {
     /// One row's window, `[window]`, the tensor a decode gather reads.
     pub fn kv_locs_row(&self, row: usize) -> Tensor {
         assert!(row < self.max_bs, "kv_locs_row past the captured batch");
-        self.kv_locs.select(0, row as i64)
+        self.kv_locs.select(0, row).expect("kv locs row")
     }
 
     /// The logits `[max_bs, vocab]` f32 the step writes into, and the sampler
@@ -144,7 +157,7 @@ impl DecodeBuffers {
     /// than the captured batch.
     pub fn logits_rows(&self, n: usize) -> Tensor {
         assert!(n <= self.max_bs, "logits_rows past the captured batch");
-        self.logits.narrow(0, 0, n as i64)
+        self.logits.narrow(0, 0, n).expect("logit rows")
     }
 
     /// Stage `rows` at the head of every buffer. The tail keeps whatever the
@@ -208,8 +221,8 @@ impl DecodeBuffers {
     ///
     /// The padding value does not matter to the arithmetic -- the device mask
     /// drops every position past the step's own -- but it must be a *valid* pool
-    /// index, because the gather is an `index_select` and libtorch's CUDA kernel
-    /// asserts on an out-of-range index. Location 0 always exists.
+    /// index, because the gather reads it as a pool location. Location 0 always
+    /// exists.
     pub fn stage_window(&self, row: usize, locs: &[u32]) -> Result<(), DecodeBufferError> {
         assert!(row < self.max_bs, "stage_window past the captured batch");
         if locs.len() > self.window {
@@ -229,8 +242,12 @@ impl DecodeBuffers {
             })
             .collect();
         host.resize(self.window, 0);
-        let src = Tensor::from_slice(&host).to_device(self.kv_locs.device());
-        self.kv_locs.select(0, row as i64).copy_(&src);
+        let dst = self.kv_locs.select(0, row).expect("kv locs row");
+        let src = dst
+            .runtime()
+            .from_slice_i32(&host, &[self.window])
+            .expect("stage kv window");
+        src.copy_to(&dst).expect("write kv window");
         Ok(())
     }
 
@@ -251,21 +268,25 @@ impl DecodeBuffers {
                 }
             })
             .collect();
-        let src = Tensor::from_slice(&host).to_device(dst.device());
-        dst.narrow(0, 0, values.len() as i64).copy_(&src);
+        let dst = dst.narrow(0, 0, values.len()).expect("decode buffer head");
+        let src = dst
+            .runtime()
+            .from_slice_i32(&host, &[values.len()])
+            .expect("stage decode metadata");
+        src.copy_to(&dst).expect("write decode metadata");
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::infrastructure::torch::auto_device;
+
+    fn dev() -> Device {
+        Device::Cuda(0)
+    }
 
     fn i32_vec(t: &Tensor) -> Vec<i32> {
-        let flat = t.contiguous().flatten(0, -1);
-        let mut out = vec![0i32; flat.numel()];
-        flat.copy_data(&mut out, flat.numel());
-        out
+        t.to_host_i32().expect("read i32 buffer")
     }
 
     fn row(seed: u32) -> DecodeRow {
@@ -279,17 +300,17 @@ mod tests {
 
     #[test]
     fn buffers_start_zeroed_with_the_asked_shape() {
-        let b = DecodeBuffers::new(4, 8, 16, auto_device());
+        let b = DecodeBuffers::new(4, 8, 16, dev());
         assert_eq!(b.max_bs(), 4);
         assert_eq!(b.vocab(), 8);
-        assert_eq!(b.input_ids().size(), vec![4]);
-        assert_eq!(b.logits().size(), vec![4, 8]);
+        assert_eq!(b.input_ids().shape(), vec![4]);
+        assert_eq!(b.logits().shape(), vec![4, 8]);
         assert_eq!(i32_vec(b.out_locs()), vec![0; 4]);
     }
 
     #[test]
     fn staging_a_step_writes_every_row() {
-        let b = DecodeBuffers::new(4, 8, 16, auto_device());
+        let b = DecodeBuffers::new(4, 8, 16, dev());
         b.stage(&[row(0), row(1)]).unwrap();
         assert_eq!(i32_vec(b.input_ids())[..2], [100, 101]);
         assert_eq!(i32_vec(b.positions())[..2], [7, 8]);
@@ -298,8 +319,32 @@ mod tests {
     }
 
     #[test]
+    fn staging_keeps_the_buffer_addresses_fixed() {
+        let b = DecodeBuffers::new(2, 8, 4, dev());
+        let ptrs = [
+            b.input_ids().device_ptr(),
+            b.positions().device_ptr(),
+            b.state_slots().device_ptr(),
+            b.out_locs().device_ptr(),
+            b.kv_locs().device_ptr(),
+            b.logits().device_ptr(),
+        ];
+        b.stage(&[row(0), row(9)]).unwrap();
+        b.stage_window(0, &[7, 8]).unwrap();
+        let after = [
+            b.input_ids().device_ptr(),
+            b.positions().device_ptr(),
+            b.state_slots().device_ptr(),
+            b.out_locs().device_ptr(),
+            b.kv_locs().device_ptr(),
+            b.logits().device_ptr(),
+        ];
+        assert_eq!(ptrs, after, "a capture bakes these addresses");
+    }
+
+    #[test]
     fn staging_more_rows_than_capacity_is_refused() {
-        let b = DecodeBuffers::new(2, 8, 16, auto_device());
+        let b = DecodeBuffers::new(2, 8, 16, dev());
         assert_eq!(
             b.stage(&[row(0), row(1), row(2)]),
             Err(DecodeBufferError::TooManyRows { rows: 3, max: 2 })
@@ -308,7 +353,7 @@ mod tests {
 
     #[test]
     fn padding_fills_the_tail_with_sentinel_rows() {
-        let b = DecodeBuffers::new(4, 8, 16, auto_device());
+        let b = DecodeBuffers::new(4, 8, 16, dev());
         b.stage_padded(&[row(0), row(1)], 4).unwrap();
         assert_eq!(i32_vec(b.input_ids())[..2], [100, 101]);
         assert_eq!(i32_vec(b.out_locs())[..2], [4096, 4097]);
@@ -322,7 +367,7 @@ mod tests {
 
     #[test]
     fn padding_smaller_than_the_staged_rows_is_refused() {
-        let b = DecodeBuffers::new(4, 8, 16, auto_device());
+        let b = DecodeBuffers::new(4, 8, 16, dev());
         assert_eq!(
             b.stage_padded(&[row(0), row(1)], 1),
             Err(DecodeBufferError::PaddedUnderRows { rows: 2, padded: 1 })
@@ -335,7 +380,7 @@ mod tests {
 
     #[test]
     fn a_second_step_overwrites_the_first_in_place() {
-        let b = DecodeBuffers::new(2, 8, 16, auto_device());
+        let b = DecodeBuffers::new(2, 8, 16, dev());
         b.stage(&[row(0), row(1)]).unwrap();
         let first = i32_vec(b.input_ids());
         b.stage(&[row(9)]).unwrap();
@@ -354,9 +399,9 @@ mod tests {
 
     #[test]
     fn the_kv_window_starts_zeroed() {
-        let b = DecodeBuffers::new(1, 8, 4, auto_device());
+        let b = DecodeBuffers::new(1, 8, 4, dev());
         assert_eq!(b.window(), 4);
-        assert_eq!(b.kv_locs().size(), vec![1, 4]);
+        assert_eq!(b.kv_locs().shape(), vec![1, 4]);
         assert_eq!(
             i32_vec(&b.kv_locs_row(0)),
             vec![0; 4],
@@ -366,7 +411,7 @@ mod tests {
 
     #[test]
     fn stage_window_aligns_the_locations_and_pads_the_tail() {
-        let b = DecodeBuffers::new(2, 8, 4, auto_device());
+        let b = DecodeBuffers::new(2, 8, 4, dev());
         b.stage_window(0, &[7, 8]).unwrap();
         assert_eq!(
             i32_vec(&b.kv_locs_row(0)),
@@ -382,7 +427,7 @@ mod tests {
 
     #[test]
     fn a_window_longer_than_the_buffer_is_refused() {
-        let b = DecodeBuffers::new(1, 8, 2, auto_device());
+        let b = DecodeBuffers::new(1, 8, 2, dev());
         assert_eq!(
             b.stage_window(0, &[1, 2, 3]),
             Err(DecodeBufferError::WindowOverCapacity { locs: 3, window: 2 })

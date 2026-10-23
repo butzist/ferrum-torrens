@@ -602,8 +602,13 @@ pub const MUL_F32: &str = "mul_f32";
 pub const CAST_BF16_F32: &str = "cast_bf16_f32";
 pub const CAST_F32_BF16: &str = "cast_f32_bf16";
 pub const INDEX_SELECT_BF16: &str = "index_select_bf16";
+pub const GATHER_ROWS_BF16: &str = "gather_rows_bf16";
+pub const GATHER_ROWS_F32: &str = "gather_rows_f32";
+pub const SCATTER_ROWS_BF16: &str = "scatter_rows_bf16";
+pub const SCATTER_ROWS_F32: &str = "scatter_rows_f32";
 pub const COPY_STRIDED_BF16: &str = "copy_strided_bf16";
 pub const COPY_STRIDED_F32: &str = "copy_strided_f32";
+pub const COPY_STRIDED_I32: &str = "copy_strided_i32";
 pub const UNARY_BF16: &str = "unary_bf16";
 pub const UNARY_F32: &str = "unary_f32";
 pub const SCALAR_BF16: &str = "scalar_bf16";
@@ -619,7 +624,7 @@ pub const ROPE_BF16: &str = "rope_bf16";
 pub const REPEAT_HEADS_BF16: &str = "repeat_heads_bf16";
 pub const CAUSAL_SDPA_BF16: &str = "causal_sdpa_bf16";
 
-const LINEAR_NAMES: [&str; 31] = [
+const LINEAR_NAMES: [&str; 36] = [
     GDN_DECODE,
     CONV_DECODE,
     ADD_RMSNORM,
@@ -635,8 +640,13 @@ const LINEAR_NAMES: [&str; 31] = [
     CAST_BF16_F32,
     CAST_F32_BF16,
     INDEX_SELECT_BF16,
+    GATHER_ROWS_BF16,
+    GATHER_ROWS_F32,
+    SCATTER_ROWS_BF16,
+    SCATTER_ROWS_F32,
     COPY_STRIDED_BF16,
     COPY_STRIDED_F32,
+    COPY_STRIDED_I32,
     UNARY_BF16,
     UNARY_F32,
     SCALAR_BF16,
@@ -795,11 +805,26 @@ pub fn linear_cubin(name: &str) -> Result<&'static [u8], MoEError> {
         INDEX_SELECT_BF16 => {
             include_bytes!(concat!(env!("OUT_DIR"), "/kernel/index_select_bf16.cubin"))
         }
+        GATHER_ROWS_BF16 => {
+            include_bytes!(concat!(env!("OUT_DIR"), "/kernel/gather_rows_bf16.cubin"))
+        }
+        GATHER_ROWS_F32 => {
+            include_bytes!(concat!(env!("OUT_DIR"), "/kernel/gather_rows_f32.cubin"))
+        }
+        SCATTER_ROWS_BF16 => {
+            include_bytes!(concat!(env!("OUT_DIR"), "/kernel/scatter_rows_bf16.cubin"))
+        }
+        SCATTER_ROWS_F32 => {
+            include_bytes!(concat!(env!("OUT_DIR"), "/kernel/scatter_rows_f32.cubin"))
+        }
         COPY_STRIDED_BF16 => {
             include_bytes!(concat!(env!("OUT_DIR"), "/kernel/copy_strided_bf16.cubin"))
         }
         COPY_STRIDED_F32 => {
             include_bytes!(concat!(env!("OUT_DIR"), "/kernel/copy_strided_f32.cubin"))
+        }
+        COPY_STRIDED_I32 => {
+            include_bytes!(concat!(env!("OUT_DIR"), "/kernel/copy_strided_i32.cubin"))
         }
         UNARY_BF16 => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/unary_bf16.cubin")),
         UNARY_F32 => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/unary_f32.cubin")),
@@ -848,11 +873,26 @@ fn linear_ptx(name: &str) -> &'static str {
         INDEX_SELECT_BF16 => {
             include_str!(concat!(env!("OUT_DIR"), "/kernel/index_select_bf16.ptx"))
         }
+        GATHER_ROWS_BF16 => {
+            include_str!(concat!(env!("OUT_DIR"), "/kernel/gather_rows_bf16.ptx"))
+        }
+        GATHER_ROWS_F32 => {
+            include_str!(concat!(env!("OUT_DIR"), "/kernel/gather_rows_f32.ptx"))
+        }
+        SCATTER_ROWS_BF16 => {
+            include_str!(concat!(env!("OUT_DIR"), "/kernel/scatter_rows_bf16.ptx"))
+        }
+        SCATTER_ROWS_F32 => {
+            include_str!(concat!(env!("OUT_DIR"), "/kernel/scatter_rows_f32.ptx"))
+        }
         COPY_STRIDED_BF16 => {
             include_str!(concat!(env!("OUT_DIR"), "/kernel/copy_strided_bf16.ptx"))
         }
         COPY_STRIDED_F32 => {
             include_str!(concat!(env!("OUT_DIR"), "/kernel/copy_strided_f32.ptx"))
+        }
+        COPY_STRIDED_I32 => {
+            include_str!(concat!(env!("OUT_DIR"), "/kernel/copy_strided_i32.ptx"))
         }
         UNARY_BF16 => include_str!(concat!(env!("OUT_DIR"), "/kernel/unary_bf16.ptx")),
         UNARY_F32 => include_str!(concat!(env!("OUT_DIR"), "/kernel/unary_f32.ptx")),

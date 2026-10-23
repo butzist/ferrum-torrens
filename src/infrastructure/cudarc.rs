@@ -32,9 +32,10 @@ use crate::infrastructure::cuda_driver::{CUstream, CudaError, Driver, GdnKernels
 use crate::infrastructure::kernel_abi::{
     ADD_BF16, ADD_F32, ADD_RMSNORM, AddRmsnormArgs, ArgPack, CAST_BF16_F32, CAST_F32_BF16,
     CAUSAL_SDPA_BF16, COL_MUL_BF16, COL_MUL_F32, COPY_STRIDED_BF16, COPY_STRIDED_F32,
-    INDEX_SELECT_BF16, LinearAbi, MAX_ALL_F32, MUL_BF16, MUL_F32, REPEAT_HEADS_BF16, ROPE_BF16,
-    SCALAR_BF16, SCALAR_F32, SOFTMAX_LAST_F32, SUM_ALL_F32, SUM_LAST_F32, TOPK_LAST_F32,
-    UNARY_BF16, UNARY_F32, add_rmsnorm_args, add_rmsnorm_grid,
+    COPY_STRIDED_I32, GATHER_ROWS_BF16, GATHER_ROWS_F32, INDEX_SELECT_BF16, LinearAbi, MAX_ALL_F32,
+    MUL_BF16, MUL_F32, REPEAT_HEADS_BF16, ROPE_BF16, SCALAR_BF16, SCALAR_F32, SCATTER_ROWS_BF16,
+    SCATTER_ROWS_F32, SOFTMAX_LAST_F32, SUM_ALL_F32, SUM_LAST_F32, TOPK_LAST_F32, UNARY_BF16,
+    UNARY_F32, add_rmsnorm_args, add_rmsnorm_grid,
 };
 
 fn bad(e: impl std::fmt::Display) -> MoEError {
@@ -1292,6 +1293,80 @@ impl Tensor {
         )?;
         Ok(out)
     }
+
+    /// Gather rows of a bf16/f32 `[rows, cols]` by a device i32 index vector:
+    /// `out[r, :] = self[index[r], :]`.
+    pub fn gather_rows(&self, index: &Tensor) -> Result<Tensor, MoEError> {
+        let name = match self.dtype() {
+            TensorDType::Bf16 => GATHER_ROWS_BF16,
+            TensorDType::F32 => GATHER_ROWS_F32,
+            other => return Err(bad(format!("no row gather for {}", other.name()))),
+        };
+        if self.dim() != 2 {
+            return Err(bad("gather_rows wants a 2-d table"));
+        }
+        if index.dtype() != TensorDType::I32 || index.dim() != 1 {
+            return Err(bad("gather_rows wants a 1-d i32 index"));
+        }
+        let src = self.contiguous()?;
+        let index = index.contiguous()?;
+        let out = self
+            .rt
+            .zeros(&[index.shape[0], self.shape[1]], self.dtype())?;
+        if index.shape[0] == 0 || self.shape[1] == 0 {
+            return Ok(out);
+        }
+        self.rt.kernels().gather_rows(
+            self.rt.raw_stream(),
+            name,
+            src.device_ptr(),
+            index.device_ptr(),
+            out.device_ptr(),
+            self.shape[1],
+            index.shape[0],
+        )?;
+        Ok(out)
+    }
+
+    /// Scatter the rows of a bf16/f32 `src` `[rows, cols]` into this contiguous
+    /// destination table at a device i32 index vector:
+    /// `dst[index[r], :] = src[r, :]`.
+    pub fn scatter_rows(&self, index: &Tensor, src: &Tensor) -> Result<(), MoEError> {
+        let name = match self.dtype() {
+            TensorDType::Bf16 => SCATTER_ROWS_BF16,
+            TensorDType::F32 => SCATTER_ROWS_F32,
+            other => return Err(bad(format!("no row scatter for {}", other.name()))),
+        };
+        if self.dim() != 2 || !self.is_contiguous() {
+            return Err(bad("scatter_rows wants a contiguous 2-d destination"));
+        }
+        if index.dtype() != TensorDType::I32 || index.dim() != 1 {
+            return Err(bad("scatter_rows wants a 1-d i32 index"));
+        }
+        if src.dim() != 2 || src.dtype() != self.dtype() {
+            return Err(bad("scatter_rows wants a src of the destination dtype"));
+        }
+        if src.shape != [index.shape[0], self.shape[1]] {
+            return Err(bad(format!(
+                "scatter_rows src {:?} for {} indices over {} columns",
+                src.shape, index.shape[0], self.shape[1]
+            )));
+        }
+        if index.shape[0] == 0 || self.shape[1] == 0 {
+            return Ok(());
+        }
+        let src = src.contiguous()?;
+        let index = index.contiguous()?;
+        self.rt.kernels().scatter_rows(
+            self.rt.raw_stream(),
+            name,
+            self.device_ptr(),
+            index.device_ptr(),
+            src.device_ptr(),
+            self.shape[1],
+            index.shape[0],
+        )
+    }
 }
 
 impl Tensor {
@@ -1361,6 +1436,7 @@ impl Tensor {
         let name = match self.dtype() {
             TensorDType::Bf16 => COPY_STRIDED_BF16,
             TensorDType::F32 => COPY_STRIDED_F32,
+            TensorDType::I32 => COPY_STRIDED_I32,
             other => return Err(bad(format!("no copy_to for {}", other.name()))),
         };
         self.rt.kernels().copy_strided(
@@ -1573,6 +1649,52 @@ impl LinearKernels {
         pack.ptr(src)?;
         pack.ptr(idx)?;
         pack.ptr(out)?;
+        pack.u32(cols as u32)?;
+        let mut params = pack.kernel_params()?;
+        let block = kernel.constexpr("BLOCK")? as usize;
+        let grid = (rows as u32, cols.div_ceil(block) as u32, 1);
+        self.launch(name, grid, &mut params, stream)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gather_rows(
+        &self,
+        stream: CUstream,
+        name: &str,
+        src: u64,
+        idx: u64,
+        out: u64,
+        cols: usize,
+        rows: usize,
+    ) -> Result<(), MoEError> {
+        let kernel = self.abi.kernel(name)?;
+        let mut pack = ArgPack::for_linear(kernel);
+        pack.ptr(src)?;
+        pack.ptr(idx)?;
+        pack.ptr(out)?;
+        pack.u32(cols as u32)?;
+        let mut params = pack.kernel_params()?;
+        let block = kernel.constexpr("BLOCK")? as usize;
+        let grid = (rows as u32, cols.div_ceil(block) as u32, 1);
+        self.launch(name, grid, &mut params, stream)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scatter_rows(
+        &self,
+        stream: CUstream,
+        name: &str,
+        dst: u64,
+        idx: u64,
+        src: u64,
+        cols: usize,
+        rows: usize,
+    ) -> Result<(), MoEError> {
+        let kernel = self.abi.kernel(name)?;
+        let mut pack = ArgPack::for_linear(kernel);
+        pack.ptr(dst)?;
+        pack.ptr(idx)?;
+        pack.ptr(src)?;
         pack.u32(cols as u32)?;
         let mut params = pack.kernel_params()?;
         let block = kernel.constexpr("BLOCK")? as usize;

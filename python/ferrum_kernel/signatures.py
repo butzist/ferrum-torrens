@@ -622,6 +622,34 @@ def index_select_constexprs(block: int = SELECT_BLOCK) -> dict:
     return {"BLOCK": block}
 
 
+def gather_rows(dtype: str = SERVING_DTYPE) -> dict:
+    return {
+        "src_ptr": f"*{dtype}",
+        "idx_ptr": "*i32",
+        "out_ptr": f"*{dtype}",
+        "cols": "i32",
+        "BLOCK": "constexpr",
+    }
+
+
+def gather_rows_constexprs(block: int = SELECT_BLOCK) -> dict:
+    return {"BLOCK": block}
+
+
+def scatter_rows(dtype: str = SERVING_DTYPE) -> dict:
+    return {
+        "dst_ptr": f"*{dtype}",
+        "idx_ptr": "*i32",
+        "src_ptr": f"*{dtype}",
+        "cols": "i32",
+        "BLOCK": "constexpr",
+    }
+
+
+def scatter_rows_constexprs(block: int = SELECT_BLOCK) -> dict:
+    return {"BLOCK": block}
+
+
 def copy_strided(dtype: str = SERVING_DTYPE) -> dict:
     return {
         "src_ptr": f"*{dtype}",

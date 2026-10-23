@@ -43,6 +43,8 @@ from .elementwise import (
     _cast_f32_bf16_kernel,
     _copy_strided_kernel,
     _index_select_rows_kernel,
+    _gather_rows_kernel,
+    _scatter_rows_kernel,
 )
 from .gdn import _gdn_decode_kernel, _gdn_tri_solve_kernel
 from .norm import _add_rmsnorm_kernel
@@ -58,6 +60,8 @@ from .signatures import cast as _cast_sig, cast_constexprs
 from .signatures import conv_decode as _conv_decode_sig
 from .signatures import copy_strided as _copy_strided_sig, copy_strided_constexprs
 from .signatures import index_select as _index_select_sig, index_select_constexprs
+from .signatures import gather_rows as _gather_rows_sig, gather_rows_constexprs
+from .signatures import scatter_rows as _scatter_rows_sig, scatter_rows_constexprs
 from .signatures import conv_decode_constexprs
 from .signatures import fp8_gemm as _fp8_gemm_sig
 from .signatures import fp8_gemm_constexprs
@@ -237,6 +241,30 @@ def main() -> int:
             index_select_constexprs(),
         ),
         (
+            "gather_rows_bf16",
+            _gather_rows_kernel,
+            _gather_rows_sig("bf16"),
+            gather_rows_constexprs(),
+        ),
+        (
+            "gather_rows_f32",
+            _gather_rows_kernel,
+            _gather_rows_sig("fp32"),
+            gather_rows_constexprs(),
+        ),
+        (
+            "scatter_rows_bf16",
+            _scatter_rows_kernel,
+            _scatter_rows_sig("bf16"),
+            scatter_rows_constexprs(),
+        ),
+        (
+            "scatter_rows_f32",
+            _scatter_rows_kernel,
+            _scatter_rows_sig("fp32"),
+            scatter_rows_constexprs(),
+        ),
+        (
             "copy_strided_bf16",
             _copy_strided_kernel,
             _copy_strided_sig("bf16"),
@@ -246,6 +274,12 @@ def main() -> int:
             "copy_strided_f32",
             _copy_strided_kernel,
             _copy_strided_sig("fp32"),
+            copy_strided_constexprs(),
+        ),
+        (
+            "copy_strided_i32",
+            _copy_strided_kernel,
+            _copy_strided_sig("i32"),
             copy_strided_constexprs(),
         ),
     ):

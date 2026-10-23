@@ -58,6 +58,28 @@ def _index_select_rows_kernel(src_ptr, idx_ptr, out_ptr, cols, BLOCK: tl.constex
 
 
 @triton.jit
+def _gather_rows_kernel(src_ptr, idx_ptr, out_ptr, cols, BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    block = tl.program_id(1)
+    offs = block * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < cols
+    idx = tl.load(idx_ptr + row).to(tl.int64)
+    value = tl.load(src_ptr + idx * cols + offs, mask=mask)
+    tl.store(out_ptr + row * cols + offs, value, mask=mask)
+
+
+@triton.jit
+def _scatter_rows_kernel(dst_ptr, idx_ptr, src_ptr, cols, BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    block = tl.program_id(1)
+    offs = block * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < cols
+    idx = tl.load(idx_ptr + row).to(tl.int64)
+    value = tl.load(src_ptr + row * cols + offs, mask=mask)
+    tl.store(dst_ptr + idx * cols + offs, value, mask=mask)
+
+
+@triton.jit
 def _copy_strided_kernel(
     src_ptr,
     dst_ptr,
@@ -107,6 +129,20 @@ def launch_index_select_rows(
     rows, cols = out.shape
     _index_select_rows_kernel[(rows, triton.cdiv(cols, SELECT_BLOCK))](
         src, idx, out, cols, BLOCK=SELECT_BLOCK, num_warps=4
+    )
+
+
+def launch_gather_rows(src: torch.Tensor, idx: torch.Tensor, out: torch.Tensor) -> None:
+    rows, cols = out.shape
+    _gather_rows_kernel[(rows, triton.cdiv(cols, SELECT_BLOCK))](
+        src, idx, out, cols, BLOCK=SELECT_BLOCK, num_warps=4
+    )
+
+
+def launch_scatter_rows(dst: torch.Tensor, idx: torch.Tensor, src: torch.Tensor) -> None:
+    rows, cols = src.shape
+    _scatter_rows_kernel[(rows, triton.cdiv(cols, SELECT_BLOCK))](
+        dst, idx, src, cols, BLOCK=SELECT_BLOCK, num_warps=4
     )
 
 

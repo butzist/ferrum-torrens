@@ -15,16 +15,15 @@
 
 use std::sync::Mutex;
 
-use tch::{Kind, Tensor};
-
 use crate::domain::kvcache::{
     EvictResult, HybridRadixIndex, KvCache, KvcacheError, LinearStatePool, PagePool, SequenceCache,
 };
 use crate::domain::model::{LayerType, ModelParams};
+use crate::infrastructure::cudarc::{Runtime, Tensor, TensorDType};
 use crate::infrastructure::torch::Device;
 
 /// ALGORITHM.md 3.1: one token per page.
-pub const PAGE_SIZE: i64 = 1;
+pub const PAGE_SIZE: usize = 1;
 
 /// What the KV pool stores a token in.
 ///
@@ -40,12 +39,20 @@ pub enum KvDType {
 }
 
 impl KvDType {
-    fn kind(self) -> Kind {
+    fn tensor_dtype(self) -> TensorDType {
         match self {
-            KvDType::F32 => Kind::Float,
-            KvDType::BFloat16 => Kind::BFloat16,
+            KvDType::F32 => TensorDType::F32,
+            KvDType::BFloat16 => TensorDType::Bf16,
         }
     }
+}
+
+fn runtime(device: Device) -> Runtime {
+    let ordinal = match device {
+        Device::Cuda(ordinal) => ordinal,
+        Device::Cpu => 0,
+    };
+    Runtime::open(ordinal).expect("open the cudarc compute runtime")
 }
 
 /// Global layer id -> slab index, `None` for a layer that keeps no state of this
@@ -73,26 +80,34 @@ fn dense_map(params: &ModelParams, kind: LayerType) -> Vec<Option<usize>> {
 pub struct MhaPool {
     kv: Tensor,
     dense_of: Vec<Option<usize>>,
-    kv_heads: i64,
-    head_dim: i64,
+    kv_heads: usize,
+    head_dim: usize,
     dtype: KvDType,
+    rt: Runtime,
 }
 
 impl MhaPool {
     pub fn new(params: &ModelParams, num_pages: usize, dtype: KvDType, device: Device) -> Self {
+        Self::with_runtime(params, num_pages, dtype, runtime(device))
+    }
+
+    fn with_runtime(params: &ModelParams, num_pages: usize, dtype: KvDType, rt: Runtime) -> Self {
         let dense_of = dense_map(params, LayerType::FullAttention);
-        let layers = dense_of.iter().filter(|d| d.is_some()).count() as i64;
-        let (kv_heads, head_dim) = (params.num_kv_heads as i64, params.head_dim as i64);
-        let kv = Tensor::zeros(
-            [2, layers, num_pages as i64, PAGE_SIZE, kv_heads, head_dim],
-            (dtype.kind(), device.to_tch()),
-        );
+        let layers = dense_of.iter().filter(|d| d.is_some()).count();
+        let (kv_heads, head_dim) = (params.num_kv_heads, params.head_dim);
+        let kv = rt
+            .zeros(
+                &[2, layers, num_pages, PAGE_SIZE, kv_heads, head_dim],
+                dtype.tensor_dtype(),
+            )
+            .expect("allocate the kv pool");
         Self {
             kv,
             dense_of,
             kv_heads,
             head_dim,
             dtype,
+            rt,
         }
     }
 
@@ -103,7 +118,7 @@ impl MhaPool {
     }
 
     pub fn num_pages(&self) -> usize {
-        self.kv.size()[2] as usize
+        self.kv.shape()[2]
     }
 
     /// What the pool stores a token in. The paged attention kernel is compiled
@@ -120,14 +135,24 @@ impl MhaPool {
     /// place that knows the pool's physical layout.
     pub fn kv_slab_ptrs(&self, layer: usize) -> (u64, u64) {
         let slab = self.slab(layer);
-        let k = self.kv.select(0, 0).select(0, slab);
-        let v = self.kv.select(0, 1).select(0, slab);
-        (k.data_ptr() as u64, v.data_ptr() as u64)
+        let k = self
+            .kv
+            .select(0, 0)
+            .expect("kv half")
+            .select(0, slab)
+            .expect("kv slab");
+        let v = self
+            .kv
+            .select(0, 1)
+            .expect("kv half")
+            .select(0, slab)
+            .expect("kv slab");
+        (k.device_ptr(), v.device_ptr())
     }
 
     /// Bytes the pool holds, for the config's memory arithmetic.
     pub fn bytes(&self) -> usize {
-        self.kv.numel() * self.dtype.kind().elt_size_in_bytes()
+        self.kv.numel() * self.dtype.tensor_dtype().element_size()
     }
 
     /// Write this step's `k`/`v` (`[t, kv_heads, head_dim]`) at `locs`.
@@ -136,25 +161,37 @@ impl MhaPool {
         self.store_indexed(layer, &idx, locs.len(), k, v);
     }
 
-    /// `store`, but the locations are already a device `[t]` index tensor.
+    /// `store`, but the locations are already a device `[t]` i32 index tensor.
     ///
     /// A captured decode step bakes the address of the index tensor, so the
     /// locations live on the device rather than being rebuilt host-side each
     /// step (decision 51).
     pub fn store_at(&self, layer: usize, locs: &Tensor, k: &Tensor, v: &Tensor) {
-        let idx = locs.to_kind(Kind::Int64);
-        self.store_indexed(layer, &idx, locs.numel(), k, v);
+        self.store_indexed(layer, locs, locs.numel(), k, v);
     }
 
     fn store_indexed(&self, layer: usize, idx: &Tensor, t: usize, k: &Tensor, v: &Tensor) {
         let slab = self.slab(layer);
-        debug_assert_eq!(k.size(), vec![t as i64, self.kv_heads, self.head_dim]);
-        debug_assert_eq!(v.size(), vec![t as i64, self.kv_heads, self.head_dim]);
-        for (half, tt) in [(0i64, k), (1, v)] {
-            // `select` hands back a view, so the in-place write lands in the
-            // pool's storage rather than in a copy.
-            let mut view = self.kv.select(0, half).select(0, slab).shallow_clone();
-            let _ = view.index_copy_(0, idx, &tt.unsqueeze(1).to_kind(self.dtype.kind()));
+        debug_assert_eq!(k.shape(), &[t, self.kv_heads, self.head_dim]);
+        debug_assert_eq!(v.shape(), &[t, self.kv_heads, self.head_dim]);
+        let cols = self.kv_heads * self.head_dim;
+        for (half, tt) in [(0usize, k), (1, v)] {
+            let dst = self
+                .kv
+                .select(0, half)
+                .expect("kv half")
+                .select(0, slab)
+                .expect("kv slab")
+                .reshape(&[self.num_pages(), cols])
+                .expect("kv slab view");
+            let src = tt
+                .contiguous()
+                .expect("kv rows")
+                .cast(self.dtype.tensor_dtype())
+                .expect("kv dtype")
+                .reshape(&[t, cols])
+                .expect("kv rows flat");
+            dst.scatter_rows(idx, &src).expect("store kv rows");
         }
     }
 
@@ -168,13 +205,17 @@ impl MhaPool {
     /// result is `[rows, window, kv_heads, head_dim]`, so a batched decode
     /// gathers every request's window in one op (decision 51).
     pub fn gather_rows(&self, layer: usize, locs: &Tensor) -> (Tensor, Tensor) {
-        let rows = locs.size()[0];
-        let window = locs.size()[1];
-        let idx = locs.to_kind(Kind::Int64).reshape([-1]);
+        let (rows, window) = (locs.shape()[0], locs.shape()[1]);
+        let idx = locs
+            .contiguous()
+            .expect("window locations")
+            .reshape(&[rows * window])
+            .expect("flat window");
         let (k, v) = self.gather_indexed(layer, &idx);
+        let shape = [rows, window, self.kv_heads, self.head_dim];
         (
-            k.reshape([rows, window, self.kv_heads, self.head_dim]),
-            v.reshape([rows, window, self.kv_heads, self.head_dim]),
+            k.reshape(&shape).expect("k window"),
+            v.reshape(&shape).expect("v window"),
         )
     }
 
@@ -183,24 +224,36 @@ impl MhaPool {
         // Gathers are always f32: the attention math and the paged-kernel
         // fallback read f32, and a narrower pool stores bf16 only to save bytes.
         // Upcasting bf16 -> f32 is exact.
-        let half = |h: i64| -> Tensor {
-            self.kv
+        let cols = self.kv_heads * self.head_dim;
+        let n = idx.shape()[0];
+        let half = |h: usize| -> Tensor {
+            let rows = self
+                .kv
                 .select(0, h)
+                .expect("kv half")
                 .select(0, slab)
-                .index_select(0, idx)
-                .squeeze_dim(1)
-                .to_kind(Kind::Float)
+                .expect("kv slab")
+                .reshape(&[self.num_pages(), cols])
+                .expect("kv slab view");
+            rows.gather_rows(idx)
+                .expect("gather kv rows")
+                .cast(TensorDType::F32)
+                .expect("kv f32")
+                .reshape(&[n, self.kv_heads, self.head_dim])
+                .expect("kv rows")
         };
         (half(0), half(1))
     }
 
     fn index(&self, locs: &[u32]) -> Tensor {
-        let data: Vec<i64> = locs.iter().map(|&l| l as i64).collect();
-        Tensor::from_slice(&data).to(self.kv.device())
+        let data: Vec<i32> = locs.iter().map(|&l| l as i32).collect();
+        self.rt
+            .from_slice_i32(&data, &[data.len()])
+            .expect("stage kv index")
     }
 
-    fn slab(&self, layer: usize) -> i64 {
-        self.dense_of[layer].expect("layer has no kv slab") as i64
+    fn slab(&self, layer: usize) -> usize {
+        self.dense_of[layer].expect("layer has no kv slab")
     }
 }
 
@@ -223,39 +276,47 @@ pub struct LinearStateSlabs {
     conv: Tensor,
     recurrent: Tensor,
     dense_of: Vec<Option<usize>>,
-    slots: i64,
-    conv_dim: i64,
-    width: i64,
-    v_heads: i64,
-    k_dim: i64,
-    v_dim: i64,
+    slots: usize,
+    conv_dim: usize,
+    width: usize,
+    v_heads: usize,
+    k_dim: usize,
+    v_dim: usize,
+    rt: Runtime,
 }
 
 impl LinearStateSlabs {
     pub fn new(params: &ModelParams, num_slots: usize, device: Device) -> Self {
+        Self::with_runtime(params, num_slots, runtime(device))
+    }
+
+    fn with_runtime(params: &ModelParams, num_slots: usize, rt: Runtime) -> Self {
         let dense_of = dense_map(params, LayerType::LinearAttention);
-        let layers = dense_of.iter().filter(|d| d.is_some()).count() as i64;
-        let (k_heads, k_dim) = (
-            params.linear_num_key_heads as i64,
-            params.linear_key_head_dim as i64,
-        );
-        let (v_heads, v_dim) = (
-            params.linear_num_value_heads as i64,
-            params.linear_value_head_dim as i64,
-        );
-        let width = params.linear_conv_kernel_dim as i64 - 1;
+        let layers = dense_of.iter().filter(|d| d.is_some()).count();
+        let (k_heads, k_dim) = (params.linear_num_key_heads, params.linear_key_head_dim);
+        let (v_heads, v_dim) = (params.linear_num_value_heads, params.linear_value_head_dim);
+        let width = params.linear_conv_kernel_dim.saturating_sub(1);
         let conv_dim = 2 * k_heads * k_dim + v_heads * v_dim;
-        let kind = (Kind::Float, device.to_tch());
+        let conv = rt
+            .zeros(&[layers, num_slots, conv_dim, width], TensorDType::F32)
+            .expect("allocate the conv state");
+        let recurrent = rt
+            .zeros(
+                &[layers, num_slots, v_heads, k_dim, v_dim],
+                TensorDType::F32,
+            )
+            .expect("allocate the recurrent state");
         Self {
-            conv: Tensor::zeros([layers, num_slots as i64, conv_dim, width], kind),
-            recurrent: Tensor::zeros([layers, num_slots as i64, v_heads, k_dim, v_dim], kind),
+            conv,
+            recurrent,
             dense_of,
-            slots: num_slots as i64,
+            slots: num_slots,
             conv_dim,
             width,
             v_heads,
             k_dim,
             v_dim,
+            rt,
         }
     }
 
@@ -264,106 +325,155 @@ impl LinearStateSlabs {
     }
 
     pub fn num_slots(&self) -> usize {
-        self.slots as usize
+        self.slots
     }
 
     /// Bytes the state slabs hold, for the config's memory arithmetic.
     pub fn bytes(&self) -> usize {
-        (self.conv.numel() + self.recurrent.numel()) * Kind::Float.elt_size_in_bytes()
+        (self.conv.numel() + self.recurrent.numel()) * TensorDType::F32.element_size()
     }
 
-    pub fn conv_size(&self) -> Vec<i64> {
+    pub fn conv_size(&self) -> Vec<usize> {
         vec![self.conv_dim, self.width]
     }
 
-    pub fn recurrent_size(&self) -> Vec<i64> {
+    pub fn recurrent_size(&self) -> Vec<usize> {
         vec![self.v_heads, self.k_dim, self.v_dim]
+    }
+
+    fn conv_view(&self, slot: u32, layer: usize) -> Tensor {
+        self.conv
+            .select(0, self.slab(layer))
+            .expect("conv layer")
+            .select(0, slot as usize)
+            .expect("conv slot")
+    }
+
+    fn recurrent_view(&self, slot: u32, layer: usize) -> Tensor {
+        self.recurrent
+            .select(0, self.slab(layer))
+            .expect("recurrent layer")
+            .select(0, slot as usize)
+            .expect("recurrent slot")
     }
 
     /// The slot's conv state for this layer, zero before anything is written.
     pub fn conv_state(&self, slot: u32, layer: usize) -> Tensor {
-        self.conv
-            .select(0, self.slab(layer))
-            .select(0, slot as i64)
-            .shallow_clone()
+        self.conv_view(slot, layer)
     }
 
     pub fn set_conv_state(&self, slot: u32, layer: usize, state: Tensor) {
-        let mut view = self
-            .conv
-            .select(0, self.slab(layer))
-            .select(0, slot as i64)
-            .shallow_clone();
-        view.copy_(&state.view(&self.conv_size()[..]));
+        let dst = self.conv_view(slot, layer);
+        let src = state
+            .contiguous()
+            .expect("conv state")
+            .reshape(&self.conv_size())
+            .expect("conv state view");
+        src.copy_to(&dst).expect("write conv state");
     }
 
     /// The slot's recurrent state for this layer, zero before anything is
     /// written.
     pub fn recurrent_state(&self, slot: u32, layer: usize) -> Tensor {
-        self.recurrent
-            .select(0, self.slab(layer))
-            .select(0, slot as i64)
-            .shallow_clone()
+        self.recurrent_view(slot, layer)
     }
 
     pub fn set_recurrent_state(&self, slot: u32, layer: usize, state: Tensor) {
-        let mut view = self
-            .recurrent
-            .select(0, self.slab(layer))
-            .select(0, slot as i64)
-            .shallow_clone();
-        view.copy_(&state.view(&self.recurrent_size()[..]));
+        let dst = self.recurrent_view(slot, layer);
+        let src = state
+            .contiguous()
+            .expect("recurrent state")
+            .reshape(&self.recurrent_size())
+            .expect("recurrent state view");
+        src.copy_to(&dst).expect("write recurrent state");
     }
 
     /// The rows' conv state, `[rows, conv_dim, width]`, addressed by a device
-    /// `[rows]` slot index: a batched decode step reads the slots it staged
+    /// `[rows]` i32 slot index: a batched decode step reads the slots it staged
     /// rather than host numbers (decision 51).
     pub fn conv_state_rows(&self, slots: &Tensor, layer: usize) -> Tensor {
-        self.conv
+        let rows = self
+            .conv
             .select(0, self.slab(layer))
-            .index_select(0, &slots.to_kind(Kind::Int64))
+            .expect("conv layer")
+            .reshape(&[self.slots, self.conv_dim * self.width])
+            .expect("conv rows");
+        let idx = slots.contiguous().expect("slot index");
+        rows.gather_rows(&idx)
+            .expect("gather conv rows")
+            .reshape(&[idx.shape()[0], self.conv_dim, self.width])
+            .expect("conv rows shape")
     }
 
-    /// `set_conv_state` for a device `[rows]` slot index; `state` is
+    /// `set_conv_state` for a device `[rows]` i32 slot index; `state` is
     /// `[rows, conv_dim, width]`.
     pub fn set_conv_state_rows(&self, slots: &Tensor, layer: usize, state: &Tensor) {
-        let mut view = self.conv.select(0, self.slab(layer)).shallow_clone();
-        let _ = view.index_copy_(0, &slots.to_kind(Kind::Int64), &state.to_kind(Kind::Float));
+        let dst = self
+            .conv
+            .select(0, self.slab(layer))
+            .expect("conv layer")
+            .reshape(&[self.slots, self.conv_dim * self.width])
+            .expect("conv rows");
+        let src = state
+            .contiguous()
+            .expect("conv rows")
+            .cast(TensorDType::F32)
+            .expect("conv dtype")
+            .reshape(&[state.shape()[0], self.conv_dim * self.width])
+            .expect("conv rows flat");
+        dst.scatter_rows(slots, &src).expect("write conv rows");
     }
 
     /// The rows' recurrent state, `[rows, v_heads, k_dim, v_dim]`, addressed by a
-    /// device `[rows]` slot index.
+    /// device `[rows]` i32 slot index.
     pub fn recurrent_state_rows(&self, slots: &Tensor, layer: usize) -> Tensor {
-        self.recurrent
+        let rows = self
+            .recurrent
             .select(0, self.slab(layer))
-            .index_select(0, &slots.to_kind(Kind::Int64))
+            .expect("recurrent layer")
+            .reshape(&[self.slots, self.v_heads * self.k_dim * self.v_dim])
+            .expect("recurrent rows");
+        let idx = slots.contiguous().expect("slot index");
+        rows.gather_rows(&idx)
+            .expect("gather recurrent rows")
+            .reshape(&[idx.shape()[0], self.v_heads, self.k_dim, self.v_dim])
+            .expect("recurrent rows shape")
     }
 
-    /// `set_recurrent_state` for a device `[rows]` slot index; `state` is
+    /// `set_recurrent_state` for a device `[rows]` i32 slot index; `state` is
     /// `[rows, v_heads, k_dim, v_dim]`.
     pub fn set_recurrent_state_rows(&self, slots: &Tensor, layer: usize, state: &Tensor) {
-        let mut view = self.recurrent.select(0, self.slab(layer)).shallow_clone();
-        let _ = view.index_copy_(0, &slots.to_kind(Kind::Int64), &state.to_kind(Kind::Float));
+        let dst = self
+            .recurrent
+            .select(0, self.slab(layer))
+            .expect("recurrent layer")
+            .reshape(&[self.slots, self.v_heads * self.k_dim * self.v_dim])
+            .expect("recurrent rows");
+        let src = state
+            .contiguous()
+            .expect("recurrent rows")
+            .cast(TensorDType::F32)
+            .expect("recurrent dtype")
+            .reshape(&[state.shape()[0], self.v_heads * self.k_dim * self.v_dim])
+            .expect("recurrent rows flat");
+        dst.scatter_rows(slots, &src).expect("write recurrent rows");
     }
 
     /// Zero a whole slot, so a recycled slot cannot leak the previous request's
     /// state into its first prefill chunk.
     pub fn reset_slot(&self, slot: u32) {
+        let conv = self
+            .rt
+            .zeros(&self.conv_size(), TensorDType::F32)
+            .expect("zero conv state");
+        let recurrent = self
+            .rt
+            .zeros(&self.recurrent_size(), TensorDType::F32)
+            .expect("zero recurrent state");
         for layer in 0..self.dense_of.len() {
             if self.dense_of[layer].is_some() {
-                self.set_conv_state(
-                    slot,
-                    layer,
-                    Tensor::zeros(self.conv_size(), (Kind::Float, self.conv.device())),
-                );
-                self.set_recurrent_state(
-                    slot,
-                    layer,
-                    Tensor::zeros(
-                        self.recurrent_size(),
-                        (Kind::Float, self.recurrent.device()),
-                    ),
-                );
+                self.set_conv_state(slot, layer, conv.clone());
+                self.set_recurrent_state(slot, layer, recurrent.clone());
             }
         }
     }
@@ -376,27 +486,20 @@ impl LinearStateSlabs {
         debug_assert_ne!(src, dst, "copy_slot is not a reset");
         for layer in 0..self.dense_of.len() {
             if self.dense_of[layer].is_some() {
-                self.conv
-                    .select(0, self.slab(layer))
-                    .select(0, dst as i64)
-                    .shallow_clone()
-                    .copy_(&self.conv.select(0, self.slab(layer)).select(0, src as i64));
-                self.recurrent
-                    .select(0, self.slab(layer))
-                    .select(0, dst as i64)
-                    .shallow_clone()
-                    .copy_(
-                        &self
-                            .recurrent
-                            .select(0, self.slab(layer))
-                            .select(0, src as i64),
-                    );
+                let conv = self.conv_view(dst, layer);
+                self.conv_view(src, layer)
+                    .copy_to(&conv)
+                    .expect("copy conv slot");
+                let recurrent = self.recurrent_view(dst, layer);
+                self.recurrent_view(src, layer)
+                    .copy_to(&recurrent)
+                    .expect("copy recurrent slot");
             }
         }
     }
 
-    fn slab(&self, layer: usize) -> i64 {
-        self.dense_of[layer].expect("layer has no linear state") as i64
+    fn slab(&self, layer: usize) -> usize {
+        self.dense_of[layer].expect("layer has no linear state")
     }
 }
 
@@ -416,18 +519,13 @@ pub struct DeviceCache {
     slots: Mutex<LinearStatePool>,
     tree: Mutex<HybridRadixIndex>,
     slabs: SharedSlabs,
+    _rt: Runtime,
 }
 
-/// `tch::Tensor` is `Send` but not `Sync`, and the engine holds the model (and
-/// through it this cache) behind an `Arc` on its own thread pool. libtorch is
-/// thread-safe; the only thing being shared is the handle, and the engine runs
-/// one forward at a time. Same newtype the dense weights already use.
 struct SharedSlabs {
     mha: MhaPool,
     state: LinearStateSlabs,
 }
-
-unsafe impl Sync for SharedSlabs {}
 
 impl DeviceCache {
     pub fn new(
@@ -437,14 +535,25 @@ impl DeviceCache {
         dtype: KvDType,
         device: Device,
     ) -> Self {
+        Self::with_runtime(params, num_pages, num_slots, dtype, runtime(device))
+    }
+
+    fn with_runtime(
+        params: &ModelParams,
+        num_pages: usize,
+        num_slots: usize,
+        dtype: KvDType,
+        rt: Runtime,
+    ) -> Self {
         Self {
-            pages: Mutex::new(PagePool::new(PAGE_SIZE as usize, num_pages)),
+            pages: Mutex::new(PagePool::new(PAGE_SIZE, num_pages)),
             slots: Mutex::new(LinearStatePool::new(num_slots)),
-            tree: Mutex::new(HybridRadixIndex::new(PAGE_SIZE as usize)),
+            tree: Mutex::new(HybridRadixIndex::new(PAGE_SIZE)),
             slabs: SharedSlabs {
-                mha: MhaPool::new(params, num_pages, dtype, device),
-                state: LinearStateSlabs::new(params, num_slots, device),
+                mha: MhaPool::with_runtime(params, num_pages, dtype, rt.clone()),
+                state: LinearStateSlabs::with_runtime(params, num_slots, rt.clone()),
             },
+            _rt: rt,
         }
     }
 
@@ -642,20 +751,8 @@ impl KvCache for DeviceCache {
 mod tests {
     use super::*;
     use crate::domain::kvcache::KvcacheError;
-    use crate::infrastructure::torch::{auto_device, f32_tensor, to_f32_vec};
+    use half::bf16;
 
-    fn data(n: usize, seed: u32) -> Vec<f32> {
-        let mut s = seed | 1;
-        (0..n)
-            .map(|_| {
-                s = s.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-                ((s >> 9) as f32 / (1 << 23) as f32) * 2.0 - 1.0
-            })
-            .collect()
-    }
-
-    /// Two full-attention layers and two linear ones, so the remap is exercised
-    /// on a hybrid tower without a checkpoint.
     fn params() -> ModelParams {
         ModelParams {
             hidden_size: 8,
@@ -690,21 +787,71 @@ mod tests {
         }
     }
 
+    fn data(n: usize, seed: u32) -> Vec<f32> {
+        let mut s = seed | 1;
+        (0..n)
+            .map(|_| {
+                s = s.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                ((s >> 9) as f32 / (1 << 23) as f32) * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    fn f32_tensor(like: &Tensor, values: &[f32], shape: &[usize]) -> Tensor {
+        like.runtime()
+            .from_slice_f32(values, shape)
+            .expect("stage f32")
+    }
+
+    fn bf16_tensor(like: &Tensor, values: &[f32], shape: &[usize]) -> Tensor {
+        let bits: Vec<bf16> = values.iter().map(|v| bf16::from_f32(*v)).collect();
+        like.runtime()
+            .from_slice_bf16(&bits, shape)
+            .expect("stage bf16")
+    }
+
+    fn dev_index(like: &Tensor, values: &[i32]) -> Tensor {
+        like.runtime()
+            .from_slice_i32(values, &[values.len()])
+            .expect("stage index")
+    }
+
+    fn to_f32(t: &Tensor) -> Vec<f32> {
+        t.to_host_f32().expect("read device")
+    }
+
     /// Values already rounded to bf16, so a store/gather round trip is exact
     /// rather than close: the pool promises it hands back what it was given.
-    fn kv_pair(t: usize, kvh: i64, hd: i64, seed: u32) -> (Tensor, Tensor) {
-        let d = auto_device();
-        let n = t * kvh as usize * hd as usize;
-        let shape = [t as i64, kvh, hd];
+    fn kv_pair(like: &Tensor, t: usize, kvh: usize, hd: usize, seed: u32) -> (Tensor, Tensor) {
+        let n = t * kvh * hd;
+        let shape = [t, kvh, hd];
         (
-            f32_tensor(&data(n, seed), &shape, d).to_kind(Kind::BFloat16),
-            f32_tensor(&data(n, seed + 1), &shape, d).to_kind(Kind::BFloat16),
+            bf16_tensor(like, &data(n, seed), &shape),
+            bf16_tensor(like, &data(n, seed + 1), &shape),
+        )
+    }
+
+    fn pool(num_pages: usize, dtype: KvDType) -> MhaPool {
+        MhaPool::with_runtime(&params(), num_pages, dtype, runtime(Device::Cuda(0)))
+    }
+
+    fn state(num_slots: usize) -> LinearStateSlabs {
+        LinearStateSlabs::with_runtime(&params(), num_slots, runtime(Device::Cuda(0)))
+    }
+
+    fn cache(num_pages: usize, num_slots: usize) -> DeviceCache {
+        DeviceCache::with_runtime(
+            &params(),
+            num_pages,
+            num_slots,
+            KvDType::F32,
+            runtime(Device::Cuda(0)),
         )
     }
 
     #[test]
     fn only_full_attention_layers_get_a_slab() {
-        let pool = MhaPool::new(&params(), 16, KvDType::F32, auto_device());
+        let pool = pool(16, KvDType::F32);
         assert_eq!(pool.dense_of(0), Some(0));
         assert_eq!(pool.dense_of(1), None, "a linear layer has no kv");
         assert_eq!(pool.dense_of(3), Some(1));
@@ -713,87 +860,87 @@ mod tests {
 
     #[test]
     fn a_stored_location_gathers_back_exactly() {
-        let pool = MhaPool::new(&params(), 16, KvDType::F32, auto_device());
-        let (k, v) = kv_pair(3, 2, 4, 61);
+        let pool = pool(16, KvDType::F32);
+        let (k, v) = kv_pair(&pool.kv, 3, 2, 4, 61);
         pool.store(0, &[5, 2, 9], &k, &v);
         let (gk, gv) = pool.gather(0, &[5, 2, 9]);
-        assert_eq!(to_f32_vec(&gk), to_f32_vec(&k));
-        assert_eq!(to_f32_vec(&gv), to_f32_vec(&v));
+        assert_eq!(to_f32(&gk), to_f32(&k));
+        assert_eq!(to_f32(&gv), to_f32(&v));
     }
 
     #[test]
     fn gather_reads_locations_in_the_order_asked() {
-        let pool = MhaPool::new(&params(), 16, KvDType::F32, auto_device());
-        let (k, v) = kv_pair(3, 2, 4, 63);
+        let pool = pool(16, KvDType::F32);
+        let (k, v) = kv_pair(&pool.kv, 3, 2, 4, 63);
         pool.store(0, &[5, 2, 9], &k, &v);
         let (gk, _) = pool.gather(0, &[9, 5, 2]);
-        let rows = |t: &Tensor| {
-            let f = to_f32_vec(t);
-            f[..8].to_vec()
-        };
-        assert_eq!(rows(&gk), rows(&k.select(0, 2)));
+        let want: Vec<f32> = [2usize, 0, 1]
+            .iter()
+            .flat_map(|&r| to_f32(&k.select(0, r).unwrap()))
+            .collect();
+        assert_eq!(to_f32(&gk), want);
     }
 
     #[test]
     fn a_later_store_replaces_the_earlier_one_at_the_same_location() {
-        let pool = MhaPool::new(&params(), 16, KvDType::F32, auto_device());
-        let (k, v) = kv_pair(2, 2, 4, 65);
+        let pool = pool(16, KvDType::F32);
+        let (k, v) = kv_pair(&pool.kv, 2, 2, 4, 65);
         pool.store(0, &[1, 2], &k, &v);
-        let (k2, v2) = kv_pair(1, 2, 4, 67);
+        let (k2, v2) = kv_pair(&pool.kv, 1, 2, 4, 67);
         pool.store(0, &[2], &k2, &v2);
         let (gk, gv) = pool.gather(0, &[2]);
-        assert_eq!(to_f32_vec(&gk), to_f32_vec(&k2));
-        assert_eq!(to_f32_vec(&gv), to_f32_vec(&v2));
+        assert_eq!(to_f32(&gk), to_f32(&k2));
+        assert_eq!(to_f32(&gv), to_f32(&v2));
     }
 
     #[test]
     fn one_layers_slab_does_not_disturb_another() {
-        let pool = MhaPool::new(&params(), 16, KvDType::F32, auto_device());
-        let (k, v) = kv_pair(2, 2, 4, 69);
+        let pool = pool(16, KvDType::F32);
+        let (k, v) = kv_pair(&pool.kv, 2, 2, 4, 69);
         pool.store(0, &[3, 4], &k, &v);
-        let (k2, v2) = kv_pair(2, 2, 4, 71);
+        let (k2, v2) = kv_pair(&pool.kv, 2, 2, 4, 71);
         pool.store(3, &[3, 4], &k2, &v2);
-        assert_eq!(to_f32_vec(&pool.gather(0, &[3, 4]).0), to_f32_vec(&k));
-        assert_eq!(to_f32_vec(&pool.gather(3, &[3, 4]).0), to_f32_vec(&k2));
+        assert_eq!(to_f32(&pool.gather(0, &[3, 4]).0), to_f32(&k));
+        assert_eq!(to_f32(&pool.gather(3, &[3, 4]).0), to_f32(&k2));
     }
 
     #[test]
     fn an_unwritten_location_reads_as_zero() {
-        let pool = MhaPool::new(&params(), 8, KvDType::F32, auto_device());
+        let pool = pool(8, KvDType::F32);
         let (gk, gv) = pool.gather(0, &[7]);
-        assert_eq!(to_f32_vec(&gk), vec![0.0; 8]);
-        assert_eq!(to_f32_vec(&gv), vec![0.0; 8]);
+        assert_eq!(to_f32(&gk), vec![0.0; 8]);
+        assert_eq!(to_f32(&gv), vec![0.0; 8]);
     }
 
     #[test]
     fn a_bf16_pool_hands_back_the_value_rounded_to_bf16() {
-        let pool = MhaPool::new(&params(), 8, KvDType::BFloat16, auto_device());
+        let pool = pool(8, KvDType::BFloat16);
         let n = 2 * 2 * 4;
         let want = data(n, 83);
-        let k = f32_tensor(&want, &[2, 2, 4], auto_device());
+        let k = f32_tensor(&pool.kv, &want, &[2, 2, 4]);
         pool.store(0, &[4, 6], &k, &k);
         let (gk, _) = pool.gather(0, &[4, 6]);
         assert_eq!(
-            gk.kind(),
-            Kind::Float,
+            gk.dtype(),
+            TensorDType::F32,
             "a bf16 pool must gather back as f32 for the attention math"
         );
         assert_eq!(
-            to_f32_vec(&gk),
-            to_f32_vec(&k.to_kind(Kind::BFloat16)),
+            to_f32(&gk),
+            to_f32(&k.cast(TensorDType::Bf16).unwrap()),
             "a lossy pool must round, not truncate"
         );
-        assert_ne!(to_f32_vec(&gk), want);
+        assert_ne!(to_f32(&gk), want);
     }
 
     #[test]
     fn the_kv_slab_pointers_step_by_one_layer_of_tokens() {
         let p = params();
-        let pool = MhaPool::new(&p, 7, KvDType::F32, auto_device());
+        let pool = pool(7, KvDType::F32);
         let (k0, v0) = pool.kv_slab_ptrs(0);
         let (k1, _) = pool.kv_slab_ptrs(3);
         // Two dense slabs in the tower, K then V, so V starts two layers in.
-        let per = 7 * PAGE_SIZE * p.num_kv_heads as i64 * p.head_dim as i64 * 4;
+        let per = 7 * PAGE_SIZE * p.num_kv_heads * p.head_dim * 4;
         assert_eq!(v0 - k0, 2 * per as u64, "V follows both K slabs");
         assert_eq!(k1 - k0, per as u64, "slab 1 is one layer after slab 0");
         assert_eq!(pool.dtype(), KvDType::F32);
@@ -814,7 +961,7 @@ mod tests {
 
     #[test]
     fn a_device_cache_hands_out_pages_and_state_slots() {
-        let cache = DeviceCache::new(&params(), 8, 2, KvDType::F32, auto_device());
+        let cache = cache(8, 2);
         assert_eq!(cache.num_pages(), 8);
         assert_eq!(cache.available(), 8);
 
@@ -858,7 +1005,7 @@ mod tests {
 
     #[test]
     fn a_device_cache_refuses_to_reserve_past_its_pages() {
-        let cache = DeviceCache::new(&params(), 4, 1, KvDType::F32, auto_device());
+        let cache = cache(4, 1);
         let mut a = cache.begin();
         cache.reserve(&mut a, 3).unwrap();
         assert_eq!(
@@ -870,13 +1017,14 @@ mod tests {
 
     #[test]
     fn a_recycled_state_slot_is_zeroed() {
-        let cache = DeviceCache::new(&params(), 8, 1, KvDType::F32, auto_device());
+        let cache = cache(8, 1);
         let a_slot = {
             let a = cache.begin();
+            let state = &cache.state().recurrent;
             cache.state().set_recurrent_state(
                 a.state_slot(),
                 1,
-                f32_tensor(&[1.0; 32], &[2, 4, 4], auto_device()),
+                f32_tensor(state, &[1.0; 32], &[2, 4, 4]),
             );
             a.state_slot()
         };
@@ -885,7 +1033,7 @@ mod tests {
         let b = cache.begin();
         assert_eq!(b.state_slot(), a.state_slot());
         assert!(
-            to_f32_vec(&cache.state().recurrent_state(b.state_slot(), 1))
+            to_f32(&cache.state().recurrent_state(b.state_slot(), 1))
                 .iter()
                 .all(|v| *v == 0.0),
             "a recycled slot must not leak the previous request's state"
@@ -894,7 +1042,7 @@ mod tests {
 
     #[test]
     fn only_linear_layers_hold_linear_state() {
-        let s = LinearStateSlabs::new(&params(), 4, auto_device());
+        let s = state(4);
         assert_eq!(s.dense_of(0), None);
         assert_eq!(s.dense_of(1), Some(0));
         assert_eq!(s.dense_of(2), Some(1));
@@ -904,45 +1052,39 @@ mod tests {
 
     #[test]
     fn a_linear_state_slot_starts_at_zero_and_round_trips() {
-        let s = LinearStateSlabs::new(&params(), 2, auto_device());
+        let s = state(2);
         let conv = s.conv_state(0, 1);
-        assert_eq!(conv.size(), vec![2 * 2 * 4 + 2 * 4, 3]);
-        assert!(to_f32_vec(&conv).iter().all(|v| *v == 0.0));
+        assert_eq!(conv.shape(), &[2 * 2 * 4 + 2 * 4, 3]);
+        assert!(to_f32(&conv).iter().all(|v| *v == 0.0));
         let rec = s.recurrent_state(0, 1);
-        assert_eq!(rec.size(), vec![2, 4, 4]);
+        assert_eq!(rec.shape(), &[2, 4, 4]);
 
         let want_conv = data(conv.numel(), 73);
-        s.set_conv_state(
-            0,
-            1,
-            f32_tensor(&want_conv, &conv.size()[..], auto_device()),
-        );
-        assert_eq!(to_f32_vec(&s.conv_state(0, 1)), want_conv);
+        s.set_conv_state(0, 1, f32_tensor(&s.conv, &want_conv, conv.shape()));
+        assert_eq!(to_f32(&s.conv_state(0, 1)), want_conv);
 
         let want_rec = data(rec.numel(), 75);
-        s.set_recurrent_state(0, 1, f32_tensor(&want_rec, &rec.size()[..], auto_device()));
-        assert_eq!(to_f32_vec(&s.recurrent_state(0, 1)), want_rec);
+        s.set_recurrent_state(0, 1, f32_tensor(&s.recurrent, &want_rec, rec.shape()));
+        assert_eq!(to_f32(&s.recurrent_state(0, 1)), want_rec);
     }
 
     #[test]
     fn linear_state_slots_are_independent_and_resettable() {
-        let s = LinearStateSlabs::new(&params(), 2, auto_device());
+        let s = state(2);
         let one = vec![1.0f32; 32];
-        s.set_recurrent_state(0, 1, f32_tensor(&one, &[2, 4, 4], auto_device()));
-        assert_eq!(to_f32_vec(&s.recurrent_state(1, 1)), vec![0.0; 32]);
-        assert_eq!(to_f32_vec(&s.recurrent_state(0, 1)), one);
+        s.set_recurrent_state(0, 1, f32_tensor(&s.recurrent, &one, &[2, 4, 4]));
+        assert_eq!(to_f32(&s.recurrent_state(1, 1)), vec![0.0; 32]);
+        assert_eq!(to_f32(&s.recurrent_state(0, 1)), one);
         s.reset_slot(0);
         assert!(
-            to_f32_vec(&s.recurrent_state(0, 1))
-                .iter()
-                .all(|v| *v == 0.0),
+            to_f32(&s.recurrent_state(0, 1)).iter().all(|v| *v == 0.0),
             "a recycled slot must not leak the previous request's state"
         );
     }
 
     #[test]
     fn a_linear_state_slot_copies_conv_and_recurrent_to_another() {
-        let s = LinearStateSlabs::new(&params(), 2, auto_device());
+        let s = state(2);
         let cv = s.conv_size();
         let rv = s.recurrent_size();
         // Both linear layers carry distinct state on slot 0.
@@ -950,115 +1092,102 @@ mod tests {
             s.set_conv_state(
                 0,
                 layer,
-                f32_tensor(
-                    &data((cv[0] * cv[1]) as usize, 81 + layer as u32),
-                    &cv[..],
-                    auto_device(),
-                ),
+                f32_tensor(&s.conv, &data(cv[0] * cv[1], 81 + layer as u32), &cv[..]),
             );
             s.set_recurrent_state(
                 0,
                 layer,
                 f32_tensor(
-                    &data((rv[0] * rv[1] * rv[2]) as usize, 91 + layer as u32),
+                    &s.recurrent,
+                    &data(rv[0] * rv[1] * rv[2], 91 + layer as u32),
                     &rv[..],
-                    auto_device(),
                 ),
             );
         }
         s.copy_slot(0, 1);
         for layer in [1usize, 2] {
             assert_eq!(
-                to_f32_vec(&s.conv_state(1, layer)),
-                to_f32_vec(&s.conv_state(0, layer)),
+                to_f32(&s.conv_state(1, layer)),
+                to_f32(&s.conv_state(0, layer)),
                 "the copy matches the source conv"
             );
             assert_eq!(
-                to_f32_vec(&s.recurrent_state(1, layer)),
-                to_f32_vec(&s.recurrent_state(0, layer)),
+                to_f32(&s.recurrent_state(1, layer)),
+                to_f32(&s.recurrent_state(0, layer)),
                 "the copy matches the source recurrent"
             );
         }
         // Copy-on-write: writing the live slot afterwards leaves the snapshot.
-        let before = to_f32_vec(&s.recurrent_state(1, 1));
+        let before = to_f32(&s.recurrent_state(1, 1));
         s.set_recurrent_state(
             0,
             1,
-            f32_tensor(&vec![7.0f32; before.len()], &rv[..], auto_device()),
+            f32_tensor(&s.recurrent, &vec![7.0f32; before.len()], &rv[..]),
         );
         assert_eq!(
-            to_f32_vec(&s.recurrent_state(1, 1)),
+            to_f32(&s.recurrent_state(1, 1)),
             before,
             "a snapshot slot is not aliased by a later live write"
         );
     }
 
-    /// A device index tensor, as a captured step would stage one.
-    fn dev_index(values: &[i64]) -> Tensor {
-        Tensor::from_slice(values).to(auto_device().to_tch())
-    }
-
     #[test]
     fn a_device_index_store_and_gather_match_the_host_path() {
-        let pool = MhaPool::new(&params(), 16, KvDType::F32, auto_device());
-        let (k, v) = kv_pair(2, 2, 4, 91);
-        let locs = dev_index(&[5, 2]);
+        let pool = pool(16, KvDType::F32);
+        let (k, v) = kv_pair(&pool.kv, 2, 2, 4, 91);
+        let locs = dev_index(&pool.kv, &[5, 2]);
         pool.store_at(0, &locs, &k, &v);
-        let (gk, gv) = pool.gather_rows(0, &locs.reshape([1, 2]));
-        assert_eq!(to_f32_vec(&gk), to_f32_vec(&k));
-        assert_eq!(to_f32_vec(&gv), to_f32_vec(&v));
+        let (gk, gv) = pool.gather_rows(0, &locs.reshape(&[1, 2]).unwrap());
+        assert_eq!(to_f32(&gk), to_f32(&k));
+        assert_eq!(to_f32(&gv), to_f32(&v));
         // The host accessor reads back the very values the device path wrote.
-        assert_eq!(to_f32_vec(&pool.gather(0, &[5, 2]).0), to_f32_vec(&k));
+        assert_eq!(to_f32(&pool.gather(0, &[5, 2]).0), to_f32(&k));
     }
 
     #[test]
     fn a_batched_gather_reads_each_rows_window_in_order() {
-        let pool = MhaPool::new(&params(), 16, KvDType::F32, auto_device());
-        let (k, v) = kv_pair(4, 2, 4, 97);
+        let pool = pool(16, KvDType::F32);
+        let (k, v) = kv_pair(&pool.kv, 4, 2, 4, 97);
         // Token `r` lands at pool location `r`, so the window can name rows back.
-        pool.store_at(0, &dev_index(&[0, 1, 2, 3]), &k, &v);
-        let windows = dev_index(&[2, 0, 3, 1]).reshape([2, 2]);
+        pool.store_at(0, &dev_index(&pool.kv, &[0, 1, 2, 3]), &k, &v);
+        let windows = dev_index(&pool.kv, &[2, 0, 3, 1]).reshape(&[2, 2]).unwrap();
         let (gk, _) = pool.gather_rows(0, &windows);
-        assert_eq!(gk.size(), vec![2, 2, 2, 4]);
-        let flat = to_f32_vec(&gk);
-        let want: Vec<f32> = [2i64, 0, 3, 1]
+        assert_eq!(gk.shape(), &[2, 2, 2, 4]);
+        let flat = to_f32(&gk);
+        let want: Vec<f32> = [2usize, 0, 3, 1]
             .iter()
-            .flat_map(|&r| to_f32_vec(&k.select(0, r)))
+            .flat_map(|&r| to_f32(&k.select(0, r).unwrap()))
             .collect();
         assert_eq!(flat, want, "row 0 then row 1, each window in order");
     }
 
     #[test]
     fn a_device_slot_reads_and_writes_the_same_state_as_the_host_slot() {
-        let s = LinearStateSlabs::new(&params(), 3, auto_device());
-        let slot = dev_index(&[1]);
+        let s = state(3);
+        let slot = dev_index(&s.conv, &[1]);
         let cv = s.conv_size();
-        let conv = f32_tensor(&data((cv[0] * cv[1]) as usize, 93), &cv[..], auto_device());
-        s.set_conv_state_rows(&slot, 1, &conv.unsqueeze(0));
+        let conv = f32_tensor(&s.conv, &data(cv[0] * cv[1], 93), &cv[..]);
+        s.set_conv_state_rows(&slot, 1, &conv.unsqueeze(0).unwrap());
         assert_eq!(
-            to_f32_vec(&s.conv_state_rows(&slot, 1).select(0, 0)),
-            to_f32_vec(&conv)
+            to_f32(&s.conv_state_rows(&slot, 1).select(0, 0).unwrap()),
+            to_f32(&conv)
         );
         assert_eq!(
-            to_f32_vec(&s.conv_state(1, 1)),
-            to_f32_vec(&conv),
+            to_f32(&s.conv_state(1, 1)),
+            to_f32(&conv),
             "the host accessor sees the device write"
         );
 
         let rv = s.recurrent_size();
-        let rec = f32_tensor(
-            &data((rv[0] * rv[1] * rv[2]) as usize, 95),
-            &rv[..],
-            auto_device(),
-        );
-        s.set_recurrent_state_rows(&slot, 1, &rec.unsqueeze(0));
+        let rec = f32_tensor(&s.recurrent, &data(rv[0] * rv[1] * rv[2], 95), &rv[..]);
+        s.set_recurrent_state_rows(&slot, 1, &rec.unsqueeze(0).unwrap());
         assert_eq!(
-            to_f32_vec(&s.recurrent_state_rows(&slot, 1).select(0, 0)),
-            to_f32_vec(&rec)
+            to_f32(&s.recurrent_state_rows(&slot, 1).select(0, 0).unwrap()),
+            to_f32(&rec)
         );
-        assert_eq!(to_f32_vec(&s.recurrent_state(1, 1)), to_f32_vec(&rec));
+        assert_eq!(to_f32(&s.recurrent_state(1, 1)), to_f32(&rec));
         assert!(
-            to_f32_vec(&s.recurrent_state_rows(&dev_index(&[0]), 1))
+            to_f32(&s.recurrent_state_rows(&dev_index(&s.conv, &[0]), 1))
                 .iter()
                 .all(|v| *v == 0.0),
             "the device accessor never aliases another slot"
@@ -1068,21 +1197,21 @@ mod tests {
     /// Mark a slot's first linear layer so a restore can be told apart from a
     /// zeroed fresh slot.
     fn stamp(s: &LinearStateSlabs, slot: u32, value: f32) {
-        let n = s.recurrent_size().iter().product::<i64>() as usize;
+        let n = s.recurrent_size().iter().product::<usize>();
         s.set_recurrent_state(
             slot,
             1,
-            f32_tensor(&vec![value; n], &s.recurrent_size()[..], auto_device()),
+            f32_tensor(&s.recurrent, &vec![value; n], &s.recurrent_size()[..]),
         );
     }
 
     fn stamp_of(cache: &DeviceCache, slot: u32) -> Vec<f32> {
-        to_f32_vec(&cache.state().recurrent_state(slot, 1))
+        to_f32(&cache.state().recurrent_state(slot, 1))
     }
 
     #[test]
     fn a_committed_prefix_is_reused_by_the_next_request() {
-        let cache = DeviceCache::new(&params(), 32, 4, KvDType::F32, auto_device());
+        let cache = cache(32, 4);
         let mut a = cache.begin();
         assert_eq!(
             cache.adopt_prefix(&mut a, &[1, 2, 3]),
@@ -1115,7 +1244,7 @@ mod tests {
 
     #[test]
     fn a_prefix_shorter_than_a_snapshot_boundary_reuses_nothing() {
-        let cache = DeviceCache::new(&params(), 32, 4, KvDType::F32, auto_device());
+        let cache = cache(32, 4);
         let mut a = cache.begin();
         cache.reserve(&mut a, 4).unwrap();
         stamp(cache.state(), a.state_slot(), 7.0);
@@ -1137,7 +1266,7 @@ mod tests {
 
     #[test]
     fn a_prompt_end_commit_lets_a_follower_reuse_the_prompt() {
-        let cache = DeviceCache::new(&params(), 64, 4, KvDType::F32, auto_device());
+        let cache = cache(64, 4);
         let mut a = cache.begin();
         cache.reserve(&mut a, 4).unwrap();
         stamp(cache.state(), a.state_slot(), 3.0);
@@ -1167,7 +1296,7 @@ mod tests {
     /// boundary resumable for a later mid-prompt request.
     #[test]
     fn a_chunk_boundary_commit_is_reusable_mid_prompt() {
-        let cache = DeviceCache::new(&params(), 64, 8, KvDType::F32, auto_device());
+        let cache = cache(64, 8);
         let total_pages = cache.num_pages();
         let mut a = cache.begin();
         cache.reserve(&mut a, 2).unwrap();
@@ -1214,7 +1343,7 @@ mod tests {
 
     #[test]
     fn pages_and_slots_are_conserved_across_reuse() {
-        let cache = DeviceCache::new(&params(), 32, 4, KvDType::F32, auto_device());
+        let cache = cache(32, 4);
         let total_pages = cache.num_pages();
         let mut a = cache.begin();
         cache.reserve(&mut a, 6).unwrap();
@@ -1235,7 +1364,7 @@ mod tests {
 
     #[test]
     fn adopting_the_same_prefix_twice_shares_one_tree_snapshot() {
-        let cache = DeviceCache::new(&params(), 32, 4, KvDType::F32, auto_device());
+        let cache = cache(32, 4);
         let mut a = cache.begin();
         cache.reserve(&mut a, 4).unwrap();
         stamp(cache.state(), a.state_slot(), 9.0);
@@ -1263,7 +1392,7 @@ mod tests {
 
     #[test]
     fn a_prompt_end_snapshot_shares_pages_with_the_still_decoding_request() {
-        let cache = DeviceCache::new(&params(), 32, 4, KvDType::F32, auto_device());
+        let cache = cache(32, 4);
         let mut a = cache.begin();
         cache.reserve(&mut a, 4).unwrap();
         stamp(cache.state(), a.state_slot(), 2.0);
