@@ -15,11 +15,10 @@
 
 use std::sync::Arc;
 
-use tch::Tensor;
-
 use crate::domain::expert_kernel::MoEError;
 use crate::domain::model::ModelParams;
 use crate::infrastructure::cuda_driver::{AttentionKernels, CUstream, CudaError, Driver};
+use crate::infrastructure::cudarc::{Runtime, Tensor};
 use crate::infrastructure::kernel_abi::{
     AttentionAbi, AttentionArgs, PAGED_ATTENTION, PAGED_ATTENTION_BF16, attention_grid,
     paged_attention_args,
@@ -45,6 +44,7 @@ pub struct PagedAttention {
     kernels: AttentionKernels,
     abi: AttentionAbi,
     kv_heads: i64,
+    _rt: Runtime,
     stream: CUstream,
 }
 
@@ -64,10 +64,9 @@ impl PagedAttention {
                 "the paged attention launcher needs a CUDA device".into(),
             ));
         };
-        // The pool is a libtorch tensor, so ATen needs its CUDA kernels
-        // registered before the first launch reads it.
-        crate::infrastructure::torch::load_cuda_backend()
-            .map_err(|e| MoEError::Bad(format!("libtorch cuda: {e}")))?;
+        // The launcher owns a cudarc runtime so its tensors and cubin launches
+        // share one primary context and stream; no libtorch backend is needed.
+        let rt = Runtime::open(ordinal)?;
         let lib = Driver::open().map_err(driver)?;
         lib.init().map_err(driver)?;
         lib.attach_primary_context(ordinal as i32).map_err(driver)?;
@@ -78,6 +77,7 @@ impl PagedAttention {
             kernels,
             abi,
             kv_heads: params.num_kv_heads as i64,
+            _rt: rt,
             stream,
         })
     }
@@ -118,26 +118,26 @@ impl PagedAttention {
         let kernel = self.abi.kernel(name).map_err(bad_abi)?;
         let c = |name: &str| kernel.constexpr(name).map_err(bad_abi);
         let (q_heads, head_dim) = (c("NUM_Q_HEADS")?, c("HEAD_DIM")?);
-        let q_size = q.size();
-        if q_size.len() != 3 || q_size[1] as u64 != q_heads || q_size[2] as u64 != head_dim {
+        let q_size = q.shape();
+        if q_size.len() != 3 || q_size[1] != q_heads as usize || q_size[2] != head_dim as usize {
             return Err(MoEError::Bad(format!(
                 "the paged kernel was built for {q_heads} q-heads of {head_dim} dims, not {q_size:?}"
             )));
         }
         let rows = q_size[0];
-        if out.size() != q_size {
+        if out.shape() != q_size {
             return Err(MoEError::Bad(format!(
                 "the paged attention output is {:?}, not {q_size:?}",
-                out.size()
+                out.shape()
             )));
         }
-        if locs.size().len() != 2 || locs.size()[0] != rows {
+        if locs.shape().len() != 2 || locs.shape()[0] != rows {
             return Err(MoEError::Bad(format!(
                 "the paged attention window is {:?} for {rows} rows",
-                locs.size()
+                locs.shape()
             )));
         }
-        if positions.numel() as i64 != rows {
+        if positions.numel() != rows {
             return Err(MoEError::Bad(format!(
                 "the paged attention positions are {} for {rows} rows",
                 positions.numel()
@@ -153,19 +153,19 @@ impl PagedAttention {
                 self.kv_heads
             )));
         }
-        let window = locs.size()[1];
+        let window = locs.shape()[1];
         let args = AttentionArgs {
-            q: q.data_ptr() as u64,
+            q: q.device_ptr(),
             k: k_ptr,
             v: v_ptr,
-            locs: locs.data_ptr() as u64,
-            positions: positions.data_ptr() as u64,
-            out: out.data_ptr() as u64,
+            locs: locs.device_ptr(),
+            positions: positions.device_ptr(),
+            out: out.device_ptr(),
             window: window as u32,
         };
         let pack = paged_attention_args(&self.abi, name, &args).map_err(bad_abi)?;
         let mut params = pack.kernel_params().map_err(bad_abi)?;
-        let grid = attention_grid(rows as usize, kernel).map_err(bad_abi)?;
+        let grid = attention_grid(rows, kernel).map_err(bad_abi)?;
         // SAFETY: the caller guarantees every address is live in this context;
         // `params` was built from this kernel's manifest entry, and `self.stream`
         // belongs to the context made current at construction.

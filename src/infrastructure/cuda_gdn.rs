@@ -13,11 +13,10 @@
 
 use std::sync::Arc;
 
-use tch::Tensor;
-
 use crate::domain::expert_kernel::MoEError;
 use crate::domain::model::ModelParams;
 use crate::infrastructure::cuda_driver::{CUstream, CudaError, Driver, GdnKernels};
+use crate::infrastructure::cudarc::{Runtime, Tensor, TensorDType};
 use crate::infrastructure::kernel_abi::{
     ADD_RMSNORM, AddRmsnormArgs, CONV_DECODE, ConvArgs, GDN_DECODE, GDN_TRI_SOLVE, GdnArgs,
     GdnTriSolveArgs, LinearAbi, add_rmsnorm_args, add_rmsnorm_grid, conv_decode_args, conv_grid,
@@ -43,16 +42,17 @@ fn bad_abi(e: MoEError) -> MoEError {
 pub struct GdnDecode {
     kernels: GdnKernels,
     abi: LinearAbi,
-    k_heads: i64,
-    v_heads: i64,
-    kd: i64,
-    vdim: i64,
+    k_heads: usize,
+    v_heads: usize,
+    kd: usize,
+    vdim: usize,
     /// `2 * key_dim + value_dim`, the fused conv's feature width.
-    conv_dim: i64,
+    conv_dim: usize,
     /// The conv kernel width (`linear_conv_kernel_dim`).
-    conv_k: i64,
+    conv_k: usize,
     /// `hidden_size`, the width the fused add + RMSNorm kernel tiles.
-    hidden: i64,
+    hidden: usize,
+    _rt: Runtime,
     stream: CUstream,
 }
 
@@ -72,24 +72,17 @@ impl GdnDecode {
                 "the fused GDN launcher needs a CUDA device".into(),
             ));
         };
-        // The inputs are libtorch tensors, so ATen needs its CUDA kernels
-        // registered before the first launch reads them.
-        crate::infrastructure::torch::load_cuda_backend()
-            .map_err(|e| MoEError::Bad(format!("libtorch cuda: {e}")))?;
+        // The launcher owns a cudarc runtime so its tensors and cubin launches
+        // share one primary context and stream; no libtorch backend is needed.
+        let rt = Runtime::open(ordinal)?;
         let lib = Driver::open().map_err(driver)?;
         lib.init().map_err(driver)?;
         lib.attach_primary_context(ordinal as i32).map_err(driver)?;
         let abi = LinearAbi::committed().map_err(bad_abi)?;
         check_geometry(params, &abi)?;
         let kernels = GdnKernels::load(Arc::new(lib), abi.clone()).map_err(driver)?;
-        let (k_heads, v_heads) = (
-            params.linear_num_key_heads as i64,
-            params.linear_num_value_heads as i64,
-        );
-        let (kd, vdim) = (
-            params.linear_key_head_dim as i64,
-            params.linear_value_head_dim as i64,
-        );
+        let (k_heads, v_heads) = (params.linear_num_key_heads, params.linear_num_value_heads);
+        let (kd, vdim) = (params.linear_key_head_dim, params.linear_value_head_dim);
         Ok(Self {
             kernels,
             abi,
@@ -98,8 +91,9 @@ impl GdnDecode {
             kd,
             vdim,
             conv_dim: 2 * k_heads * kd + v_heads * vdim,
-            conv_k: params.linear_conv_kernel_dim as i64,
-            hidden: params.hidden_size as i64,
+            conv_k: params.linear_conv_kernel_dim,
+            hidden: params.hidden_size,
+            _rt: rt,
             stream,
         })
     }
@@ -110,8 +104,8 @@ impl GdnDecode {
 
     /// Launch one fused GDN decode step for `rows` rows.
     ///
-    /// `ba` is `[rows, 2 * v_heads]` f32 (`b` then `a`), `a_log`/`dt_bias` are
-    /// `[v_heads]`, `q`/`k` are `[rows, k_heads, k_dim]`, `v` is
+    /// `ba` is `[rows, 2 * v_heads]` model dtype (`b` then `a`), `a_log`/`dt_bias`
+    /// are `[v_heads]`, `q`/`k` are `[rows, k_heads, k_dim]`, `v` is
     /// `[rows, v_heads, v_dim]`, `state` is `[rows, v_heads, k_dim, v_dim]` f32
     /// (updated in place) and `out` is `[rows, v_heads, v_dim]`.
     ///
@@ -131,7 +125,7 @@ impl GdnDecode {
         out: &Tensor,
     ) -> Result<(), MoEError> {
         let kernel = self.abi.kernel(GDN_DECODE).map_err(bad_abi)?;
-        let q_size = q.size();
+        let q_size = q.shape();
         let bad = |what: &str| {
             MoEError::Bad(format!(
                 "the gdn kernel was built for {what}, not the shapes handed in"
@@ -145,48 +139,48 @@ impl GdnDecode {
             )));
         }
         let rows = q_size[0];
-        if k.size() != q_size {
+        if k.shape() != q_size {
             return Err(bad("k = q"));
         }
-        if v.size() != [rows, self.v_heads, self.vdim] {
+        if v.shape() != [rows, self.v_heads, self.vdim].as_slice() {
             return Err(bad("v = [rows, v_heads, v_dim]"));
         }
-        if out.size() != v.size() {
+        if out.shape() != v.shape() {
             return Err(bad("out = v"));
         }
-        if state.size() != [rows, self.v_heads, self.kd, self.vdim] {
+        if state.shape() != [rows, self.v_heads, self.kd, self.vdim].as_slice() {
             return Err(bad("state = [rows, v_heads, k_dim, v_dim]"));
         }
-        if ba.size() != [rows, 2 * self.v_heads] {
+        if ba.shape() != [rows, 2 * self.v_heads].as_slice() {
             return Err(bad("ba = [rows, 2 * v_heads]"));
         }
-        if a_log.numel() != self.v_heads as usize || dt_bias.numel() != self.v_heads as usize {
+        if a_log.numel() != self.v_heads || dt_bias.numel() != self.v_heads {
             return Err(bad("a_log and dt_bias = [v_heads]"));
         }
         // The kernel walks each row head-major with unit last stride; the forward
         // hands it narrows of one conv buffer, which satisfy this.
-        let unit = |t: &Tensor, head: i64| t.stride()[1] == head && t.stride()[2] == 1;
+        let unit = |t: &Tensor, head: usize| t.strides()[1] == head && t.strides()[2] == 1;
         if !unit(q, self.kd) || !unit(k, self.kd) || !unit(v, self.vdim) {
             return Err(MoEError::Bad(
                 "the gdn kernel needs q/k/v head-major with unit last stride".into(),
             ));
         }
         let args = GdnArgs {
-            ba: ba.data_ptr() as u64,
-            a_log: a_log.data_ptr() as u64,
-            dt_bias: dt_bias.data_ptr() as u64,
-            q: q.data_ptr() as u64,
-            k: k.data_ptr() as u64,
-            v: v.data_ptr() as u64,
-            state: state.data_ptr() as u64,
-            out: out.data_ptr() as u64,
-            stride_q: q.stride()[0] as u32,
-            stride_k: k.stride()[0] as u32,
-            stride_v: v.stride()[0] as u32,
+            ba: ba.device_ptr(),
+            a_log: a_log.device_ptr(),
+            dt_bias: dt_bias.device_ptr(),
+            q: q.device_ptr(),
+            k: k.device_ptr(),
+            v: v.device_ptr(),
+            state: state.device_ptr(),
+            out: out.device_ptr(),
+            stride_q: q.strides()[0] as u32,
+            stride_k: k.strides()[0] as u32,
+            stride_v: v.strides()[0] as u32,
         };
         let pack = gdn_decode_args(&self.abi, &args).map_err(bad_abi)?;
         let mut params = pack.kernel_params().map_err(bad_abi)?;
-        let grid = gdn_grid(rows as usize, kernel).map_err(bad_abi)?;
+        let grid = gdn_grid(rows, kernel).map_err(bad_abi)?;
         // SAFETY: the caller guarantees every tensor is live in this context;
         // `params` was built from this kernel's manifest entry, and `self.stream`
         // belongs to the context made current at construction.
@@ -198,8 +192,8 @@ impl GdnDecode {
     ///
     /// `a` is `[v_heads, n, n]` f32 strictly lower, `rhs`/`out` are
     /// `[v_heads, n, v_dim]` f32 contiguous. `n` must not exceed the cubin's
-    /// baked row tile; a longer or mismatched shape falls back to the libtorch
-    /// loop at the call site.
+    /// baked row tile; a longer or mismatched shape falls back to the call
+    /// site's loop.
     ///
     /// # Safety
     /// Every tensor must be a live device allocation in this launcher's context.
@@ -210,21 +204,21 @@ impl GdnDecode {
                 "the tri-solve kernel was built for {what}, not the shapes handed in"
             ))
         };
-        let a_size = a.size();
+        let a_size = a.shape();
         if a_size.len() != 3 || a_size[0] != self.v_heads || a_size[1] != a_size[2] {
             return Err(bad("a = [v_heads, n, n]"));
         }
         let n = a_size[1];
-        if n > kernel.constexpr("N").map_err(bad_abi)? as i64 {
+        if n > kernel.constexpr("N").map_err(bad_abi)? as usize {
             return Err(bad("n within the baked row tile"));
         }
-        if self.vdim != kernel.constexpr("DV").map_err(bad_abi)? as i64 {
+        if self.vdim != kernel.constexpr("DV").map_err(bad_abi)? as usize {
             return Err(bad("DV matching the value dim"));
         }
-        if rhs.size() != [self.v_heads, n, self.vdim] || out.size() != rhs.size() {
+        if rhs.shape() != [self.v_heads, n, self.vdim].as_slice() || out.shape() != rhs.shape() {
             return Err(bad("rhs = out = [v_heads, n, v_dim]"));
         }
-        let f32_contiguous = |t: &Tensor| t.kind() == tch::Kind::Float && t.is_contiguous();
+        let f32_contiguous = |t: &Tensor| t.dtype() == TensorDType::F32 && t.is_contiguous();
         if !f32_contiguous(a) || !f32_contiguous(rhs) || !f32_contiguous(out) {
             return Err(MoEError::Bad(format!(
                 "the tri-solve kernel needs contiguous f32 tensors (a={} rhs={} out={})",
@@ -233,11 +227,11 @@ impl GdnDecode {
                 f32_contiguous(out)
             )));
         }
-        let (a_strides, rhs_strides, out_strides) = (a.stride(), rhs.stride(), out.stride());
+        let (a_strides, rhs_strides, out_strides) = (a.strides(), rhs.strides(), out.strides());
         let args = GdnTriSolveArgs {
-            a: a.data_ptr() as u64,
-            rhs: rhs.data_ptr() as u64,
-            out: out.data_ptr() as u64,
+            a: a.device_ptr(),
+            rhs: rhs.device_ptr(),
+            out: out.device_ptr(),
             n: n as u32,
             stride_a_h: a_strides[0] as u32,
             stride_a_r: a_strides[1] as u32,
@@ -248,17 +242,16 @@ impl GdnDecode {
         };
         let pack = gdn_tri_solve_args(&self.abi, &args).map_err(bad_abi)?;
         let mut params = pack.kernel_params().map_err(bad_abi)?;
-        let grid = gdn_tri_solve_grid(self.v_heads as usize, self.vdim as usize, kernel)
-            .map_err(bad_abi)?;
+        let grid = gdn_tri_solve_grid(self.v_heads, self.vdim, kernel).map_err(bad_abi)?;
         // SAFETY: as above; the outputs are fully overwritten by the kernel.
         unsafe { self.kernels.launch(kernel, grid, &mut params, self.stream) }.map_err(driver)
     }
 
     /// Launch one fused conv + silu decode step for `rows` rows.
     ///
-    /// `x` is `[rows, conv_dim]` f32, `w` `[conv_dim, K]` f32, `state`
+    /// `x` is `[rows, conv_dim]` model dtype, `w` `[conv_dim, K]`, `state`
     /// `[rows, conv_dim, K - 1]` f32 (updated in place) and `out`
-    /// `[rows, conv_dim]` f32. Only `x`'s row stride need be real: the forward
+    /// `[rows, conv_dim]`. Only `x`'s row stride need be real: the forward
     /// hands a strided narrow of the qkvz projection.
     ///
     /// # Safety
@@ -277,32 +270,32 @@ impl GdnDecode {
                 "the conv kernel was built for {what}, not the shapes handed in"
             ))
         };
-        let x_size = x.size();
+        let x_size = x.shape();
         if x_size.len() != 2 || x_size[1] != self.conv_dim {
             return Err(bad("x = [rows, conv_dim]"));
         }
         let rows = x_size[0];
-        if w.size() != [self.conv_dim, self.conv_k] {
+        if w.shape() != [self.conv_dim, self.conv_k].as_slice() {
             return Err(bad("w = [conv_dim, K]"));
         }
-        if state.size() != [rows, self.conv_dim, self.conv_k - 1] {
+        if state.shape() != [rows, self.conv_dim, self.conv_k - 1].as_slice() {
             return Err(bad("state = [rows, conv_dim, K - 1]"));
         }
-        if out.size() != x_size {
+        if out.shape() != x_size {
             return Err(bad("out = x"));
         }
         let args = ConvArgs {
-            x: x.data_ptr() as u64,
-            w: w.data_ptr() as u64,
-            state: state.data_ptr() as u64,
-            out: out.data_ptr() as u64,
-            stride_x: x.stride()[0] as u32,
-            stride_state: state.stride()[0] as u32,
-            stride_out: out.stride()[0] as u32,
+            x: x.device_ptr(),
+            w: w.device_ptr(),
+            state: state.device_ptr(),
+            out: out.device_ptr(),
+            stride_x: x.strides()[0] as u32,
+            stride_state: state.strides()[0] as u32,
+            stride_out: out.strides()[0] as u32,
         };
         let pack = conv_decode_args(&self.abi, &args).map_err(bad_abi)?;
         let mut params = pack.kernel_params().map_err(bad_abi)?;
-        let grid = conv_grid(rows as usize, kernel).map_err(bad_abi)?;
+        let grid = conv_grid(rows, kernel).map_err(bad_abi)?;
         // SAFETY: the caller guarantees every tensor is live in this context;
         // `params` was built from this kernel's manifest entry, and `self.stream`
         // belongs to the context made current at construction.
@@ -336,35 +329,35 @@ impl GdnDecode {
                 "the norm kernel was built for {what}, not the shapes handed in"
             ))
         };
-        let x_size = x.size();
-        if x_size.len() != 2 || x_size[1] != self.hidden || x.stride()[1] != 1 {
+        let x_size = x.shape();
+        if x_size.len() != 2 || x_size[1] != self.hidden || x.strides()[1] != 1 {
             return Err(bad("x = [rows, hidden] with a unit inner stride"));
         }
         let rows = x_size[0];
-        if r.size() != x_size || r.stride()[1] != 1 {
+        if r.shape() != x_size || r.strides()[1] != 1 {
             return Err(bad("r = x"));
         }
-        if w.numel() as i64 != self.hidden {
+        if w.numel() != self.hidden {
             return Err(bad("w = [hidden]"));
         }
         for t in [sum_out, out] {
-            if t.size() != x_size || t.stride()[0] != self.hidden || t.stride()[1] != 1 {
+            if t.shape() != x_size || t.strides()[0] != self.hidden || t.strides()[1] != 1 {
                 return Err(bad("contiguous [rows, hidden] outputs"));
             }
         }
         let args = AddRmsnormArgs {
-            x: x.data_ptr() as u64,
-            r: r.data_ptr() as u64,
-            w: w.data_ptr() as u64,
-            sum: sum_out.data_ptr() as u64,
-            out: out.data_ptr() as u64,
+            x: x.device_ptr(),
+            r: r.device_ptr(),
+            w: w.device_ptr(),
+            sum: sum_out.device_ptr(),
+            out: out.device_ptr(),
             eps,
-            stride_x: x.stride()[0] as u32,
-            stride_r: r.stride()[0] as u32,
+            stride_x: x.strides()[0] as u32,
+            stride_r: r.strides()[0] as u32,
         };
         let pack = add_rmsnorm_args(&self.abi, &args).map_err(bad_abi)?;
         let mut params = pack.kernel_params().map_err(bad_abi)?;
-        let grid = add_rmsnorm_grid(rows as usize);
+        let grid = add_rmsnorm_grid(rows);
         // SAFETY: as above; the outputs are fully overwritten by the kernel.
         unsafe { self.kernels.launch(kernel, grid, &mut params, self.stream) }.map_err(driver)
     }

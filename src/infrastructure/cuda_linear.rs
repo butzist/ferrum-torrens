@@ -15,10 +15,9 @@
 
 use std::sync::Arc;
 
-use tch::{Kind, Tensor};
-
 use crate::domain::expert_kernel::MoEError;
 use crate::infrastructure::cuda_driver::{CUstream, CudaError, Driver, GdnKernels};
+use crate::infrastructure::cudarc::{Runtime, Tensor, TensorDType};
 use crate::infrastructure::kernel_abi::{
     DenseGemvArgs, FP8_GEMM, FP8_GEMV, FP8_SPLITK_REDUCE, Fp8GemmArgs, Fp8GemvArgs, Fp8ReduceArgs,
     LinearAbi, NVFP4_DENSE_GEMV, fp8_gemm_args, fp8_gemm_grid, fp8_gemv_args, fp8_gemv_grid,
@@ -44,6 +43,7 @@ fn bad_abi(e: MoEError) -> MoEError {
 pub struct DenseGemv {
     kernels: GdnKernels,
     abi: LinearAbi,
+    _rt: Runtime,
     stream: CUstream,
 }
 
@@ -61,8 +61,7 @@ impl DenseGemv {
                 "the dense NVFP4 gemv launcher needs a CUDA device".into(),
             ));
         };
-        crate::infrastructure::torch::load_cuda_backend()
-            .map_err(|e| MoEError::Bad(format!("libtorch cuda: {e}")))?;
+        let rt = Runtime::open(ordinal)?;
         let lib = Driver::open().map_err(driver)?;
         lib.init().map_err(driver)?;
         lib.attach_primary_context(ordinal as i32).map_err(driver)?;
@@ -72,6 +71,7 @@ impl DenseGemv {
         Ok(Self {
             kernels,
             abi,
+            _rt: rt,
             stream,
         })
     }
@@ -99,8 +99,8 @@ impl DenseGemv {
         c: &Tensor,
     ) -> Result<(), MoEError> {
         let kernel = self.abi.kernel(NVFP4_DENSE_GEMV).map_err(bad_abi)?;
-        let a_size = a.size();
-        let p_size = packed.size();
+        let a_size = a.shape();
+        let p_size = packed.shape();
         let bad = |what: &str| {
             MoEError::Bad(format!(
                 "the dense gemv kernel was built for {what}, not the shapes handed in"
@@ -116,40 +116,40 @@ impl DenseGemv {
         }
         // The kernel reads packed as int32 words, so the row (N) must be
         // contiguous within a K strip and the K stride a whole number of words.
-        if packed.stride()[1] != 1 || packed.stride()[0] == 0 {
+        if packed.strides()[1] != 1 || packed.strides()[0] == 0 {
             return Err(bad("packed = [K // 8, N] contiguous in N"));
         }
-        if scale.size() != [k / 16, n] {
+        if scale.shape() != [k / 16, n].as_slice() {
             return Err(bad("scale = [K // 16, N]"));
         }
-        if global.numel() != (n * 2) as usize {
+        if global.numel() != n * 2 {
             return Err(bad("global = [N] f16 (N * 2 bytes)"));
         }
-        if c.size() != [m, n] {
+        if c.shape() != [m, n].as_slice() {
             return Err(bad("c = [M, N]"));
         }
         let args = DenseGemvArgs {
-            a: a.data_ptr() as u64,
-            packed: packed.data_ptr() as u64,
-            scale: scale.data_ptr() as u64,
-            global: global.data_ptr() as u64,
-            c: c.data_ptr() as u64,
+            a: a.device_ptr(),
+            packed: packed.device_ptr(),
+            scale: scale.device_ptr(),
+            global: global.device_ptr(),
+            c: c.device_ptr(),
             m: m as u32,
             n: n as u32,
             k_words: k_words as u32,
-            stride_am: a.stride()[0] as u32,
-            stride_ak: a.stride()[1] as u32,
+            stride_am: a.strides()[0] as u32,
+            stride_ak: a.strides()[1] as u32,
             // K-major: N is contiguous (stride_pn), K steps by N (stride_pkw).
-            stride_pn: packed.stride()[1] as u32,
-            stride_pkw: packed.stride()[0] as u32,
-            stride_sn: scale.stride()[1] as u32,
-            stride_sblk: scale.stride()[0] as u32,
-            stride_cm: c.stride()[0] as u32,
-            stride_cn: c.stride()[1] as u32,
+            stride_pn: packed.strides()[1] as u32,
+            stride_pkw: packed.strides()[0] as u32,
+            stride_sn: scale.strides()[1] as u32,
+            stride_sblk: scale.strides()[0] as u32,
+            stride_cm: c.strides()[0] as u32,
+            stride_cn: c.strides()[1] as u32,
         };
         let pack = nvfp4_dense_gemv_args(&self.abi, &args).map_err(bad_abi)?;
         let mut params = pack.kernel_params().map_err(bad_abi)?;
-        let grid = nvfp4_dense_gemv_grid(m as usize, n as usize, kernel).map_err(bad_abi)?;
+        let grid = nvfp4_dense_gemv_grid(m, n, kernel).map_err(bad_abi)?;
         // SAFETY: the caller guarantees every tensor is live in this context;
         // `params` was built from this kernel's manifest entry, and `self.stream`
         // belongs to the context made current at construction.
@@ -166,6 +166,7 @@ impl DenseGemv {
 pub struct Fp8Linear {
     kernels: GdnKernels,
     abi: LinearAbi,
+    rt: Runtime,
     stream: CUstream,
 }
 
@@ -181,8 +182,7 @@ impl Fp8Linear {
                 "the fp8 linear launcher needs a CUDA device".into(),
             ));
         };
-        crate::infrastructure::torch::load_cuda_backend()
-            .map_err(|e| MoEError::Bad(format!("libtorch cuda: {e}")))?;
+        let rt = Runtime::open(ordinal)?;
         let lib = Driver::open().map_err(driver)?;
         lib.init().map_err(driver)?;
         lib.attach_primary_context(ordinal as i32).map_err(driver)?;
@@ -194,6 +194,7 @@ impl Fp8Linear {
         Ok(Self {
             kernels,
             abi,
+            rt,
             stream,
         })
     }
@@ -220,11 +221,11 @@ impl Fp8Linear {
         let block_n = gemv.constexpr("BLOCK_N").map_err(bad_abi)? as usize;
         let block_k = gemv.constexpr("BLOCK_K").map_err(bad_abi)? as usize;
         let bad = |what: &str| MoEError::Bad(format!("the fp8 gemv expects {what}"));
-        let w_size = w.size();
+        let w_size = w.shape();
         if w_size.len() != 2 {
             return Err(bad("w = [N, K]"));
         }
-        let (n, k) = (w_size[0] as usize, w_size[1] as usize);
+        let (n, k) = (w_size[0], w_size[1]);
         if a.numel() != k {
             return Err(bad("a = [K]"));
         }
@@ -235,20 +236,20 @@ impl Fp8Linear {
         let n_tiles = n.div_ceil(block_n);
         let split_k = fp8_split_k(n_tiles, n_kb);
         let kb_per = n_kb.div_ceil(split_k);
-        let part = Tensor::empty([split_k as i64, n as i64], (Kind::Float, a.device()));
+        let part = self.rt.zeros(&[split_k, n], TensorDType::F32)?;
         let args = Fp8GemvArgs {
-            a: a.data_ptr() as u64,
-            w: w.data_ptr() as u64,
-            part: part.data_ptr() as u64,
+            a: a.device_ptr(),
+            w: w.device_ptr(),
+            part: part.device_ptr(),
             n: n as u32,
             k: k as u32,
             n_kb: n_kb as u32,
             kb_per: kb_per as u32,
-            stride_ak: a.stride().last().copied().unwrap_or(1) as u32,
-            stride_wn: w.stride()[0] as u32,
-            stride_wk: w.stride()[1] as u32,
-            stride_pk: part.stride()[0] as u32,
-            stride_pn: part.stride()[1] as u32,
+            stride_ak: a.strides().last().copied().unwrap_or(1) as u32,
+            stride_wn: w.strides()[0] as u32,
+            stride_wk: w.strides()[1] as u32,
+            stride_pk: part.strides()[0] as u32,
+            stride_pn: part.strides()[1] as u32,
         };
         let pack = fp8_gemv_args(&self.abi, &args).map_err(bad_abi)?;
         let mut params = pack.kernel_params().map_err(bad_abi)?;
@@ -258,13 +259,13 @@ impl Fp8Linear {
         unsafe { self.kernels.launch(gemv, grid, &mut params, self.stream) }.map_err(driver)?;
 
         let rargs = Fp8ReduceArgs {
-            part: part.data_ptr() as u64,
-            scale: scale.data_ptr() as u64,
-            out: out.data_ptr() as u64,
+            part: part.device_ptr(),
+            scale: scale.device_ptr(),
+            out: out.device_ptr(),
             n: n as u32,
             split_k: split_k as u32,
-            stride_pk: part.stride()[0] as u32,
-            stride_pn: part.stride()[1] as u32,
+            stride_pk: part.strides()[0] as u32,
+            stride_pn: part.strides()[1] as u32,
         };
         let rpack = fp8_splitk_reduce_args(&self.abi, &rargs).map_err(bad_abi)?;
         let mut rparams = rpack.kernel_params().map_err(bad_abi)?;
@@ -289,34 +290,34 @@ impl Fp8Linear {
     ) -> Result<(), MoEError> {
         let kernel = self.abi.kernel(FP8_GEMM).map_err(bad_abi)?;
         let bad = |what: &str| MoEError::Bad(format!("the fp8 gemm expects {what}"));
-        let a_size = a.size();
-        let w_size = w.size();
+        let a_size = a.shape();
+        let w_size = w.shape();
         if a_size.len() != 2 || w_size.len() != 2 {
             return Err(bad("a = [M, K], w = [N, K]"));
         }
         let (m, k) = (a_size[0], a_size[1]);
         let n = w_size[0];
-        if w_size[1] != k || scale.numel() != n as usize || out.size() != [m, n] {
+        if w_size[1] != k || scale.numel() != n || out.shape() != [m, n].as_slice() {
             return Err(bad("w = [N, K], scale = [N], out = [M, N]"));
         }
         let args = Fp8GemmArgs {
-            a: a.data_ptr() as u64,
-            w: w.data_ptr() as u64,
-            scale: scale.data_ptr() as u64,
-            c: out.data_ptr() as u64,
+            a: a.device_ptr(),
+            w: w.device_ptr(),
+            scale: scale.device_ptr(),
+            c: out.device_ptr(),
             m: m as u32,
             n: n as u32,
             k: k as u32,
-            stride_am: a.stride()[0] as u32,
-            stride_ak: a.stride()[1] as u32,
-            stride_wn: w.stride()[0] as u32,
-            stride_wk: w.stride()[1] as u32,
-            stride_cm: out.stride()[0] as u32,
-            stride_cn: out.stride()[1] as u32,
+            stride_am: a.strides()[0] as u32,
+            stride_ak: a.strides()[1] as u32,
+            stride_wn: w.strides()[0] as u32,
+            stride_wk: w.strides()[1] as u32,
+            stride_cm: out.strides()[0] as u32,
+            stride_cn: out.strides()[1] as u32,
         };
         let pack = fp8_gemm_args(&self.abi, &args).map_err(bad_abi)?;
         let mut params = pack.kernel_params().map_err(bad_abi)?;
-        let grid = fp8_gemm_grid(m as usize, n as usize, kernel).map_err(bad_abi)?;
+        let grid = fp8_gemm_grid(m, n, kernel).map_err(bad_abi)?;
         // SAFETY: as `gemv`.
         unsafe { self.kernels.launch(kernel, grid, &mut params, self.stream) }.map_err(driver)
     }

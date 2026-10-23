@@ -1,18 +1,19 @@
 // Gated kernel-level gate for the paged attention launcher: one query row per
 // token against its own prefix window (the R10.3 prefill shape) must match the
-// same f32 SDPA the Host fallback runs, for identical bf16 K/V.
+// same f32 reference the Python oracle runs, for identical bf16 K/V.
 //
-//   cargo test --release --features cuda --test paged_attention_kernel \
-//     -- --ignored --nocapture
+//   cargo test --release --features cudarc --test paged_attention_kernel \
+//     -- --ignored --nocapture --test-threads=1
 //
 // (needs a CUDA device; reads only the FTW config for the head geometry, so no
 // model weights are loaded and it runs in seconds.)
 
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cudarc")]
 
 use ferrum_torrens::infrastructure::cuda_attention::PagedAttention;
-use ferrum_torrens::infrastructure::torch::{self, Device, to_f32_vec};
-use tch::{Kind, Tensor};
+use ferrum_torrens::infrastructure::cudarc::{Runtime, TensorDType};
+use ferrum_torrens::infrastructure::torch::Device;
+use half::bf16;
 
 const FTW_DIR: &str = ".model-cache/Qwen3.6-35B-A3B-NVFP4.ftw";
 
@@ -27,36 +28,188 @@ fn data(n: usize, salt: u64) -> Vec<f32> {
         .collect()
 }
 
-#[test]
-#[ignore = "requires a cuda device"]
-fn one_query_row_per_token_matches_causal_sdpa() {
-    let device = torch::auto_device();
-    let Device::Cuda(_) = device else {
-        eprintln!("skipping: no cuda device");
-        return;
-    };
+fn narrow(values: &[f32]) -> Vec<bf16> {
+    values.iter().map(|v| bf16::from_f32(*v)).collect()
+}
+
+fn widen(values: &[bf16]) -> Vec<f32> {
+    values.iter().map(|v| v.to_f32()).collect()
+}
+
+fn open() -> Option<Runtime> {
+    match Runtime::open(0) {
+        Ok(rt) => Some(rt),
+        Err(e) => {
+            eprintln!("skipping: no cudarc runtime: {e}");
+            None
+        }
+    }
+}
+
+fn params() -> ferrum_torrens::domain::model::ModelParams {
     let cfg: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(format!("{FTW_DIR}/config.json")).unwrap())
             .unwrap();
-    let params =
-        ferrum_torrens::models::qwen3_6::config::parse_text_config(&cfg["text_config"]).unwrap();
-    let (qh, kvh, hd) = (params.num_q_heads, params.num_kv_heads, params.head_dim);
+    ferrum_torrens::models::qwen3_6::config::parse_text_config(&cfg["text_config"]).unwrap()
+}
+
+/// The Python oracle: one query per (row, head), softmax over the row's
+/// prefix window, output stored at bf16 width.
+#[allow(clippy::too_many_arguments)]
+fn reference(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    locs: &[i32],
+    positions: &[i32],
+    rows: usize,
+    q_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    window: usize,
+) -> Vec<f32> {
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let mut out = vec![0.0f32; rows * q_heads * head_dim];
+    for row in 0..rows {
+        let end = (positions[row] as usize + 1).min(window);
+        if end == 0 {
+            continue;
+        }
+        for head in 0..q_heads {
+            let kv_head = head * kv_heads / q_heads;
+            let q_base = (row * q_heads + head) * head_dim;
+            let mut scores = vec![0.0f32; end];
+            let mut max = f32::NEG_INFINITY;
+            for (token, score) in scores.iter_mut().enumerate() {
+                let loc = locs[row * window + token] as usize;
+                let k_base = (loc * kv_heads + kv_head) * head_dim;
+                let dot: f32 = (0..head_dim).map(|d| q[q_base + d] * k[k_base + d]).sum();
+                *score = dot * scale;
+                max = max.max(*score);
+            }
+            let mut sum = 0.0f32;
+            for score in &mut scores {
+                *score = (*score - max).exp();
+                sum += *score;
+            }
+            for d in 0..head_dim {
+                let acc: f32 = scores
+                    .iter()
+                    .enumerate()
+                    .map(|(token, p)| {
+                        let loc = locs[row * window + token] as usize;
+                        let v_base = (loc * kv_heads + kv_head) * head_dim;
+                        p * v[v_base + d]
+                    })
+                    .sum();
+                out[q_base + d] = bf16::from_f32(acc / sum).to_f32();
+            }
+        }
+    }
+    out
+}
+
+fn max_diff(got: &[f32], want: &[f32]) -> f32 {
+    let scale = want.iter().fold(0.0f32, |acc, v| acc.max(v.abs()));
+    got.iter()
+        .zip(want)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max)
+        / scale
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_and_check(
+    rt: &Runtime,
+    params: &ferrum_torrens::domain::model::ModelParams,
+    q_host: &[f32],
+    k_slab_host: &[f32],
+    v_slab_host: &[f32],
+    locs_host: &[i32],
+    positions_host: &[i32],
+    rows: usize,
+    window: usize,
+    what: &str,
+) {
+    let (q_heads, kv_heads, head_dim) = (params.num_q_heads, params.num_kv_heads, params.head_dim);
+    let q = rt
+        .from_slice_bf16(&narrow(q_host), &[rows, q_heads, head_dim])
+        .unwrap();
+    let k = rt
+        .from_slice_bf16(
+            &narrow(k_slab_host),
+            &[
+                k_slab_host.len() / (kv_heads * head_dim),
+                kv_heads,
+                head_dim,
+            ],
+        )
+        .unwrap();
+    let v = rt
+        .from_slice_bf16(
+            &narrow(v_slab_host),
+            &[
+                v_slab_host.len() / (kv_heads * head_dim),
+                kv_heads,
+                head_dim,
+            ],
+        )
+        .unwrap();
+    let locs = rt.from_slice_i32(locs_host, &[rows, window]).unwrap();
+    let positions = rt.from_slice_i32(positions_host, &[rows]).unwrap();
+    let out = rt
+        .zeros(&[rows, q_heads, head_dim], TensorDType::Bf16)
+        .unwrap();
+
+    let attn = PagedAttention::new(Device::Cuda(0), params, rt.raw_stream()).unwrap();
+    // SAFETY: every tensor is a live device allocation in this launcher's
+    // context, and `locs` names rows of the contiguous K/V slabs.
+    unsafe {
+        attn.decode(
+            &q,
+            &out,
+            k.device_ptr(),
+            v.device_ptr(),
+            &locs,
+            &positions,
+            true,
+        )
+    }
+    .unwrap();
+    rt.synchronize().unwrap();
+
+    let want = reference(
+        &widen(&narrow(q_host)),
+        k_slab_host,
+        v_slab_host,
+        locs_host,
+        positions_host,
+        rows,
+        q_heads,
+        kv_heads,
+        head_dim,
+        window,
+    );
+    let got = out.to_host_f32().unwrap();
+    let diff = max_diff(&got, &want);
+    println!("{what}: {} values, max|d|={diff:.3e} of scale", got.len());
+    assert!(
+        diff < 1e-2,
+        "{what} drifted from the CPU oracle: {diff:.3e}"
+    );
+}
+
+#[test]
+#[ignore = "requires a cuda device"]
+fn one_query_row_per_token_matches_causal_sdpa() {
+    let Some(rt) = open() else { return };
+    let params = params();
+    let (q_heads, kv_heads, head_dim) = (params.num_q_heads, params.num_kv_heads, params.head_dim);
     let t = 6usize;
 
-    let dev = device.to_tch();
-    let in_dtype = (Kind::BFloat16, dev);
-    let q = Tensor::from_slice(&data(t * qh * hd, 11))
-        .to_kind(in_dtype.0)
-        .to(in_dtype.1);
-    let k = Tensor::from_slice(&data(t * kvh * hd, 29))
-        .to_kind(in_dtype.0)
-        .to(in_dtype.1);
-    let v = Tensor::from_slice(&data(t * kvh * hd, 47))
-        .to_kind(in_dtype.0)
-        .to(in_dtype.1);
-    let q = q.reshape([t as i64, qh as i64, hd as i64]);
-    let k = k.reshape([t as i64, kvh as i64, hd as i64]);
-    let v = v.reshape([t as i64, kvh as i64, hd as i64]);
+    let q = data(t * q_heads * head_dim, 11);
+    let k = narrow(&data(t * kv_heads * head_dim, 29));
+    let v = narrow(&data(t * kv_heads * head_dim, 47));
 
     // Row r reads locations 0..=r out of the shared [t, kvh, hd] slabs.
     let mut locs = vec![0i32; t * t];
@@ -65,113 +218,48 @@ fn one_query_row_per_token_matches_causal_sdpa() {
             *dst = j as i32;
         }
     }
-    let locs = Tensor::from_slice(&locs)
-        .reshape([t as i64, t as i64])
-        .to(dev);
-    let positions = Tensor::from_slice(&(0..t as i32).collect::<Vec<_>>()).to(dev);
-    let out = Tensor::zeros([t as i64, qh as i64, hd as i64], (Kind::BFloat16, dev));
+    let positions: Vec<i32> = (0..t as i32).collect();
 
-    let attn = PagedAttention::new(device, &params, std::ptr::null_mut()).unwrap();
-    // SAFETY: every tensor is a live device allocation in this launcher's
-    // context, and `locs` names rows of the contiguous K/V slabs.
-    unsafe {
-        attn.decode(
-            &q,
-            &out,
-            k.data_ptr() as u64,
-            v.data_ptr() as u64,
-            &locs,
-            &positions,
-            true,
-        )
-    }
-    .unwrap();
-
-    // The Host fallback's arithmetic: f32 upcast, repeat-interleave GQA, causal
-    // SDPA, `[t, qh * hd]` out.
-    let (qf, kf, vf) = (
-        q.to_kind(Kind::Float),
-        k.to_kind(Kind::Float),
-        v.to_kind(Kind::Float),
-    );
-    let rep = (qh / kvh) as i64;
-    let kf = kf
-        .unsqueeze(2)
-        .expand([t as i64, kvh as i64, rep, hd as i64], true)
-        .reshape([t as i64, qh as i64, hd as i64]);
-    let vf = vf
-        .unsqueeze(2)
-        .expand([t as i64, kvh as i64, rep, hd as i64], true)
-        .reshape([t as i64, qh as i64, hd as i64]);
-    let scale = 1.0 / (hd as f64).sqrt();
-    let mask: Option<Tensor> = None;
-    let expected = Tensor::scaled_dot_product_attention(
-        &qf.transpose(0, 1).unsqueeze(0),
-        &kf.transpose(0, 1).unsqueeze(0),
-        &vf.transpose(0, 1).unsqueeze(0),
-        mask.as_ref(),
-        0.0,
-        true,
-        scale,
-        false,
-    )
-    .squeeze_dim(0)
-    .transpose(0, 1)
-    .reshape([t as i64, (qh * hd) as i64]);
-
-    let got = to_f32_vec(&out.reshape([t as i64, (qh * hd) as i64]));
-    // The cubin's output pointer is bf16 (decision 87); compare at that width.
-    let want = to_f32_vec(&expected.to_kind(Kind::BFloat16));
-    let scale = want.iter().fold(0.0f32, |acc, v| acc.max(v.abs()));
-    let diff = got
-        .iter()
-        .zip(&want)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0f32, f32::max)
-        / scale;
-    assert!(
-        diff < 1e-2,
-        "paged prefill window drifted from causal SDPA: {diff:.3e} of scale"
+    run_and_check(
+        &rt,
+        &params,
+        &q,
+        &widen(&k),
+        &widen(&v),
+        &locs,
+        &positions,
+        t,
+        t,
+        "paged prefill window",
     );
 }
 
 #[test]
 #[ignore = "requires a cuda device"]
 fn pool_slab_window_matches_the_stored_prefix() {
-    use ferrum_torrens::infrastructure::kvcache_dev::{KvDType, MhaPool};
-
-    let device = torch::auto_device();
-    let Device::Cuda(_) = device else {
-        eprintln!("skipping: no cuda device");
-        return;
-    };
-    let cfg: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(format!("{FTW_DIR}/config.json")).unwrap())
-            .unwrap();
-    let params =
-        ferrum_torrens::models::qwen3_6::config::parse_text_config(&cfg["text_config"]).unwrap();
-    let (qh, kvh, hd) = (params.num_q_heads, params.num_kv_heads, params.head_dim);
+    let Some(rt) = open() else { return };
+    let params = params();
+    let (q_heads, kv_heads, head_dim) = (params.num_q_heads, params.num_kv_heads, params.head_dim);
     let t = 6usize;
+    let num_pages = 32usize;
 
-    let dev = device.to_tch();
-    let q = Tensor::from_slice(&data(t * qh * hd, 11))
-        .to_kind(Kind::BFloat16)
-        .to(dev)
-        .reshape([t as i64, qh as i64, hd as i64]);
-    let k = Tensor::from_slice(&data(t * kvh * hd, 29))
-        .to_kind(Kind::BFloat16)
-        .to(dev)
-        .reshape([t as i64, kvh as i64, hd as i64]);
-    let v = Tensor::from_slice(&data(t * kvh * hd, 47))
-        .to_kind(Kind::BFloat16)
-        .to(dev)
-        .reshape([t as i64, kvh as i64, hd as i64]);
+    let q = data(t * q_heads * head_dim, 11);
+    let k = narrow(&data(t * kv_heads * head_dim, 29));
+    let v = narrow(&data(t * kv_heads * head_dim, 47));
 
     // The pool stores K/V at scattered page ids; the window must name the
     // token's own page, not its position.
     let pages: [u32; 6] = [5, 2, 9, 0, 7, 3];
-    let pool = MhaPool::new(&params, 32, KvDType::BFloat16, device);
-    pool.store(3, &pages, &k, &v);
+    let mut k_slab = vec![0.0f32; num_pages * kv_heads * head_dim];
+    let mut v_slab = vec![0.0f32; num_pages * kv_heads * head_dim];
+    for (token, page) in pages.iter().enumerate() {
+        let dst = *page as usize * kv_heads * head_dim;
+        let src = token * kv_heads * head_dim;
+        k_slab[dst..dst + kv_heads * head_dim]
+            .copy_from_slice(&widen(&k[src..src + kv_heads * head_dim]));
+        v_slab[dst..dst + kv_heads * head_dim]
+            .copy_from_slice(&widen(&v[src..src + kv_heads * head_dim]));
+    }
 
     let mut locs = vec![0i32; t * t];
     for r in 0..t {
@@ -179,59 +267,18 @@ fn pool_slab_window_matches_the_stored_prefix() {
             locs[r * t + j] = pages[j] as i32;
         }
     }
-    let locs = Tensor::from_slice(&locs)
-        .reshape([t as i64, t as i64])
-        .to(dev);
-    let positions = Tensor::from_slice(&(0..t as i32).collect::<Vec<_>>()).to(dev);
-    let out = Tensor::zeros([t as i64, qh as i64, hd as i64], (Kind::BFloat16, dev));
+    let positions: Vec<i32> = (0..t as i32).collect();
 
-    let attn = PagedAttention::new(device, &params, std::ptr::null_mut()).unwrap();
-    let (k_ptr, v_ptr) = pool.kv_slab_ptrs(3);
-    // SAFETY: all tensors are live device allocations in this context; `pages`
-    // names the pool rows just written.
-    unsafe { attn.decode(&q, &out, k_ptr, v_ptr, &locs, &positions, true) }.unwrap();
-
-    let (qf, kf, vf) = (
-        q.to_kind(Kind::Float),
-        k.to_kind(Kind::Float),
-        v.to_kind(Kind::Float),
-    );
-    let rep = (qh / kvh) as i64;
-    let kf = kf
-        .unsqueeze(2)
-        .expand([t as i64, kvh as i64, rep, hd as i64], true)
-        .reshape([t as i64, qh as i64, hd as i64]);
-    let vf = vf
-        .unsqueeze(2)
-        .expand([t as i64, kvh as i64, rep, hd as i64], true)
-        .reshape([t as i64, qh as i64, hd as i64]);
-    let scale = 1.0 / (hd as f64).sqrt();
-    let mask: Option<Tensor> = None;
-    let expected = Tensor::scaled_dot_product_attention(
-        &qf.transpose(0, 1).unsqueeze(0),
-        &kf.transpose(0, 1).unsqueeze(0),
-        &vf.transpose(0, 1).unsqueeze(0),
-        mask.as_ref(),
-        0.0,
-        true,
-        scale,
-        false,
-    )
-    .squeeze_dim(0)
-    .transpose(0, 1)
-    .reshape([t as i64, (qh * hd) as i64]);
-
-    let got = to_f32_vec(&out.reshape([t as i64, (qh * hd) as i64]));
-    let want = to_f32_vec(&expected.to_kind(Kind::BFloat16));
-    let scale = want.iter().fold(0.0f32, |acc, v| acc.max(v.abs()));
-    let diff = got
-        .iter()
-        .zip(&want)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0f32, f32::max)
-        / scale;
-    assert!(
-        diff < 1e-2,
-        "pool slab window drifted from causal SDPA: {diff:.3e} of scale"
+    run_and_check(
+        &rt,
+        &params,
+        &q,
+        &k_slab,
+        &v_slab,
+        &locs,
+        &positions,
+        t,
+        t,
+        "pool slab window",
     );
 }
