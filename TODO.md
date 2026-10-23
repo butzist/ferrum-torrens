@@ -174,7 +174,12 @@ tok/s at 2057 (+30.3%)**, 517 flat (400.9), and `gdn_qkvz` **718.8 -> 269.3 ms**
 (-62.5%) / total 1991-token step 2890 -> 2239 ms. The next grouped-MoE lever is
 still the compacted nonempty-segment grid (proposal in `OPTIMIZATION.md`
 R10.8).
-Progress history and the full decision log (numbers 1..123) live in `DONE.md`;
+M7.1 landed the torch-less `cudarc` tensor adapter behind the non-default
+`cudarc` feature (decision 126): GEMM/rms_norm/gather/elementwise parity and
+capture replay are gated, and the devshell links CUDA 13.4 cuBLAS. It is not on
+the serving path; M7.2/M7.3 (load and forward) are next.
+
+Progress history and the full decision log (numbers 1..126) live in `DONE.md`;
 read that for the "why" behind any decision number referenced in code or tests.
 
 Goal: a **minimal, fast, single-GPU** Rust serving engine for **one model** --
@@ -461,11 +466,18 @@ any port.
   cudarc + CUDA 13.4 libcublas 13.8.0.4 is bit-exact and within 1.1% of tch on
   the prefill shapes; CUDA 12.9 cuBLAS is the 16-44% slowdown M7.0 blamed on
   candle. Engine-owned-buffer capture and cubin interop are exact.
-- [ ] **M7.1 runtime adapter (cudarc).** Pin `cuda-13040`; port the
-  `ComputeRuntime` surface (device/owned buffer/stream/GEMM/cast/slice/gather)
-  over `src/infrastructure/cudarc.rs` and prove it against tch on small shapes.
-  The devshell must ship a CUDA 13.4+ libcublas for M7.5 (Triton keeps 12.9
-  ptxas); until then the libtorch-bundled 13.8 root is the test loader.
+- [x] **M7.1 runtime adapter (cudarc) -- landed (2026-10-23, decision 126).**
+  `src/infrastructure/cudarc.rs` now owns a `Tensor` handle (bf16/f32/i32/i64,
+  shape/strides/offset, shared buffer), from-slice/zeros/upload/download,
+  view/reshape/narrow/transpose/contiguous, add/mul, bf16<->f32 cast, bf16
+  `matmul_nt` on `gemm_bf16_nt`, `rms_norm`/`add_rms_norm` through the
+  `add_rmsnorm` cubin, and row `index_select`. Generic elementwise kernels joined
+  the `linear` manifest section. Per-op parity, capture replay and cubin interop
+  are gated in `tests/cudarc_adapter.rs`. The devshell now ships
+  `cudaPackages_13_4.libcublas` in a merged `CUDA_HOME` with
+  `CUDARC_CUDA_VERSION=13040`; Triton keeps its 12.9 ptxas. Remaining for M7.3:
+  the non-dense tch surface (exp/log/reductions/topk/softmax, f32 matmul/bmm,
+  prefill conv1d, plain causal SDPA, cat/stack/expand/select and friends).
 - [ ] **M7.2 weights/load.** FTW dense widening and upload through candle;
   `domain::dequant` stays the host transform.
 - [ ] **M7.3 forward.** Port `forward_torch.rs` off `tch::Tensor`; the scalar

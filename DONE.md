@@ -3918,3 +3918,50 @@ subsection names are kept verbatim.
      - Logs `/tmp/opencode/m7_1a/` (`gate1_cuda13nix_steady.log` is the
        headline; `gate1_cuda12_steady.log` is the failure).
 
+126. **M7.1 lands the cudarc tensor adapter and a CUDA 13.4 devshell cuBLAS**
+     (2026-10-23, branch `m7-torchless`). The adapter is behind the non-default
+     `cudarc` feature and not on the serving path; no forward code moved.
+     - **Adapter.** `infrastructure/cudarc.rs` now has a `Tensor` handle over a
+       reference-counted `CudaSlice` with a row-major shape, element strides and
+       a view offset (bf16/f32/i32/i64). It provides from-slice/zeros,
+       upload/download, `view`/`reshape`/`narrow`/`transpose`/`contiguous`,
+       `add`/`mul`, bf16<->f32 cast, bf16 `matmul_nt` on the proven
+       `gemm_bf16_nt`, `rms_norm`/`add_rms_norm` through the `add_rmsnorm`
+       cubin, and row `index_select`. `Runtime` is now cheaply cloneable and
+       loads the committed linear cubins once; the existing raw-pointer,
+       stream, allocation and capture hooks are unchanged.
+     - **Kernels.** Five generic Triton kernels joined the `linear` manifest
+       section: `add`/`mul` (bf16 and f32), bf16<->f32 cast, bf16 row
+       index-select by an i64 device index, and a rank-4 strided copy (bf16/f32)
+       for `contiguous()`. `aot.py`, `compile_check.py`, `signatures.py` and
+       `kernel_abi.rs` list them; `scripts/check-kernels.sh` lowers all 29
+       kernels for sm_120. They carry no model shape.
+     - **Toolchain.** `flake.nix` builds a merged `cudarc-cuda-home` from
+       `cudaPackages_13_4.libcublas` (13.8.0.4) over the 12.9 cudatoolkit, sets
+       `CUDA_HOME` to it and `CUDARC_CUDA_VERSION=13040`, and prepends its lib
+       to `LD_LIBRARY_PATH`; Triton keeps `${pkgs.cudatoolkit}/bin/ptxas`.
+       Validated in `nix develop`: `libcublas.so.13` resolves to
+       `/nix/store/vl2x8p9vxcp6qbgy5x77bpfa1znpvq7p-cuda13.4-libcublas-13.8.0.4-lib/lib/libcublas.so.13.8.0.4`.
+     - **Parity/capture/interop** (`tests/cudarc_adapter.rs`, `--ignored`,
+       devshell): add/mul/cast max|d|=0 on small shapes; matmul_nt 8/8
+       bit-exact; rms_norm 4096/4096 max|d|=0; index_select 12/12 bit-exact;
+       reshape/narrow/transpose 38/38 bit-exact; a GEMM + add_rmsnorm capture
+       replays 131072/131072 bit-exact twice with a stable output pointer; the
+       tch-fed add_rmsnorm interop is 131072/131072 bit-exact for sum and out.
+       The four layout unit tests run under `--features cudarc` without a GPU.
+     - **Surface inventory forcing M7.3** (`forward_torch.rs`, Tensor calls):
+       size 46, unsqueeze 48, reshape 45, transpose 30, narrow 27, view 20,
+       to_kind 20, matmul 12, sum_dim_intlist 11, bmm 7, silu 8, exp 12,
+       sqrt 13, reciprocal 8, g_add_scalar 8, pow 7, select 10, squeeze_dim 8,
+       shallow_clone 12, expand 5, contiguous 5, index_select 4, to_device 4,
+       copy_ 3, conv1d 2, cos/sin 2, add_rms_norm 2, tri_solve 1, softmax 1,
+       topk 1, cumsum 1, masked_fill 1, comparisons 4, plus `zeros` 16,
+       `arange` 7, `cat` 5, `from_slice` 5, `empty` 4, `zeros_like` 2, `stack` 1,
+       `scaled_dot_product_attention` 2 and many `+ - * /` operators. The
+       adapter covers GEMM, norm, gather, casts, add/mul and the view layer;
+       already-cubin-covered ops are add_rms_norm, gdn_decode, conv_decode,
+       gdn_tri_solve, paged_attention, nvfp4/fp8 GEMV/GEMM and silu_mul. M7.3
+       still needs exp/log/softmax/topk/reductions, f32 matmul/bmm, prefill
+       conv1d, plain causal SDPA, cat/stack/expand/repeat/select/split,
+       comparisons/masked_fill, and zeros_like/empty.
+     - Logs `/tmp/opencode/m7_1/`.

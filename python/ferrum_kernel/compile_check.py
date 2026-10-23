@@ -37,6 +37,13 @@ from .nvfp4_moe import (
 from .offload import _ensure_experts_kernel, _index_copy_multi_kernel
 from .attention import _paged_attention_decode_kernel
 from .conv import _conv_decode_kernel
+from .elementwise import (
+    _binary_kernel,
+    _cast_bf16_f32_kernel,
+    _cast_f32_bf16_kernel,
+    _copy_strided_kernel,
+    _index_select_rows_kernel,
+)
 from .gdn import _gdn_decode_kernel, _gdn_tri_solve_kernel
 from .norm import _add_rmsnorm_kernel
 from .fp8_linear import (
@@ -45,7 +52,12 @@ from .fp8_linear import (
     _fp8_splitk_reduce_kernel,
 )
 from .linear import _nvfp4_dense_gemv_kernel
+from .signatures import binary as _binary_sig
+from .signatures import binary_constexprs
+from .signatures import cast as _cast_sig, cast_constexprs
 from .signatures import conv_decode as _conv_decode_sig
+from .signatures import copy_strided as _copy_strided_sig, copy_strided_constexprs
+from .signatures import index_select as _index_select_sig, index_select_constexprs
 from .signatures import conv_decode_constexprs
 from .signatures import fp8_gemm as _fp8_gemm_sig
 from .signatures import fp8_gemm_constexprs
@@ -210,6 +222,38 @@ def main() -> int:
     except Exception as e:  # noqa: BLE001
         failures += 1
         print(f"add_rmsnorm FAILED: {type(e).__name__}: {str(e)[:200]}")
+    # The generic elementwise set the cudarc tensor adapter needs (M7.1).
+    for label, fn, sig, consts in (
+        ("add_bf16", _binary_kernel, _binary_sig("bf16"), binary_constexprs(0)),
+        ("mul_bf16", _binary_kernel, _binary_sig("bf16"), binary_constexprs(1)),
+        ("add_f32", _binary_kernel, _binary_sig("fp32"), binary_constexprs(0)),
+        ("mul_f32", _binary_kernel, _binary_sig("fp32"), binary_constexprs(1)),
+        ("cast_bf16_f32", _cast_bf16_f32_kernel, _cast_sig("bf16", "fp32"), cast_constexprs()),
+        ("cast_f32_bf16", _cast_f32_bf16_kernel, _cast_sig("fp32", "bf16"), cast_constexprs()),
+        (
+            "index_select_bf16",
+            _index_select_rows_kernel,
+            _index_select_sig("bf16"),
+            index_select_constexprs(),
+        ),
+        (
+            "copy_strided_bf16",
+            _copy_strided_kernel,
+            _copy_strided_sig("bf16"),
+            copy_strided_constexprs(),
+        ),
+        (
+            "copy_strided_f32",
+            _copy_strided_kernel,
+            _copy_strided_sig("fp32"),
+            copy_strided_constexprs(),
+        ),
+    ):
+        try:
+            check(label, fn, sig, consts)
+        except Exception as e:  # noqa: BLE001
+            failures += 1
+            print(f"{label} FAILED: {type(e).__name__}: {str(e)[:200]}")
     # The dense NVFP4 GEMV the lm_head runs (TODO.md section 8 item 18).
     try:
         check(

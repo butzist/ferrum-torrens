@@ -145,3 +145,33 @@ of tch on every prefill shape. Engine-owned-buffer capture and cubin interop are
 exact. Proceed with M7.1 on cudarc, pin `cuda-13040`, and add a CUDA 13.4+
 libcublas to the devshell before M7.5.
 
+
+## M7.1 result (2026-10-23): the cudarc adapter and its toolchain
+
+See `DONE.md` 126. The adapter lives behind the non-default `cudarc` feature in
+`src/infrastructure/cudarc.rs`. It covers the dense-path tensor surface the
+M7.3 port needs first: owned bf16/f32/i32/i64 tensors, from-slice/zeros,
+upload/download, view/reshape/narrow/transpose/contiguous, add/mul, bf16<->f32
+cast, bf16 `matmul_nt`, `rms_norm`/`add_rms_norm` via the committed cubin, and
+row `index_select`. Generic elementwise kernels (add/mul/cast/index-select/
+strided copy) were added to the `linear` manifest section; Triton remains the
+only kernel authoring path.
+
+The devshell now provides `cudaPackages_13_4.libcublas` (13.8.0.4) through a
+merged `CUDA_HOME`, sets `CUDARC_CUDA_VERSION=13040`, and puts the 13.4
+`libcublas.so.13` first on `LD_LIBRARY_PATH`. Triton keeps the 12.9 `ptxas`;
+the default and `--features cuda` builds keep their previous headers. The
+merged root was validated with `nix develop` (`libcublas.so.13` resolves to
+the 13.4 store path) and the gates below.
+
+Parity/capture/interop (`tests/cudarc_adapter.rs`, all `--ignored`, run in the
+devshell): add/mul/cast exact on the small-shape table, `matmul_nt` 8/8
+bit-exact, rms_norm 4096/4096 at max|d|=0, index_select 12/12 bit-exact,
+view/narrow/transpose 38/38 bit-exact, a captured GEMM + add_rmsnorm graph
+131072/131072 bit-exact over two replays at a stable output address, and the
+tch-fed `add_rmsnorm` interop 131072/131072 bit-exact for sum and out.
+
+M7.3 still needs the rest of the `tch` surface: exp/log/softmax/topk/reductions,
+f32 matmul and `bmm`, prefill `conv1d`, the plain causal SDPA path,
+cat/stack/expand/repeat/select/split, comparisons/masked_fill, and the
+`zeros_like`/`empty` constructors. The adapter is not on the serving path.

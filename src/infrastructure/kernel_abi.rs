@@ -594,7 +594,18 @@ pub const ADD_RMSNORM: &str = "add_rmsnorm";
 /// The prefill chunk triangular solve (OPTIMIZATION.md R9.3).
 pub const GDN_TRI_SOLVE: &str = "gdn_tri_solve";
 
-const LINEAR_NAMES: [&str; 8] = [
+/// The generic elementwise kernels the cudarc tensor adapter launches (M7.1).
+pub const ADD_BF16: &str = "add_bf16";
+pub const MUL_BF16: &str = "mul_bf16";
+pub const ADD_F32: &str = "add_f32";
+pub const MUL_F32: &str = "mul_f32";
+pub const CAST_BF16_F32: &str = "cast_bf16_f32";
+pub const CAST_F32_BF16: &str = "cast_f32_bf16";
+pub const INDEX_SELECT_BF16: &str = "index_select_bf16";
+pub const COPY_STRIDED_BF16: &str = "copy_strided_bf16";
+pub const COPY_STRIDED_F32: &str = "copy_strided_f32";
+
+const LINEAR_NAMES: [&str; 17] = [
     GDN_DECODE,
     CONV_DECODE,
     ADD_RMSNORM,
@@ -603,6 +614,15 @@ const LINEAR_NAMES: [&str; 8] = [
     FP8_GEMV,
     FP8_SPLITK_REDUCE,
     FP8_GEMM,
+    ADD_BF16,
+    MUL_BF16,
+    ADD_F32,
+    MUL_F32,
+    CAST_BF16_F32,
+    CAST_F32_BF16,
+    INDEX_SELECT_BF16,
+    COPY_STRIDED_BF16,
+    COPY_STRIDED_F32,
 ];
 
 #[derive(Debug, Deserialize)]
@@ -738,6 +758,21 @@ pub fn linear_cubin(name: &str) -> Result<&'static [u8], MoEError> {
             include_bytes!(concat!(env!("OUT_DIR"), "/kernel/fp8_splitk_reduce.cubin"))
         }
         FP8_GEMM => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/fp8_gemm.cubin")),
+        ADD_BF16 => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/add_bf16.cubin")),
+        MUL_BF16 => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/mul_bf16.cubin")),
+        ADD_F32 => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/add_f32.cubin")),
+        MUL_F32 => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/mul_f32.cubin")),
+        CAST_BF16_F32 => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/cast_bf16_f32.cubin")),
+        CAST_F32_BF16 => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/cast_f32_bf16.cubin")),
+        INDEX_SELECT_BF16 => {
+            include_bytes!(concat!(env!("OUT_DIR"), "/kernel/index_select_bf16.cubin"))
+        }
+        COPY_STRIDED_BF16 => {
+            include_bytes!(concat!(env!("OUT_DIR"), "/kernel/copy_strided_bf16.cubin"))
+        }
+        COPY_STRIDED_F32 => {
+            include_bytes!(concat!(env!("OUT_DIR"), "/kernel/copy_strided_f32.cubin"))
+        }
         other => return Err(MoEError::Bad(format!("no committed cubin for {other}"))),
     })
 }
@@ -756,6 +791,21 @@ fn linear_ptx(name: &str) -> &'static str {
             include_str!(concat!(env!("OUT_DIR"), "/kernel/fp8_splitk_reduce.ptx"))
         }
         FP8_GEMM => include_str!(concat!(env!("OUT_DIR"), "/kernel/fp8_gemm.ptx")),
+        ADD_BF16 => include_str!(concat!(env!("OUT_DIR"), "/kernel/add_bf16.ptx")),
+        MUL_BF16 => include_str!(concat!(env!("OUT_DIR"), "/kernel/mul_bf16.ptx")),
+        ADD_F32 => include_str!(concat!(env!("OUT_DIR"), "/kernel/add_f32.ptx")),
+        MUL_F32 => include_str!(concat!(env!("OUT_DIR"), "/kernel/mul_f32.ptx")),
+        CAST_BF16_F32 => include_str!(concat!(env!("OUT_DIR"), "/kernel/cast_bf16_f32.ptx")),
+        CAST_F32_BF16 => include_str!(concat!(env!("OUT_DIR"), "/kernel/cast_f32_bf16.ptx")),
+        INDEX_SELECT_BF16 => {
+            include_str!(concat!(env!("OUT_DIR"), "/kernel/index_select_bf16.ptx"))
+        }
+        COPY_STRIDED_BF16 => {
+            include_str!(concat!(env!("OUT_DIR"), "/kernel/copy_strided_bf16.ptx"))
+        }
+        COPY_STRIDED_F32 => {
+            include_str!(concat!(env!("OUT_DIR"), "/kernel/copy_strided_f32.ptx"))
+        }
         other => panic!("no committed ptx for {other}"),
     }
 }

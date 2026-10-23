@@ -91,6 +91,25 @@
         # nix/kernels.nix.
         kernels = pkgs.callPackage ./nix/kernels.nix {inherit pythonEnv;};
 
+        # M7.1 (cudarc) links a CUDA 13 cuBLAS: the devshell's CUDA 12.9
+        # libcublas is the 16-44% prefill slowdown M7.0 blamed on candle, while
+        # 13.8.0.4 matches ATen. Keep the Triton assembler on 12.9: only the
+        # cudarc feature sees this merged root, and the default/`cuda` builds
+        # still point at the cudatoolkit headers.
+        cudaCublas = pkgs.cudaPackages_13_4.libcublas;
+        cudarcCudaHome = pkgs.runCommand "cudarc-cuda-home" {} ''
+          mkdir -p $out/lib
+          ln -s ${pkgs.cudatoolkit}/bin $out/bin
+          ln -s ${pkgs.cudatoolkit}/include $out/include
+          for f in ${pkgs.cudatoolkit}/lib/*; do
+            ln -s "$f" "$out/lib/$(basename "$f")"
+          done
+          # The 13.4 cuBLAS wins the name over the toolkit's 12.9 copy.
+          for f in ${cudaCublas.lib}/lib/*; do
+            ln -sf "$f" "$out/lib/$(basename "$f")"
+          done
+        '';
+
         # Rust is the production language, and the only one at runtime. Python
         # is used for the one-time HF -> FTW conversion via FreeToken's `ft
         # checkpoint` and for the kernel toolchain (see AGENTS.md).
@@ -123,6 +142,7 @@
           pkgs.python312
           pkgs.uv
           pythonEnv
+          cudarcCudaHome
           libtorchCuda
           # Headers for `--features cuda` builds. The `.dev` output is not in
           # the default output's runtime closure, so it must be listed here to
@@ -166,7 +186,7 @@
           # here puts on the loader path). The shellHook below adds the two parts
           # that are not store paths: the driver's mount point and a matching
           # libstdc++.
-          LD_LIBRARY_PATH = "${pkgs.cudatoolkit}/lib:${libtorchCuda}/lib:${pkgs.zlib}/lib";
+          LD_LIBRARY_PATH = "${cudarcCudaHome}/lib:${pkgs.cudatoolkit}/lib:${libtorchCuda}/lib:${pkgs.zlib}/lib";
 
           # tch build-script configuration: link the nix-provided libtorch instead
           # of downloading one (hence default-features = false in Cargo.toml).
@@ -187,7 +207,10 @@
           # capture mempool needs `<CUDA_HOME>/include` (cuda_runtime_api.h),
           # which libtorch's own headers pull in but its `include` dir does not
           # ship.
-          CUDA_HOME = "${pkgs.cudatoolkit}";
+          CUDA_HOME = "${cudarcCudaHome}";
+          # cudarc's `cuda-version-from-build-system` knob. The library it
+          # actually loads is the 13.4 cuBLAS above.
+          CUDARC_CUDA_VERSION = "13040";
 
           # build.rs copies `$FERRUM_KERNEL_DIR/kernel` into OUT_DIR; the cubins
           # are the `kernels` derivation's output (nix/kernels.nix), built from

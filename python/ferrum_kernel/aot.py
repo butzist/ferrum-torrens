@@ -38,6 +38,13 @@ from triton.backends.nvidia.compiler import CUDAOptions
 from triton.compiler import ASTSource, compile as triton_compile
 
 from .conv import _conv_decode_kernel
+from .elementwise import (
+    _binary_kernel,
+    _cast_bf16_f32_kernel,
+    _cast_f32_bf16_kernel,
+    _copy_strided_kernel,
+    _index_select_rows_kernel,
+)
 from .gdn import _gdn_decode_kernel, _gdn_tri_solve_kernel
 from .norm import _add_rmsnorm_kernel
 from .fp8_linear import (
@@ -73,6 +80,14 @@ from .signatures import (
     SERVING_TOP_K,
     conv_decode,
     conv_decode_constexprs,
+    binary,
+    binary_constexprs,
+    cast,
+    cast_constexprs,
+    copy_strided,
+    copy_strided_constexprs,
+    index_select,
+    index_select_constexprs,
     down_constexprs,
     gate_up_constexprs,
     gdn_decode,
@@ -256,6 +271,60 @@ LINEAR_KERNELS: dict[str, dict] = {
         "signature": add_rmsnorm(),
         "constexprs": add_rmsnorm_constexprs(),
         "num_warps": 8,
+    },
+    "add_bf16": {
+        "fn": _binary_kernel,
+        "signature": binary("bf16"),
+        "constexprs": binary_constexprs(0),
+        "num_warps": 4,
+    },
+    "mul_bf16": {
+        "fn": _binary_kernel,
+        "signature": binary("bf16"),
+        "constexprs": binary_constexprs(1),
+        "num_warps": 4,
+    },
+    "add_f32": {
+        "fn": _binary_kernel,
+        "signature": binary("fp32"),
+        "constexprs": binary_constexprs(0),
+        "num_warps": 4,
+    },
+    "mul_f32": {
+        "fn": _binary_kernel,
+        "signature": binary("fp32"),
+        "constexprs": binary_constexprs(1),
+        "num_warps": 4,
+    },
+    "cast_bf16_f32": {
+        "fn": _cast_bf16_f32_kernel,
+        "signature": cast("bf16", "fp32"),
+        "constexprs": cast_constexprs(),
+        "num_warps": 4,
+    },
+    "cast_f32_bf16": {
+        "fn": _cast_f32_bf16_kernel,
+        "signature": cast("fp32", "bf16"),
+        "constexprs": cast_constexprs(),
+        "num_warps": 4,
+    },
+    "index_select_bf16": {
+        "fn": _index_select_rows_kernel,
+        "signature": index_select("bf16"),
+        "constexprs": index_select_constexprs(),
+        "num_warps": 4,
+    },
+    "copy_strided_bf16": {
+        "fn": _copy_strided_kernel,
+        "signature": copy_strided("bf16"),
+        "constexprs": copy_strided_constexprs(),
+        "num_warps": 4,
+    },
+    "copy_strided_f32": {
+        "fn": _copy_strided_kernel,
+        "signature": copy_strided("fp32"),
+        "constexprs": copy_strided_constexprs(),
+        "num_warps": 4,
     },
 }
 

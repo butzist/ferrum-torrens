@@ -194,7 +194,8 @@ flowchart LR
 
   subgraph KernelAOT["kernel toolchain (devshell, hermetic python)"]
     direction TB
-    K1["python/ferrum_kernel/\nnvfp4_moe.py, offload.py,\nattention.py, gdn.py, linear.py,\nfp8_linear.py, signatures.py"]
+    K1["python/ferrum_kernel/\nnvfp4_moe.py, offload.py,\nattention.py, gdn.py, linear.py,\nfp8_linear.py, signatures.py,
+elementwise.py"]
     K2["aot.py: triton.compile\nGPUTarget cuda sm_120"]
     K3[("kernel/*.cubin + *.ptx\n+ manifest.json (Nix output)")]
     K1 --> K2 --> K3
@@ -208,6 +209,11 @@ flowchart LR
   off, the registry hands back the scalar oracle; with it on, the libtorch
   forward. `cargo fmt` + `cargo clippy` + `cargo test` stay green without the
   feature and must be re-run with it in the devshell.
+- **`cudarc` is a separate non-default feature.** It builds the M7.1 adapter
+  without `tch`, so it can be compiled and tested without libtorch. The devshell
+  points `CUDA_HOME` at a merged root whose `libcublas` is CUDA 13.4 (the 12.9
+  copy is the M7.0 prefill slowdown) and sets `CUDARC_CUDA_VERSION=13040`;
+  Triton keeps the 12.9 `ptxas`.
 - **`build.rs` stages the cubins and compiles the capture bridge.** Every build
   copies `$FERRUM_KERNEL_DIR/kernel` (the `kernels` Nix derivation,
   `nix/kernels.nix`) into `OUT_DIR/kernel`; under `--features cuda` it also
@@ -227,14 +233,17 @@ flowchart LR
   `paged_attention_bf16`, the pool-dtype variants) and
   `linear` (`gdn_decode`, the fused GDN decode, `conv_decode`, the fused GDN
   causal conv + silu, `gdn_tri_solve`, the prefill chunk triangular solve,
-  `nvfp4_dense_gemv`, the lm_head tail, and
-  `fp8_gemv`/`fp8_splitk_reduce`/`fp8_gemm`, the vendored W8A16 FP8 projections).
+  `nvfp4_dense_gemv`, the lm_head tail,
+  `fp8_gemv`/`fp8_splitk_reduce`/`fp8_gemm`, the vendored W8A16 FP8 projections,
+  and the M7.1 elementwise set: `add`/`mul` in bf16 and f32, bf16<->f32 cast,
+  bf16 row `index_select`, and the strided copy `contiguous()` uses).
   The devshell aliases
   `kernel-aot`, `kernel-selftest` (CPU interpreter gate) and
   `kernel-compile-check` are the kernel inner loop.
 - **The devshell exports the roots** `LIBTORCH`, `LIBTORCH_INCLUDE`,
-  `LIBTORCH_LIB`, `CXX`, `CUDA_HOME` and the loader path, and wires Triton's
-  `ptxas` and `libcuda` probes. `scripts/run-gated.sh` (`ft-gate`) runs the
+  `LIBTORCH_LIB`, `CXX`, `CUDA_HOME` (the merged 12.9 toolkit + 13.4 cuBLAS
+  root cudarc links), `CUDARC_CUDA_VERSION` and the loader path, and wires
+  Triton's `ptxas` (still 12.9) and `libcuda` probes. `scripts/run-gated.sh` (`ft-gate`) runs the
   heavy real-checkpoint tests serially under an `RLIMIT_AS` cap.
 - **The Nix side is three files.** `flake.nix` owns the project (the toolchain
   packages and the devshell), `nix/kernels.nix` builds the cubins, and
@@ -814,6 +823,7 @@ reaches the oracle token through the captured graph.
 | Library / tool | Kind | Used by | Purpose |
 |---|---|---|---|
 | `libtorch` (via `tch`) | runtime, `cuda` feature | `infrastructure/torch.rs`, `models/qwen3_6/forward_torch.rs`, `infrastructure/kvcache_dev.rs`, `infrastructure/cuda_moe.rs`, `infrastructure/decode_graph.rs` | All dense compute (GEMMs, norms, rope, attention, GDN), device tensors, the KV/state slabs, and the MoE slot banks |
+| `cudarc` 0.19.10 | runtime, non-default `cudarc` feature | `infrastructure/cudarc.rs`, `tests/cudarc_adapter.rs` | M7.1 torch-less tensor adapter: owned bf16/f32/i32/i64 buffers, cuBLAS BF16 GEMM, committed cubins, capture, and the elementwise kernels; not on the serving path |
 | CUDA driver API (`libcuda.so.1`) | runtime, hand-rolled FFI | `infrastructure/cuda_driver.rs` | Load and launch the cubins, allocate device + page-locked memory, capture and replay CUDA graphs |
 | Triton (cubins) | build-time authoring; artifacts embedded at compile time | `python/ferrum_kernel/*`, `nix/kernels.nix` | The hand-written NVFP4 grouped-MoE GEMV, the silu/sum-reduce, the two offload staging kernels, and the paged GQA decode attention kernel. Authored and AOT-compiled in Python; launched by `cuda_driver` with no interpreter at runtime |
 | `c10_cuda` (torch C++) | runtime, via `build.rs` shim | `shim/c10_graph_shim.cpp`, `infrastructure/cuda_graph.rs`, `infrastructure/decode_graph.rs` | The torch current-stream set and the graph memory pool that `tch` does not expose; needed for CUDA-graph capture of torch ops |
@@ -824,13 +834,14 @@ reaches the oracle token through the captured graph.
 Boundary note: `tch`/`Tensor` and the CUDA driver handles live entirely in
 `infrastructure`; the domain sees only `MoETensor`, counts and opaque bytes.
 
-**Planned boundary `[TODO]`: torch-less tensor runtime (M7).** Replace `tch`
-with a Rust tensor runtime (candle 0.11 first, a minimal cudarc layer as the
-fallback) behind the same `cuda` adapter boundary. The domain, the FTW reader,
-the scalar oracle and every cubin ABI stay put; the adapter would own device
-tensors, cuBLAS GEMM, raw pointers and the stream the driver launches on, and
-`shim/c10_graph_shim.cpp` would disappear with libtorch. Nothing is built yet;
-the M7.0 spike (decision 114) decides it before a port.
+**Planned boundary `[partial]`: torch-less tensor runtime (M7).** Replace
+`tch` with a Rust tensor runtime behind the same `cuda` adapter boundary.
+M7.0 chose a minimal `cudarc` layer over candle (decision 124); M7.1 built it
+behind the non-default `cudarc` feature (decision 126). It owns device tensors,
+cuBLAS BF16 GEMM, the committed cubins, raw pointers and the stream the driver
+launches on, and its capture/parity gates are green. It is not on the serving
+path: `forward_torch.rs` still uses `tch` until M7.3, and
+`shim/c10_graph_shim.cpp` disappears with libtorch in M7.5.
 
 ---
 

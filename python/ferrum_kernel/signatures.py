@@ -13,6 +13,7 @@ baked into the cubin rather than passed at launch.
 from __future__ import annotations
 
 from .conv import CONV_BLOCK_N
+from .elementwise import COPY_BLOCK, ELEM_BLOCK, SELECT_BLOCK
 from .gdn import GDN_BV, GDN_SOLVE_BV, GDN_SOLVE_N
 from .fp8_linear import (
     GEMM_BLOCK_K as FP8_GEMM_BLOCK_K,
@@ -575,3 +576,67 @@ def fp8_gemm_constexprs() -> dict:
         "BLOCK_N": FP8_GEMM_BLOCK_N,
         "BLOCK_K": FP8_GEMM_BLOCK_K,
     }
+
+
+def binary(dtype: str = SERVING_DTYPE) -> dict:
+    """Flat add/mul for the cudarc tensor adapter; `OP` picks the elementwise op."""
+    return {
+        "a_ptr": f"*{dtype}",
+        "b_ptr": f"*{dtype}",
+        "out_ptr": f"*{dtype}",
+        "n": "i32",
+        "OP": "constexpr",
+        "BLOCK": "constexpr",
+    }
+
+
+def binary_constexprs(op: int, block: int = ELEM_BLOCK) -> dict:
+    return {"OP": op, "BLOCK": block}
+
+
+def cast(src_dtype: str, dst_dtype: str) -> dict:
+    return {
+        "src_ptr": f"*{src_dtype}",
+        "out_ptr": f"*{dst_dtype}",
+        "n": "i32",
+        "BLOCK": "constexpr",
+    }
+
+
+def cast_constexprs(block: int = ELEM_BLOCK) -> dict:
+    return {"BLOCK": block}
+
+
+def index_select(dtype: str = SERVING_DTYPE) -> dict:
+    return {
+        "src_ptr": f"*{dtype}",
+        "idx_ptr": "*i64",
+        "out_ptr": f"*{dtype}",
+        "cols": "i32",
+        "BLOCK": "constexpr",
+    }
+
+
+def index_select_constexprs(block: int = SELECT_BLOCK) -> dict:
+    return {"BLOCK": block}
+
+
+def copy_strided(dtype: str = SERVING_DTYPE) -> dict:
+    return {
+        "src_ptr": f"*{dtype}",
+        "dst_ptr": f"*{dtype}",
+        "d0": "i32",
+        "d1": "i32",
+        "d2": "i32",
+        "d3": "i32",
+        "s0": "i32",
+        "s1": "i32",
+        "s2": "i32",
+        "s3": "i32",
+        "n": "i32",
+        "BLOCK": "constexpr",
+    }
+
+
+def copy_strided_constexprs(block: int = COPY_BLOCK) -> dict:
+    return {"BLOCK": block}
