@@ -36,7 +36,7 @@ from .nvfp4_moe import (
 )
 from .offload import _ensure_experts_kernel, _index_copy_multi_kernel
 from .attention import _paged_attention_decode_kernel
-from .conv import _conv_decode_kernel
+from .conv import _conv_decode_kernel, _conv_prefill_kernel
 from .elementwise import (
     _binary_kernel,
     _cast_bf16_f32_kernel,
@@ -62,6 +62,7 @@ from .signatures import binary as _binary_sig
 from .signatures import binary_constexprs
 from .signatures import cast as _cast_sig, cast_constexprs
 from .signatures import conv_decode as _conv_decode_sig
+from .signatures import conv_prefill as _conv_prefill_sig
 from .signatures import copy_strided as _copy_strided_sig, copy_strided_constexprs
 from .signatures import index_select as _index_select_sig, index_select_constexprs
 from .signatures import gather_rows as _gather_rows_sig, gather_rows_constexprs
@@ -70,7 +71,7 @@ from .signatures import cumsum_dim0 as _cumsum_dim0_sig, cumsum_dim0_constexprs
 from .signatures import gdn_ratio_masks as _gdn_ratio_masks_sig, gdn_ratio_masks_constexprs
 from .signatures import mul_mid as _mul_mid_sig, mul_mid_constexprs
 from .signatures import scale_heads as _scale_heads_sig, scale_heads_constexprs
-from .signatures import conv_decode_constexprs
+from .signatures import conv_decode_constexprs, conv_prefill_constexprs
 from .signatures import fp8_gemm as _fp8_gemm_sig
 from .signatures import fp8_gemm_constexprs
 from .signatures import fp8_gemv as _fp8_gemv_sig
@@ -211,6 +212,17 @@ def main() -> int:
         )
     except Exception as e:  # noqa: BLE001
         print(f"conv_decode FAILED: {type(e).__name__}: {str(e)[:200]}")
+        failures += 1
+    # The chunked GDN causal conv + silu (prefill).
+    try:
+        check(
+            "conv_prefill",
+            _conv_prefill_kernel,
+            _conv_prefill_sig(),
+            conv_prefill_constexprs(),
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"conv_prefill FAILED: {type(e).__name__}: {str(e)[:200]}")
         failures += 1
     # The prefill chunk triangular solve (OPTIMIZATION.md R9.3).
     try:

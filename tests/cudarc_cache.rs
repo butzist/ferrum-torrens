@@ -5,7 +5,11 @@
 //!     -- --ignored --nocapture --test-threads=1
 #![cfg(feature = "cudarc")]
 
+use ferrum_torrens::domain::model::{LayerType, ModelParams};
+use ferrum_torrens::domain::weights::DType;
 use ferrum_torrens::infrastructure::cudarc::{Runtime, Tensor, TensorDType};
+use ferrum_torrens::infrastructure::kvcache_dev::{KvDType, MhaPool};
+use ferrum_torrens::infrastructure::torch::Device;
 use half::bf16;
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
@@ -84,5 +88,58 @@ fn gather_and_scatter_rows_match_cpu_copies() -> Res<()> {
             dtype.name()
         );
     }
+    Ok(())
+}
+
+fn pool_params() -> ModelParams {
+    ModelParams {
+        hidden_size: 8,
+        num_layers: 2,
+        vocab_size: 16,
+        num_experts: 4,
+        top_k: 2,
+        moe_intermediate_size: 8,
+        shared_expert_intermediate_size: 8,
+        num_q_heads: 4,
+        num_kv_heads: 2,
+        head_dim: 4,
+        rotary_dim: 4,
+        rope_theta: 1e7,
+        linear_key_head_dim: 4,
+        linear_num_key_heads: 2,
+        linear_value_head_dim: 4,
+        linear_num_value_heads: 2,
+        linear_conv_kernel_dim: 4,
+        gdn_state_recurrent_dtype: DType::F32,
+        rms_norm_eps: 1e-6,
+        layer_types: vec![LayerType::FullAttention, LayerType::FullAttention],
+        max_position_embeddings: 4096,
+        eos_token_id: 0,
+        bos_token_id: 0,
+        expert_slot_bytes: 1,
+    }
+}
+
+#[test]
+#[ignore = "needs a CUDA device"]
+fn gather_native_matches_the_f32_gather_for_a_bf16_pool() -> Res<()> {
+    let rt = Runtime::open(0)?;
+    let pool = MhaPool::new(&pool_params(), 8, KvDType::BFloat16, Device::Cuda(0));
+    let params = pool_params();
+    let (t, kvh, hd) = (3usize, params.num_kv_heads, params.head_dim);
+    let locs = [2u32, 0, 5];
+    let raw = values(t * kvh * hd, 19);
+    let bits: Vec<bf16> = raw.iter().map(|v| bf16::from_f32(*v)).collect();
+    let k = rt.from_slice_bf16(&bits, &[t, kvh, hd])?;
+    let v = rt.from_slice_bf16(&bits, &[t, kvh, hd])?;
+    pool.store(0, &locs, &k, &v);
+
+    let (k_f32, v_f32) = pool.gather(0, &locs);
+    let (k_native, v_native) = pool.gather_native(0, &locs);
+    assert_eq!(k_f32.dtype(), TensorDType::F32);
+    assert_eq!(k_native.dtype(), TensorDType::Bf16);
+    assert_eq!(k_f32.shape(), k_native.shape());
+    assert_eq!(k_f32.to_host_f32()?, k_native.to_host_f32()?);
+    assert_eq!(v_f32.to_host_f32()?, v_native.to_host_f32()?);
     Ok(())
 }

@@ -35,6 +35,10 @@ fn widen(values: &[bf16]) -> Vec<f32> {
     values.iter().map(|v| v.to_f32()).collect()
 }
 
+fn half(values: Vec<f32>) -> Vec<f32> {
+    values.into_iter().map(|v| v * 0.5).collect()
+}
+
 fn open() -> Option<Runtime> {
     match Runtime::open(0) {
         Ok(rt) => Some(rt),
@@ -109,6 +113,83 @@ fn conv_decode_matches_the_scalar_conv_and_silu() {
     let diff = max_abs(&got, &want);
     println!("conv_decode: {} values, max|d|={diff:.3e}", got.len());
     assert!(diff <= 1e-3, "conv_decode max|d|={diff:.3e} > 1e-3");
+}
+
+#[test]
+#[ignore = "needs a CUDA device"]
+fn conv_prefill_matches_the_scalar_chunk_conv_and_silu() {
+    let Some(rt) = open() else { return };
+    let params = params();
+    let (conv_dim, k) = (8192usize, params.linear_conv_kernel_dim);
+    let state_len = k - 1;
+    let gdn = GdnDecode::new(Device::Cuda(0), &params, rt.raw_stream()).unwrap();
+
+    let w_host = narrow(&half(data(conv_dim * k, 5)));
+    let wf = widen(&w_host);
+    let state_host = half(data(conv_dim * state_len, 13));
+
+    for t in [130usize, 1] {
+        let x_host = narrow(&half(data(t * conv_dim, 3)));
+        let xf = widen(&x_host);
+        let x = rt.from_slice_bf16(&x_host, &[t, conv_dim]).unwrap();
+        let w = rt.from_slice_bf16(&w_host, &[conv_dim, k]).unwrap();
+        let state = rt
+            .from_slice_f32(&state_host, &[conv_dim, state_len])
+            .unwrap();
+        let out = rt.zeros(&[t, conv_dim], TensorDType::Bf16).unwrap();
+        let new_state = rt.zeros(&[conv_dim, state_len], TensorDType::F32).unwrap();
+
+        // SAFETY: every tensor is a live allocation on this runtime's stream,
+        // sized for the committed conv prefill cubin, and `state` is read-only.
+        unsafe { gdn.conv_prefill(&x, &w, &state, &out, &new_state) }.unwrap();
+        rt.synchronize().unwrap();
+
+        let width = state_len + t;
+        let mut full = vec![0.0f32; conv_dim * width];
+        for c in 0..conv_dim {
+            let row = &mut full[c * width..(c + 1) * width];
+            row[..state_len].copy_from_slice(&state_host[c * state_len..(c + 1) * state_len]);
+            for i in 0..t {
+                row[state_len + i] = xf[i * conv_dim + c];
+            }
+        }
+        let mut want = vec![0.0f32; t * conv_dim];
+        for c in 0..conv_dim {
+            for i in 0..t {
+                let mut acc = 0.0f32;
+                for p in 0..k {
+                    acc += full[c * width + i + p] * wf[c * k + p];
+                }
+                want[i * conv_dim + c] = bf16::from_f32(silu(acc)).to_f32();
+            }
+        }
+        let mut want_state = vec![0.0f32; conv_dim * state_len];
+        for c in 0..conv_dim {
+            let tail = &full[c * width + width - state_len..(c + 1) * width];
+            want_state[c * state_len..(c + 1) * state_len].copy_from_slice(tail);
+        }
+
+        let got = out.to_host_f32().unwrap();
+        let diff = max_abs(&got, &want);
+        println!(
+            "conv_prefill t={t}: {} values, max|d|={diff:.3e}",
+            got.len()
+        );
+        assert!(diff <= 1e-3, "conv_prefill t={t} max|d|={diff:.3e} > 1e-3");
+
+        let got_state = new_state.to_host_f32().unwrap();
+        let state_diff = max_abs(&got_state, &want_state);
+        println!("conv_prefill t={t} state: max|d|={state_diff:.3e}");
+        assert!(
+            state_diff <= 1e-3,
+            "conv_prefill t={t} state max|d|={state_diff:.3e} > 1e-3"
+        );
+        assert_eq!(
+            state.to_host_f32().unwrap(),
+            state_host,
+            "conv_prefill must not mutate the pre-chunk state"
+        );
+    }
 }
 
 #[test]

@@ -12,7 +12,7 @@ baked into the cubin rather than passed at launch.
 
 from __future__ import annotations
 
-from .conv import CONV_BLOCK_N
+from .conv import CONV_BLOCK_N, CONV_PREFILL_BLOCK
 from .elementwise import (
     COPY_BLOCK,
     ELEM_BLOCK,
@@ -446,6 +446,39 @@ def conv_decode_constexprs(
         "K": k,
         "TAPS": 1 << (k - 1).bit_length(),
         "BLOCK_N": block_n,
+    }
+
+
+def conv_prefill() -> dict:
+    """The chunked GDN causal conv + silu (the prefill counterpart of
+    `conv_decode`). `x`/`w`/`out` are the model dtype, `state`/`new_state` are
+    f32; `state` is read-only, `new_state` is the post-chunk window."""
+    return {
+        "x_ptr": f"*{SERVING_DTYPE}",
+        "w_ptr": f"*{SERVING_DTYPE}",
+        "state_ptr": "*fp32",
+        "out_ptr": f"*{SERVING_DTYPE}",
+        "new_state_ptr": "*fp32",
+        "stride_x": "i32",
+        "stride_out": "i32",
+        "T": "i32",
+        "CONV_DIM": "constexpr",
+        "K": "constexpr",
+        "TAPS": "constexpr",
+        "BLOCK": "constexpr",
+    }
+
+
+def conv_prefill_constexprs(
+    conv_dim: int = SERVING_CONV_DIM,
+    k: int = SERVING_CONV_WIDTH,
+    block: int = CONV_PREFILL_BLOCK,
+) -> dict:
+    return {
+        "CONV_DIM": conv_dim,
+        "K": k,
+        "TAPS": 1 << (k - 1).bit_length(),
+        "BLOCK": block,
     }
 
 

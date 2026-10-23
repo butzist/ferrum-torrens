@@ -195,10 +195,17 @@ impl MhaPool {
         }
     }
 
-    /// Read the K/V at `locs` back, in the order asked.
+    /// Read the K/V at `locs` back, in the order asked, widened to f32.
     pub fn gather(&self, layer: usize, locs: &[u32]) -> (Tensor, Tensor) {
         let idx = self.index(locs);
         self.gather_indexed(layer, &idx)
+    }
+
+    /// `gather` in the pool's own dtype, so a bf16 pool feeds the bf16 SDPA
+    /// without a round trip through f32.
+    pub fn gather_native(&self, layer: usize, locs: &[u32]) -> (Tensor, Tensor) {
+        let idx = self.index(locs);
+        self.gather_indexed_native(layer, &idx)
     }
 
     /// Read one fixed-length window per row: `locs` is `[rows, window]` and the
@@ -220,10 +227,18 @@ impl MhaPool {
     }
 
     fn gather_indexed(&self, layer: usize, idx: &Tensor) -> (Tensor, Tensor) {
-        let slab = self.slab(layer);
-        // Gathers are always f32: the attention math and the paged-kernel
+        // Gathers here are always f32: the attention math and the paged-kernel
         // fallback read f32, and a narrower pool stores bf16 only to save bytes.
         // Upcasting bf16 -> f32 is exact.
+        let (k, v) = self.gather_indexed_native(layer, idx);
+        (
+            k.cast(TensorDType::F32).expect("kv f32"),
+            v.cast(TensorDType::F32).expect("kv f32"),
+        )
+    }
+
+    fn gather_indexed_native(&self, layer: usize, idx: &Tensor) -> (Tensor, Tensor) {
+        let slab = self.slab(layer);
         let cols = self.kv_heads * self.head_dim;
         let n = idx.shape()[0];
         let half = |h: usize| -> Tensor {
@@ -237,8 +252,6 @@ impl MhaPool {
                 .expect("kv slab view");
             rows.gather_rows(idx)
                 .expect("gather kv rows")
-                .cast(TensorDType::F32)
-                .expect("kv f32")
                 .reshape(&[n, self.kv_heads, self.head_dim])
                 .expect("kv rows")
         };

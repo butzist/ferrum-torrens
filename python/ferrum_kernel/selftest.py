@@ -547,6 +547,44 @@ def check_conv(device: torch.device, tol: float, full: bool) -> int:
     return failures
 
 
+def check_conv_prefill(device: torch.device, tol: float, full: bool) -> int:
+    """Chunked causal conv + silu against the plain-torch oracle: a single token
+    (the decode parity case) and a chunk with a non-zero pre-state."""
+    cases = [
+        ("t1", {"t": 1, "conv_dim": 32, "k": 4}),
+        ("chunk", {"t": 130, "conv_dim": 32, "k": 4}),
+    ]
+    if full:
+        cases.append(("qwen-shape", {"t": 130, "conv_dim": 8192, "k": 4}))
+    failures = 0
+    for label, shape in cases:
+        for seed in range(2):
+            g = torch.Generator(device="cpu").manual_seed(seed)
+            dev = torch.device(device)
+            t, conv_dim, k = shape["t"], shape["conv_dim"], shape["k"]
+            x = (torch.randn((t, conv_dim), generator=g, dtype=torch.float32) * 0.5).to(
+                dev
+            ).to(torch.bfloat16)
+            w = (torch.randn((conv_dim, k), generator=g, dtype=torch.float32) * 0.5).to(
+                dev
+            ).to(torch.bfloat16)
+            state = (torch.randn((conv_dim, k - 1), generator=g, dtype=torch.float32) * 0.5).to(dev)
+            want_out, want_state = conv_mod.conv_prefill_reference(x, w, state)
+            got_out = torch.empty((t, conv_dim), dtype=torch.bfloat16, device=device)
+            got_state = torch.empty((conv_dim, k - 1), dtype=torch.float32, device=device)
+            conv_mod.conv_prefill(x, w, state, got_out, got_state)
+            rel_out = (got_out - want_out).abs().max() / want_out.abs().max().clamp(min=1e-6)
+            rel_state = (got_state - want_state).abs().max() / want_state.abs().max().clamp(min=1e-6)
+            print(
+                f"conv_prefill {label} seed {seed}: out rel {rel_out:.3e}, "
+                f"state rel {rel_state:.3e}"
+            )
+            if rel_out.item() > tol or rel_state.item() > tol:
+                failures += 1
+                print(f"conv_prefill {label} seed {seed}: FAIL", file=sys.stderr)
+    return failures
+
+
 def random_norm_case(device: str, rows: int, hidden: int, seed: int):
     g = torch.Generator(device="cpu").manual_seed(seed)
     dev = torch.device(device)
@@ -792,6 +830,12 @@ def main(argv: list[str] | None = None) -> int:
         torch.device(args.device), args.tol, full=args.device != "cpu"
     )
     if conv_failures:
+        print("FAIL", file=sys.stderr)
+        return 1
+    conv_prefill_failures = check_conv_prefill(
+        torch.device(args.device), args.tol, full=args.device != "cpu"
+    )
+    if conv_prefill_failures:
         print("FAIL", file=sys.stderr)
         return 1
     norm_failures = check_norm(

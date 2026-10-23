@@ -37,7 +37,7 @@ from triton.backends.compiler import GPUTarget
 from triton.backends.nvidia.compiler import CUDAOptions
 from triton.compiler import ASTSource, compile as triton_compile
 
-from .conv import _conv_decode_kernel
+from .conv import _conv_decode_kernel, _conv_prefill_kernel
 from .elementwise import (
     _binary_kernel,
     _cast_bf16_f32_kernel,
@@ -96,6 +96,8 @@ from .signatures import (
     SERVING_TOP_K,
     conv_decode,
     conv_decode_constexprs,
+    conv_prefill,
+    conv_prefill_constexprs,
     binary,
     binary_constexprs,
     cast,
@@ -282,6 +284,12 @@ LINEAR_KERNELS: dict[str, dict] = {
         "fn": _conv_decode_kernel,
         "signature": conv_decode(),
         "constexprs": conv_decode_constexprs(),
+        "num_warps": 4,
+    },
+    "conv_prefill": {
+        "fn": _conv_prefill_kernel,
+        "signature": conv_prefill(),
+        "constexprs": conv_prefill_constexprs(),
         "num_warps": 4,
     },
     "gdn_tri_solve": {

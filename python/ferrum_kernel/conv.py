@@ -144,4 +144,148 @@ def conv_decode_reference(
     return out, full[:, :, 1:]
 
 
-__all__ = ["CONV_BLOCK_N", "conv_decode", "conv_decode_reference"]
+# The feature tile of the prefill conv. A constexpr baked into the cubin and
+# recorded in the manifest (signatures.SERVING_CONV_PREFILL_BLOCK).
+CONV_PREFILL_BLOCK = 128
+
+
+@triton.jit
+def _conv_prefill_kernel(
+    x_ptr,
+    w_ptr,
+    state_ptr,
+    out_ptr,
+    new_state_ptr,
+    stride_x,
+    stride_out,
+    T,
+    CONV_DIM: tl.constexpr,
+    K: tl.constexpr,
+    TAPS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    state_len = K - 1
+    i_t = tl.program_id(0)
+    i_c = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = i_c < CONV_DIM
+    p = tl.arange(0, TAPS)
+
+    # Tap p of the window for token i_t is input i_t - (K-1) + p; a negative
+    # index is one of the K-1 samples held in the pre-chunk state.
+    idx = i_t - state_len + p
+    from_x = idx >= 0
+    x_tap = tl.load(
+        x_ptr + idx[None, :] * stride_x + i_c[:, None],
+        mask=from_x[None, :] & (p < K)[None, :] & mask[:, None],
+        other=0.0,
+    ).to(tl.float32)
+    s_tap = tl.load(
+        state_ptr + i_c[:, None] * state_len + (idx + state_len)[None, :],
+        mask=(~from_x)[None, :] & (p < K)[None, :] & mask[:, None],
+        other=0.0,
+    ).to(tl.float32)
+    win = tl.where(from_x[None, :], x_tap, s_tap)
+    w_tap = tl.load(
+        w_ptr + i_c[:, None] * K + p[None, :],
+        mask=(p < K)[None, :] & mask[:, None],
+        other=0.0,
+    ).to(tl.float32)
+    acc = tl.sum(win * w_tap, axis=1)
+    tl.store(
+        out_ptr + i_t * stride_out + i_c,
+        (acc / (1.0 + tl.exp(-acc))).to(out_ptr.dtype.element_ty),
+        mask=mask,
+    )
+
+    # This token is column i_t - T + (K-1) of the new state, if it falls in the
+    # last K-1 inputs of the concatenated pre-state and chunk.
+    j = i_t - T + state_len
+    x_tok = tl.load(x_ptr + i_t * stride_x + i_c, mask=mask, other=0.0).to(tl.float32)
+    tl.store(
+        new_state_ptr + i_c * state_len + j,
+        x_tok.to(new_state_ptr.dtype.element_ty),
+        mask=mask & (j >= 0) & (j < state_len),
+    )
+
+    # A chunk shorter than K-1 leaves the oldest columns to the pre-state; the
+    # first token's program writes them for this feature tile.
+    pre = state_len - T
+    pre_col = tl.arange(0, TAPS)
+    pre_mask = (i_t == 0) & (pre_col < pre) & (pre_col < state_len)
+    s_pre = tl.load(
+        state_ptr + i_c[:, None] * state_len + (T + pre_col)[None, :],
+        mask=pre_mask[None, :] & mask[:, None],
+        other=0.0,
+    )
+    tl.store(
+        new_state_ptr + i_c[:, None] * state_len + pre_col[None, :],
+        s_pre,
+        mask=pre_mask[None, :] & mask[:, None],
+    )
+
+
+def conv_prefill(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    state: torch.Tensor,
+    out: torch.Tensor,
+    new_state: torch.Tensor,
+    block: int = CONV_PREFILL_BLOCK,
+) -> None:
+    """One causal depthwise conv + silu over a whole chunk.
+
+    `x` is `[t, conv_dim]` model dtype, `w` `[conv_dim, K]` model dtype, `state`
+    `[conv_dim, K-1]` f32, `out` `[t, conv_dim]` model dtype and `new_state`
+    `[conv_dim, K-1]` f32. `state` is not mutated; `new_state` is the state after
+    the chunk.
+    """
+    t, conv_dim = x.shape
+    k = w.shape[1]
+    grid = (t, triton.cdiv(conv_dim, block))
+    _conv_prefill_kernel[grid](
+        x,
+        w,
+        state,
+        out,
+        new_state,
+        x.stride(0),
+        out.stride(0),
+        t,
+        CONV_DIM=conv_dim,
+        K=k,
+        TAPS=triton.next_power_of_2(k),
+        BLOCK=block,
+        num_warps=4,
+    )
+
+
+def conv_prefill_reference(
+    x: torch.Tensor, w: torch.Tensor, state: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Plain-torch oracle for the chunk conv, mirroring the decode reference.
+
+    `x` is `[t, conv_dim]`, `w` `[conv_dim, K]` and `state` `[conv_dim, K-1]`.
+    Token `i` reads the `K` columns of `[state, x]` starting at `i`; the new
+    state is the last `K-1` inputs.
+    """
+    state_len = w.shape[1] - 1
+    full = torch.cat(
+        [state.to(torch.float32), x.to(torch.float32).transpose(0, 1)], dim=1
+    )
+    t = x.shape[0]
+    wf = w.to(torch.float32)
+    out = torch.empty((t, x.shape[1]), dtype=x.dtype, device=x.device)
+    for i in range(t):
+        conv = (full[:, i : i + w.shape[1]] * wf).sum(-1)
+        out[i] = (conv * torch.sigmoid(conv)).to(x.dtype)
+    return out, full[:, full.shape[1] - state_len :].contiguous()
+
+
+__all__ = [
+    "CONV_BLOCK_N",
+    "CONV_PREFILL_BLOCK",
+    "conv_decode",
+    "conv_decode_reference",
+    "conv_prefill",
+    "conv_prefill_reference",
+]

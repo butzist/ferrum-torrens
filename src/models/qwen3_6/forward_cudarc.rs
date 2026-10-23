@@ -19,7 +19,7 @@ use crate::infrastructure::cuda_gdn::GdnDecode;
 use crate::infrastructure::cuda_linear::{DenseGemv, Fp8Linear};
 use crate::infrastructure::cudarc::{Runtime, Tensor, TensorDType, Unary};
 use crate::infrastructure::ftw::FtwIndex;
-use crate::infrastructure::kvcache_dev::{DeviceCache, LinearStateSlabs};
+use crate::infrastructure::kvcache_dev::{DeviceCache, KvDType, LinearStateSlabs};
 use crate::infrastructure::torch::Device;
 
 use super::load_cudarc::{Dense, DenseWeight, HeadWeight, Layer, Mixer, Tower};
@@ -531,10 +531,15 @@ impl CudarcQwen3_6 {
                 let q_offset = cache.cached() - t;
                 let pool = self.cache.mha();
                 pool.store(li, cache.tail(t), &k, &v);
-                let (k_all, v_all) = pool.gather(li, cache.filled());
-                q.cast(TensorDType::F32)?
-                    .causal_sdpa(&k_all, &v_all, q_offset)?
-                    .cast(TensorDType::Bf16)?
+                if pool.dtype() == KvDType::BFloat16 {
+                    let (k_all, v_all) = pool.gather_native(li, cache.filled());
+                    q.causal_sdpa(&k_all, &v_all, q_offset)?
+                } else {
+                    let (k_all, v_all) = pool.gather(li, cache.filled());
+                    q.cast(TensorDType::F32)?
+                        .causal_sdpa(&k_all, &v_all, q_offset)?
+                        .cast(TensorDType::Bf16)?
+                }
             }
         }
         .reshape(&[t, q_dim])?;
@@ -592,16 +597,15 @@ impl CudarcQwen3_6 {
             }
         };
         let conv_w = conv.reshape(&[conv_dim, k])?;
-        let conv_row = conv_state.reshape(&[1, conv_dim, k - 1])?;
-
-        let mut mixed_rows = Vec::with_capacity(t);
-        for i in 0..t {
-            let xr = conv_in.narrow(0, i, 1)?;
-            let out = self.rt.zeros(&[1, conv_dim], TensorDType::Bf16)?;
-            unsafe { self.gdn.conv_decode(&xr, &conv_w, &conv_row, &out) }?;
-            mixed_rows.push(out);
+        let mixed = self.rt.zeros(&[t, conv_dim], TensorDType::Bf16)?;
+        let new_state = self.rt.zeros(&[conv_dim, k - 1], TensorDType::F32)?;
+        unsafe {
+            self.gdn
+                .conv_prefill(&conv_in, &conv_w, &conv_state, &mixed, &new_state)
+        }?;
+        if let Access::Cached { cache, state } = access {
+            state.set_conv_state(cache.state_slot(), li, new_state);
         }
-        let mixed = Tensor::cat(&mixed_rows)?;
         let q = mixed
             .narrow(1, 0, key_dim)?
             .contiguous()?

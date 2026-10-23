@@ -18,9 +18,10 @@ use crate::domain::model::ModelParams;
 use crate::infrastructure::cuda_driver::{CUstream, CudaError, Driver, GdnKernels};
 use crate::infrastructure::cudarc::{Runtime, Tensor, TensorDType};
 use crate::infrastructure::kernel_abi::{
-    ADD_RMSNORM, AddRmsnormArgs, CONV_DECODE, ConvArgs, GDN_DECODE, GDN_TRI_SOLVE, GdnArgs,
-    GdnTriSolveArgs, LinearAbi, add_rmsnorm_args, add_rmsnorm_grid, conv_decode_args, conv_grid,
-    gdn_decode_args, gdn_grid, gdn_tri_solve_args, gdn_tri_solve_grid,
+    ADD_RMSNORM, AddRmsnormArgs, CONV_DECODE, CONV_PREFILL, ConvArgs, ConvPrefillArgs, GDN_DECODE,
+    GDN_TRI_SOLVE, GdnArgs, GdnTriSolveArgs, LinearAbi, add_rmsnorm_args, add_rmsnorm_grid,
+    conv_decode_args, conv_grid, conv_prefill_args, conv_prefill_grid, gdn_decode_args, gdn_grid,
+    gdn_tri_solve_args, gdn_tri_solve_grid,
 };
 use crate::infrastructure::torch::Device;
 
@@ -308,6 +309,65 @@ impl GdnDecode {
         unsafe { self.kernels.launch(kernel, grid, &mut params, self.stream) }.map_err(driver)
     }
 
+    /// Launch the chunked conv + silu: one launch over every token of `x`.
+    ///
+    /// `x` is `[t, conv_dim]` model dtype, `w` `[conv_dim, K]` model dtype,
+    /// `state` `[conv_dim, K-1]` f32 (read-only), `out` `[t, conv_dim]` model
+    /// dtype and `new_state` `[conv_dim, K-1]` f32 (overwritten).
+    ///
+    /// # Safety
+    /// Every tensor must be a live device allocation in this launcher's context.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn conv_prefill(
+        &self,
+        x: &Tensor,
+        w: &Tensor,
+        state: &Tensor,
+        out: &Tensor,
+        new_state: &Tensor,
+    ) -> Result<(), MoEError> {
+        let kernel = self.abi.kernel(CONV_PREFILL).map_err(bad_abi)?;
+        let bad = |what: &str| {
+            MoEError::Bad(format!(
+                "the conv prefill kernel was built for {what}, not the shapes handed in"
+            ))
+        };
+        let x_size = x.shape();
+        if x_size.len() != 2 || x_size[1] != self.conv_dim || x.strides()[1] != 1 {
+            return Err(bad("x = [t, conv_dim] with a unit inner stride"));
+        }
+        let tokens = x_size[0];
+        if w.shape() != [self.conv_dim, self.conv_k].as_slice() || w.strides()[1] != 1 {
+            return Err(bad("w = [conv_dim, K]"));
+        }
+        let state_shape = [self.conv_dim, self.conv_k - 1];
+        for t in [state, new_state] {
+            if t.shape() != state_shape || t.dtype() != TensorDType::F32 || !t.is_contiguous() {
+                return Err(bad("contiguous f32 [conv_dim, K - 1] state/new_state"));
+            }
+        }
+        if out.shape() != x_size || out.strides()[1] != 1 {
+            return Err(bad("out = [t, conv_dim] with a unit inner stride"));
+        }
+        let args = ConvPrefillArgs {
+            x: x.device_ptr(),
+            w: w.device_ptr(),
+            state: state.device_ptr(),
+            out: out.device_ptr(),
+            new_state: new_state.device_ptr(),
+            stride_x: x.strides()[0] as u32,
+            stride_out: out.strides()[0] as u32,
+            t: tokens as u32,
+        };
+        let pack = conv_prefill_args(&self.abi, &args).map_err(bad_abi)?;
+        let mut params = pack.kernel_params().map_err(bad_abi)?;
+        let grid = conv_prefill_grid(tokens, kernel).map_err(bad_abi)?;
+        // SAFETY: the caller guarantees every tensor is live in this context;
+        // `params` was built from this kernel's manifest entry, and `self.stream`
+        // belongs to the context made current at construction.
+        unsafe { self.kernels.launch(kernel, grid, &mut params, self.stream) }.map_err(driver)
+    }
+
     /// Launch the fused residual-add + RMSNorm for `rows` rows: one kernel
     /// writes both the new residual (`sum_out = x + r`) and the normalized row
     /// (`out = rms_norm(sum_out) * w`), replacing the add plus the ten-kernel
@@ -401,6 +461,19 @@ fn check_geometry(params: &ModelParams, abi: &LinearAbi) -> Result<(), MoEError>
         if built != value {
             return Err(MoEError::Bad(format!(
                 "the conv kernel was built with {name} = {built}, but the model has {value}"
+            )));
+        }
+    }
+    let prefill = abi.kernel(CONV_PREFILL).map_err(bad_abi)?;
+    let pc = |name: &str| prefill.constexpr(name).map_err(bad_abi);
+    for (name, value) in [
+        ("CONV_DIM", conv_dim),
+        ("K", params.linear_conv_kernel_dim as u64),
+    ] {
+        let built = pc(name)?;
+        if built != value {
+            return Err(MoEError::Bad(format!(
+                "the conv prefill kernel was built with {name} = {built}, but the model has {value}"
             )));
         }
     }

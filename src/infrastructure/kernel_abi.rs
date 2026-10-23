@@ -588,6 +588,9 @@ pub const FP8_GEMM: &str = "fp8_gemm";
 /// The fused single-token GDN causal conv + silu (TODO.md item 19).
 pub const CONV_DECODE: &str = "conv_decode";
 
+/// The chunked GDN causal conv + silu the prefill path launches.
+pub const CONV_PREFILL: &str = "conv_prefill";
+
 /// The fused residual-add + RMSNorm (OPTIMIZATION.md R6: the norm launch tax).
 pub const ADD_RMSNORM: &str = "add_rmsnorm";
 
@@ -631,9 +634,10 @@ pub const GDN_RATIO_MASKS_F32: &str = "gdn_ratio_masks_f32";
 pub const MUL_MID_F32: &str = "mul_mid_f32";
 pub const SCALE_HEADS_F32: &str = "scale_heads_f32";
 
-const LINEAR_NAMES: [&str; 43] = [
+const LINEAR_NAMES: [&str; 44] = [
     GDN_DECODE,
     CONV_DECODE,
+    CONV_PREFILL,
     ADD_RMSNORM,
     GDN_TRI_SOLVE,
     NVFP4_DENSE_GEMV,
@@ -800,6 +804,7 @@ pub fn linear_cubin(name: &str) -> Result<&'static [u8], MoEError> {
     Ok(match name {
         GDN_DECODE => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/gdn_decode.cubin")),
         CONV_DECODE => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/conv_decode.cubin")),
+        CONV_PREFILL => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/conv_prefill.cubin")),
         ADD_RMSNORM => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/add_rmsnorm.cubin")),
         GDN_TRI_SOLVE => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/gdn_tri_solve.cubin")),
         NVFP4_DENSE_GEMV => {
@@ -892,6 +897,7 @@ fn linear_ptx(name: &str) -> &'static str {
     match name {
         GDN_DECODE => include_str!(concat!(env!("OUT_DIR"), "/kernel/gdn_decode.ptx")),
         CONV_DECODE => include_str!(concat!(env!("OUT_DIR"), "/kernel/conv_decode.ptx")),
+        CONV_PREFILL => include_str!(concat!(env!("OUT_DIR"), "/kernel/conv_prefill.ptx")),
         ADD_RMSNORM => include_str!(concat!(env!("OUT_DIR"), "/kernel/add_rmsnorm.ptx")),
         GDN_TRI_SOLVE => include_str!(concat!(env!("OUT_DIR"), "/kernel/gdn_tri_solve.ptx")),
         NVFP4_DENSE_GEMV => include_str!(concat!(env!("OUT_DIR"), "/kernel/nvfp4_dense_gemv.ptx")),
@@ -1568,6 +1574,52 @@ pub fn conv_grid(rows: usize, kernel: &LinearKernel) -> Result<(u32, u32, u32), 
     Ok((
         rows as u32,
         (conv_dim as usize).div_ceil(block_n as usize) as u32,
+        1,
+    ))
+}
+
+/// Device addresses for one chunked GDN causal conv + silu launch. `x` is
+/// `[t, conv_dim]` model dtype, `w` `[conv_dim, K]` model dtype, `state`
+/// `[conv_dim, K-1]` and `new_state` `[conv_dim, K-1]` f32, `out` `[t,
+/// conv_dim]` model dtype. `state` is read-only and `new_state` is fully
+/// overwritten from the chunk's tail.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ConvPrefillArgs {
+    pub x: u64,
+    pub w: u64,
+    pub state: u64,
+    pub out: u64,
+    pub new_state: u64,
+    pub stride_x: u32,
+    pub stride_out: u32,
+    pub t: u32,
+}
+
+/// The conv prefill launch argument pack, in the cubin's declared order.
+pub fn conv_prefill_args(abi: &LinearAbi, a: &ConvPrefillArgs) -> Result<ArgPack, MoEError> {
+    let kernel = abi.kernel(CONV_PREFILL)?;
+    let mut p = ArgPack::for_linear(kernel);
+    p.ptr(a.x)?;
+    p.ptr(a.w)?;
+    p.ptr(a.state)?;
+    p.ptr(a.out)?;
+    p.ptr(a.new_state)?;
+    p.u32(a.stride_x)?;
+    p.u32(a.stride_out)?;
+    p.u32(a.t)?;
+    Ok(p)
+}
+
+/// The conv prefill launch grid: one program per `(token, feature block)`.
+pub fn conv_prefill_grid(
+    tokens: usize,
+    kernel: &LinearKernel,
+) -> Result<(u32, u32, u32), MoEError> {
+    let conv_dim = kernel.constexpr("CONV_DIM")?;
+    let block = kernel.constexpr("BLOCK")?;
+    Ok((
+        tokens as u32,
+        (conv_dim as usize).div_ceil(block as usize) as u32,
         1,
     ))
 }
@@ -2451,6 +2503,48 @@ mod tests {
         let kernel = abi.kernel(CONV_DECODE).unwrap();
         // 8192 features / 256 tile = 32 blocks in y, one program per row in x.
         assert_eq!(conv_grid(2, kernel).unwrap(), (2, 32, 1));
+    }
+
+    #[test]
+    fn the_conv_prefill_manifest_records_the_shape() {
+        let abi = LinearAbi::committed().unwrap();
+        let kernel = abi.kernel(CONV_PREFILL).unwrap();
+        assert_eq!(kernel.constexpr("CONV_DIM").unwrap(), 8192);
+        assert_eq!(kernel.constexpr("K").unwrap(), 4);
+        assert_eq!(kernel.constexpr("TAPS").unwrap(), 4);
+        assert_eq!(kernel.constexpr("BLOCK").unwrap(), 128);
+        assert_eq!(kernel.num_warps, 4);
+    }
+
+    #[test]
+    fn the_conv_prefill_argument_builder_matches_its_kernel_signature() {
+        let abi = LinearAbi::committed().unwrap();
+        let args = ConvPrefillArgs {
+            x: 0x1000,
+            w: 0x2000,
+            state: 0x3000,
+            out: 0x4000,
+            new_state: 0x5000,
+            stride_x: 8192,
+            stride_out: 8192,
+            t: 130,
+        };
+        let pack = conv_prefill_args(&abi, &args).unwrap();
+        let kernel = abi.kernel(CONV_PREFILL).unwrap();
+        let params = pack.kernel_params().unwrap();
+        assert_eq!(params.len(), kernel.args.len() + kernel.scratch_params);
+        assert_eq!(pack.slots()[2], 0x3000);
+        assert_eq!(pack.slots()[4], 0x5000);
+        assert_eq!(pack.slots()[5], 8192);
+        assert_eq!(pack.slots()[7], 130);
+    }
+
+    #[test]
+    fn the_conv_prefill_grid_tiles_tokens_and_features() {
+        let abi = LinearAbi::committed().unwrap();
+        let kernel = abi.kernel(CONV_PREFILL).unwrap();
+        // 8192 features / 128 tile = 64 blocks in y, one program per token in x.
+        assert_eq!(conv_prefill_grid(130, kernel).unwrap(), (130, 64, 1));
     }
 
     #[test]
