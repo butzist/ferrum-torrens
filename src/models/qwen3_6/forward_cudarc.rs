@@ -29,6 +29,19 @@ type Result<T> = std::result::Result<T, MoEError>;
 
 const LM_HEAD_BLOCK: usize = 8_192;
 
+/// Measurement only: `FT_ABLATE=moe,gdn,...` skips a stage so a prefill run can
+/// attribute its time. The logits are then not a forward result.
+fn ablated(what: &str) -> bool {
+    static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| {
+        std::env::var("FT_ABLATE")
+            .map(|v| v.split(',').map(str::to_string).collect())
+            .unwrap_or_default()
+    })
+    .iter()
+    .any(|p| p == what)
+}
+
 fn moe_bad(msg: impl std::fmt::Display) -> MoEError {
     MoEError::Bad(msg.to_string())
 }
@@ -846,12 +859,25 @@ impl CudarcQwen3_6 {
                 }
                 Some(r) => x.add_rms_norm(&r, &layer.input_norm, p.rms_norm_eps)?,
             };
-            let mixer_out = match &layer.mixer {
-                Mixer::Full { .. } => self.full_attention(li, layer, &h1, positions, access)?,
-                Mixer::Linear { .. } => self.gdn_layer(li, layer, &h1, access)?,
+            let mixer_out = if ablated("mixer") {
+                self.rt.zeros(&[t, p.hidden_size], TensorDType::Bf16)?
+            } else {
+                match &layer.mixer {
+                    Mixer::Full { .. } if !ablated("attn") => {
+                        self.full_attention(li, layer, &h1, positions, access)?
+                    }
+                    Mixer::Linear { .. } if !ablated("gdn") => {
+                        self.gdn_layer(li, layer, &h1, access)?
+                    }
+                    _ => self.rt.zeros(&[t, p.hidden_size], TensorDType::Bf16)?,
+                }
             };
             let (sum2, h2) = mixer_out.add_rms_norm(&xsum, &layer.post_norm, p.rms_norm_eps)?;
-            x = self.moe(li, &h2)?;
+            x = if ablated("moe") {
+                h2.clone()
+            } else {
+                self.moe(li, &h2)?
+            };
             residual = Some(sum2);
         }
 
@@ -861,6 +887,9 @@ impl CudarcQwen3_6 {
         };
         let last = stream.narrow(0, t - 1, 1)?;
         let normed = rms_norm(&last, &self.tower.final_norm, p.rms_norm_eps)?;
+        if ablated("head") {
+            return Ok(vec![0.0; p.vocab_size]);
+        }
         self.lm_head_logits(&normed)
     }
 }
