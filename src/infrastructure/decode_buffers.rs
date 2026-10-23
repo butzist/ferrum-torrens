@@ -211,6 +211,18 @@ impl DecodeBuffers {
         rows: &[DecodeRow],
         padded_bs: usize,
     ) -> Result<(), DecodeBufferError> {
+        self.stage_padded_with(rows, padded_bs, DecodeRow::sentinel())
+    }
+
+    /// `stage_padded` with the row the padding tail carries. A captured graph's
+    /// dummy rows run the real forward, so their writes have to land on a
+    /// reserved state slot and pool location rather than the sentinel.
+    pub fn stage_padded_with(
+        &self,
+        rows: &[DecodeRow],
+        padded_bs: usize,
+        padding: DecodeRow,
+    ) -> Result<(), DecodeBufferError> {
         if padded_bs < rows.len() {
             return Err(DecodeBufferError::PaddedUnderRows {
                 rows: rows.len(),
@@ -224,7 +236,7 @@ impl DecodeBuffers {
             });
         }
         let mut full = rows.to_vec();
-        full.resize(padded_bs, DecodeRow::sentinel());
+        full.resize(padded_bs, padding);
         self.stage(&full)
     }
 

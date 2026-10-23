@@ -1,12 +1,15 @@
 # FerrumTorrens -- FreeToken MVP port to Rust: TODO
 
-Status (2026-10-23): **M7 is complete: the cudarc runtime is the serving path
-and libtorch/tch/candle are gone from the dependency tree and devshell
-(decision 132).** Decode CUDA-graph capture is parked, not ported, but its
-eager prerequisite is restored: `CudarcQwen3_6::forward_decode_into` runs the
-batched device-addressed step. The gates are
-`tests/cudarc_engine_generate.rs` and the broader
-`tests/engine_real_generate.rs` on the real checkpoint. Prior M2/M3 status: M2 (API) current, late M3 in practice; **prefill pp is
+Status (2026-10-23): **M7 is complete: the cudarc runtime is the serving path,
+libtorch/tch/candle are gone (decision 132), and decode CUDA-graph capture is
+ported (decision 134).** `CudarcQwen3_6::forward_decode_into` runs the batched
+device-addressed step, and `EngineDecodeGraphs` records it per batch size on the
+model's own stream when `cuda_graph = true` with the Triton kernel on CUDA.
+Captured replay is bit-exact against the eager step; E2E it is +2% tg at both
+517 and 2057 (33.0 vs 32.4 and 28.9 vs 28.4 tok/s), so the remaining gap is the
+cache size and the step's math, not the launch chain. The gates are
+`tests/cudarc_engine_generate.rs`, `tests/decode_graph_capture.rs` and the
+broader `tests/engine_real_generate.rs` on the real checkpoint. Prior M2/M3 status: M2 (API) current, late M3 in practice; **prefill pp is
 ahead of FreeToken** after R10.6a/b, R10.7, R10.8, R10.9 and R10.10: 400.9 tok/s
 at 517 (FT 366.2, 1.10x) and 958.5 at 2057 (FT 725.0, 1.32x). The wins were the
 harness chunk cap (462), the DMA copy-engine prefetch (585), one grouped-GEMM
@@ -187,9 +190,9 @@ whole text tower now form the serving forward, wired through the registry
 (decision 132). `tests/cudarc_engine_generate.rs` and
 `tests/engine_real_generate.rs` both reach the oracle token on the real
 checkpoint. `tch`, `torch-sys`, `candle-*`, the C++ capture shim and the
-libtorch devshell closure are removed; decode CUDA-graph capture is parked.
+libtorch devshell closure are removed; decode CUDA-graph capture is ported.
 
-Progress history and the full decision log (numbers 1..132) live in `DONE.md`;
+Progress history and the full decision log (numbers 1..134) live in `DONE.md`;
 read that for the "why" behind any decision number referenced in code or tests.
 
 Goal: a **minimal, fast, single-GPU** Rust serving engine for **one model** --
@@ -236,8 +239,8 @@ with `--text-model-only`). Known-good bf16/Fp8 siblings: `Qwen/Qwen3.6-35B-A3B`,
   expert kernels and their staging/attention peers are the hand-written Triton
   kernels (decision 2). No build-time `nvcc`/fatbin step and no runtime JIT.
 - Prefill: chunked (default budget 8192), strict prefill-priority scheduling.
-- Decode: one eager model step per token; CUDA-graph capture is parked on the
-  cudarc runtime (decision 132), not part of the current serving path.
+- Decode: one step per token; one CUDA graph per batch size (`1`, `2`, `4`,
+  `max_running`) when `cuda_graph = true`, eager otherwise (decision 134).
 - Sampling: temperature / top_k / top_p / greedy (argmax) only. EOS + stop-strings + max-tokens.
 - OpenAI-compatible HTTP API (the whole MVP surface; Anthropic is out, decision 38).
 - Function/tool calling on `/v1/chat/completions` (request `tools`, streamed
@@ -501,14 +504,14 @@ any port.
   stays the CPU fallback and the gate. `tests/cudarc_engine_generate.rs` and
   `tests/engine_real_generate.rs` both reach the oracle token on the cudarc
   runtime.
-- [x] **M7.4 kernels -- DONE; capture PARKED (2026-10-23, decision 132).**
-  The launchers take the cudarc stream and raw storage, and the C++ capture
-  shim is deleted. Decode CUDA-graph capture was not ported: the engine keeps
-  `CapturedDecode` and `BuiltModel.captured` (always `None`), and
-  `cuda_graph = true` only warns. The eager prerequisite is back:
-  `forward_decode_into` runs the batched device-addressed step, and
-  `DecodeBuffers::with_runtime` allocates on the model's stream
-  (`tests/device_decode_matches_refeed.rs`). Revisit when capture is ported.
+- [x] **M7.4 kernels and capture -- DONE (2026-10-23, decisions 132, 134).**
+  The launchers take the cudarc stream and raw storage. Decode capture is ported
+  to cudarc (`infrastructure/decode_graph.rs`); the registry records one graph
+  per batch size when `cuda_graph = true` + `kernel.triton` on CUDA, owns the
+  padding state slot/page, and keeps the model alive with the graphs.
+  `tests/decode_graph_capture.rs` proves bs=1 and bs=2 replay are bit-exact
+  against `forward_decode_into`; `tests/device_decode_matches_refeed.rs` covers
+  the eager step. Capture failure at load warns and serves eagerly.
 - [x] **M7.5 remove libtorch -- DONE (2026-10-23, decision 132).**
   `tch`, `torch-sys`, `candle-*`, the C++ build script, `shim/`, the torch
   forward and the libtorch devshell closure are gone. The same gate set runs
@@ -516,7 +519,7 @@ any port.
 
 ## 7. Decisions
 
-The full log of confirmed decisions (numbers 1..113, stable -- code, tests and
+The full log of confirmed decisions (numbers 1..134, stable -- code, tests and
 `ARCHITECTURE.md` reference them by number) lives in `DONE.md`. This section
 lists only the decisions that still bind open work; everything else there is
 history.
@@ -541,9 +544,14 @@ history.
   Triton cubin stay put; only `infrastructure/torch.rs` and the model forward
   move.
 - **132** -- **the torchless cudarc runtime is the serving path and libtorch is
-  removed.** The deliberate implementation detail, gate numbers and the parked
-  capture decision live in `DONE.md` decision 132. Capture may return only as a
-  new ported feature; nothing may reintroduce `tch`, `torch-sys` or `candle`.
+  removed.** The deliberate implementation detail and gate numbers live in
+  `DONE.md` decision 132. Nothing may reintroduce `tch`, `torch-sys` or `candle`.
+- **134** -- **decode CUDA-graph capture is ported to cudarc** (decision 134,
+  `DONE.md`). `cuda_graph = true` captures per batch size only when
+  `kernel.triton` is on and the device is CUDA; otherwise it warns and serves
+  eagerly. `BuiltModel` declares `captured` before `model` so the graphs (which
+  bake weight/pool addresses) drop first. A capture that fails at load warns and
+  falls back to eager rather than failing the build.
 
 - **94** -- the whole-layer prefill's buffer is the `2 * num_experts` **coldest**
   slots chosen by `usage.argsort` (`select_buffer_slots`); it frees exactly those
@@ -1213,7 +1221,7 @@ re-profiled at HEAD: the GDN *bundle* is 42% (`gdn_qkvz` 0.85 + `gdn_ba`
 
 The hardest infrastructure -- driver-API kernel launching (MoE GEMM + paged GQA
 attention), device-staged offload and the cudarc serving forward -- is done and
-gated on the real checkpoint. Decode CUDA-graph capture is parked (decision 132).
+gated on the real checkpoint. Decode CUDA-graph capture is ported (decision 134).
 The milestone label says M2 but the reality is late M3: most M3 performance work
 landed before the API cleanup, so the milestone accounting is a little lagged.
 The serving blocker is now memory, not speed: the resident tower plus an f32 KV

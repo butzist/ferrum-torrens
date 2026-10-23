@@ -16,6 +16,8 @@ pub mod cuda_moe;
 pub mod cudarc;
 #[cfg(feature = "cudarc")]
 pub mod decode_buffers;
+#[cfg(feature = "cudarc")]
+pub mod decode_graph;
 pub mod ftw;
 pub mod http;
 pub mod kernel_abi;

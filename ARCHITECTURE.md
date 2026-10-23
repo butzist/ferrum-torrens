@@ -146,7 +146,7 @@ stays pure: `Tensor` and CUDA handles never cross it (section 4).
 | Routed experts: slot cache + grouped GEMV | Device | `infrastructure/cuda_moe.rs` (cudarc storage + driver-API cubins) |
 | Slot residency plan (`lru_ensure` / whole-layer) and the prefill CSR | Device (host plan fallback) | `python/ferrum_kernel/offload.py`, `python/ferrum_kernel/moe_prefill.py`, `application/run_experts.rs` |
 | KV pool, GDN state slabs, paged GQA attention | Device | `infrastructure/kvcache_dev.rs`, `infrastructure/cuda_attention.rs` |
-| CUDA-graph capture/replay | parked | not ported to the cudarc runtime; decode stays eager |
+| CUDA-graph capture/replay | Device | `infrastructure/decode_graph.rs` + `decode_buffers.rs`; one graph per batch size, opted in with `cuda_graph = true` (decision 134) |
 | Decode stage profile (dev only, `FT_PROFILE=1`) | Device timing events | `infrastructure/profile.rs`; reference probe in `scripts/freetoken_probe/` |
 
 Crossings per step: token ids H2D, streamed expert rows H2D (misses only), logits
@@ -211,7 +211,7 @@ elementwise.py"]
   `tests/cudarc_engine_generate.rs`.
 - **`build.rs` stages the cubins.** Every build copies
   `$FERRUM_KERNEL_DIR/kernel` (the `kernels` Nix derivation, `nix/kernels.nix`)
-  into `OUT_DIR/kernel`. There is no C++ bridge any more; capture is parked.
+  into `OUT_DIR/kernel`. There is no C++ bridge; capture uses cudarc graphs directly.
 - **Kernels are authored in Triton and compiled ahead of time by Nix.**
   `python/ferrum_kernel/aot.py` emits `kernel/*.cubin`, `*.ptx` and
   `manifest.json` in the `kernels` derivation; nothing is committed. The engine
@@ -715,20 +715,34 @@ channel and a per-request sink returns `false` when it is full, which aborts
 only that request instead of stalling the batch. `Request` carries its own seed,
 so co-batching never changes a lone request's tokens.
 
-### 3.9 CUDA-graph decode capture -- parked (eager device decode restored)
+### 3.9 CUDA-graph decode capture -- implemented
 
-Decode capture is not ported to the cudarc runtime. The engine keeps the
-`CapturedDecode` port and the `BuiltModel.captured` field (always `None`), so
-the generation loop keeps its captured branch, but the composition root builds
-no graphs and `cuda_graph = true` only warns. Its prerequisite is back:
-`CudarcQwen3_6::forward_decode_into(&DecodeBuffers)` runs every staged row with
-device rope positions, paged attention over the staged KV windows, batched GDN
-state rows, the MoE device port and the NVFP4 head writing straight into
-`bufs.logits()`; `DecodeBuffers::with_runtime` allocates those buffers on the
-model's stream. The previous engine-owned graph capture (torch stream + graph
-memory pool, `decode_graph`) was removed with libtorch (decision 132). Porting
-capture is future work; the measured numbers that came from it remain history
-in `OPTIMIZATION.md`/`DONE.md`.
+Decode capture is ported to cudarc (decision 134). `infrastructure/decode_graph.rs`
+owns the engine-facing service: `EngineDecodeGraphs` records one `DecodeGraph`
+per batch size into a fixed-address `DecodeBuffers`, then replays the smallest
+captured size that fits the step, padding the tail with a reserved dummy row.
+`CapturedDecode` is the domain port; `EngineDecodeGraphs` implements it over
+`domain/decode.rs`'s `DecodeRow`.
+
+The composition root opts in when `cuda_graph = true`, `kernel.triton` is on and
+the device is CUDA (`registry::build`). It captures `[1, 2, 4, max_running]`
+after the tower and MoE port are attached, with `window = max_seq_len`. The extra
+state slot and pool page for the padding row are reserved by passing
+`reserve_padding = true` to the KV cache; the reservation moves into the graph
+service. A capture that fails at load warns with the failing op and decode stays
+eager; `cuda_graph` without the kernel on CUDA warns too. `BuiltModel` declares
+`captured` before `model` so the graphs drop first (they bake weight and pool
+addresses).
+
+The step itself is `CudarcQwen3_6::forward_decode_into(&DecodeBuffers)`: device
+rope positions, paged attention over the staged KV windows, batched GDN state
+rows, the MoE device port and the NVFP4 head writing straight into
+`bufs.logits()`. It never copies from pageable host memory, allocates outside the
+stream capture pool or synchronizes, which is what makes it capturable. The
+engine's generation loop takes `Engine::run_captured` for a decode phase whenever
+a service is present; without one the per-request cached step is unchanged.
+`tests/decode_graph_capture.rs` gates bs=1 and bs=2 replay against the eager
+step, and `tests/cudarc_engine_generate.rs` gates the registry-built path.
 
 ## 4. External libraries and where they are used
 

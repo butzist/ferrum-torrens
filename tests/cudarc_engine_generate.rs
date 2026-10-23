@@ -24,10 +24,10 @@ const PROMPT: &str = "The capital of France is";
 /// reference for this prompt (see `tests/engine_real_generate.rs`).
 const ORACLE_FIRST_TOKEN: u32 = 11751;
 
-fn config(max_output_tokens: u32) -> Config {
+fn config(max_output_tokens: u32, cuda_graph: bool) -> Config {
     format!(
         "[model]\npath = \"{FTW_DIR}\"\nmax_seq_len = 4096\nmax_output_tokens = {max_output_tokens}\n\
-         max_prefill_length = 1024\nmax_running_requests = 1\n\n\
+         max_prefill_length = 1024\nmax_running_requests = 1\ncuda_graph = {cuda_graph}\n\n\
          [kv]\nnum_tokens = 4096\ndtype = \"f32\"\n\n\
          [moe]\ncache_size_slots = 512\n\n[kernel]\ntriton = true\n"
     )
@@ -38,6 +38,8 @@ fn config(max_output_tokens: u32) -> Config {
 fn greedy(max_tokens: u32) -> SamplingParams {
     SamplingParams {
         temperature: 0.0,
+        // A fixed token budget, so both arms generate the same length.
+        ignore_eos: true,
         max_tokens,
         ..SamplingParams::default()
     }
@@ -47,10 +49,14 @@ fn greedy(max_tokens: u32) -> SamplingParams {
 #[ignore = "needs a CUDA device and the FTW checkpoint"]
 #[serial]
 fn the_cudarc_engine_generates_the_oracle_token_through_the_kernel() {
-    let cfg = config(1);
+    let cfg = config(1, false);
     assert!(cfg.kernel.triton, "this gate must exercise the MoE port");
     let start = Instant::now();
     let engine = load_engine(&cfg).expect("load the cudarc engine");
+    assert!(
+        engine.captured().is_none(),
+        "cuda_graph defaults off; this gate is the eager path"
+    );
     eprintln!(
         "cudarc engine loaded in {:.2}s on {} ({} layers)",
         start.elapsed().as_secs_f64(),
@@ -93,4 +99,60 @@ fn the_cudarc_engine_generates_the_oracle_token_through_the_kernel() {
         "every layer of every forward went through the kernel port"
     );
     assert!(steps >= layers, "at least the prefill ran, got {steps}");
+}
+
+/// The same prompt and config with `cuda_graph = true` must build the graphs
+/// and produce the eager run's tokens. The eager engine is dropped before the
+/// captured one loads, because the model pins ~17 GiB of host expert banks and
+/// two towers do not fit in the sandbox.
+#[test]
+#[ignore = "needs a CUDA device and the FTW checkpoint"]
+#[serial]
+fn the_captured_cudarc_engine_generates_the_same_tokens_as_the_eager_one() {
+    const TOKENS: u32 = 8;
+    let eager = {
+        let cfg = config(TOKENS, false);
+        let engine = load_engine(&cfg).expect("load the eager cudarc engine");
+        assert!(engine.captured().is_none());
+        let ids = engine.encode(PROMPT).expect("encode the prompt");
+        let request = make_request(&engine, 1, ids, greedy(TOKENS), 0).expect("make request");
+        let start = Instant::now();
+        let g = generation::generate(&engine, request).expect("eager generate");
+        eprintln!(
+            "eager: {} tokens in {:.2}s {:?}",
+            g.tokens.len(),
+            start.elapsed().as_secs_f64(),
+            g.tokens
+        );
+        assert_eq!(g.tokens[0], ORACLE_FIRST_TOKEN);
+        g.tokens
+    };
+
+    let cfg = config(TOKENS, true);
+    let engine = load_engine(&cfg).expect("load the captured cudarc engine");
+    let captured = engine
+        .captured()
+        .expect("cuda_graph = true must build the decode graphs");
+    eprintln!(
+        "captured: max batch {}, window {}",
+        captured.max_batch(),
+        captured.window()
+    );
+    assert_eq!(captured.max_batch(), 1, "max_running_requests = 1");
+
+    let ids = engine.encode(PROMPT).expect("encode the prompt");
+    let request = make_request(&engine, 1, ids, greedy(TOKENS), 0).expect("make request");
+    let start = Instant::now();
+    let g = generation::generate(&engine, request).expect("captured generate");
+    eprintln!(
+        "captured: {} tokens in {:.2}s {:?}",
+        g.tokens.len(),
+        start.elapsed().as_secs_f64(),
+        g.tokens
+    );
+    assert_eq!(g.finish_reason, FinishReason::Length);
+    assert_eq!(
+        g.tokens, eager,
+        "a replayed decode must match the eager run"
+    );
 }

@@ -4219,3 +4219,51 @@ subsection names are kept verbatim.
        `cuda_moe_matches_reference` eight-test gate; `cudarc_model` oracle
        (argmax 11751) and the GDN/paged differentials; `cudarc_engine_generate`
        (11751, " Paris"); `check-kernels.sh` and `selftest --interp`.
+
+134. **Decode CUDA-graph capture is ported to cudarc** (2026-10-23). The
+     engine-owned graph API returns on the cudarc runtime; the eager step is
+     unchanged when `cuda_graph = false` (the default).
+     - **Implementation.** `infrastructure/decode_graph.rs` records one
+       `DecodeGraph` per batch size on the model's own stream into fixed-address
+       `DecodeBuffers`, and `EngineDecodeGraphs` replays the smallest captured
+       size that fits, padding the tail with a reserved dummy row. The registry
+       captures `[1, 2, 4, max_running]` (deduped/sorted/capped) when
+       `cuda_graph && kernel.triton && device.is_cuda()`, after the tower and MoE
+       port are attached. It reserves one extra state slot and pool page for the
+       padding row (`reserve_padding = capture`), builds the padding `DecodeRow`,
+       and captures with `window = max_seq_len`. `BuiltModel` declares `captured`
+       before `model` so the graphs, which bake weight/pool addresses, drop
+       first. `cuda_graph` without the kernel on CUDA warns and serves eagerly; a
+       capture that fails at load warns with the failing op and falls back to
+       eager instead of failing the build.
+     - **Correctness.** `tests/decode_graph_capture.rs`: bs=1 and bs=2 replays
+       are bit-exact (`max|d| = 0.000e0`) against the uncaptured
+       `forward_decode_into`, including a bs=2 graph running one live row plus
+       the padding row. `tests/device_decode_matches_refeed.rs` stays green.
+       `tests/cudarc_engine_generate.rs` now has a captured arm: it asserts
+       `engine.captured().is_some()`, reports `max batch 1, window 4096`, and its
+       8 greedy ids equal the eager run exactly:
+       `[11751, 11, 264, 3177, 34756, 364, 1141, 8807]`.
+     - **Throughput A/B** (RTX 5060 Laptop, bs=1, bf16 KV, `FERRUM_SMOKE_TOKENS=16`,
+       one model load per run, order-balanced off/on/on/off, n=2/arm):
+
+       | prompt | cache | eager pp / tg | captured pp / tg |
+       |---|---|---|---|
+       | 517 | auto (1920) | 402.1 / 32.4 | 403.3 / 33.0 |
+       | 2057 | 1664 | 915.6 / 28.4 | 915.7 / 28.9 |
+
+       Greedy ids match across arms; pp is unchanged (capture is decode-only).
+       The captured arm is only **+2% tg**. After the cudarc recovery the eager
+       launch chain is no longer the gap, so the old 32.8-vs-32.3 capture win did
+       not survive the rewrite. The remaining 2057 decode gap is the pinned
+       1664-slot cache (auto 1920 is not used at 2057 because it OOMs that
+       prefill, decision 133) and the step's math, not the graph.
+     - **VRAM after load.** Captured adds ~130 MiB for the three graphs: 7770 vs
+       7640 MiB at 517 auto, 7546 vs 7416 MiB at 2057/1664. No capture OOMed at
+       either size; the captured arm stayed at least ~380 MiB under the 8151 MiB
+       device.
+     - **Gates.** `cargo fmt --check`; `cargo clippy --all-targets --features
+       cudarc`; `cargo test --features cudarc --lib` 429; `cargo test` 345 / 4
+       ignored; `decode_graph_capture` both tests; `device_decode_matches_refeed`;
+       `cudarc_engine_generate` eager and captured. Logs
+       `/tmp/opencode/{gate-cudarc-eager,gate-cudarc-captured,smoke-*}.log`.

@@ -1902,10 +1902,9 @@ impl CudaMoE {
         crate::infrastructure::profile::end("moe_copy", sp);
         self.probe_misses(layer);
 
-        let token_host: Vec<i32> = (0..tokens)
-            .flat_map(|t| std::iter::repeat_n(t as i32, top_k))
-            .collect();
-        let token_t = self.rt.from_slice_i32(&token_host, &[routes])?;
+        // A fresh pageable H2D here would be recorded with a host pointer that
+        // dies before a captured graph replays, so reuse the device table.
+        let token_t = self.token_table_for(tokens, top_k)?;
         let sp = crate::infrastructure::profile::begin("moe_gemm");
         let g = self.group_with_slots(x, weights, slots, token_t, tokens, top_k)?;
         self.launch(&g)?;

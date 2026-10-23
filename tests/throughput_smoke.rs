@@ -197,9 +197,13 @@ impl Sampler {
 
 fn config() -> Config {
     // The serving shape: bf16 KV (the default), the committed NVFP4 cubins via
-    // `kernel.triton`, whole-layer prefill overlap. Decode capture is parked on
-    // the cudarc runtime, so the graph is always off.
-    let graph = "false";
+    // `kernel.triton`, whole-layer prefill overlap. `FERRUM_SMOKE_GRAPH=1` turns
+    // decode capture on so the eager and captured arms share every other knob.
+    let graph = if std::env::var("FERRUM_SMOKE_GRAPH").as_deref() == Ok("1") {
+        "true"
+    } else {
+        "false"
+    };
     let kv = std::env::var("FERRUM_SMOKE_KV").unwrap_or_else(|_| "bf16".into());
     let kv_tokens = std::env::var("FERRUM_SMOKE_KVTOK").unwrap_or_else(|_| "4096".into());
     // The config default is `auto` (item 12); `FERRUM_SMOKE_CACHE` pins a slot

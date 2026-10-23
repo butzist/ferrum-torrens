@@ -8,6 +8,8 @@ use crate::domain::model::Model;
 use crate::domain::weights::WeightsReader;
 #[cfg(feature = "cudarc")]
 use crate::domain::{expert_kernel::MoEExecutor, model::ModelParams};
+#[cfg(feature = "cudarc")]
+use crate::infrastructure::decode_graph::EngineDecodeGraphs;
 use crate::infrastructure::ftw::FtwIndex;
 use crate::infrastructure::torch::Device;
 use crate::models::qwen3_6::Qwen3_6;
@@ -25,11 +27,14 @@ pub enum RegistryError {
 }
 
 /// A model plus the capture service the composition root built over its own KV
-/// cache. The cudarc runtime has no capture path yet, so `captured` is always
-/// `None`; the field and the engine's captured path stay for when it is ported.
+/// cache.
+///
+/// `captured` must drop *before* `model`: a graph bakes the model's weight and
+/// pool addresses, so the allocations it replays over have to outlive it.
+/// Rust drops fields in declaration order, which is why `captured` is first.
 pub struct BuiltModel {
-    pub model: Box<dyn CachedModel>,
     pub captured: Option<Arc<dyn CapturedDecode>>,
+    pub model: Box<dyn CachedModel>,
     /// The resolved expert-cache slot count (explicit or auto-sized, item 12).
     pub cache_size_slots: usize,
 }
@@ -82,15 +87,17 @@ pub fn build(
                 // scalar path's pre-loaded dense store.
                 let params = crate::models::qwen3_6::config::parse_text_config(tc)
                     .map_err(|e| RegistryError::Build(e.to_string()))?;
-                if config.model.cuda_graph {
+                let capture = config.model.cuda_graph && config.kernel.triton && device.is_cuda();
+                if config.model.cuda_graph && !capture {
                     eprintln!(
-                        "warning: cuda_graph is unavailable on the cudarc runtime; decode stays eager"
+                        "warning: cuda_graph needs kernel.triton = true on a CUDA device; decode stays eager"
                     );
                 }
                 // The pool owns the runtime this whole path runs on: the model,
                 // the dense launchers and the MoE adapter all launch on its
                 // stream, so a step's writes and its next reads stay ordered.
-                let cache = Arc::new(kv_cache(config, &params, device, false));
+                // A capture reserves the extra state slot for its padding row.
+                let cache = Arc::new(kv_cache(config, &params, device, capture));
                 let rt = cache.runtime().clone();
                 let stream = rt.raw_stream();
                 let driver = rt.driver().clone();
@@ -108,15 +115,30 @@ pub fn build(
                     None,
                     head_gemv,
                     fp8_linear,
-                    cache,
+                    cache.clone(),
                 )
                 .map_err(|e| RegistryError::Build(e.to_string()))?;
                 let slots = resolve_cache_slots(config, &params, device, Some(driver.as_ref()))?;
                 let moe = moe_port(config, &params, index, reader, device, stream, slots)?;
                 model.attach_moe(moe);
+                let captured = if capture {
+                    match capture_decode(config, &model, &cache, model.runtime()) {
+                        Ok(graphs) => Some(Arc::new(graphs) as Arc<dyn CapturedDecode>),
+                        Err(e) => {
+                            // A failed capture must not break serving: report the
+                            // op that refused and fall back to the eager step.
+                            eprintln!(
+                                "warning: decode graph capture failed ({e}); decode stays eager"
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
                 Ok(BuiltModel {
+                    captured,
                     model: Box::new(model),
-                    captured: None,
                     cache_size_slots: slots,
                 })
             }
@@ -135,6 +157,11 @@ fn scalar_built(
     reader: Arc<dyn WeightsReader>,
     config: &crate::config::Config,
 ) -> Result<BuiltModel, RegistryError> {
+    if config.model.cuda_graph {
+        eprintln!(
+            "warning: cuda_graph needs the cudarc runtime on a CUDA device; decode stays eager"
+        );
+    }
     Ok(BuiltModel {
         model: Box::new(
             Qwen3_6::from_text_config(tc, index, reader)
@@ -147,6 +174,64 @@ fn scalar_built(
             .explicit()
             .unwrap_or(crate::config::DEFAULT_CACHE_SIZE_SLOTS),
     })
+}
+
+/// Record one decode graph per batch size and wrap them in the engine's service.
+/// The padding row claims a reserved state slot and pool location, and the
+/// reservation itself moves into the service so nothing else can take them.
+#[cfg(feature = "cudarc")]
+fn capture_decode(
+    config: &crate::config::Config,
+    model: &crate::models::qwen3_6::forward_cudarc::CudarcQwen3_6,
+    cache: &crate::infrastructure::kvcache_dev::DeviceCache,
+    rt: &crate::infrastructure::cudarc::Runtime,
+) -> Result<EngineDecodeGraphs<crate::infrastructure::decode_graph::DecodeGraph>, RegistryError> {
+    use crate::domain::decode::DecodeRow;
+    use crate::domain::kvcache::KvCache;
+    use crate::infrastructure::decode_buffers::DecodeBuffers;
+
+    let build_err = |e: String| RegistryError::Build(e);
+    let mut padding_cache = cache.begin();
+    cache
+        .reserve(&mut padding_cache, 1)
+        .map_err(|e| build_err(e.to_string()))?;
+    let padding = DecodeRow {
+        input_id: 0,
+        position: 0,
+        state_slot: padding_cache.state_slot(),
+        out_loc: padding_cache.tail(1)[0],
+    };
+    let sizes = graph_batch_sizes(config.model.max_running_requests);
+    // SAFETY: `rt` is the model's non-default stream on the device's primary
+    // context, and the step is the strictly device-only decode forward (no host
+    // copy, no allocation outside the capture pool, no synchronization).
+    unsafe {
+        EngineDecodeGraphs::capture(
+            rt,
+            model.params().vocab_size,
+            config.model.max_seq_len,
+            &sizes,
+            padding,
+            padding_cache,
+            |bufs: &DecodeBuffers| model.forward_decode_into(bufs).map_err(|e| e.to_string()),
+        )
+    }
+    .map_err(|e| RegistryError::Build(e.to_string()))
+}
+
+/// The batch sizes to capture: `1`, `2`, `4` and `max_running`, deduplicated and
+/// capped at `max_running`. A step of `n` rows replays on the smallest captured
+/// size at or above `n`.
+#[cfg(feature = "cudarc")]
+fn graph_batch_sizes(max_running: usize) -> Vec<usize> {
+    let mut sizes = vec![1usize];
+    for s in [2usize, 4, max_running] {
+        if (1..=max_running).contains(&s) && !sizes.contains(&s) {
+            sizes.push(s);
+        }
+    }
+    sizes.sort_unstable();
+    sizes
 }
 
 /// The device KV cache the engine hands page tables out from: `[kv]` sizes it,
@@ -513,6 +598,16 @@ mod tests {
     fn missing_arch_errors() {
         let v: Value = serde_json::from_str(r#"{"model_type": "qwen3_5_moe"}"#).unwrap();
         assert!(matches!(arch_of(&v), Err(RegistryError::NoArch)));
+    }
+
+    #[cfg(feature = "cudarc")]
+    #[test]
+    fn graph_batch_sizes_cover_one_two_four_and_the_cap() {
+        assert_eq!(graph_batch_sizes(1), vec![1]);
+        assert_eq!(graph_batch_sizes(2), vec![1, 2]);
+        assert_eq!(graph_batch_sizes(3), vec![1, 2, 3]);
+        assert_eq!(graph_batch_sizes(4), vec![1, 2, 4]);
+        assert_eq!(graph_batch_sizes(8), vec![1, 2, 4, 8]);
     }
 
     /// The 8 GiB target: 3878 MiB free after the tower and KV pool, 1.69 MiB

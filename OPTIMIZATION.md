@@ -8,23 +8,31 @@ decision-88 verification and the remediation plan to FreeToken parity. `TODO.md`
 section 8 holds the open-item numbering; this file holds the measured facts and
 the ordered plan.
 
-> **Runtime note (2026-10-23, decision 132).** Every "captured" number below was
-> measured on the engine-owned CUDA-graph path over the libtorch forward. That
-> path was removed with libtorch: the serving runtime is now cudarc and decode
-> capture is parked, so captured numbers are history, not reproducible, until a
-> capture path is ported. Eager numbers and all prefill numbers remain the
-> measured reference for the current runtime.
+> **Runtime note (2026-10-23, decisions 132, 134).** Every "captured" number
+> below that came from the removed libtorch path is history. On the cudarc
+> runtime decode capture is **ported** (decision 134): the registry records one
+> graph per batch size when `cuda_graph = true`. Measured on this box (bs=1,
+> bf16 KV, `FERRUM_SMOKE_TOKENS=16`, n=2/arm, order-balanced):
 >
-> **Torchless eager baseline after the recovery slice (2026-10-23, decision
-> 133).** RTX 5060 Laptop, bf16 KV, eager: **517-token pp ~402 tok/s, tg ~32.3;
-> 2057-token pp ~935 tok/s** (with a 1664-slot cache; auto 1920 OOMs the 2057
-> prefill with the 2048-token MoE scratch), **tg ~29 at a 2057 prefix**. The
-> old libtorch path was 401/32.8 and 958. 517 is at parity; 2057 prefill is
-> within 2.4%. The gains came from the tiled causal SDPA, bf16 KV attention,
-> one fused conv prefill per layer, and the device-side MoE slot/CSR plan. The
-> remaining decode gap is the missing CUDA-graph capture; paged attention for
-> eager decode was a measured no-win and is reverted. Do not re-chase those
-> without a split-K paged kernel or a capture port.
+> | prompt | cache | eager pp / tg | captured pp / tg |
+> |---|---|---|---|
+> | 517 | auto (1920) | 402.1 / 32.4 | 403.3 / 33.0 |
+> | 2057 | 1664 | 915.6 / 28.4 | 915.7 / 28.9 |
+>
+> Capture buys only **+2% tg**; the cudarc eager step is already close to its
+> captured twin, so the old launch-chain gap did not survive the rewrite. The
+> captured arm adds ~130 MiB VRAM for the three graphs. The remaining gap is the
+> 1664-slot cache pinned at 2057 (auto 1920 still OOMs that prefill) and the
+> step's math, not the launch chain.
+>
+> **Torchless baseline after the recovery slice (2026-10-23, decision 133).**
+> RTX 5060 Laptop, bf16 KV: **517-token pp ~402 tok/s, tg ~32.4; 2057-token pp
+> ~915 tok/s** (with a 1664-slot cache), **tg ~28.9 at a 2057 prefix**. The old
+> libtorch path was 401/32.8 and 958. 517 is at parity; 2057 prefill is within
+> ~4%. The gains came from the tiled causal SDPA, bf16 KV attention, one fused
+> conv prefill per layer, and the device-side MoE slot/CSR plan. Paged attention
+> for eager decode was a measured no-win and is reverted; do not re-chase it
+> without a split-K paged kernel.
 
 ## Why
 
