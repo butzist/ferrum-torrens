@@ -136,6 +136,24 @@ Instructions for AI coding agents working in this repository.
   Triton sources confined to `python/ferrum_kernel/`; the domain core stays pure
   Rust, and nothing at runtime imports Python.
 
+## Deployment (NixOS)
+
+- `nix build .#ferrum-torrens` is the deployable binary: `nix/package.nix`
+  makes the `kernels` derivation a build input and `build.rs` embeds its
+  `kernel/` tree, so the executable carries its cubins and needs no Python,
+  torch, libtorch or `FERRUM_KERNEL_DIR` at run time. The wrapper only adds the
+  CUDA 13.4 cuBLAS root and the driver mount to `LD_LIBRARY_PATH`.
+- `flake.nixosModules.default` (`nix/module.nix`) adds
+  `services.ferrum-torrens`: a serving unit plus a first-run
+  `ferrum-torrens-model.service` that downloads the HF checkpoint and converts it
+  to FTW with the packaged `ferrum-torrens-model` helper (`nix/fetch-model.sh`,
+  which bootstraps FreeToken's conversion venv under the state dir). The model
+  unit is gated by `model.autoConvert` and
+  `ConditionPathExists=!<model.path>/freetoken_weight.json`.
+- Keep the converter out of the runtime: the serving process still links only
+  Rust/cudarc; Python exists only inside the one-shot conversion venv and the
+  kernel build.
+
 ## Reference and tooling
 
 - `FreeToken/` is the reference implementation. It is READ-ONLY. Never edit it.

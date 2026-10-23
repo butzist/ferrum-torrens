@@ -13,6 +13,39 @@ Triton and AOT-compiled by the `kernels` Nix derivation into `kernel/*.cubin`;
 the Rust build copies that tree in and launches it through the CUDA driver API.
 There is no Python or libtorch at runtime and no committed binary artifact.
 
+## NixOS service
+
+`nix build .#ferrum-torrens` builds the binary with the sm_120 cubins **baked
+in** (`nix/package.nix` depends on the `kernels` derivation; `build.rs` embeds
+its `kernel/` tree), so the deployed executable needs no devshell, no
+`FERRUM_KERNEL_DIR`, no Python and no libtorch. The flake exposes a NixOS
+module that runs it as a systemd service:
+
+```nix
+{
+  inputs.ferrum-torrens.url = "path:/path/to/ferrum-torrens";
+  imports = [ inputs.ferrum-torrens.nixosModules.default ];
+
+  services.ferrum-torrens = {
+    enable = true;
+    # HF token for the first-run download; create the file with HF_TOKEN=hf_...
+    environmentFile = "/etc/ferrum-torrens/hf-token";
+    # Defaults: nvidia/Qwen3.6-35B-A3B-NVFP4 -> /var/lib/ferrum-torrens/models/....ftw,
+    # port 1919 on 127.0.0.1, cuda_graph = true, kv 16384 tokens.
+  };
+}
+```
+
+On first boot `ferrum-torrens-model.service` downloads the HF snapshot and runs
+FreeToken's `ft checkpoint` to make the FTW dir (it bootstraps a private
+conversion venv under the state dir; network, a CUDA device and roughly 50 GiB
+of free disk are required). Follow it with
+`journalctl -u ferrum-torrens-model -f`; `ferrum-torrens.service` starts after
+it. To skip the download/convert, set `model.autoConvert = false` and point
+`model.path` at an existing FTW checkpoint (`model.source` supplies a local HF
+snapshot instead of downloading one). The service runs as a system user in the
+`video` and `render` groups and reads the FTW dir read-only.
+
 ## Documentation map
 
 - **`TODO.md`** -- the open plan: scope, repo layout, config schema, the open

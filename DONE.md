@@ -4267,3 +4267,45 @@ subsection names are kept verbatim.
        ignored; `decode_graph_capture` both tests; `device_decode_matches_refeed`;
        `cudarc_engine_generate` eager and captured. Logs
        `/tmp/opencode/{gate-cudarc-eager,gate-cudarc-captured,smoke-*}.log`.
+
+
+135. **NixOS service, first-run model bootstrap, and build-time cubins** (2026-10-23).
+     Deployment packaging, not a serving change.
+     - **Binary package.** `nix/package.nix` builds the release binary with
+       `--features cudarc` and makes the `kernels` derivation a normal build
+       input. `build.rs` copies its `kernel/` tree into `OUT_DIR` and
+       `kernel_abi.rs` includes it, so `nix build .#ferrum-torrens` produces an
+       executable with the sm_120 cubins embedded. The wrapper adds
+       `cudarcCudaHome/lib` (CUDA 13.4 cuBLAS) and `/run/opengl-driver/lib` to
+       `LD_LIBRARY_PATH`; there is no run-time Python, torch, libtorch or
+       `FERRUM_KERNEL_DIR`.
+     - **First-run conversion.** `ferrum-torrens-model` (`nix/fetch-model.sh` +
+       `nix/model.nix`) checks for `<model.path>/freetoken_weight.json`, creates
+       a private FreeToken venv under the state dir with the repository's tested
+       `uv pip install -e ... [accel]` line (`FREETOKEN_ALLOW_CUDA_MISMATCH=1`,
+       the toolkit's nvcc against the wheel's cu130 torch), downloads
+       `nvidia/Qwen3.6-35B-A3B-NVFP4` with `huggingface_hub` (or uses
+       `MODEL_SOURCE`), runs `ft checkpoint --moe-backend offload --shard-gib 8`
+       into a temp sibling, and renames it only after the FTW index exists. A
+       `flock` keeps concurrent starts single-flight; the downloaded snapshot is
+       removed after success unless `keepSource` is set.
+     - **NixOS module.** `flake.nixosModules.default` (`nix/module.nix`) exposes
+       `services.ferrum-torrens` with package/user/group/state/cache dirs, host,
+       port, firewall, model repo/revision/path/source/autoConvert/keepSource/
+       shard size, sampling-independent engine knobs (`maxSeqLen`,
+       `maxPrefillLength`, `maxRunningRequests`, `kvTokens`, `kvDtype`,
+       `cacheSizeSlots`, `cudaGraph`), `extraConfig` and `extraEnvironment`.
+       The model unit is a `oneshot` with
+       `ConditionPathExists=!<path>/freetoken_weight.json`; the serve unit
+       `requires`/`after`s it, runs as a `video`/`render` system user, and
+       restarts on failure. The generated config enables the Triton kernels and
+       CUDA-graph decode by default.
+     - **Validation.** The module and both packages evaluate against nixpkgs
+       26.11 with the real option defaults (generated config path, serve
+       `ExecStart`, the model unit's `ConditionPathExists`, firewall port,
+       user creation, environment). The flake formatter gate is `nixfmt`
+       (installed in the devshell environment via nixpkgs; the repository does
+       not commit a formatter). The first-run installer cannot be exercised
+       without network, a GPU and ~50 GiB of disk; its shell is
+       `bash -n`-clean and the venv/convert commands are the ones
+       `AGENTS.md` documents.
