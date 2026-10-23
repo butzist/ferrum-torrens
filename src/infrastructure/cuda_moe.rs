@@ -24,10 +24,11 @@ use crate::infrastructure::cuda_driver::{
 };
 use crate::infrastructure::cudarc::{Runtime, Tensor, TensorDType};
 use crate::infrastructure::kernel_abi::{
-    Abi, CopyArgs, GEMV_DOWN, GEMV_GATE_UP, GROUPED_DOWN, GROUPED_GATE_UP, INDEX_COPY, LRU_ENSURE,
-    LruArgs, MoEArgs, SILU_MUL, SUM_REDUCE, StagingAbi, gemv_down_args, gemv_gate_up_args, grid,
-    grouped_down_args, grouped_gate_up_args, index_copy_args, lru_ensure_args, silu_mul_args,
-    sum_reduce_args,
+    Abi, CopyArgs, CsrCountArgs, CsrPrefixArgs, CsrScatterArgs, GEMV_DOWN, GEMV_GATE_UP,
+    GROUPED_DOWN, GROUPED_GATE_UP, INDEX_COPY, LRU_ENSURE, LruArgs, MOE_CSR_COUNT, MOE_CSR_PREFIX,
+    MOE_CSR_SCATTER, MoEArgs, SILU_MUL, SUM_REDUCE, StagingAbi, gemv_down_args, gemv_gate_up_args,
+    grid, grouped_down_args, grouped_gate_up_args, index_copy_args, lru_ensure_args,
+    moe_csr_count_args, moe_csr_prefix_args, moe_csr_scatter_args, silu_mul_args, sum_reduce_args,
 };
 use crate::infrastructure::torch::Device;
 
@@ -169,6 +170,12 @@ pub struct CudaMoE {
     /// has run (item 8 slice 2). Retained across prefill/decode transitions, so
     /// nothing is reallocated per prefill; `None` when overlap is off.
     prefill: Option<PrefillHarness>,
+    /// Reused device scratch, one group per `(tokens, top_k)` chunk shape. The
+    /// prefill overwrites the last step's buffers on the same stream instead of
+    /// allocating ~126 MiB per layer chunk.
+    prefill_groups: Vec<StagedGroup>,
+    /// Route token tables, one per `(tokens, top_k)` chunk shape.
+    prefill_tokens: Vec<TokenTable>,
     /// The live residency policy over the shared slot banks.
     residency: Residency,
 }
@@ -200,6 +207,26 @@ pub struct StagedGroup {
     ic2: Tensor,
     ic3: Tensor,
     result: Tensor,
+    /// The CSR build's scratch, present only for a reused prefill group. Decode
+    /// groups keep it `None`; they never launch the grouped path.
+    csr: Option<CsrScratch>,
+}
+
+/// One `(tokens, top_k)` shape's device CSR buffers, reused for every layer
+/// chunk of that shape. The grouped launches read `seg`/`route_idx`; `counts`
+/// is the prefix sum's input.
+struct CsrScratch {
+    counts: Tensor,
+    seg: Tensor,
+    route_idx: Tensor,
+}
+
+/// The token-major route token table for one chunk shape. It is the same for
+/// every layer of a prefill, so it is built once per `(tokens, top_k)`.
+struct TokenTable {
+    tokens: usize,
+    top_k: usize,
+    t: Tensor,
 }
 
 /// The device-resident half of the offload cache: the LRU tables `lru_ensure`
@@ -274,9 +301,16 @@ struct PrefillHarness {
     dst_idx: [Vec<Tensor>; 2],
     /// Group size (rows), one int64 scalar each.
     num: Vec<Tensor>,
-    /// The `2 * experts` cache slots this prefill's buffer owns, chosen as the
-    /// coldest contiguous window so the hottest decode experts stay resident.
-    victims_host: Vec<i32>,
+    /// Per half, the victim slot ids viewed as an `[experts, 1]` table: the
+    /// device gather maps a router expert id to its slot. Constant for the
+    /// prefill, so it is built once on entry.
+    victim_tables: [Tensor; 2],
+    /// Per half, the grouped grid's ascending slot list. Constant for the
+    /// prefill, so it is not re-uploaded per layer.
+    seg_ids: [Tensor; 2],
+    /// Set by `moe_csr_count` if a route named a slot outside the bank. Read
+    /// once at the end of the prefill so the failure is loud, not a misread.
+    csr_bad: Tensor,
     /// The layer each half currently holds, `-1` when empty.
     half_layer: [i64; 2],
     /// Host copy plan: the pinned banks' device aliases and the device banks'
@@ -369,6 +403,8 @@ impl CudaMoE {
             device_staging: None,
             pinned: None,
             prefill: None,
+            prefill_groups: Vec::new(),
+            prefill_tokens: Vec::new(),
             residency: Residency::Decode,
         })
     }
@@ -609,7 +645,6 @@ impl CudaMoE {
                 dsts.push(rt.from_slice_i32(&dst, &[dst.len()])?);
             }
         }
-        let victims_host: Vec<i32> = (0..2 * experts).map(|s| s as i32).collect();
         let banks = self
             .pinned
             .as_ref()
@@ -627,6 +662,10 @@ impl CudaMoE {
                 "[moe] prefill DMA copy unavailable (cuMemcpyBatchAsync_v2); using index_copy"
             );
         }
+        let empty = rt.zeros(&[0], TensorDType::I32)?;
+        let victim_tables = [empty.clone(), empty.clone()];
+        let seg_ids = [empty.clone(), empty];
+        let csr_bad = rt.zeros(&[1], TensorDType::I32)?;
         self.prefill = Some(PrefillHarness {
             copy_stream,
             begin,
@@ -637,7 +676,9 @@ impl CudaMoE {
             src_idx,
             dst_idx,
             num,
-            victims_host,
+            victim_tables,
+            seg_ids,
+            csr_bad,
             half_layer: [-1, -1],
             banks,
             dst_base,
@@ -865,6 +906,7 @@ impl CudaMoE {
             ic2: self.rt.zeros(&[routes, inter], TensorDType::Bf16)?,
             ic3: self.rt.zeros(&[routes, hidden], TensorDType::Bf16)?,
             result: self.rt.zeros(&[tokens, hidden], TensorDType::Bf16)?,
+            csr: None,
         })
     }
 
@@ -918,6 +960,7 @@ impl CudaMoE {
             ic2: self.rt.zeros(&[routes, inter], TensorDType::Bf16)?,
             ic3: self.rt.zeros(&[routes, hidden], TensorDType::Bf16)?,
             result: self.rt.zeros(&[tokens, hidden], TensorDType::Bf16)?,
+            csr: None,
         };
         // Device to device, narrowing to bf16 on the way in -- the conversion
         // the host path makes during its upload, made here instead.
@@ -931,6 +974,148 @@ impl CudaMoE {
         let w = w.contiguous()?.reshape(&[w.numel()])?;
         w.narrow(0, 0, routes)?.copy_to(&g.weight_t)?;
         Ok(g)
+    }
+
+    /// A prefill chunk's reusable scratch: the same buffers `group_with_slots`
+    /// allocates, plus the CSR scratch, all zeroed once and then overwritten in
+    /// place on the compute stream.
+    fn new_prefill_group(&self, tokens: usize, top_k: usize) -> Result<StagedGroup, MoEError> {
+        let (hidden, inter) = (self.shapes.hidden, self.shapes.inter);
+        let routes = tokens * top_k;
+        Ok(StagedGroup {
+            tokens,
+            top_k,
+            routes,
+            x: self.rt.zeros(&[tokens, hidden], TensorDType::Bf16)?,
+            slot_t: self.rt.zeros(&[routes], TensorDType::I32)?,
+            token_t: self.rt.zeros(&[routes], TensorDType::I32)?,
+            weight_t: self.rt.zeros(&[routes], TensorDType::F32)?,
+            lut: self.lut.clone(),
+            ic1: self.rt.zeros(&[routes, 2 * inter], TensorDType::Bf16)?,
+            ic2: self.rt.zeros(&[routes, inter], TensorDType::Bf16)?,
+            ic3: self.rt.zeros(&[routes, hidden], TensorDType::Bf16)?,
+            result: self.rt.zeros(&[tokens, hidden], TensorDType::Bf16)?,
+            csr: Some(CsrScratch {
+                counts: self.rt.zeros(&[self.slots], TensorDType::I32)?,
+                seg: self.rt.zeros(&[self.slots + 1], TensorDType::I32)?,
+                route_idx: self.rt.zeros(&[routes], TensorDType::I32)?,
+            }),
+        })
+    }
+
+    /// Copy one chunk's device activations, weights, slots and token table into
+    /// an existing group. The addresses stay put, so a later layer reuses the
+    /// same scratch instead of allocating ~126 MiB.
+    fn stage_into_group(
+        &self,
+        g: &mut StagedGroup,
+        x: &Tensor,
+        weights: &Tensor,
+        slot_t: &Tensor,
+        token_t: &Tensor,
+    ) -> Result<(), MoEError> {
+        let (tokens, routes, hidden) = (g.tokens, g.routes, self.shapes.hidden);
+        if x.numel() != tokens * hidden {
+            return Err(MoEError::Bad(format!(
+                "prefill stage: {} activations for {tokens} tokens",
+                x.numel()
+            )));
+        }
+        let x = x.contiguous()?.reshape(&[tokens, hidden])?;
+        let x = if x.dtype() == TensorDType::Bf16 {
+            x
+        } else {
+            x.cast(TensorDType::Bf16)?
+        };
+        x.copy_to(&g.x)?;
+        let w = weights.contiguous()?.reshape(&[weights.numel()])?;
+        w.narrow(0, 0, routes)?.copy_to(&g.weight_t)?;
+        slot_t.copy_to(&g.slot_t)?;
+        token_t.copy_to(&g.token_t)?;
+        Ok(())
+    }
+
+    /// The token-major route token table for a chunk shape, built once and
+    /// reused by every layer of the prefill.
+    fn token_table_for(&mut self, tokens: usize, top_k: usize) -> Result<Tensor, MoEError> {
+        if let Some(t) = self
+            .prefill_tokens
+            .iter()
+            .find(|t| t.tokens == tokens && t.top_k == top_k)
+        {
+            return Ok(t.t.clone());
+        }
+        let host: Vec<i32> = (0..tokens)
+            .flat_map(|t| std::iter::repeat_n(t as i32, top_k))
+            .collect();
+        let t = self.rt.from_slice_i32(&host, &[host.len()])?;
+        self.prefill_tokens.push(TokenTable {
+            tokens,
+            top_k,
+            t: t.clone(),
+        });
+        Ok(t)
+    }
+
+    /// Build the grouped launches' CSR on the device: count the routes per slot,
+    /// exclusive-prefix the counts into `seg`, then scatter the route ids in
+    /// stable ascending order. The launches are ordered on the compute stream,
+    /// so no host readback is needed.
+    fn csr_build(
+        &self,
+        slot_t: &Tensor,
+        counts: &Tensor,
+        seg: &Tensor,
+        route_idx: &Tensor,
+        bad: &Tensor,
+    ) -> Result<(), MoEError> {
+        let routes = slot_t.numel();
+        let slots = self.slot_capacity();
+        let count = self.staging_abi.kernel(MOE_CSR_COUNT).map_err(bad_abi)?;
+        let args = CsrCountArgs {
+            slot: slot_t.device_ptr(),
+            counts: counts.device_ptr(),
+            bad: bad.device_ptr(),
+            routes: routes as u32,
+            slots_n: slots as u32,
+        };
+        let pack = moe_csr_count_args(&self.staging_abi, &args).map_err(bad_abi)?;
+        let mut params = pack.kernel_params().map_err(bad_abi)?;
+        // SAFETY: every pointer is a live allocation the caller holds and the
+        // stream is this adapter's; the grid is the live slot count.
+        unsafe {
+            self.staging
+                .launch_grid(count, (slots as u32, 1, 1), &mut params, self.stream)
+        }
+        .map_err(driver)?;
+
+        let prefix = self.staging_abi.kernel(MOE_CSR_PREFIX).map_err(bad_abi)?;
+        let args = CsrPrefixArgs {
+            counts: counts.device_ptr(),
+            seg: seg.device_ptr(),
+            slots_n: slots as u32,
+        };
+        let pack = moe_csr_prefix_args(&self.staging_abi, &args).map_err(bad_abi)?;
+        let mut params = pack.kernel_params().map_err(bad_abi)?;
+        // SAFETY: as above; the prefix sum is one program.
+        unsafe { self.staging.launch(prefix, &mut params, self.stream) }.map_err(driver)?;
+
+        let scatter = self.staging_abi.kernel(MOE_CSR_SCATTER).map_err(bad_abi)?;
+        let args = CsrScatterArgs {
+            slot: slot_t.device_ptr(),
+            seg: seg.device_ptr(),
+            route_idx: route_idx.device_ptr(),
+            routes: routes as u32,
+            slots_n: slots as u32,
+        };
+        let pack = moe_csr_scatter_args(&self.staging_abi, &args).map_err(bad_abi)?;
+        let mut params = pack.kernel_params().map_err(bad_abi)?;
+        // SAFETY: as above.
+        unsafe {
+            self.staging
+                .launch_grid(scatter, (slots as u32, 1, 1), &mut params, self.stream)
+        }
+        .map_err(driver)
     }
 
     /// Rewrite an existing group for the next step of the same shape, keeping
@@ -1328,6 +1513,7 @@ impl CudaMoE {
             pf.half_layer = [-1, -1];
             pf.ready_armed = [false, false];
             pf.release_armed = [false, false];
+            self.rt.from_slice_i32(&[0], &[1])?.copy_to(&pf.csr_bad)?;
             // SAFETY: `self.stream` is the adapter's live stream in the context
             // made current at construction.
             unsafe { pf.begin.record(self.stream) }.map_err(driver)?;
@@ -1401,6 +1587,25 @@ impl CudaMoE {
             .map(|st| st.experts)
             .expect("checked above");
         let block_k = self.lru_block_k()?;
+        // Both halves are fixed for the whole prefill: an `[experts, 1]` device
+        // table maps a router id to its slot, and `seg_ids` is the slot list the
+        // grouped grid walks. Building them here removes a per-layer upload.
+        let all_segments = prefill_all_segments();
+        let slots = self.slots;
+        let empty = rt.zeros(&[0], TensorDType::I32)?;
+        let mut victim_tables = [empty.clone(), empty.clone()];
+        let mut seg_ids = [empty.clone(), empty];
+        for half in 0..2 {
+            let off = half * experts;
+            let victim_half = &victims[off..off + experts];
+            victim_tables[half] = rt.from_slice_i32(victim_half, &[experts, 1])?;
+            let seg_host: Vec<i32> = if all_segments {
+                (0..slots).map(|s| s as i32).collect()
+            } else {
+                victim_half.to_vec()
+            };
+            seg_ids[half] = rt.from_slice_i32(&seg_host, &[seg_host.len()])?;
+        }
         let pf = self
             .prefill
             .as_mut()
@@ -1414,7 +1619,8 @@ impl CudaMoE {
                 *dst = rt.from_slice_i32(host, &[n])?;
             }
         }
-        pf.victims_host = victims;
+        pf.victim_tables = victim_tables;
+        pf.seg_ids = seg_ids;
         pf.window_start = start;
         Ok(())
     }
@@ -1524,9 +1730,11 @@ impl CudaMoE {
     }
 
     /// One layer of a whole-layer prefill: ensure the layer is in its half, kick
-    /// off the next layer's copy, wait for the half, run the GEMV per route chunk
-    /// over the materialized layer, then release the half. Position == expert id
-    /// (offset by the half), so no `lru_ensure` and no route rewrite happen.
+    /// off the next layer's copy, wait for the half, run the grouped GEMM per
+    /// route chunk over the materialized layer, then release the half. The slot
+    /// mapping and the CSR plan are built on the device (no host round-trip),
+    /// and the chunk scratch is reused across layers (decision 40 prerequisite
+    /// 4, R10 prefill follow-up).
     fn prefill_layer(
         &mut self,
         layer: usize,
@@ -1539,24 +1747,15 @@ impl CudaMoE {
         let hidden = self.shapes.hidden;
         let tokens = x.numel() / hidden;
         let routes = tokens * top_k;
-        let (experts_per_layer, layers) = {
+        let (_experts_per_layer, layers) = {
             let st = self.device_staging.as_ref().expect("staging");
             (st.experts, st.layers)
         };
         let half = layer % 2;
-        let victims = self.prefill.as_ref().expect("harness").victims_host.clone();
-        // The grid runs over this half's buffer slots only: every route of the
-        // chunk names one of them (whole-layer staging), and `victims_host` is
-        // ascending, so its ranges line up with the CSR's slot-sorted
-        // `route_idx`. Launching over all cache slots made ~6x of the grid
-        // retire on an empty segment.
-        let seg_host: Vec<i32> = if prefill_all_segments() {
-            (0..self.slot_capacity()).map(|s| s as i32).collect()
-        } else {
-            let off = half * experts_per_layer;
-            victims[off..off + experts_per_layer].to_vec()
+        let (victim_table, seg_ids) = {
+            let pf = self.prefill.as_ref().expect("harness");
+            (pf.victim_tables[half].clone(), pf.seg_ids[half].clone())
         };
-        let seg_ids = self.rt.from_slice_i32(&seg_host, &[seg_host.len()])?;
 
         // (1) This layer's half. Layer 0 has no lookahead, so it starts here; for
         // every later layer the previous step already prefetched it.
@@ -1577,7 +1776,8 @@ impl CudaMoE {
             }
         }
         // (3) Wait for this half (the copy stream's ready event), then run the
-        // GEMV over the materialized layer, chunked only to bound the scratch.
+        // grouped GEMM over the materialized layer, chunked only to bound the
+        // scratch.
         {
             let sp = crate::infrastructure::profile::begin("pf_wait");
             let pf = self.prefill.as_ref().expect("harness");
@@ -1588,21 +1788,14 @@ impl CudaMoE {
             crate::infrastructure::profile::end("pf_wait", sp);
         }
         let sp = crate::infrastructure::profile::begin("pf_gemm");
-        let offset = half * experts_per_layer;
         // The buffer's slot for `(half, expert_id)` is the selected victim, not
-        // the fixed `half * E + id` range (decision 94 follow-up).
-        let experts_host = host_i32(experts)?;
-        let slots_host: Vec<i32> = experts_host
-            .iter()
-            .map(|&expert| {
-                victims.get(offset + expert as usize).copied().ok_or_else(|| {
-                    MoEError::Bad(format!(
-                        "prefill expert id {expert} is past the {experts_per_layer}-expert layer"
-                    ))
-                })
-            })
-            .collect::<Result<_, _>>()?;
-        let slots = self.rt.from_slice_i32(&slots_host, &[routes])?;
+        // the fixed `half * E + id` range (decision 94 follow-up). The gather
+        // runs on the device: `experts` is already an i32 tensor, so the host
+        // never sees the 16.5k router ids.
+        let experts_flat = as_i32_ids(experts, routes, &self.rt)?;
+        let slots = victim_table
+            .gather_rows(&experts_flat)?
+            .reshape(&[routes])?;
         // The whole-layer path never runs `lru_ensure`, so `block_k` does not
         // bound it; the chunk only bounds the scratch and keeps the grouped
         // GEMV's route list small. A large chunk is a large win: with 16-token
@@ -1616,25 +1809,48 @@ impl CudaMoE {
             let xc = x.narrow(0, start, n)?;
             let wc = weights.narrow(0, start, n)?;
             let sc = slots.narrow(0, start * top_k, n * top_k)?;
-            let token_host: Vec<i32> = (0..n)
-                .flat_map(|t| std::iter::repeat_n(t as i32, top_k))
-                .collect();
-            let token_t = self.rt.from_slice_i32(&token_host, &[n * top_k])?;
+            let token_t = self.token_table_for(n, top_k)?;
             let mut oc = out.narrow(0, start, n)?;
-            let g = self.group_with_slots(&xc, &wc, sc, token_t, n, top_k)?;
+            // The scratch group is keyed by shape and overwritten on the same
+            // stream; the previous chunk has already been collected when this
+            // one stages, so the addresses are stable and reused across layers.
+            let reused = self
+                .prefill_groups
+                .iter()
+                .position(|g| g.tokens == n && g.top_k == top_k);
+            let mut g = match reused {
+                Some(i) => self.prefill_groups.remove(i),
+                None => self.new_prefill_group(n, top_k)?,
+            };
+            self.stage_into_group(&mut g, &xc, &wc, &sc, &token_t)?;
             if prefill_use_grouped() {
-                // The CSR lives as long as `g`: the queued launches read it
-                // asynchronously, the same lifetime the staged buffers have.
-                let chunk_slots = &slots_host[start * top_k..(start + n) * top_k];
-                let (seg, route_idx) =
-                    build_grouped_csr_host(chunk_slots, self.slot_capacity(), &self.rt)?;
-                self.launch_grouped(&g, &seg, &seg_ids, &route_idx)?;
+                let csr = g.csr.as_ref().expect("prefill group CSR");
+                let bad = &self.prefill.as_ref().expect("harness").csr_bad;
+                self.csr_build(&g.slot_t, &csr.counts, &csr.seg, &csr.route_idx, bad)?;
+                self.launch_grouped(&g, &csr.seg, &seg_ids, &csr.route_idx)?;
                 self.collect_dev(&g, &mut oc)?;
             } else {
                 self.launch(&g)?;
                 self.collect_dev(&g, &mut oc)?;
             }
+            self.prefill_groups.push(g);
             start += n;
+        }
+        // The count kernel raises this flag if a route named a slot outside the
+        // bank; check it once at the end rather than syncing per layer.
+        if layer + 1 == layers {
+            let bad = self
+                .prefill
+                .as_ref()
+                .expect("harness")
+                .csr_bad
+                .to_host_i32()?;
+            if bad.first().copied().unwrap_or(0) != 0 {
+                return Err(MoEError::Bad(
+                    "prefill grouped CSR: a route is not resident or names a slot past the bank"
+                        .into(),
+                ));
+            }
         }
         crate::infrastructure::profile::end("pf_gemm", sp);
         // (4) Release the half so a future layer's prefetch may reuse it.
@@ -1816,12 +2032,14 @@ fn pick_window(usage: &[i64], buffer: usize) -> usize {
     best.1
 }
 
-/// Bucket the prefill's routes per slot into a CSR the grouped launches read:
+/// Host reference for the device CSR (unit tests only): bucket the prefill's
+/// routes per slot into a CSR the grouped launches read:
 /// `seg[s]..seg[s + 1]` indexes `route_idx`, which holds the original route
 /// ids in stable per-slot order, so the segment index is the slot id. Prefill
 /// routes are always resident (whole-layer staging); the decode-only shapes a
 /// non-resident or out-of-bank slot produces are refused here rather than
 /// misread by a segment program.
+#[cfg(test)]
 fn build_grouped_csr_host(
     route_slot: &[i32],
     slots: usize,
@@ -2090,6 +2308,68 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("past the"), "{err}");
+    }
+
+    /// The device CSR build must reproduce the host reference exactly, including
+    /// the stable ascending route order inside every slot.
+    #[test]
+    fn the_device_csr_matches_the_host_reference() {
+        let Some(_) = test_rt() else {
+            return;
+        };
+        let abi = Abi::committed().unwrap();
+        let slots = 8usize;
+        let moe = match CudaMoE::new(
+            Device::Cuda(0),
+            Arc::new(Unused),
+            ExpertShapes::new(abi.hidden, abi.inter).unwrap(),
+            slots,
+        ) {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        let rt = moe.runtime();
+        let bad = rt.from_slice_i32(&[0], &[1]).unwrap();
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut cases = vec![
+            vec![0; 37],
+            vec![7],
+            vec![3, 3, 3, 1, 1, 2, 2, 2, 2],
+            vec![5, 5, 5, 5],
+        ];
+        for len in [1usize, 2, 7, 33, 128, 1025] {
+            cases.push((0..len).map(|_| (next() % slots as u64) as i32).collect());
+        }
+        for case in &cases {
+            let slots_t = rt.from_slice_i32(case, &[case.len()]).unwrap();
+            let counts = rt.zeros(&[slots], TensorDType::I32).unwrap();
+            let seg = rt.zeros(&[slots + 1], TensorDType::I32).unwrap();
+            let route_idx = rt.zeros(&[case.len()], TensorDType::I32).unwrap();
+            rt.from_slice_i32(&[0], &[1])
+                .unwrap()
+                .copy_to(&bad)
+                .unwrap();
+            moe.csr_build(&slots_t, &counts, &seg, &route_idx, &bad)
+                .unwrap();
+            let (want_seg, want_idx) = build_grouped_csr_host(case, slots, rt).unwrap();
+            assert_eq!(
+                seg.to_host_i32().unwrap(),
+                want_seg.to_host_i32().unwrap(),
+                "seg for {case:?}"
+            );
+            assert_eq!(
+                route_idx.to_host_i32().unwrap(),
+                want_idx.to_host_i32().unwrap(),
+                "route_idx for {case:?}"
+            );
+            assert_eq!(bad.to_host_i32().unwrap(), vec![0], "bad flag for {case:?}");
+        }
     }
 
     /// The prefill chunker keeps every chunk inside the committed route cap, and

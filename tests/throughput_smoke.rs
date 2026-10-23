@@ -324,7 +324,11 @@ fn single_request_throughput_smoke() {
     // Warm up: capture the decode graph and populate the expert slot cache so
     // neither lands in the measured run.
     let _ = time_request(&engine, prompt_of(&engine, 64), 8);
-    assert!(engine.expert_steps() > 0, "the kernel path must have run");
+    let moe_ablated = std::env::var("FT_ABLATE").is_ok_and(|v| v.split(',').any(|p| p == "moe"));
+    assert!(
+        moe_ablated || engine.expert_steps() > 0,
+        "the kernel path must have run"
+    );
 
     let sampler = Sampler::start();
     let t = time_request(

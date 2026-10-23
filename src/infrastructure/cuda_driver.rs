@@ -1341,6 +1341,35 @@ impl StagingKernels {
         )))
     }
 
+    /// Launch a staging kernel whose grid depends on the live step (the CSR
+    /// build runs one program per resident slot), keeping the cubin's block
+    /// shape and shared memory.
+    ///
+    /// # Safety
+    /// As [`StagingKernels::launch`]: `stream` must be current-context and
+    /// `params` the `kernel_abi` pack for this same kernel.
+    pub unsafe fn launch_grid(
+        &self,
+        kernel: &StagingKernel,
+        grid: (u32, u32, u32),
+        params: &mut [*mut c_void],
+        stream: CUstream,
+    ) -> Result<(), CudaError> {
+        let f = self.function(kernel)?;
+        // SAFETY: `f` is live in the driver's current context, the grid is the
+        // caller's live slot count, and the block shape comes from the cubin.
+        unsafe {
+            self.driver.launch(
+                f,
+                grid,
+                (kernel.block_threads(), 1, 1),
+                kernel.shared,
+                stream,
+                params,
+            )
+        }
+    }
+
     /// Launch a staging kernel with its own fixed grid and block shape.
     ///
     /// # Safety

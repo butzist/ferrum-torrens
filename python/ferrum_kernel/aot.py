@@ -81,6 +81,7 @@ from .nvfp4_moe import (
     _silu_mul_kernel,
     _sum_reduce_kernel,
 )
+from .moe_prefill import _moe_csr_count_kernel, _moe_csr_prefix_kernel, _moe_csr_scatter_kernel
 from .offload import _ensure_experts_kernel, _index_copy_multi_kernel
 from .attention import _paged_attention_decode_kernel
 
@@ -88,6 +89,7 @@ from .attention import _paged_attention_decode_kernel
 # (`min(next_power_of_2(inter), 256)`), so the AOT build pins the serving value.
 SILU_BLOCK_I = 256
 from .signatures import (
+    SERVING_BLOCK_C,
     SERVING_COPY_SPLITS,
     SERVING_DTYPE,
     SERVING_HIDDEN,
@@ -153,6 +155,10 @@ from .signatures import (
     grouped_gemm,
     index_copy,
     index_copy_constexprs,
+    moe_csr_count,
+    moe_csr_constexprs,
+    moe_csr_prefix,
+    moe_csr_scatter,
     lru_constexprs,
     lru_ensure,
     nvfp4_dense_gemv,
@@ -243,6 +249,27 @@ STAGING_KERNELS: dict[str, dict] = {
         "signature": index_copy(),
         "constexprs": index_copy_constexprs(),
         "grid": [SERVING_NUM_BANKS, SERVING_COPY_SPLITS, 1],
+    },
+    "moe_csr_count": {
+        "fn": _moe_csr_count_kernel,
+        "signature": moe_csr_count(),
+        "constexprs": moe_csr_constexprs(),
+        "grid": [SERVING_BLOCK_C, 1, 1],
+        "num_warps": 1,
+    },
+    "moe_csr_prefix": {
+        "fn": _moe_csr_prefix_kernel,
+        "signature": moe_csr_prefix(),
+        "constexprs": {},
+        "grid": [1, 1, 1],
+        "num_warps": 1,
+    },
+    "moe_csr_scatter": {
+        "fn": _moe_csr_scatter_kernel,
+        "signature": moe_csr_scatter(),
+        "constexprs": moe_csr_constexprs(),
+        "grid": [SERVING_BLOCK_C, 1, 1],
+        "num_warps": 1,
     },
 }
 
@@ -404,6 +431,12 @@ LINEAR_KERNELS: dict[str, dict] = {
     "gather_rows_f32": {
         "fn": _gather_rows_kernel,
         "signature": gather_rows("fp32"),
+        "constexprs": gather_rows_constexprs(),
+        "num_warps": 4,
+    },
+    "gather_rows_i32": {
+        "fn": _gather_rows_kernel,
+        "signature": gather_rows("i32"),
         "constexprs": gather_rows_constexprs(),
         "num_warps": 4,
     },

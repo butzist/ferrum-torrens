@@ -34,6 +34,7 @@ from .nvfp4_moe import (
     _silu_mul_kernel,
     _sum_reduce_kernel,
 )
+from .moe_prefill import _moe_csr_count_kernel, _moe_csr_prefix_kernel, _moe_csr_scatter_kernel
 from .offload import _ensure_experts_kernel, _index_copy_multi_kernel
 from .attention import _paged_attention_decode_kernel
 from .conv import _conv_decode_kernel, _conv_prefill_kernel
@@ -89,6 +90,10 @@ from .signatures import grouped_down_constexprs, grouped_gate_up_constexprs
 from .signatures import index_copy as _index_copy_sig
 from .signatures import index_copy_constexprs, lru_constexprs
 from .signatures import lru_ensure as _lru_sig
+from .signatures import moe_csr_count as _moe_csr_count_sig
+from .signatures import moe_csr_constexprs
+from .signatures import moe_csr_prefix as _moe_csr_prefix_sig
+from .signatures import moe_csr_scatter as _moe_csr_scatter_sig
 from .signatures import nvfp4_dense_gemv as _nvfp4_dense_gemv_sig
 from .signatures import nvfp4_dense_gemv_constexprs
 from .signatures import paged_attention as _paged_attention_sig
@@ -170,6 +175,16 @@ def main() -> int:
     except Exception as e:  # noqa: BLE001
         failures += 1
         print(f"index_copy FAILED: {type(e).__name__}: {str(e)[:200]}")
+    for label, fn, sig, consts in (
+        ("moe_csr_count", _moe_csr_count_kernel, _moe_csr_count_sig(), moe_csr_constexprs()),
+        ("moe_csr_prefix", _moe_csr_prefix_kernel, _moe_csr_prefix_sig(), {}),
+        ("moe_csr_scatter", _moe_csr_scatter_kernel, _moe_csr_scatter_sig(), moe_csr_constexprs()),
+    ):
+        try:
+            check(label, fn, sig, consts)
+        except Exception as e:  # noqa: BLE001
+            failures += 1
+            print(f"{label} FAILED: {type(e).__name__}: {str(e)[:200]}")
     try:
         check(
             "paged_attention",
@@ -181,6 +196,12 @@ def main() -> int:
         failures += 1
         print(f"paged_attention FAILED: {type(e).__name__}: {str(e)[:200]}")
     # The bf16-KV pool variant (TODO.md item 14): same body, bf16 K/V pointers.
+    # i32 row gather: the device slot table maps router expert ids to slots.
+    try:
+        check("gather_rows_i32", _gather_rows_kernel, _gather_rows_sig("i32"), gather_rows_constexprs())
+    except Exception as e:  # noqa: BLE001
+        failures += 1
+        print(f"gather_rows_i32 FAILED: {type(e).__name__}: {str(e)[:200]}")
     try:
         check(
             "paged_attention_bf16",

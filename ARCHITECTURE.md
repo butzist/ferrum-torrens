@@ -144,7 +144,7 @@ stays pure: `Tensor` and CUDA handles never cross it (section 4).
 | Embedding gather, RMSNorm, RoPE, attention (GQA), GDN recurrence, `lm_head` | Device | `models/qwen3_6/forward_cudarc.rs` (cudarc) + `infrastructure/cuda_linear.rs` (dense NVFP4 head) |
 | Router: gate matmul + softmax + top-8 | Device | `forward_cudarc.rs` (ids stay device) |
 | Routed experts: slot cache + grouped GEMV | Device | `infrastructure/cuda_moe.rs` (cudarc storage + driver-API cubins) |
-| Slot residency plan (`lru_ensure` / whole-layer) | Device (host plan fallback) | `python/ferrum_kernel/offload.py`, `application/run_experts.rs` |
+| Slot residency plan (`lru_ensure` / whole-layer) and the prefill CSR | Device (host plan fallback) | `python/ferrum_kernel/offload.py`, `python/ferrum_kernel/moe_prefill.py`, `application/run_experts.rs` |
 | KV pool, GDN state slabs, paged GQA attention | Device | `infrastructure/kvcache_dev.rs`, `infrastructure/cuda_attention.rs` |
 | CUDA-graph capture/replay | parked | not ported to the cudarc runtime; decode stays eager |
 | Decode stage profile (dev only, `FT_PROFILE=1`) | Device timing events | `infrastructure/profile.rs`; reference probe in `scripts/freetoken_probe/` |
@@ -186,7 +186,7 @@ flowchart LR
 
   subgraph KernelAOT["kernel toolchain (devshell, hermetic python)"]
     direction TB
-    K1["python/ferrum_kernel/\nnvfp4_moe.py, offload.py,\nattention.py, gdn.py, linear.py,\nfp8_linear.py, signatures.py,
+    K1["python/ferrum_kernel/\nnvfp4_moe.py, offload.py, moe_prefill.py,\nattention.py, gdn.py, linear.py,\nfp8_linear.py, signatures.py,
 elementwise.py"]
     K2["aot.py: triton.compile\nGPUTarget cuda sm_120"]
     K3[("kernel/*.cubin + *.ptx\n+ manifest.json (Nix output)")]
@@ -221,7 +221,8 @@ elementwise.py"]
   `gemv_gate_up`/`gemv_down` for decode, `grouped_gate_up`/`grouped_down`, the
   batched prefill grouped GEMM (R10.2, decision 112), `silu_mul` and
   `sum_reduce`),
-  `staging` (`lru_ensure`, `index_copy`), `attention` (`paged_attention` f32 and
+  `staging` (`lru_ensure`, `index_copy`, and the prefill CSR build
+  `moe_csr_count`/`moe_csr_prefix`/`moe_csr_scatter`), `attention` (`paged_attention` f32 and
   `paged_attention_bf16`, the pool-dtype variants) and
   `linear` (`gdn_decode`, the fused GDN decode, `conv_decode`, the fused GDN
   causal conv + silu, `gdn_tri_solve`, the prefill chunk triangular solve,
@@ -482,7 +483,7 @@ flowchart TB
   CM --> AB --> DR
   CM --> PB
   FB --> PB
-  DR --> Cubins[("gemv_gate_up, gemv_down,\ngrouped_gate_up, grouped_down,\nsilu_mul, sum_reduce,\nlru_ensure, index_copy")]
+  DR --> Cubins[("gemv_gate_up, gemv_down,\ngrouped_gate_up, grouped_down,\nsilu_mul, sum_reduce,\nlru_ensure, index_copy,\nmoe_csr_count/prefix/scatter")]
 ```
 
 **Dynamic -- device-staged layer step** (`grouped_moe_staged`). This is the path
@@ -520,9 +521,13 @@ the pinned banks carrying across, so prefill uses the same device path as decode
 it and the cache holds `2 * num_experts` slots (`enable_prefill_overlap`), a
 prefill-shaped step (routes > `BLOCK_K`) switches the `Residency` state machine
 to `Prefill`: a contiguous window of `2 * num_experts` cache slots becomes two
-full-layer buffers, the router's ids pass through as slot ids offset by the
-half, and there is one streamed copy of the layer plus one GEMV pass instead of
-a per-chunk `lru_ensure`. Layer `l+1` is copied into the other half on a
+full-layer buffers, a device gather maps the router's ids through that half's
+victim table, and there is one streamed copy of the layer plus one grouped GEMM
+pass instead of a per-chunk `lru_ensure`. The grouped CSR (`seg`/`route_idx`)
+is built on the device by `moe_csr_count`/`moe_csr_prefix`/`moe_csr_scatter`
+(stable ascending route order per slot), and the per-chunk scratch group and
+the token-major route table are reused across layers for a given
+`(tokens, top_k)`. Layer `l+1` is copied into the other half on a
 non-blocking copy stream while layer `l` computes (`begin`/`ready`/`release`
 events order the two streams). Since R10.6b (decision 120) that copy is one
 `cuMemcpyBatchAsync` of six contiguous runs (one per bank) through the copy
@@ -727,7 +732,7 @@ future work; the measured numbers that came from it remain history in
 |---|---|---|---|
 | `cudarc` 0.19.10 | runtime, non-default `cudarc` feature | `infrastructure/cudarc.rs`, `models/qwen3_6/{load_cudarc,forward_cudarc}.rs`, `infrastructure/kvcache_dev.rs`, `infrastructure/cuda_moe.rs` | The serving tensor runtime: owned bf16/f32/i32/i64/u8 buffers, cuBLAS BF16/f32 GEMM, committed cubins, the KV/state slabs and the elementwise/unary/scalar/col-scale/reduction/softmax/top-k/rope/head-repeat kernels |
 | CUDA driver API (`libcuda.so.1`) | runtime, hand-rolled FFI | `infrastructure/cuda_driver.rs` | Load and launch the cubins, allocate device + page-locked memory, stream and event ordering |
-| Triton (cubins) | build-time authoring; artifacts embedded at compile time | `python/ferrum_kernel/*`, `nix/kernels.nix` | The hand-written NVFP4 grouped-MoE GEMV, the silu/sum-reduce, the two offload staging kernels, and the paged GQA decode attention kernel. Authored and AOT-compiled in Python; launched by `cuda_driver` with no interpreter at runtime |
+| Triton (cubins) | build-time authoring; artifacts embedded at compile time | `python/ferrum_kernel/*`, `nix/kernels.nix` | The hand-written NVFP4 grouped-MoE GEMV, the silu/sum-reduce, the offload staging and prefill CSR kernels, and the paged GQA decode attention kernel. Authored and AOT-compiled in Python; launched by `cuda_driver` with no interpreter at runtime |
 | `axum` + `tokio` | runtime | `infrastructure/http.rs`, `main.rs` | HTTP server, SSE streaming, and the async runtime that offloads forwards to blocking threads |
 | `tokenizers` + `minijinja` | runtime | `infrastructure/tokenizers_hf.rs` | HF byte-level BPE tokenizer and the checkpoint's chat template (Python string methods rewritten to filters; `json` feature for the template's `tojson`) |
 | Python + `uv` (FreeToken venv) | build-time only | `scripts/convert_hf_to_ftw.py`, `FreeToken/` | The one-time HF -> FTW conversion via `ft checkpoint`; never in the serving process |

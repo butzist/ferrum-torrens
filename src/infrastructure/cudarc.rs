@@ -31,11 +31,11 @@ use crate::infrastructure::kernel_abi::{
     ADD_BF16, ADD_F32, ADD_RMSNORM, AddRmsnormArgs, ArgPack, CAST_BF16_F32, CAST_F32_BF16,
     CAUSAL_SDPA_BF16, CAUSAL_SDPA_F32, COL_MUL_BF16, COL_MUL_F32, COPY_STRIDED_BF16,
     COPY_STRIDED_F32, COPY_STRIDED_I32, COPY_STRIDED_I64, COPY_STRIDED_U8, CUMSUM_DIM0_F32,
-    GATHER_ROWS_BF16, GATHER_ROWS_F32, GDN_RATIO_MASKS_F32, INDEX_SELECT_BF16, LinearAbi,
-    MAX_ALL_F32, MUL_BF16, MUL_F32, MUL_MID_F32, REPEAT_HEADS_BF16, ROPE_BF16, SCALAR_BF16,
-    SCALAR_F32, SCALE_HEADS_F32, SCATTER_ROWS_BF16, SCATTER_ROWS_F32, SOFTMAX_LAST_F32,
-    SUM_ALL_F32, SUM_LAST_F32, TOPK_LAST_F32, UNARY_BF16, UNARY_F32, add_rmsnorm_args,
-    add_rmsnorm_grid,
+    GATHER_ROWS_BF16, GATHER_ROWS_F32, GATHER_ROWS_I32, GDN_RATIO_MASKS_F32, INDEX_SELECT_BF16,
+    LinearAbi, MAX_ALL_F32, MUL_BF16, MUL_F32, MUL_MID_F32, REPEAT_HEADS_BF16, ROPE_BF16,
+    SCALAR_BF16, SCALAR_F32, SCALE_HEADS_F32, SCATTER_ROWS_BF16, SCATTER_ROWS_F32,
+    SOFTMAX_LAST_F32, SUM_ALL_F32, SUM_LAST_F32, TOPK_LAST_F32, UNARY_BF16, UNARY_F32,
+    add_rmsnorm_args, add_rmsnorm_grid,
 };
 
 fn bad(e: impl std::fmt::Display) -> MoEError {
@@ -1531,12 +1531,13 @@ impl Tensor {
         Ok(out)
     }
 
-    /// Gather rows of a bf16/f32 `[rows, cols]` by a device i32 index vector:
+    /// Gather rows of a bf16/f32/i32 `[rows, cols]` by a device i32 index vector:
     /// `out[r, :] = self[index[r], :]`.
     pub fn gather_rows(&self, index: &Tensor) -> Result<Tensor, MoEError> {
         let name = match self.dtype() {
             TensorDType::Bf16 => GATHER_ROWS_BF16,
             TensorDType::F32 => GATHER_ROWS_F32,
+            TensorDType::I32 => GATHER_ROWS_I32,
             other => return Err(bad(format!("no row gather for {}", other.name()))),
         };
         if self.dim() != 2 {

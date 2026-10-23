@@ -277,8 +277,17 @@ pub fn cubin(name: &str) -> Result<&'static [u8], MoEError> {
 /// The staging kernels `CudaMoE` launches around the grouped passes, in order.
 pub const LRU_ENSURE: &str = "lru_ensure";
 pub const INDEX_COPY: &str = "index_copy";
+pub const MOE_CSR_COUNT: &str = "moe_csr_count";
+pub const MOE_CSR_PREFIX: &str = "moe_csr_prefix";
+pub const MOE_CSR_SCATTER: &str = "moe_csr_scatter";
 
-const STAGING_NAMES: [&str; 2] = [LRU_ENSURE, INDEX_COPY];
+const STAGING_NAMES: [&str; 5] = [
+    LRU_ENSURE,
+    INDEX_COPY,
+    MOE_CSR_COUNT,
+    MOE_CSR_PREFIX,
+    MOE_CSR_SCATTER,
+];
 
 #[derive(Debug, Deserialize)]
 struct StagingEntry {
@@ -407,6 +416,13 @@ pub fn staging_cubin(name: &str) -> Result<&'static [u8], MoEError> {
     Ok(match name {
         LRU_ENSURE => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/lru_ensure.cubin")),
         INDEX_COPY => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/index_copy.cubin")),
+        MOE_CSR_COUNT => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/moe_csr_count.cubin")),
+        MOE_CSR_PREFIX => {
+            include_bytes!(concat!(env!("OUT_DIR"), "/kernel/moe_csr_prefix.cubin"))
+        }
+        MOE_CSR_SCATTER => {
+            include_bytes!(concat!(env!("OUT_DIR"), "/kernel/moe_csr_scatter.cubin"))
+        }
         other => return Err(MoEError::Bad(format!("no committed cubin for {other}"))),
     })
 }
@@ -417,6 +433,9 @@ fn staging_ptx(name: &str) -> &'static str {
     match name {
         LRU_ENSURE => include_str!(concat!(env!("OUT_DIR"), "/kernel/lru_ensure.ptx")),
         INDEX_COPY => include_str!(concat!(env!("OUT_DIR"), "/kernel/index_copy.ptx")),
+        MOE_CSR_COUNT => include_str!(concat!(env!("OUT_DIR"), "/kernel/moe_csr_count.ptx")),
+        MOE_CSR_PREFIX => include_str!(concat!(env!("OUT_DIR"), "/kernel/moe_csr_prefix.ptx")),
+        MOE_CSR_SCATTER => include_str!(concat!(env!("OUT_DIR"), "/kernel/moe_csr_scatter.ptx")),
         other => panic!("no committed ptx for {other}"),
     }
 }
@@ -607,6 +626,7 @@ pub const CAST_F32_BF16: &str = "cast_f32_bf16";
 pub const INDEX_SELECT_BF16: &str = "index_select_bf16";
 pub const GATHER_ROWS_BF16: &str = "gather_rows_bf16";
 pub const GATHER_ROWS_F32: &str = "gather_rows_f32";
+pub const GATHER_ROWS_I32: &str = "gather_rows_i32";
 pub const SCATTER_ROWS_BF16: &str = "scatter_rows_bf16";
 pub const SCATTER_ROWS_F32: &str = "scatter_rows_f32";
 pub const COPY_STRIDED_BF16: &str = "copy_strided_bf16";
@@ -634,7 +654,7 @@ pub const GDN_RATIO_MASKS_F32: &str = "gdn_ratio_masks_f32";
 pub const MUL_MID_F32: &str = "mul_mid_f32";
 pub const SCALE_HEADS_F32: &str = "scale_heads_f32";
 
-const LINEAR_NAMES: [&str; 44] = [
+const LINEAR_NAMES: [&str; 45] = [
     GDN_DECODE,
     CONV_DECODE,
     CONV_PREFILL,
@@ -653,6 +673,7 @@ const LINEAR_NAMES: [&str; 44] = [
     INDEX_SELECT_BF16,
     GATHER_ROWS_BF16,
     GATHER_ROWS_F32,
+    GATHER_ROWS_I32,
     SCATTER_ROWS_BF16,
     SCATTER_ROWS_F32,
     COPY_STRIDED_BF16,
@@ -830,6 +851,9 @@ pub fn linear_cubin(name: &str) -> Result<&'static [u8], MoEError> {
         GATHER_ROWS_F32 => {
             include_bytes!(concat!(env!("OUT_DIR"), "/kernel/gather_rows_f32.cubin"))
         }
+        GATHER_ROWS_I32 => {
+            include_bytes!(concat!(env!("OUT_DIR"), "/kernel/gather_rows_i32.cubin"))
+        }
         SCATTER_ROWS_BF16 => {
             include_bytes!(concat!(env!("OUT_DIR"), "/kernel/scatter_rows_bf16.cubin"))
         }
@@ -920,6 +944,9 @@ fn linear_ptx(name: &str) -> &'static str {
         }
         GATHER_ROWS_F32 => {
             include_str!(concat!(env!("OUT_DIR"), "/kernel/gather_rows_f32.ptx"))
+        }
+        GATHER_ROWS_I32 => {
+            include_str!(concat!(env!("OUT_DIR"), "/kernel/gather_rows_i32.ptx"))
         }
         SCATTER_ROWS_BF16 => {
             include_str!(concat!(env!("OUT_DIR"), "/kernel/scatter_rows_bf16.ptx"))
@@ -1409,6 +1436,36 @@ pub struct CopyArgs {
     pub num: u64,
 }
 
+/// Device addresses and counts for the prefill CSR build. `slots` is the bank's
+/// slot capacity, so a route naming anything else (including `-1`) is refused on
+/// the device instead of read out of bounds.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CsrCountArgs {
+    pub slot: u64,
+    pub counts: u64,
+    pub bad: u64,
+    pub routes: u32,
+    pub slots_n: u32,
+}
+
+/// Device addresses for the CSR exclusive prefix sum.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CsrPrefixArgs {
+    pub counts: u64,
+    pub seg: u64,
+    pub slots_n: u32,
+}
+
+/// Device addresses for the stable per-slot route scatter.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CsrScatterArgs {
+    pub slot: u64,
+    pub seg: u64,
+    pub route_idx: u64,
+    pub routes: u32,
+    pub slots_n: u32,
+}
+
 /// The LRU admission launch: rewrites `experts` to slots in place and emits the
 /// `(miss, slot)` plan the copy follows.
 pub fn lru_ensure_args(abi: &StagingAbi, a: &LruArgs) -> Result<ArgPack, MoEError> {
@@ -1438,6 +1495,40 @@ pub fn index_copy_args(abi: &StagingAbi, a: &CopyArgs) -> Result<ArgPack, MoEErr
     p.ptr(a.dst_idx)?;
     p.ptr(a.src_idx)?;
     p.ptr(a.num)?;
+    Ok(p)
+}
+
+/// The device CSR count launch, one program per live slot.
+pub fn moe_csr_count_args(abi: &StagingAbi, a: &CsrCountArgs) -> Result<ArgPack, MoEError> {
+    let k = abi.kernel(MOE_CSR_COUNT)?;
+    let mut p = ArgPack::for_staging(k);
+    p.ptr(a.slot)?;
+    p.ptr(a.counts)?;
+    p.ptr(a.bad)?;
+    p.u32(a.routes)?;
+    p.u32(a.slots_n)?;
+    Ok(p)
+}
+
+/// The device CSR exclusive prefix-sum launch, one program.
+pub fn moe_csr_prefix_args(abi: &StagingAbi, a: &CsrPrefixArgs) -> Result<ArgPack, MoEError> {
+    let k = abi.kernel(MOE_CSR_PREFIX)?;
+    let mut p = ArgPack::for_staging(k);
+    p.ptr(a.counts)?;
+    p.ptr(a.seg)?;
+    p.u32(a.slots_n)?;
+    Ok(p)
+}
+
+/// The device CSR stable scatter launch, one program per live slot.
+pub fn moe_csr_scatter_args(abi: &StagingAbi, a: &CsrScatterArgs) -> Result<ArgPack, MoEError> {
+    let k = abi.kernel(MOE_CSR_SCATTER)?;
+    let mut p = ArgPack::for_staging(k);
+    p.ptr(a.slot)?;
+    p.ptr(a.seg)?;
+    p.ptr(a.route_idx)?;
+    p.u32(a.routes)?;
+    p.u32(a.slots_n)?;
     Ok(p)
 }
 
@@ -2187,6 +2278,17 @@ mod tests {
         assert_eq!(copy.block_threads(), 128);
         assert_eq!(copy.constexpr("NUM_BANKS").unwrap(), 6);
         assert_eq!(copy.constexpr("SEG_I32").unwrap(), 4096);
+        // The prefill CSR build: one program per slot for count/scatter, one
+        // for the prefix sum. The live grid is the slot count; the manifest
+        // records the cache ceiling.
+        let count = abi.kernel(MOE_CSR_COUNT).unwrap();
+        assert_eq!(count.grid, [2048, 1, 1]);
+        assert_eq!(count.constexpr("BLOCK").unwrap(), 1024);
+        let prefix = abi.kernel(MOE_CSR_PREFIX).unwrap();
+        assert_eq!(prefix.grid, [1, 1, 1]);
+        let scatter = abi.kernel(MOE_CSR_SCATTER).unwrap();
+        assert_eq!(scatter.grid, [2048, 1, 1]);
+        assert_eq!(scatter.constexpr("BLOCK").unwrap(), 1024);
     }
 
     #[test]
@@ -2229,9 +2331,31 @@ mod tests {
             src_idx: 0x5000,
             num: 0x6000,
         };
+        let count = CsrCountArgs {
+            slot: 0x1000,
+            counts: 0x2000,
+            bad: 0x3000,
+            routes: 16384,
+            slots_n: 2048,
+        };
+        let prefix = CsrPrefixArgs {
+            counts: 0x1000,
+            seg: 0x2000,
+            slots_n: 2048,
+        };
+        let scatter = CsrScatterArgs {
+            slot: 0x1000,
+            seg: 0x2000,
+            route_idx: 0x3000,
+            routes: 16384,
+            slots_n: 2048,
+        };
         let built = [
             (LRU_ENSURE, lru_ensure_args(&abi, &lru)),
             (INDEX_COPY, index_copy_args(&abi, &copy)),
+            (MOE_CSR_COUNT, moe_csr_count_args(&abi, &count)),
+            (MOE_CSR_PREFIX, moe_csr_prefix_args(&abi, &prefix)),
+            (MOE_CSR_SCATTER, moe_csr_scatter_args(&abi, &scatter)),
         ];
         for (name, pack) in built {
             let pack = pack.unwrap_or_else(|e| panic!("{name}: {e}"));

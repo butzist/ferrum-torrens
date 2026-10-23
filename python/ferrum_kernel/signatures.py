@@ -34,6 +34,7 @@ from .fp8_linear import (
 from .linear import DENSE_BLOCK_KW, DENSE_BLOCK_N
 from .norm import NORM_BLOCK_H
 from .nvfp4_moe import GEMM_BLOCK_KW, GEMM_BLOCK_M, GEMM_BLOCK_N, GEMV_BLOCK_KW, GEMV_BLOCK_N, REDUCE_BLOCK_N
+from .moe_prefill import CSR_BLOCK
 from .offload import COPY_SEG_I32, USAGE_MAX, copy_splits
 
 # The serving attention geometry (Qwen3.6-35B-A3B): 16 query heads over 2 KV
@@ -155,6 +156,43 @@ def index_copy() -> dict:
         "NUM_BANKS": "constexpr",
         "SEG_I32": "constexpr",
     }
+
+
+def moe_csr_count() -> dict:
+    """Device CSR count: routes naming each slot, plus an out-of-range flag."""
+    return {
+        "slot_ptr": "*i32",
+        "counts_ptr": "*i32",
+        "bad_ptr": "*i32",
+        "routes": "i32",
+        "slots": "i32",
+        "BLOCK": "constexpr",
+    }
+
+
+def moe_csr_prefix() -> dict:
+    """Device CSR exclusive prefix sum into `seg[S + 1]`."""
+    return {
+        "counts_ptr": "*i32",
+        "seg_ptr": "*i32",
+        "slots": "i32",
+    }
+
+
+def moe_csr_scatter() -> dict:
+    """Device CSR stable route scatter into `route_idx`."""
+    return {
+        "slot_ptr": "*i32",
+        "seg_ptr": "*i32",
+        "route_idx_ptr": "*i32",
+        "routes": "i32",
+        "slots": "i32",
+        "BLOCK": "constexpr",
+    }
+
+
+def moe_csr_constexprs(block: int = CSR_BLOCK) -> dict:
+    return {"BLOCK": block}
 
 
 def gate_up_constexprs() -> dict:
