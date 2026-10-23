@@ -1,13 +1,14 @@
 # FerrumTorrens -- FreeToken MVP port to Rust: TODO
 
 Status (2026-10-23): M2 (API) current, late M3 in practice; **prefill pp is
-ahead of FreeToken** after R10.6a/b, R10.7, R10.8 and R10.9: 400.9 tok/s at 517
-(FT 366.2, 1.10x) and 929.4 at 2057 (FT 725.0, 1.28x). The wins were the harness
-chunk cap (462), the DMA copy-engine prefetch (585), one grouped-GEMM chunk per
-prompt (665), a 64-column grouped tile (717), and the FP8 prefill GEMM's
-coalesced load + 128x128 8-warp tile (929).
-Decode is unchanged; the remaining gap is bs=1 decode (0.93x) and optional
-compute slices at 2057 (attention). The heavy M3
+ahead of FreeToken** after R10.6a/b, R10.7, R10.8, R10.9 and R10.10: 400.9 tok/s
+at 517 (FT 366.2, 1.10x) and 958.5 at 2057 (FT 725.0, 1.32x). The wins were the
+harness chunk cap (462), the DMA copy-engine prefetch (585), one grouped-GEMM
+chunk per prompt (665), a 64-column grouped tile (717), the FP8 prefill GEMM's
+coalesced load + 128x128 8-warp tile (929), and the compacted grouped-GEMM grid
+plus `BLOCK_M=64` (958). **bs=1 decode is now ahead of FreeToken** too: the auto
+cache planner's 512 MiB reserve (was 1 GiB) resolves 1920 slots (4096-token KV smoke) and **tg 32.8
+tok/s** (FT 30.3, 1.08x; decision 127). The heavy M3
 infrastructure is landed and gated on the real checkpoint: driver-API kernels
 (NVFP4 MoE + paged GQA decode), device-staged offload, engine-owned per-batch-size
 decode graphs, and bf16 KV by default so a default config fits the 8 GiB target.
@@ -1168,6 +1169,15 @@ re-profiled at HEAD: the GDN *bundle* is 42% (`gdn_qkvz` 0.85 + `gdn_ba`
   (401.7 -> 400.9), `gdn_qkvz` **718.8 -> 269.3 ms**, total 1991-token step
   **2890 -> 2239 ms (-22.5%)**; greedy ids `[561, 3841]`, VRAM flat, decode
   gates green (M=1 GEMV untouched). Logs `/tmp/opencode/r10_9/`.
+- [x] **R10.10 compacted grouped-GEMM grid + `BLOCK_M=64` (2026-10-23,
+  decision 128).** The grouped GEMM launched over every cache slot, so ~6x of
+  its grid retired on an empty segment. The grid now runs over the half's
+  `2E` buffer slots (`seg_ids`, `FERRUM_PF_SEGMENTS=all` restores the old
+  grid), and `BLOCK_M` is 64 so one M-tile covers an expert's routes at a
+  1991-token chunk. Interleaved A/B: pp **929.9 -> 950.1 tok/s at 2057
+  (+2.2%)**, 517 flat; `BLOCK_M=64` alone was +1.4% and compaction alone +0.6%,
+  so both were needed to clear the 2% bar. Greedy ids `[561, 3841]`, both
+  prefill arms green. Logs `/tmp/opencode/r10_10/`.
 
 ### State of play
 
@@ -1197,9 +1207,9 @@ default do not fit the 8 GiB device (item 6).
 ```
 max_seq_len = 65536            # floor; KV makes ~200k feasible if prompted
 kv_dtype = "bf16"              # [kv] dtype; half of f32, fits the 8 GB target
-moe_cache_size_slots = "auto"  # auto sizes from free VRAM (decision 90); or 256..2048
+moe_cache_size_slots = "auto"  # auto sizes from free VRAM (decisions 90, 127); or 256..2048
                                # floor 256; >= 512 enables whole-layer prefill overlap (>= 2*E)
-                               # ceiling 2048 (decision 85)
+                               # ceiling 2048 (decision 85); 512 MiB reserve -> ~1920 slots
 max_running_requests = 4
 max_prefill_length = 8192
 prefill_overlap = true         # takes effect only when cache_size_slots >= 512

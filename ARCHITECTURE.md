@@ -516,8 +516,8 @@ sequenceDiagram
 is a route cap, and its committed `BLOCK_C = 2048` caps the slot cache it can
 address (decision 85). The slot count itself is `moe.cache_size_slots`: an
 integer or `"auto"` (default), where auto sizes it from the free device memory
-once the tower and KV pool are resident (item 12, decision 90,
-`registry::resolve_cache_slots`). `CudaMoE::grouped_moe_staged` chunks a larger list by tokens
+once the tower and KV pool are resident, reserving 512 MiB for the prefill
+scratch and graphs (item 12, decisions 90, 127, `registry::resolve_cache_slots`). `CudaMoE::grouped_moe_staged` chunks a larger list by tokens
 (`staged_chunk_tokens`) and repeats the sequence per chunk, the device LRU and
 the pinned banks carrying across, so prefill uses the same device path as decode
 (decision 66). `CachedExperts` without device staging still takes the host plan
@@ -538,8 +538,10 @@ engine, so it occupies no SMs; the batch symbol is optional, so
 (`BLOCK_K`-row groups over static index tensors), which `copy_missing` still
 uses for decode misses. The GEMV still runs per route chunk only to bound
 the `[routes, ...]` scratch. Since R10.2 (decision 112) the whole-layer path
-launches the batched grouped GEMM (`launch_grouped`, one program per (slot
-segment, N tile) over a per-chunk slot CSR) instead of the per-route GEMV, so
+launches the batched grouped GEMM (`launch_grouped`, one program per
+(compacted buffer-slot segment, N tile) over a per-chunk slot CSR; the grid
+covers only the active half's `2E` slots, R10.10/decision 128) instead of the
+per-route GEMV, so
 each expert's weight is read once per chunk; decode keeps the GEMV and
 `FERRUM_PF_GEMV=1` forces it for the A/B. A step that drops back below the cap
 returns to `Decode`; the buffer's slots are the **coldest contiguous window**

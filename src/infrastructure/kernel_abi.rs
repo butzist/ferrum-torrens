@@ -1030,9 +1030,11 @@ pub struct MoEArgs {
     pub ic2: u64,
     pub ic3: u64,
     pub out: u64,
-    /// The grouped prefill's CSR (R10.2): `[S + 1]` segment starts and the
-    /// segment-major route permutation. Unused by the decode GEMV.
+    /// The grouped prefill's CSR (R10.2): `[S + 1]` segment starts, the
+    /// compacted slot list the grid runs over, and the segment-major route
+    /// permutation. Unused by the decode GEMV.
     pub seg: u64,
+    pub seg_ids: u64,
     pub route_idx: u64,
 }
 
@@ -1124,6 +1126,7 @@ pub fn grouped_gate_up_args(abi: &Abi, a: &MoEArgs) -> Result<ArgPack, MoEError>
     p.ptr(a.route_token)?;
     p.ptr(a.route_weight)?;
     p.ptr(a.seg)?;
+    p.ptr(a.seg_ids)?;
     p.ptr(a.route_idx)?;
     p.u32(k.n as u32)?;
     // A_ROW_IS_ROUTE is false: the activations are x [tokens, hidden].
@@ -1157,6 +1160,7 @@ pub fn grouped_down_args(abi: &Abi, a: &MoEArgs) -> Result<ArgPack, MoEError> {
     p.ptr(a.route_token)?;
     p.ptr(a.route_weight)?;
     p.ptr(a.seg)?;
+    p.ptr(a.seg_ids)?;
     p.ptr(a.route_idx)?;
     p.u32(k.n as u32)?;
     // A_ROW_IS_ROUTE is true: the activations are already one row per route.
@@ -1754,7 +1758,8 @@ mod tests {
             ic3: 0xe000,
             out: 0xf000,
             seg: 0x1_0000,
-            route_idx: 0x1_1000,
+            seg_ids: 0x1_1000,
+            route_idx: 0x1_2000,
         };
         let built = [
             (GEMV_GATE_UP, gemv_gate_up_args(&abi, &args)),
@@ -1797,9 +1802,9 @@ mod tests {
             ..MoEArgs::default()
         };
         let gate = grouped_gate_up_args(&abi, &args).unwrap();
-        // param 9: N, then (mn, mk, a_rs, a_cs, a_ws) for pe/pn/pkw, se/sn/sblk, ge/gn, cm, cn
+        // param 10: N, then (mn, mk, a_rs, a_cs, a_ws) for pe/pn/pkw, se/sn/sblk, ge/gn, cm, cn
         assert_eq!(
-            &gate.slots()[9..22],
+            &gate.slots()[10..23],
             &[
                 (2 * inter) as u64,
                 hidden as u64,
@@ -1819,7 +1824,7 @@ mod tests {
         );
         let down = grouped_down_args(&abi, &args).unwrap();
         assert_eq!(
-            &down.slots()[9..22],
+            &down.slots()[10..23],
             &[
                 hidden as u64,
                 inter as u64,

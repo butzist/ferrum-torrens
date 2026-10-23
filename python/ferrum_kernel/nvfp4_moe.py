@@ -68,8 +68,10 @@ REDUCE_WARPS = 4
 # over the per-route decode GEMV, which re-reads the weight per route. The tile
 # is a real matmul: bf16 inputs into the sm_120 tensor cores, fp32 accumulate.
 # R10.8 swept the tile: N=64 at 4 warps is the win (pf_gemm 0.521 -> 0.405
-# ms/token, pp 664.5 -> 717.1 at 2057); N=128 and 8 warps, M=64 and KW=32 lost.
-GEMM_BLOCK_M = 32
+# ms/token, pp 664.5 -> 717.1 at 2057); N=128 and 8 warps lost. R10.10 then
+# compacted the grid to the buffer slots and raised M 32 -> 64, one M-tile per
+# expert at a 1991-token chunk (pp 929.9 -> 950.1, decision 128).
+GEMM_BLOCK_M = 64
 GEMM_BLOCK_N = 64
 GEMM_BLOCK_KW = 16
 GEMM_WARPS = 4
@@ -302,6 +304,7 @@ def _nvfp4_grouped_gemm_kernel(
     route_token_ptr,  # [R] int32
     route_weight_ptr,  # [R] f32
     seg_ptr,  # [S + 1] int32: route_idx[seg[s]:seg[s + 1]] all have slot s
+    seg_ids_ptr,  # [SEG] int32: the slot id each program works on (ascending)
     route_idx_ptr,  # [R] int32, segment-major route permutation
     N,
     stride_am, stride_ak,
@@ -316,27 +319,30 @@ def _nvfp4_grouped_gemm_kernel(
     MUL_WEIGHT: tl.constexpr,
     A_ROW_IS_ROUTE: tl.constexpr,
 ):
-    """One expert segment's GEMM: the routes of slot `seg` in M-tiles.
+    """One expert segment's GEMM: the routes of slot `seg_ids[pid]` in M-tiles.
 
-    The segment index IS the slot id (the CSR buckets routes by slot), so the
-    weight read happens once per (segment, n-tile) however many routes name
-    the expert -- the prefill lever over the per-route decode GEMV. There is
-    no -1 branch: whole-layer staging makes every prefill route resident, and
-    decode keeps the GEMV. `c` is written at each route's own index so the
-    per-route `silu_mul` and the dense top_k reduce are unchanged.
+    The grid runs over a compacted segment list, not every slot: the CSR
+    buckets routes by slot, and the caller passes only the slots that can
+    hold routes (the prefill buffer window), so programs never retire on an
+    empty segment. The weight read happens once per (segment, n-tile)
+    however many routes name the expert -- the prefill lever over the
+    per-route decode GEMV. There is no -1 branch: whole-layer staging makes
+    every prefill route resident, and decode keeps the GEMV. `c` is written
+    at each route's own index so the per-route `silu_mul` and the dense top_k
+    reduce are unchanged.
 
     The `[BLOCK_KW * 8, BLOCK_N]` dequantized tile is assembled once per
     K-iteration and fed to `tl.dot`; `scale` is per 16 k-values, so all eight
     codes of a word share one word-scale.
     """
-    seg = tl.program_id(0)
+    seg = tl.load(seg_ids_ptr + tl.program_id(0)).to(tl.int64)
     n_offs = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
     n_mask = n_offs < N
     start = tl.load(seg_ptr + seg)
     end = tl.load(seg_ptr + seg + 1)
     if start == end:
         return
-    slot = seg.to(tl.int64)
+    slot = seg
     packed_slot = packed_ptr + slot * stride_pe
     scale_slot = scale_ptr + slot * stride_se
     g = tl.load(
@@ -489,6 +495,7 @@ def _grouped_gemm(
     route_token: torch.Tensor,
     route_weight: torch.Tensor,
     seg: torch.Tensor,
+    seg_ids: torch.Tensor,
     route_idx: torch.Tensor,
     mul_weight: bool,
     a_row_is_route: bool,
@@ -499,9 +506,10 @@ def _grouped_gemm(
     assert K % 8 == 0, f"K {K} must be a multiple of 8 for int32 wide loads"
     assert route_idx.numel() == route_token.numel() == route_weight.numel()
     assert seg.numel() == slots + 1, f"seg {seg.numel()} vs slots {slots}"
+    assert seg_ids.numel() > 0 and int(seg_ids.max()) < slots, "seg ids past the bank"
     require_native_e4m3(a.device)
     packed_i32 = packed.view(torch.int32)  # [S, N, K // 8]
-    grid = (slots, triton.cdiv(N, GEMM_BLOCK_N))
+    grid = (seg_ids.numel(), triton.cdiv(N, GEMM_BLOCK_N))
     consts = {
         "K_WORDS": K // 8,
         "BLOCK_M": GEMM_BLOCK_M,
@@ -513,7 +521,7 @@ def _grouped_gemm(
     _check_constexprs(consts)
     _nvfp4_grouped_gemm_kernel[grid](
         a, packed_i32, scale, glob, c,
-        route_token, route_weight, seg, route_idx,
+        route_token, route_weight, seg, seg_ids, route_idx,
         N,
         a.stride(0), a.stride(1),
         packed_i32.stride(0), packed_i32.stride(1), packed_i32.stride(2),
@@ -613,11 +621,12 @@ def grouped_moe_gemm(
     seg = torch.zeros((slots + 1,), device=dev, dtype=torch.int32)
     seg[1:] = counts.cumsum(0).to(torch.int32)
     route_idx = torch.argsort(route_slot, stable=True).to(torch.int32)
+    seg_ids = torch.arange(slots, device=dev, dtype=torch.int32)
 
     ic1 = torch.empty((routes, two_i), device=dev, dtype=torch.bfloat16)
     _grouped_gemm(
         x, gu_packed, gu_scale, gu_global, ic1,
-        route_token, route_weight, seg, route_idx, False, False,
+        route_token, route_weight, seg, seg_ids, route_idx, False, False,
     )
     ic2 = torch.empty((routes, inter), device=dev, dtype=torch.bfloat16)
     block_i = min(triton.next_power_of_2(inter), 256)
@@ -628,7 +637,7 @@ def grouped_moe_gemm(
     ic3 = torch.empty((routes, hidden), device=dev, dtype=torch.bfloat16)
     _grouped_gemm(
         ic2, dn_packed, dn_scale, dn_global, ic3,
-        route_token, route_weight, seg, route_idx, True, True,
+        route_token, route_weight, seg, seg_ids, route_idx, True, True,
     )
     out = torch.empty((tokens, hidden), device=dev, dtype=torch.bfloat16)
     _sum_reduce_kernel[(tokens, triton.cdiv(hidden, REDUCE_BLOCK_N))](

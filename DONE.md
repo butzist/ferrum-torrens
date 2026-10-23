@@ -3965,3 +3965,66 @@ subsection names are kept verbatim.
        conv1d, plain causal SDPA, cat/stack/expand/repeat/select/split,
        comparisons/masked_fill, and zeros_like/empty.
      - Logs `/tmp/opencode/m7_1/`.
+
+127. **The auto MoE cache now resolves 1920 slots, and bs=1 decode passes
+     FreeToken** (2026-10-23). `AUTO_CACHE_RESERVE_BYTES` drops 1 GiB -> 512 MiB
+     and the sizing moves into a pure `auto_cache_slots(free, slot_bytes,
+     ceiling)` helper with a unit test. Nothing else about the planner changed:
+     it still reads free VRAM after the tower and KV pool are resident, clamps
+     to `[MIN, BLOCK_C]` and rounds down to the 128-slot LRU block.
+     - **Why 512 MiB and not the 2048-slot ceiling.** With the smoke's 4096-token KV pool on
+       the 8 GiB target the report is `free=3878 MiB`, `slot_bytes=1775616`, `ceiling=2048`. The old
+       reserve resolved 1664 slots; 512 MiB resolves 1920. 1984 and 2048 both
+       pass a 517-token prefill but **OOM the 2057-token prefill scratch**
+       (silu 64 MiB / cat 32 MiB) with 22-32 MiB left, so the prefill
+       `PREFILL_CHUNK_TOKENS=2048` scratch is the binding constraint, not the
+       decode graph. 1920 leaves 529 MiB after load (7622/8151 MiB) and the
+       1991-token prefill passes.
+     - **Measured** (RTX 5060 Laptop, bs=1, bf16 KV, 64 greedy tokens, AIME
+       smoke prompt, graph replay on, interleaved order-balanced n=3/arm):
+       tg **30.2 -> 32.8 tok/s (+8.4%; raw 30.2/30.2/30.2 vs 32.8/32.7/32.7)**,
+       VRAM 7190 -> 7622 MiB. FreeToken on the same box is 30.3 tok/s, so the
+       bs=1 decode ratio moves **0.93x -> 1.08x**. Greedy ids are identical.
+     - **Prefill is unaffected or slightly better**: 517 stays 401.0 tok/s, and
+       2057 at the production chunk measures 952.0/962.8/960.7 = **958.5 tok/s**
+       (929.4 before the cache/tile changes; 1.32x FreeToken). The 2057 auto run
+       resolves 1920 and does not OOM.
+     - Gates: `cargo fmt --check`, clippy CPU and `--features cuda`, `cargo
+       test` (342), `cargo test --features cuda --lib` (455), the grouped
+       prefill overlap gate in both arms, and
+       `batching_raises_aggregate_decode_throughput` (serial 30.0 / batched
+       46.9 tok/s, 1.56x). Logs `/tmp/opencode/r10_10/`.
+
+128. **R10.10 compacts the grouped-prefill grid and raises `BLOCK_M` to 64**
+     (2026-10-23). The `_nvfp4_grouped_gemm` grid was `(slots, N/BLOCK_N)` with
+     `slots` the whole cache (1664), so at a 1991-token chunk ~85% of the CTAs
+     loaded `seg`, saw `start == end` and returned: 256 experts per layer live
+     in one of the two `2E` buffer halves.
+     - **Kernel/ABI.** The kernel now takes `seg_ids_ptr` and derives
+       `slot = seg_ids[program_id(0)]`; the grid is the compacted list length.
+       The Rust CSR is unchanged (a global `[slots+1]` cumsum plus the
+       slot-sorted `route_idx`); `prefill_layer` passes the active half's
+       `victims` slice, which is ascending so the segment ranges stay aligned.
+       `FERRUM_PF_SEGMENTS=all` restores the all-slots grid for the A/B.
+       `GEMM_BLOCK_M` goes 32 -> 64 so one M-tile covers an expert's ~62 routes
+       at 1991 tokens. `build.rs` also declares
+       `rerun-if-env-changed=FERRUM_KERNEL_DIR`: changing the kernel root (the
+       local AOT tree vs the Nix store) previously reused a stale staged
+       manifest, which is what made the first A/B run against the old ABI.
+     - **Measured at 2057** (`FERRUM_SMOKE_PREFILL=2057`,
+       `FERRUM_SMOKE_PREFILL_CHUNK=8192`, cache 1664, 2 tokens, one model load
+       at a time, interleaved): new (compacted + `BLOCK_M=64`) 955.3/940.7/954.4
+       = **950.1** vs old (all slots + `BLOCK_M=32`) 915.2/936.4/938.1 =
+       **929.9 tok/s (+2.2%)**. The components are individually under the bar
+       (`BLOCK_M=64` +1.4%, compaction +0.6%) and only the pair clears it, so
+       both ship. The 517 control is flat (copy-bound), greedy ids are
+       `[561, 3841]` in every run, VRAM is unchanged, and decode is untouched
+       (M=1 keeps the GEMV).
+     - **Closed, do not re-chase**: `BLOCK_M=64` alone (+1.4%) and the compacted
+       grid alone (+0.6%) are below the 2% bar; `BLOCK_N=128`/8 warps and
+       `BLOCK_KW=32` were already rejected in R10.8. The grouped GEMM remains
+       dequant-bound, not launch-bound.
+     - Gates: `selftest --interp`, `compile_check`, `scripts/check-kernels.sh`
+       (the full verify line), `a_whole_layer_prefill_overlap_matches_the_host_plan`
+       in both the grouped and `FERRUM_PF_GEMV=1` arms, the batching gate, and
+       the 342/455 CPU and CUDA unit suites. Logs `/tmp/opencode/r10_10/`.

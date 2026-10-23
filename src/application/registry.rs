@@ -412,8 +412,7 @@ fn resolve_cache_slots(
                 .constexpr("BLOCK_C")
         })
         .map_err(|e| build_err(e.to_string()))? as usize;
-    let budget = free.saturating_sub(AUTO_CACHE_RESERVE_BYTES);
-    let slots = (budget / slot_bytes.max(1)).clamp(crate::config::MIN_CACHE_SIZE_SLOTS, ceiling);
+    let slots = auto_cache_slots(free, slot_bytes, ceiling);
     if std::env::var_os("FT_SLOTS_REPORT").is_some() {
         eprintln!(
             "[slots] kv_tokens={} free={} MiB reserve={} MiB slot_bytes={} ceiling={} resolved={}",
@@ -422,18 +421,29 @@ fn resolve_cache_slots(
             AUTO_CACHE_RESERVE_BYTES >> 20,
             slot_bytes,
             ceiling,
-            slots / 128 * 128,
+            slots,
         );
     }
-    Ok(slots / 128 * 128)
+    Ok(slots)
+}
+
+/// Slot count from the free VRAM after the tower and KV pool are resident,
+/// rounded down to the 128-slot LRU block. `free` and `slot_bytes` are bytes.
+#[cfg(feature = "cuda")]
+fn auto_cache_slots(free: usize, slot_bytes: usize, ceiling: usize) -> usize {
+    let budget = free.saturating_sub(AUTO_CACHE_RESERVE_BYTES);
+    let slots = (budget / slot_bytes.max(1)).clamp(crate::config::MIN_CACHE_SIZE_SLOTS, ceiling);
+    slots / 128 * 128
 }
 
 /// Bytes held back from the auto cache budget for the captured decode graphs,
-/// transient activations and allocator fragmentation. Measured: at 2048 slots
-/// the run sits at 7434/8151 MiB with graph replay live, so ~0.7 GiB is enough;
-/// this rounds up for a healthy margin on a shared desktop GPU.
+/// transient activations and allocator fragmentation. The binding constraint
+/// is the prefill scratch at `PREFILL_CHUNK_TOKENS`: at 8 GiB, 1984 slots plus
+/// a 2057-token prefill runs out during the silu/cat scratch, while 1920
+/// (529 MiB free after load) fits. Keeping 512 MiB resolves 1920 here; the
+/// larger caches this buys cut the decode miss rate (+8% tg at 1920 vs 1664).
 #[cfg(feature = "cuda")]
-const AUTO_CACHE_RESERVE_BYTES: usize = 1024 * 1024 * 1024;
+const AUTO_CACHE_RESERVE_BYTES: usize = 512 * 1024 * 1024;
 
 /// The paged attention launcher, when the engine runs on a CUDA device. The
 /// device decode path reads each row's KV window straight out of the pool
@@ -668,6 +678,22 @@ mod tests {
         assert_eq!(graph_batch_sizes(3), vec![1, 2, 3]);
         assert_eq!(graph_batch_sizes(4), vec![1, 2, 4]);
         assert_eq!(graph_batch_sizes(8), vec![1, 2, 4, 8]);
+    }
+
+    /// The 8 GiB target: 3878 MiB free after the tower and KV pool, 1.69 MiB
+    /// per expert slot. 512 MiB reserved leaves 1920 slots; the next 128-slot
+    /// step (2048) OOMs the 2057-token prefill scratch.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn auto_cache_slots_leave_room_for_the_prefill_scratch() {
+        let mib = 1024 * 1024;
+        let slot = 1_775_616;
+        assert_eq!(auto_cache_slots(3878 * mib, slot, 2048), 1920);
+        assert_eq!(
+            auto_cache_slots(0, slot, 2048),
+            crate::config::MIN_CACHE_SIZE_SLOTS
+        );
+        assert_eq!(auto_cache_slots(64 * 1024 * mib, slot, 2048), 2048);
     }
 
     /// Reader that only exists to satisfy `build`; no weights are read there.

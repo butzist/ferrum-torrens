@@ -189,6 +189,7 @@ def grouped_gemm(
         "route_token_ptr": "*i32",
         "route_weight_ptr": "*fp32",
         "seg_ptr": "*i32",
+        "seg_ids_ptr": "*i32",
         "route_idx_ptr": "*i32",
         "N": "i32",
         "stride_am": "i32",

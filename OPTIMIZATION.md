@@ -1148,10 +1148,10 @@ n=5 per metric, rounds order-balanced.
 | metric | ours (current) | FreeToken (2026-10-20) | ratio |
 |---|---|---|---|
 | pp @517 / 476-478 tok | 143 (dec 102) -> 150 (dec 103) -> **267.4** (R10.2) -> **271.3** (R10.6a) -> **401.0** (R10.6b) tok/s | **366.2 +/- 1.3** (n=5, min 364.4, max 368.0) | **1.10x** |
-| pp @2057 / 1878-1879 tok | **391.7** (R10.2) -> **462.1** (R10.6a) -> **585.0** (R10.6b) -> **664.6** (R10.7) -> **717.1** (R10.8) -> **929.4** (R10.9) tok/s | **725.0 +/- 3.1** (n=5, min 719.9, max 727.4) | **1.28x** |
+| pp @2057 / 1878-1879 tok | **391.7** (R10.2) -> **462.1** (R10.6a) -> **585.0** (R10.6b) -> **664.6** (R10.7) -> **717.1** (R10.8) -> **929.4** (R10.9) -> **958.5** (R10.10) tok/s | **725.0 +/- 3.1** (n=5, min 719.9, max 727.4) | **1.32x** |
 | K=4 aggregate, batched | **26.2** tok/s | **25.17 +/- 0.05** (n=5, min 25.09, max 25.21) | **1.04x** |
 | K=4 serial window | 16.6 tok/s | **11.70 +/- 0.01** (n=5, 8.19-8.21 s windows) | **1.42x** |
-| bs=1 captured decode | 28.3 tok/s | 30.3 tok/s (decision 76, unchanged) | **0.93x** |
+| bs=1 captured decode | **32.8** tok/s (R11) | 30.3 tok/s (decision 76, unchanged) | **1.08x** |
 
 The FreeToken prefill runs predate R10.2, so the `ours` column carries the
 post-R10.2 number (decision 112). A 2026-10-22 control on the same smoke config
@@ -1610,3 +1610,35 @@ runs the new GEMM tile) and `batching_raises_aggregate_decode_throughput`
 `cargo clippy --all-targets` and `--features cuda`, `cargo test` (342),
 `cargo test --features cuda --lib` (453) all pass. Logs
 `/tmp/opencode/r10_9/`.
+
+## R10.10 grouped-prefill grid compaction + `BLOCK_M=64` -- LANDED (2026-10-23)
+
+R10.8 left the grouped GEMM launching `(cache_slots, N/BLOCK_N)` programs, but a
+whole-layer prefill half only holds `2E = 512` buffer slots, so ~85% of the
+grid loaded `seg`, found `start == end` and returned. The kernel now takes a
+`seg_ids` list and runs `program_id(0)` over it; the Rust side passes the
+active half's ascending `victims` slice (the CSR stays global, so the ranges
+line up). `FERRUM_PF_SEGMENTS=all` reproduces the old grid for an A/B.
+`GEMM_BLOCK_M` goes 32 -> 64, so one M-tile covers the ~62 routes per expert at
+a 1991-token chunk.
+
+Interleaved A/B at 2057 (n=3/arm, same binary, cache 1664, 2 tokens): new
+955.3/940.7/954.4 = **950.1 tok/s** vs old 915.2/936.4/938.1 = **929.9 (+2.2%)**.
+The parts are individually below the bar (`BLOCK_M=64` +1.4%, compaction
++0.6%) and only ship together. The 517 control is flat (copy-bound), greedy ids
+are `[561, 3841]`, VRAM is unchanged. `pf_gemm` is still dequant-bound; larger
+N/K tiles and more warps were already rejected in R10.8. Logs
+`/tmp/opencode/r10_10/`.
+
+## R11 decode cache sizing -- LANDED (2026-10-23)
+
+The auto planner reserved 1 GiB, which resolved 1664 slots on the 8 GiB target
+with the smoke's 4096-token KV pool (`free=3878 MiB`, `slot_bytes=1775616`). Dropping the reserve to 512 MiB
+resolves 1920. That is the largest safe step: 1984 and 2048 both OOM the
+2057-token prefill scratch (silu/cat) even though they pass a 517-token
+prefill, so the `PREFILL_CHUNK_TOKENS=2048` scratch, not the decode graph, is
+the binding constraint. Interleaved n=3/arm at bs=1: tg **30.2 -> 32.8 tok/s
+(+8.4%)**, VRAM 7190 -> 7622 MiB, greedy ids unchanged; FreeToken is 30.3, so
+bs=1 decode is now **1.08x**. Prefill is flat at 517 (401.0) and 958.5 at 2057
+on the auto cache. `FERRUM_SMOKE_CACHE=1984`/`2048` remain useful diagnostics
+for a larger prefill chunk budget. Logs `/tmp/opencode/r10_10/`.

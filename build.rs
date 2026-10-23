@@ -13,6 +13,7 @@
 
 fn main() {
     println!("cargo:rerun-if-changed=shim/c10_graph_shim.cpp");
+    println!("cargo:rerun-if-env-changed=FERRUM_KERNEL_DIR");
     stage_kernels();
     if std::env::var_os("CARGO_FEATURE_CUDA").is_none() {
         return;

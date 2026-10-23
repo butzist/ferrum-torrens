@@ -979,6 +979,7 @@ impl CudaMoE {
             ic3: ptr(&g.ic3),
             out: ptr(&g.result),
             seg: 0,
+            seg_ids: 0,
             route_idx: 0,
         };
         let stream = self.stream;
@@ -1027,9 +1028,11 @@ impl CudaMoE {
     }
 
     /// The prefill grouped GEMM launches (R10.2, OPTIMIZATION.md R10): both
-    /// GEMVs become one program per (slot segment, N tile) over the CSR
+    /// GEMVs become one program per (compacted segment, N tile) over the CSR
     /// `seg`/`route_idx`, so an expert's weight is read once per (segment,
-    /// n-tile) however many routes name it. Decode keeps `launch`'s per-route
+    /// n-tile) however many routes name it and empty slots never launch a CTA.
+    /// `seg_ids` lists the slots the grid may touch (ascending, so it aligns
+    /// with `route_idx`'s slot-sorted order). Decode keeps `launch`'s per-route
     /// GEMV; the silu and the reduce are the same kernels in the same order,
     /// and `route_idx` keeps `ic1`/`ic3` indexed by the original route. The
     /// caller owns the CSR tensors and must hold them until the stream has
@@ -1038,6 +1041,7 @@ impl CudaMoE {
         &self,
         g: &StagedGroup,
         seg: &Tensor,
+        seg_ids: &Tensor,
         route_idx: &Tensor,
     ) -> Result<(), MoEError> {
         let gu = self
@@ -1049,7 +1053,7 @@ impl CudaMoE {
             .as_ref()
             .ok_or_else(|| MoEError::Bad("launch before any expert was staged".into()))?;
         let (tokens, routes) = (g.tokens, g.routes);
-        let slots = self.slot_capacity();
+        let segments = seg_ids.numel();
 
         let ptr = |t: &Tensor| t.data_ptr() as u64;
         let args = MoEArgs {
@@ -1071,13 +1075,14 @@ impl CudaMoE {
             ic3: ptr(&g.ic3),
             out: ptr(&g.result),
             seg: ptr(seg),
+            seg_ids: ptr(seg_ids),
             route_idx: ptr(route_idx),
         };
         let stream = self.stream;
         for (name, rows, pack) in [
             (
                 GROUPED_GATE_UP,
-                slots,
+                segments,
                 grouped_gate_up_args(&self.abi, &args).map_err(bad_abi)?,
             ),
             (
@@ -1087,7 +1092,7 @@ impl CudaMoE {
             ),
             (
                 GROUPED_DOWN,
-                slots,
+                segments,
                 grouped_down_args(&self.abi, &args).map_err(bad_abi)?,
             ),
             (
@@ -1521,6 +1526,24 @@ impl CudaMoE {
             (st.experts, st.layers)
         };
         let half = layer % 2;
+        // The grid runs over this half's buffer slots only: every route of the
+        // chunk names one of them (whole-layer staging), and `victims` is
+        // ascending, so its ranges line up with the CSR's slot-sorted
+        // `route_idx`. Launching over all cache slots made ~6x of the grid
+        // retire on an empty segment.
+        let seg_ids = if prefill_all_segments() {
+            let dev = self.device.to_tch();
+            Tensor::arange(self.slot_capacity() as i64, (tch::Kind::Int, dev))
+        } else {
+            let pf = self.prefill.as_ref().expect("harness");
+            pf.victims
+                .narrow(
+                    0,
+                    (half * experts_per_layer) as i64,
+                    experts_per_layer as i64,
+                )
+                .contiguous()
+        };
 
         // (1) This layer's half. Layer 0 has no lookahead, so it starts here; for
         // every later layer the previous step already prefetched it.
@@ -1591,7 +1614,7 @@ impl CudaMoE {
                 // The CSR lives as long as `g`: the queued launches read it
                 // asynchronously, the same lifetime the staged buffers have.
                 let (seg, route_idx) = build_grouped_csr(&g.slot_t, self.slot_capacity())?;
-                self.launch_grouped(&g, &seg, &route_idx)?;
+                self.launch_grouped(&g, &seg, &seg_ids, &route_idx)?;
                 self.collect_dev(&g, &mut oc)?;
             } else {
                 self.launch(&g)?;
@@ -1715,6 +1738,17 @@ fn prefill_use_grouped() -> bool {
 
 fn prefill_grouped_from(value: Option<&str>) -> bool {
     value != Some("1")
+}
+
+/// The grouped GEMM grid runs over the half's `2E` buffer slots by default
+/// (R10.10); `FERRUM_PF_SEGMENTS=all` launches over every cache slot instead,
+/// reproducing the pre-R10.10 grid for an A/B.
+fn prefill_all_segments() -> bool {
+    prefill_all_segments_from(std::env::var("FERRUM_PF_SEGMENTS").ok().as_deref())
+}
+
+fn prefill_all_segments_from(value: Option<&str>) -> bool {
+    value == Some("all")
 }
 
 /// Resolve the whole-layer prefetch engine once: `FERRUM_PF_DMA=0` forces the
@@ -1935,6 +1969,16 @@ mod tests {
 
     /// The whole-layer prefetch uses the copy engine by default (R10.6b);
     /// `FERRUM_PF_DMA=0` restores the `index_copy` kernel for the A/B.
+    /// The compacted grid is the default (R10.10); `FERRUM_PF_SEGMENTS=all`
+    /// restores the all-slots grid for the A/B.
+    #[test]
+    fn a_prefill_segment_env_override_parses() {
+        assert!(!prefill_all_segments_from(None));
+        assert!(!prefill_all_segments_from(Some("0")));
+        assert!(!prefill_all_segments_from(Some("garbage")));
+        assert!(prefill_all_segments_from(Some("all")));
+    }
+
     #[test]
     fn a_prefill_dma_env_override_parses() {
         assert_eq!(prefill_dma_from(None, true), PrefillDma::On);
