@@ -4092,3 +4092,29 @@ subsection names are kept verbatim.
        GDN/attention/MoE hand-offs, the cache/decode-buffer path, and wiring the
        primitives into the forward. M7.4 must move the kernel launchers to
        cudarc storage/stream before the full forward can run without tch.
+
+131. **Rope and the GDN gate/normalization primitives are torch-less** (2026-10-23).
+     `models/qwen3_6/forward_cudarc.rs` adds the rest of the pure-math surface
+     around the mixer; still not on the serving path.
+     - **Rope.** `rope_tables` builds the f32 cos/sin tables exactly like
+       `precompute_rope_cache` (angle in f64, one rounding to f32, trig on the
+       device so it shares CUDA's `cosf`/`sinf`), and `apply_rope` runs a
+       dedicated Triton kernel that rotates the first `rotary_dim` dims in
+       halves and copies the tail, f32 math stored back bf16. This replaces the
+       `view/narrow/cat/broadcast` chain and is **bit-exact** against
+       `apply_rope_cos_sin` on `[4, 16, 256]` with `rotary_dim=64`.
+     - **GDN primitives.** `gdn_gate` (`softplus(a + dt_bias) * -exp(a_log)`),
+       `gdn_beta`, `l2_normalize` (square, last-dim sum, `+eps`, sqrt,
+       reciprocal, row scale) and `repeat_heads` (the GQA repeat-interleave,
+       a dedicated kernel instead of `expand` + copy) are ported. Against tch:
+       gate 2.4e-7, beta 1.2e-7, L2 norm 3.7e-9, GQA expand bit-exact.
+     - **Adapter surface.** A `rope_bf16` kernel, a `repeat_heads_bf16` kernel,
+       and a column-add form of the scale kernel (`a + dt_bias`); both kernels
+       joined the `linear` manifest section, and the full ABI/PTX and
+       `check-kernels.sh` gates pass.
+     - **Gates.** `cargo fmt --check`, clippy default/`cudarc`/`cuda`,
+       `cargo test` (342), `cudarc --lib` (359), `cuda --lib` (455), the new
+       `rope_gdn_gate_and_gqa_match_tch` gate, and `check-kernels.sh`.
+     - **Remaining M7.3**: the prefill chunked recurrence (cumsum, masked
+       triangular masks, batched matmul, permute), the GDN/attention/MoE hand-off
+       and cache wiring, finally the forward file itself.

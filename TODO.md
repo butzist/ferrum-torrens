@@ -181,7 +181,8 @@ capture replay are gated, and the devshell links CUDA 13.4 cuBLAS. M7.2 now
 loads the dense tower through cudarc with the serving storage policy and no
 libtorch in the process (decision 129), and M7.3 has started: the dense math
 primitives (`rms_norm`, `linear`, `sigmoid`, `softplus`, `topk_renorm`) are
-ported and bit-exact (decision 130). None is on the serving path yet.
+ported and bit-exact (decision 130), followed by rope, the GDN gates/L2 norm
+and the GQA head expand (decision 131). None is on the serving path yet.
 
 Progress history and the full decision log (numbers 1..126) live in `DONE.md`;
 read that for the "why" behind any decision number referenced in code or tests.
@@ -496,10 +497,12 @@ any port.
   (`rms_norm`, `sigmoid`, `softplus`, `linear`, `topk_renorm`); they are
   bit-exact against the `tch` formulations on the serving hidden size
   (`tests/cudarc_forward.rs`). The adapter gained the elementwise/scalar/
-  column-scale/reduction/softmax/top-k/f32-GEMM surface they need. Still to
-  port: rope, the GDN/attention/MoE kernel hand-offs (M7.4), the cache path,
-  and wiring the new ops into the serving forward; the scalar oracle stays the
-  gate.
+  column-scale/reduction/softmax/top-k/f32-GEMM surface they need, and the
+  rope tables/apply plus the GDN gate, L2 norm and GQA expand are ported
+  (decision 131): rope and the head expand are bit-exact, the gates within
+  2.4e-7. Still to port: the GDN/attention/MoE kernel hand-offs (M7.4), the
+  cache path, the prefill chunked recurrence, and wiring the ops into the
+  serving forward; the scalar oracle stays the gate.
 - [ ] **M7.4 kernels/capture.** Launchers take the candle stream and raw storage;
   disable event tracking for capture; delete `shim/c10_graph_shim.cpp`.
 - [ ] **M7.5 remove libtorch.** Drop `tch`, `torch-sys`, the C++ build script and

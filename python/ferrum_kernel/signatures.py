@@ -743,3 +743,36 @@ def topk_last() -> dict:
 
 def topk_last_constexprs(block: int = SELECT_BLOCK) -> dict:
     return {"BLOCK": block}
+
+
+def rope(dtype: str = SERVING_DTYPE) -> dict:
+    return {
+        "x_ptr": f"*{dtype}",
+        "cos_ptr": "*fp32",
+        "sin_ptr": "*fp32",
+        "out_ptr": f"*{dtype}",
+        "heads": "i32",
+        "head_dim": "i32",
+        "rotary_dim": "i32",
+        "half": "i32",
+        "BLOCK": "constexpr",
+    }
+
+
+def rope_constexprs(head_dim: int = 256) -> dict:
+    return {"BLOCK": head_dim}
+
+
+def repeat_heads(dtype: str = SERVING_DTYPE) -> dict:
+    return {
+        "x_ptr": f"*{dtype}",
+        "out_ptr": f"*{dtype}",
+        "kb": "i32",
+        "rep": "i32",
+        "dim": "i32",
+        "BLOCK": "constexpr",
+    }
+
+
+def repeat_heads_constexprs(dim: int = 128) -> dict:
+    return {"BLOCK": dim}

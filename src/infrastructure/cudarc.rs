@@ -32,8 +32,9 @@ use crate::infrastructure::cuda_driver::{CUstream, CudaError, Driver, GdnKernels
 use crate::infrastructure::kernel_abi::{
     ADD_BF16, ADD_F32, ADD_RMSNORM, AddRmsnormArgs, ArgPack, CAST_BF16_F32, CAST_F32_BF16,
     COL_MUL_BF16, COL_MUL_F32, COPY_STRIDED_BF16, COPY_STRIDED_F32, INDEX_SELECT_BF16, LinearAbi,
-    MAX_ALL_F32, MUL_BF16, MUL_F32, SCALAR_BF16, SCALAR_F32, SOFTMAX_LAST_F32, SUM_ALL_F32,
-    SUM_LAST_F32, TOPK_LAST_F32, UNARY_BF16, UNARY_F32, add_rmsnorm_args, add_rmsnorm_grid,
+    MAX_ALL_F32, MUL_BF16, MUL_F32, REPEAT_HEADS_BF16, ROPE_BF16, SCALAR_BF16, SCALAR_F32,
+    SOFTMAX_LAST_F32, SUM_ALL_F32, SUM_LAST_F32, TOPK_LAST_F32, UNARY_BF16, UNARY_F32,
+    add_rmsnorm_args, add_rmsnorm_grid,
 };
 
 fn bad(e: impl std::fmt::Display) -> MoEError {
@@ -784,24 +785,33 @@ impl Tensor {
     /// `self[r, c] * scale[c]`, the post-GEMM weight scale. `scale` is f32 with
     /// one value per column, or a single value for the broadcast form.
     pub fn col_mul(&self, scale: &Tensor) -> Result<Tensor, MoEError> {
+        self.col_op(scale, 0)
+    }
+
+    /// `self[r, c] + scale[c]`, the column-broadcast add (the GDN `a + dt_bias`).
+    pub fn add_col(&self, scale: &Tensor) -> Result<Tensor, MoEError> {
+        self.col_op(scale, 3)
+    }
+
+    fn col_op(&self, scale: &Tensor, mul_op: u32) -> Result<Tensor, MoEError> {
         if self.dim() != 2 || scale.dtype() != TensorDType::F32 || scale.dim() != 1 {
-            return Err(bad("col_mul wants [rows, cols] and its f32 [cols] scale"));
+            return Err(bad("col op wants [rows, cols] and its f32 [cols] scale"));
         }
         let cols = self.shape[1];
         let op = if scale.shape[0] == 1 {
             1
         } else if scale.shape[0] == cols {
-            0
+            mul_op
         } else {
             return Err(bad(format!(
-                "col_mul scale has {} values for {cols} columns",
+                "col op scale has {} values for {cols} columns",
                 scale.shape[0]
             )));
         };
         let name = match self.dtype() {
             TensorDType::Bf16 => COL_MUL_BF16,
             TensorDType::F32 => COL_MUL_F32,
-            other => return Err(bad(format!("no col_mul for {}", other.name()))),
+            other => return Err(bad(format!("no col op for {}", other.name()))),
         };
         let x = self.contiguous()?;
         let scale = scale.contiguous()?;
@@ -1122,6 +1132,80 @@ impl Tensor {
             Buffer::F32(Arc::new(out)),
             vec![m, n],
         ))
+    }
+
+    /// Partial-NeoX rope over an `[tokens, heads * head_dim]` activation.
+    /// `cos`/`sin` are f32 `[tokens, rotary_dim / 2]`.
+    pub fn rope(
+        &self,
+        cos: &Tensor,
+        sin: &Tensor,
+        heads: usize,
+        head_dim: usize,
+        rotary_dim: usize,
+    ) -> Result<Tensor, MoEError> {
+        if self.dtype() != TensorDType::Bf16 || self.dim() != 2 {
+            return Err(bad("rope wants a bf16 [tokens, heads * head_dim]"));
+        }
+        let half = rotary_dim / 2;
+        let tokens = self.shape[0];
+        if self.shape[1] != heads * head_dim
+            || cos.dtype() != TensorDType::F32
+            || sin.dtype() != TensorDType::F32
+            || cos.shape != [tokens, half]
+            || sin.shape != cos.shape
+        {
+            return Err(bad("rope shape mismatch"));
+        }
+        let x = self.contiguous()?;
+        let cos = cos.contiguous()?;
+        let sin = sin.contiguous()?;
+        let out = self.rt.zeros(&self.shape, TensorDType::Bf16)?;
+        if tokens == 0 {
+            return Ok(out);
+        }
+        self.rt.kernels().rope(
+            self.rt.raw_stream(),
+            x.device_ptr(),
+            cos.device_ptr(),
+            sin.device_ptr(),
+            out.device_ptr(),
+            tokens,
+            heads,
+            head_dim,
+            rotary_dim,
+        )?;
+        Ok(out)
+    }
+
+    /// GQA expand: `[tokens, kb, dim] -> [tokens, kb * rep, dim]`.
+    pub fn repeat_heads(&self, kb: usize, rep: usize) -> Result<Tensor, MoEError> {
+        if self.dtype() != TensorDType::Bf16 || self.dim() != 3 || self.shape[1] != kb {
+            return Err(bad("repeat_heads wants a bf16 [tokens, kb, dim]"));
+        }
+        let (tokens, _, dim) = (self.shape[0], self.shape[1], self.shape[2]);
+        let x = self.contiguous()?;
+        let out = self.rt.zeros(&[tokens, kb * rep, dim], TensorDType::Bf16)?;
+        if tokens == 0 {
+            return Ok(out);
+        }
+        let kernel = self.rt.kernels();
+        let abi_kernel = kernel.abi.kernel(REPEAT_HEADS_BF16)?;
+        if dim > abi_kernel.constexpr("BLOCK")? as usize {
+            return Err(bad(format!(
+                "repeat_heads dim {dim} exceeds the cubin block"
+            )));
+        }
+        kernel.repeat_heads(
+            self.rt.raw_stream(),
+            x.device_ptr(),
+            out.device_ptr(),
+            tokens,
+            kb,
+            rep,
+            dim,
+        )?;
+        Ok(out)
     }
 
     pub fn rms_norm(&self, w: &Tensor, eps: f32) -> Result<Tensor, MoEError> {
@@ -1458,6 +1542,61 @@ impl LinearKernels {
         pack.u32(n as u32)?;
         let mut params = pack.kernel_params()?;
         self.launch(name, (1, 1, 1), &mut params, stream)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rope(
+        &self,
+        stream: CUstream,
+        x: u64,
+        cos: u64,
+        sin: u64,
+        out: u64,
+        tokens: usize,
+        heads: usize,
+        head_dim: usize,
+        rotary_dim: usize,
+    ) -> Result<(), MoEError> {
+        let k = self.abi.kernel(ROPE_BF16)?;
+        let mut pack = ArgPack::for_linear(k);
+        pack.ptr(x)?;
+        pack.ptr(cos)?;
+        pack.ptr(sin)?;
+        pack.ptr(out)?;
+        pack.u32(heads as u32)?;
+        pack.u32(head_dim as u32)?;
+        pack.u32(rotary_dim as u32)?;
+        pack.u32((rotary_dim / 2) as u32)?;
+        let mut params = pack.kernel_params()?;
+        self.launch(
+            ROPE_BF16,
+            (tokens as u32, heads as u32, 1),
+            &mut params,
+            stream,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn repeat_heads(
+        &self,
+        stream: CUstream,
+        x: u64,
+        out: u64,
+        tokens: usize,
+        kb: usize,
+        rep: usize,
+        dim: usize,
+    ) -> Result<(), MoEError> {
+        let k = self.abi.kernel(REPEAT_HEADS_BF16)?;
+        let mut pack = ArgPack::for_linear(k);
+        pack.ptr(x)?;
+        pack.ptr(out)?;
+        pack.u32(kb as u32)?;
+        pack.u32(rep as u32)?;
+        pack.u32(dim as u32)?;
+        let mut params = pack.kernel_params()?;
+        let grid = (tokens as u32, (kb * rep) as u32, 1);
+        self.launch(REPEAT_HEADS_BF16, grid, &mut params, stream)
     }
 
     #[allow(clippy::too_many_arguments)]

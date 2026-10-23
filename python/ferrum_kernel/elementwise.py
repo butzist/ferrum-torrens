@@ -195,7 +195,11 @@ def _col_mul_kernel(x_ptr, scale_ptr, out_ptr, cols, OP, BLOCK: tl.constexpr):
     idx = tl.where(OP == 2, row_idx, idx)
     s = tl.load(scale_ptr + idx, mask=mask, other=0.0).to(tl.float32)
     x = tl.load(x_ptr + row * cols + col, mask=mask, other=0.0).to(tl.float32)
-    tl.store(out_ptr + row * cols + col, x * s, mask=mask)
+    if OP == 3:
+        y = x + s
+    else:
+        y = x * s
+    tl.store(out_ptr + row * cols + col, y, mask=mask)
 
 
 @triton.jit
@@ -305,3 +309,66 @@ def launch_topk_last(x: torch.Tensor, vals: torch.Tensor, idx: torch.Tensor, k: 
     rows, cols = x.shape
     assert cols <= SELECT_BLOCK, f"topk_last needs cols <= {SELECT_BLOCK}, got {cols}"
     _topk_last_kernel[(rows,)](x, vals, idx, cols, k, BLOCK=SELECT_BLOCK, num_warps=4)
+
+
+@triton.jit
+def _rope_kernel(
+    x_ptr,
+    cos_ptr,
+    sin_ptr,
+    out_ptr,
+    heads,
+    head_dim,
+    rotary_dim,
+    half,
+    BLOCK: tl.constexpr,
+):
+    """Partial-NeoX rope over one token's head: rotate the first `rotary_dim`
+    dims in halves, copy the tail through. `cos`/`sin` are f32 `[tokens, half]`
+    and the math is f32, stored back in the activation's dtype."""
+    token = tl.program_id(0)
+    head = tl.program_id(1)
+    base = (token * heads + head) * head_dim
+    i = tl.arange(0, BLOCK)
+    m = i < half
+    lo = tl.load(x_ptr + base + i, mask=m, other=0.0).to(tl.float32)
+    hi = tl.load(x_ptr + base + half + i, mask=m, other=0.0).to(tl.float32)
+    c = tl.load(cos_ptr + token * half + i, mask=m, other=1.0)
+    s = tl.load(sin_ptr + token * half + i, mask=m, other=0.0)
+    tl.store(out_ptr + base + i, lo * c - hi * s, mask=m)
+    tl.store(out_ptr + base + half + i, hi * c + lo * s, mask=m)
+
+    tail = rotary_dim + i
+    mt = tail < head_dim
+    t = tl.load(x_ptr + base + tail, mask=mt, other=0.0)
+    tl.store(out_ptr + base + tail, t, mask=mt)
+
+
+@triton.jit
+def _repeat_heads_kernel(x_ptr, out_ptr, kb, rep, dim, BLOCK: tl.constexpr):
+    """GQA expand: out[t, kb*rep + r, d] = x[t, kb, d], the `expand_heads`
+    repeat-interleave the reference gets from `view/expand/reshape`."""
+    token = tl.program_id(0)
+    head = tl.program_id(1)
+    src = token * kb + head // rep
+    offs = tl.arange(0, BLOCK)
+    m = offs < dim
+    v = tl.load(x_ptr + src * dim + offs, mask=m)
+    tl.store(out_ptr + (token * (kb * rep) + head) * dim + offs, v, mask=m)
+
+
+def launch_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, out: torch.Tensor,
+                heads: int, head_dim: int, rotary_dim: int) -> None:
+    tokens = x.shape[0]
+    _rope_kernel[(tokens, heads)](
+        x, cos, sin, out, heads, head_dim, rotary_dim, rotary_dim // 2,
+        BLOCK=triton.next_power_of_2(head_dim), num_warps=4,
+    )
+
+
+def launch_repeat_heads(x: torch.Tensor, out: torch.Tensor, kb: int, rep: int) -> None:
+    tokens, _, dim = x.shape
+    _repeat_heads_kernel[(tokens, kb * rep)](
+        x, out, kb, rep, dim,
+        BLOCK=triton.next_power_of_2(dim), num_warps=4,
+    )

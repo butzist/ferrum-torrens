@@ -195,3 +195,11 @@ unary/scalar/column-scale/reduction/softmax/top-k/f32-GEMM surface they need
 `forward_torch.rs`: rope, the GDN/attention/MoE hand-offs and the cache path
 remain, and M7.4 must move the kernel launchers onto cudarc storage before the
 whole forward can run torch-less.
+
+## M7.3 rope + GDN primitives (2026-10-23)
+
+See `DONE.md` 131. Rope tables/apply, the GDN decay/beta gates, the q/k L2 norm
+and the GQA head expand are ported to cudarc with dedicated kernels where the
+`tch` chain was `cat`/broadcast-heavy. Rope and the head expand are bit-exact
+against the `tch` formulas; the gates are within 2.4e-7. The prefill chunked
+recurrence and the kernel/cache wiring remain.

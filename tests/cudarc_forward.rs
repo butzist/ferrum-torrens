@@ -138,3 +138,130 @@ fn dense_forward_primitives_match_tch() -> Res<()> {
     close(&weights.to_host_f32()?, &tw, 1e-6, "topk weights");
     Ok(())
 }
+
+fn tch_rope(
+    x: &tch::Tensor,
+    heads: i64,
+    head_dim: i64,
+    rotary_dim: i64,
+    base: f32,
+    tokens: i64,
+    dev: Device,
+) -> Vec<f32> {
+    let half = rotary_dim / 2;
+    let inv_t = tch::Tensor::arange(half, (Kind::Double, dev.to_tch()))
+        .g_mul_scalar(-2.0 * (base as f64).ln() / rotary_dim as f64)
+        .exp()
+        .reshape([1, half]);
+    let pos = tch::Tensor::arange(tokens, (Kind::Double, dev.to_tch())).reshape([tokens, 1]);
+    let ang = pos.matmul(&inv_t).to_kind(Kind::Float);
+    let cos = ang.cos().unsqueeze(1);
+    let sin = ang.sin().unsqueeze(1);
+    let x3 = x.view([tokens, heads, head_dim]);
+    let (lo, hi, tail) = (
+        x3.narrow(2, 0, half),
+        x3.narrow(2, half, half),
+        x3.narrow(2, rotary_dim, head_dim - rotary_dim),
+    );
+    let rot_lo = &lo * &cos - &hi * &sin;
+    let rot_hi = &hi * cos + &lo * sin;
+    to_f32_vec(
+        &tch::Tensor::cat(&[&rot_lo, &rot_hi, &tail], 2)
+            .reshape([tokens, heads * head_dim])
+            .to_kind(x.kind()),
+    )
+}
+
+#[test]
+#[ignore = "needs a CUDA device and libtorch"]
+fn rope_gdn_gate_and_gqa_match_tch() -> Res<()> {
+    let rt = Runtime::open(0)?;
+    load_cuda_backend();
+    let dev = Device::Cuda(0);
+    let (tokens, heads, head_dim, rotary_dim) = (4usize, 16usize, 256usize, 64usize);
+    let base = 10_000_000.0f32;
+
+    // rope
+    let x_host = values(tokens * heads * head_dim, 23, -0.5, 0.5);
+    let x_bits: Vec<bf16> = x_host.iter().map(|v| bf16::from_f32(*v)).collect();
+    let x = rt.from_slice_bf16(&x_bits, &[tokens, heads * head_dim])?;
+    let tx = bf16_tensor(&x_host, &[tokens as i64, (heads * head_dim) as i64], dev);
+    let (cos, sin) = forward_cudarc::rope_tables(&rt, tokens, rotary_dim, base)?;
+    let got =
+        forward_cudarc::apply_rope(&x, heads, head_dim, rotary_dim, &cos, &sin)?.to_host_f32()?;
+    let want = tch_rope(
+        &tx,
+        heads as i64,
+        head_dim as i64,
+        rotary_dim as i64,
+        base,
+        tokens as i64,
+        dev,
+    );
+    close(&got, &want, 1e-2, "rope");
+
+    // GDN gate/beta and the L2 norm, f32.
+    let vb = 32usize;
+    let n = 4usize;
+    let a_host = values(n * vb, 29, -1.0, 1.0);
+    let dt_host = values(vb, 31, -0.5, 0.5);
+    let al_host = values(vb, 37, -0.5, 0.5);
+    let a = rt.from_slice_f32(&a_host, &[n, vb])?;
+    let dt = rt.from_slice_f32(&dt_host, &[vb])?;
+    let al = rt.from_slice_f32(&al_host, &[vb])?;
+    let ta = f32_tensor(&a_host, &[n as i64, vb as i64], dev);
+    let tdt = f32_tensor(&dt_host, &[vb as i64], dev);
+    let tal = f32_tensor(&al_host, &[vb as i64], dev);
+    let tg = &(&ta + &tdt).softplus() * tal.exp().neg();
+    close(
+        &forward_cudarc::gdn_gate(&a, &dt, &al)?.to_host_f32()?,
+        &to_f32_vec(&tg),
+        1e-6,
+        "gdn gate",
+    );
+    let b_host = values(n * vb, 41, -2.0, 2.0);
+    let b = rt.from_slice_f32(&b_host, &[n, vb])?;
+    let tb = f32_tensor(&b_host, &[n as i64, vb as i64], dev);
+    close(
+        &forward_cudarc::gdn_beta(&b)?.to_host_f32()?,
+        &to_f32_vec(&tb.sigmoid()),
+        1e-6,
+        "gdn beta",
+    );
+
+    let (dk, dv) = (64usize, 32usize);
+    let q_host = values(n * vb * dk, 43, -1.0, 1.0);
+    let q = rt.from_slice_f32(&q_host, &[n, vb, dk])?;
+    let tq = f32_tensor(&q_host, &[n as i64, vb as i64, dk as i64], dev);
+    let q2 = tq
+        .pow_tensor_scalar(2.0)
+        .sum_dim_intlist(-1, true, Kind::Float)
+        .g_add_scalar(1e-6);
+    let tqhat = &tq * (q2.sqrt().reciprocal() * (1.0 / (dk as f64).sqrt()));
+    close(
+        &forward_cudarc::l2_normalize(&q, 1e-6, 1.0 / (dk as f32).sqrt())?.to_host_f32()?,
+        &to_f32_vec(&tqhat),
+        1e-6,
+        "gdn l2 norm",
+    );
+
+    // GQA expand.
+    let kb = 8usize;
+    let rep = 2usize;
+    let h_host = values(2 * kb * dv, 47, -1.0, 1.0);
+    let h_bits: Vec<bf16> = h_host.iter().map(|v| bf16::from_f32(*v)).collect();
+    let h = rt.from_slice_bf16(&h_bits, &[2, kb, dv])?;
+    let th = bf16_tensor(&h_host, &[2, kb as i64, dv as i64], dev);
+    let want = to_f32_vec(
+        &th.view([2, kb as i64, 1, dv as i64])
+            .expand([2, kb as i64, rep as i64, dv as i64], false)
+            .reshape([2, (kb * rep) as i64, dv as i64]),
+    );
+    close(
+        &forward_cudarc::repeat_heads(&h, kb, rep)?.to_host_f32()?,
+        &want,
+        0.0,
+        "gqa expand",
+    );
+    Ok(())
+}
