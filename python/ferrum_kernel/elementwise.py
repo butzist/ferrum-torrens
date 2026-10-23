@@ -573,3 +573,89 @@ def launch_causal_sdpa(
         BLOCK_M=SDPA_BLOCK_M, BLOCK_N=block_n, BLOCK_D=SDPA_BLOCK_D,
         num_warps=4,
     )
+
+
+# The GDN prefill chunk helpers. `cumsum_dim0` is one program per column tile
+# that walks the rows in order; the ratio masks and the two broadcasts are
+# row-parallel. `n` is the chunk length (at most 64), `mv` the value heads.
+@triton.jit
+def _cumsum_dim0_kernel(x_ptr, out_ptr, rows, cols, BLOCK: tl.constexpr):
+    col = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = col < cols
+    acc = tl.zeros((BLOCK,), dtype=tl.float32)
+    for row in tl.range(0, rows):
+        x = tl.load(x_ptr + row * cols + col, mask=mask, other=0.0).to(tl.float32)
+        acc += x
+        tl.store(out_ptr + row * cols + col, acc, mask=mask)
+
+
+@triton.jit
+def _gdn_ratio_masks_kernel(g_ptr, lo_ptr, loeq_ptr, n, hv, BLOCK: tl.constexpr):
+    h = tl.program_id(0)
+    e = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    total = n * n
+    mask = e < total
+    i = e // n
+    j = e % n
+    gi = tl.load(g_ptr + i * hv + h, mask=mask, other=0.0).to(tl.float32)
+    gj = tl.load(g_ptr + j * hv + h, mask=mask, other=0.0).to(tl.float32)
+    # Zero the upper triangle before `exp`, as the reference does, so a large
+    # positive ratio cannot overflow the lanes it is about to discard.
+    lower_eq = i >= j
+    ratio = tl.exp(tl.where(lower_eq, gi - gj, 0.0))
+    base = h * total + e
+    tl.store(lo_ptr + base, tl.where(i > j, ratio, 0.0), mask=mask)
+    tl.store(loeq_ptr + base, tl.where(lower_eq, ratio, 0.0), mask=mask)
+
+
+@triton.jit
+def _mul_mid_kernel(x_ptr, scale_ptr, out_ptr, cols, BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = col < cols
+    s = tl.load(scale_ptr + row).to(tl.float32)
+    x = tl.load(x_ptr + row * cols + col, mask=mask, other=0.0).to(tl.float32)
+    tl.store(out_ptr + row * cols + col, x * s, mask=mask)
+
+
+@triton.jit
+def _scale_heads_kernel(x_ptr, scale_ptr, out_ptr, rows_per_head, cols, BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = col < cols
+    s = tl.load(scale_ptr + row // rows_per_head).to(tl.float32)
+    x = tl.load(x_ptr + row * cols + col, mask=mask, other=0.0).to(tl.float32)
+    tl.store(out_ptr + row * cols + col, x * s, mask=mask)
+
+
+def launch_cumsum_dim0(x: torch.Tensor, out: torch.Tensor) -> None:
+    rows, cols = x.shape
+    _cumsum_dim0_kernel[(triton.cdiv(cols, SELECT_BLOCK),)](
+        x, out, rows, cols, BLOCK=SELECT_BLOCK, num_warps=4
+    )
+
+
+def launch_gdn_ratio_masks(
+    g: torch.Tensor, lo: torch.Tensor, loeq: torch.Tensor
+) -> None:
+    n, hv = g.shape
+    _gdn_ratio_masks_kernel[(hv, triton.cdiv(n * n, SELECT_BLOCK))](
+        g, lo, loeq, n, hv, BLOCK=SELECT_BLOCK, num_warps=4
+    )
+
+
+def launch_mul_mid(x: torch.Tensor, scale: torch.Tensor, out: torch.Tensor) -> None:
+    rows = x.numel() // x.shape[-1]
+    cols = x.shape[-1]
+    _mul_mid_kernel[(rows, triton.cdiv(cols, SELECT_BLOCK))](
+        x, scale, out, cols, BLOCK=SELECT_BLOCK, num_warps=4
+    )
+
+
+def launch_scale_heads(x: torch.Tensor, scale: torch.Tensor, out: torch.Tensor) -> None:
+    rows_per_head = x.shape[1]
+    rows = x.shape[0] * rows_per_head
+    cols = x.shape[2]
+    _scale_heads_kernel[(rows, triton.cdiv(cols, SELECT_BLOCK))](
+        x, scale, out, rows_per_head, cols, BLOCK=SELECT_BLOCK, num_warps=4
+    )

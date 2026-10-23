@@ -227,8 +227,10 @@ elementwise.py"]
   causal conv + silu, `gdn_tri_solve`, the prefill chunk triangular solve,
   `nvfp4_dense_gemv`, the lm_head tail,
   `fp8_gemv`/`fp8_splitk_reduce`/`fp8_gemm`, the vendored W8A16 FP8 projections,
-  and the M7.1 elementwise set: `add`/`mul` in bf16 and f32, bf16<->f32 cast,
-  bf16 row `index_select`, and the strided copy `contiguous()` uses).
+  the GDN prefill chunk helpers (`cumsum_dim0`, `gdn_ratio_masks`, `mul_mid`,
+  `scale_heads`), and the M7.1 elementwise set: `add`/`mul` in bf16 and f32,
+  bf16<->f32 cast, bf16 row `index_select`, and the strided copy `contiguous()`
+  uses).
   The devshell aliases
   `kernel-aot`, `kernel-selftest` (CPU interpreter gate) and
   `kernel-compile-check` are the kernel inner loop.

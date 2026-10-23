@@ -10,6 +10,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use ferrum_torrens::domain::expert_kernel::{MoEDeviceRequest, MoEError, MoEExecutor, MoETensor};
 use ferrum_torrens::domain::kvcache::CachedModel;
 use ferrum_torrens::domain::model::{ForwardInput, Model};
 use ferrum_torrens::domain::weights::WeightsReader;
@@ -165,5 +166,156 @@ fn the_cudarc_forward_matches_the_scalar_oracle() {
         "decode argmax {} = {}",
         argmax(&decoded),
         decoded[argmax(&decoded)]
+    );
+}
+
+/// The differential below runs a 130-token prompt through the full tower. The
+/// inline NVFP4 expert path (no MoE port attached) re-reads and widens every
+/// routed expert per token, which is minutes of host work at this length and
+/// says nothing about the GDN recurrence. A zero-routed stub keeps the same
+/// attention, GDN and shared-expert math in both runs.
+struct ZeroMoe;
+
+impl MoEExecutor for ZeroMoe {
+    fn execute_device<'a>(
+        &self,
+        _req: &MoEDeviceRequest<'a>,
+        _out: &mut dyn MoETensor,
+    ) -> Result<(), MoEError> {
+        Ok(())
+    }
+
+    fn steps(&self) -> u64 {
+        0
+    }
+}
+
+fn tower() -> CudarcQwen3_6 {
+    eprintln!("loading the cudarc tower");
+    let start = Instant::now();
+    let dir = std::path::Path::new(FTW_DIR);
+    let index = Arc::new(
+        FtwIndex::parse(
+            &std::fs::read_to_string(dir.join("freetoken_weight.json"))
+                .expect("read the FTW index"),
+        )
+        .expect("parse the FTW index"),
+    );
+    let reader: Arc<dyn WeightsReader> = Arc::new(FtwReader::open(dir).expect("open the FTW"));
+    let config_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+    let text_config = config_json.get("text_config").expect("text_config").clone();
+    let params = config::parse_text_config(&text_config).expect("parse text_config");
+    let device = Device::Cuda(0);
+    let cache = Arc::new(DeviceCache::new(&params, 160, 1, KvDType::F32, device));
+    let rt = cache.runtime().clone();
+    let head_gemv = Arc::new(DenseGemv::new(device, rt.raw_stream()).expect("dense gemv"));
+    let fp8 = Arc::new(Fp8Linear::new(device, rt.raw_stream()).expect("fp8 linear"));
+    let mut model = CudarcQwen3_6::load(
+        params,
+        rt,
+        index,
+        reader,
+        None,
+        Some(head_gemv),
+        Some(fp8),
+        cache,
+    )
+    .expect("load the cudarc tower");
+    model.attach_moe(Some(Arc::new(ZeroMoe)));
+    eprintln!("tower loaded in {:.2}s", start.elapsed().as_secs_f64());
+    model
+}
+
+#[test]
+#[ignore = "needs a CUDA device and the FTW checkpoint"]
+#[serial]
+fn the_chunked_gdn_prefill_matches_the_per_token_path() {
+    use ferrum_torrens::domain::tokenizer::Tokenizer;
+    use ferrum_torrens::models::qwen3_6::forward_cudarc::set_gdn_chunked;
+
+    let model = tower();
+    let tokenizer = ferrum_torrens::infrastructure::tokenizers_hf::HfTokenizer::from_file(
+        &std::path::Path::new(FTW_DIR)
+            .join("tokenizer.json")
+            .to_string_lossy(),
+    )
+    .expect("load the tokenizer");
+    let text = "The quick brown fox jumps over the lazy dog. ".repeat(20);
+    let ids = tokenizer.encode(&text).expect("encode");
+    assert!(
+        ids.len() >= 130,
+        "need a 128+ token prompt, got {}",
+        ids.len()
+    );
+    let ids = &ids[..130];
+    let prompt = input(ids, 0);
+
+    eprintln!("chunked 130-token forward");
+    set_gdn_chunked(true);
+    let chunked = model.forward(&prompt);
+    eprintln!("per-token 130-token forward");
+    set_gdn_chunked(false);
+    let tokenwise = model.forward(&prompt);
+
+    assert!(
+        chunked.iter().all(|v| v.is_finite()),
+        "non-finite chunked logits"
+    );
+    assert!(
+        tokenwise.iter().all(|v| v.is_finite()),
+        "non-finite per-token logits"
+    );
+    let (a, b) = (argmax(&chunked), argmax(&tokenwise));
+    let max_d = chunked
+        .iter()
+        .zip(&tokenwise)
+        .map(|(x, y)| (*x - *y).abs())
+        .fold(0.0f32, f32::max);
+    let top_d = (chunked[a] - tokenwise[b]).abs();
+    eprintln!(
+        "130-token GDN differential: chunked argmax {a} = {}, per-token argmax {b} = {}, top|d| = {top_d}, max|d| = {max_d}",
+        chunked[a], tokenwise[b]
+    );
+    assert_eq!(a, b, "chunked and per-token argmax disagree");
+    // The top logit is the serving-relevant one. The full-vocabulary max drifts
+    // further because the two recurrences differ in f32 association, which flips
+    // a few bf16 roundings and compounds over 30 layers; the recurrence itself
+    // matches the token loop to ~1e-7 in the state (cudarc_gdn_ops).
+    assert!(
+        top_d <= 2e-2,
+        "chunked vs per-token top logit |d| = {top_d}"
+    );
+    assert!(max_d <= 2e-1, "chunked vs per-token max|d| = {max_d}");
+
+    eprintln!("cached 3-token prefill + decode");
+    let short = input(&ids[..3], 0);
+    let stateless_short = model.forward(&short);
+    let kv = model
+        .cache()
+        .expect("the cudarc forward carries a kv cache");
+    let mut seq = kv.begin();
+    kv.reserve(&mut seq, 3).expect("reserve the prefill pages");
+    let prefill = model.forward_cached(&short, &mut seq).unwrap();
+    assert_eq!(
+        argmax(&prefill),
+        argmax(&stateless_short),
+        "3-token cached prefill argmax differs from the stateless run"
+    );
+
+    let next = argmax(&prefill) as u32;
+    let four = [ids[0], ids[1], ids[2], next];
+    let stateless_four = model.forward(&input(&four, 0));
+    kv.reserve(&mut seq, 1).expect("reserve the decode page");
+    let decoded = model.forward_cached(&input(&[next], 3), &mut seq).unwrap();
+    eprintln!(
+        "3+1 cached argmax {} vs stateless argmax {}",
+        argmax(&decoded),
+        argmax(&stateless_four)
+    );
+    assert_eq!(
+        argmax(&decoded),
+        argmax(&stateless_four),
+        "cached decode argmax differs from the stateless run"
     );
 }

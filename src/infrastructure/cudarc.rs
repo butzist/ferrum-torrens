@@ -30,11 +30,12 @@ use crate::infrastructure::cuda_driver::{CUstream, CudaError, Driver, GdnKernels
 use crate::infrastructure::kernel_abi::{
     ADD_BF16, ADD_F32, ADD_RMSNORM, AddRmsnormArgs, ArgPack, CAST_BF16_F32, CAST_F32_BF16,
     CAUSAL_SDPA_BF16, CAUSAL_SDPA_F32, COL_MUL_BF16, COL_MUL_F32, COPY_STRIDED_BF16,
-    COPY_STRIDED_F32, COPY_STRIDED_I32, COPY_STRIDED_I64, COPY_STRIDED_U8, GATHER_ROWS_BF16,
-    GATHER_ROWS_F32, INDEX_SELECT_BF16, LinearAbi, MAX_ALL_F32, MUL_BF16, MUL_F32,
-    REPEAT_HEADS_BF16, ROPE_BF16, SCALAR_BF16, SCALAR_F32, SCATTER_ROWS_BF16, SCATTER_ROWS_F32,
-    SOFTMAX_LAST_F32, SUM_ALL_F32, SUM_LAST_F32, TOPK_LAST_F32, UNARY_BF16, UNARY_F32,
-    add_rmsnorm_args, add_rmsnorm_grid,
+    COPY_STRIDED_F32, COPY_STRIDED_I32, COPY_STRIDED_I64, COPY_STRIDED_U8, CUMSUM_DIM0_F32,
+    GATHER_ROWS_BF16, GATHER_ROWS_F32, GDN_RATIO_MASKS_F32, INDEX_SELECT_BF16, LinearAbi,
+    MAX_ALL_F32, MUL_BF16, MUL_F32, MUL_MID_F32, REPEAT_HEADS_BF16, ROPE_BF16, SCALAR_BF16,
+    SCALAR_F32, SCALE_HEADS_F32, SCATTER_ROWS_BF16, SCATTER_ROWS_F32, SOFTMAX_LAST_F32,
+    SUM_ALL_F32, SUM_LAST_F32, TOPK_LAST_F32, UNARY_BF16, UNARY_F32, add_rmsnorm_args,
+    add_rmsnorm_grid,
 };
 
 fn bad(e: impl std::fmt::Display) -> MoEError {
@@ -1182,6 +1183,195 @@ impl Tensor {
         ))
     }
 
+    /// Batched `[b, m, k] x [b, k, n] -> [b, m, n]`, all f32.
+    ///
+    /// cuBLAS is column-major, so a row-major `C = A @ B` is computed as
+    /// `C^T[n, m] = B[n, k] @ A[k, m]`: pass `B` as the first operand, `A` as
+    /// the second, swap `m`/`n` and use each matrix's element count as the
+    /// batch stride. This mirrors `matmul_nt_f32`'s mapping.
+    pub fn bmm(&self, other: &Tensor) -> Result<Tensor, MoEError> {
+        if self.dim() != 3 || other.dim() != 3 {
+            return Err(bad(format!(
+                "bmm wants 3-d operands, got {} and {}",
+                self.dim(),
+                other.dim()
+            )));
+        }
+        if self.dtype() != TensorDType::F32 || other.dtype() != TensorDType::F32 {
+            return Err(bad("bmm is f32 only"));
+        }
+        let (b, m, k) = (self.shape[0], self.shape[1], self.shape[2]);
+        let (ob, ok, n) = (other.shape[0], other.shape[1], other.shape[2]);
+        if b != ob || k != ok {
+            return Err(bad(format!(
+                "bmm shape mismatch {:?} x {:?}",
+                self.shape, other.shape
+            )));
+        }
+        let a = self.contiguous()?;
+        let rhs = other.contiguous()?;
+        if b == 0 || m == 0 || n == 0 || k == 0 {
+            return self.rt.zeros(&[b, m, n], TensorDType::F32);
+        }
+        let mut out = self.rt.alloc_f32(b * m * n)?;
+        let ap = a.device_ptr();
+        let bp = rhs.device_ptr();
+        let (cp, _ro) = out.device_ptr_mut(&self.rt.inner.stream);
+        let (alpha, beta) = (1.0f32, 0.0f32);
+        // SAFETY: the shape checks bound every operand, `out` is exactly
+        // b*m*n elements, and all three pointers are live in this context.
+        unsafe {
+            ::cudarc::cublas::result::gemm_strided_batched_ex(
+                *self.rt.inner.blas.handle(),
+                cublasOperation_t::CUBLAS_OP_N,
+                cublasOperation_t::CUBLAS_OP_N,
+                n as i32,
+                m as i32,
+                k as i32,
+                (&alpha) as *const f32 as *const _,
+                bp as *const _,
+                cudaDataType_t::CUDA_R_32F,
+                n as i32,
+                (n * k) as i64,
+                ap as *const _,
+                cudaDataType_t::CUDA_R_32F,
+                k as i32,
+                (m * k) as i64,
+                (&beta) as *const f32 as *const _,
+                cp as *mut _,
+                cudaDataType_t::CUDA_R_32F,
+                n as i32,
+                (m * n) as i64,
+                b as i32,
+                cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+            )
+        }
+        .map_err(bad)?;
+        drop(_ro);
+        Ok(Tensor::new(
+            self.rt.clone(),
+            Buffer::F32(Arc::new(out)),
+            vec![b, m, n],
+        ))
+    }
+
+    /// Inclusive prefix sum down dim 0 of a f32 `[rows, cols]`.
+    pub fn cumsum_dim0(&self) -> Result<Tensor, MoEError> {
+        if self.dim() != 2 || self.dtype() != TensorDType::F32 {
+            return Err(bad("cumsum_dim0 wants a f32 [rows, cols]"));
+        }
+        let (rows, cols) = (self.shape[0], self.shape[1]);
+        let x = self.contiguous()?;
+        let out = self.rt.zeros(&self.shape, TensorDType::F32)?;
+        if self.numel() == 0 {
+            return Ok(out);
+        }
+        self.rt.kernels().cumsum_dim0(
+            self.rt.raw_stream(),
+            x.device_ptr(),
+            out.device_ptr(),
+            rows,
+            cols,
+        )?;
+        Ok(out)
+    }
+
+    /// The lower-triangular decay ratios a chunked GDN recurrence needs.
+    ///
+    /// `self` is the f32 `[n, hv]` cumulative log-decay. The outputs are f32
+    /// `[hv, n, n]`: `lo[h,i,j] = exp(g[i,h] - g[j,h])` for `i > j` and 0
+    /// elsewhere, and `loeq` keeps the diagonal as well. `n` is at most 64.
+    pub fn gdn_ratio_masks(&self) -> Result<(Tensor, Tensor), MoEError> {
+        if self.dim() != 2 || self.dtype() != TensorDType::F32 {
+            return Err(bad("gdn_ratio_masks wants a f32 [n, hv]"));
+        }
+        let (n, hv) = (self.shape[0], self.shape[1]);
+        if n > 64 {
+            return Err(bad(format!("gdn_ratio_masks n = {n}, want <= 64")));
+        }
+        let shape = [hv, n, n];
+        let lo = self.rt.zeros(&shape, TensorDType::F32)?;
+        let loeq = self.rt.zeros(&shape, TensorDType::F32)?;
+        if n == 0 || hv == 0 {
+            return Ok((lo, loeq));
+        }
+        let g = self.contiguous()?;
+        self.rt.kernels().gdn_ratio_masks(
+            self.rt.raw_stream(),
+            g.device_ptr(),
+            lo.device_ptr(),
+            loeq.device_ptr(),
+            n,
+            hv,
+        )?;
+        Ok((lo, loeq))
+    }
+
+    /// `out[b, i, j] = self[b, i, j] * scale[b, i]` for f32
+    /// `[b, m, n] * [b, m]` (scale may also be shaped `[b, m, 1]`).
+    pub fn mul_mid(&self, scale: &Tensor) -> Result<Tensor, MoEError> {
+        if self.dim() != 3 || self.dtype() != TensorDType::F32 {
+            return Err(bad("mul_mid wants a f32 [b, m, n]"));
+        }
+        if scale.dtype() != TensorDType::F32 {
+            return Err(bad("mul_mid scale must be f32"));
+        }
+        let (b, m, n) = (self.shape[0], self.shape[1], self.shape[2]);
+        if scale.numel() != b * m {
+            return Err(bad(format!(
+                "mul_mid scale has {} values for {b}x{m} rows",
+                scale.numel()
+            )));
+        }
+        let x = self.contiguous()?;
+        let scale = scale.contiguous()?;
+        let out = self.rt.zeros(&self.shape, TensorDType::F32)?;
+        if self.numel() == 0 {
+            return Ok(out);
+        }
+        self.rt.kernels().mul_mid(
+            self.rt.raw_stream(),
+            x.device_ptr(),
+            scale.device_ptr(),
+            out.device_ptr(),
+            n,
+            b * m,
+        )?;
+        Ok(out)
+    }
+
+    /// `out[b, ..] = self[b, ..] * scale[b]` for f32 `[b, m, n] * [b]`.
+    pub fn scale_heads(&self, scale: &Tensor) -> Result<Tensor, MoEError> {
+        if self.dim() != 3 || self.dtype() != TensorDType::F32 {
+            return Err(bad("scale_heads wants a f32 [b, m, n]"));
+        }
+        if scale.dtype() != TensorDType::F32 || scale.dim() != 1 || scale.shape[0] != self.shape[0]
+        {
+            return Err(bad(format!(
+                "scale_heads wants a f32 [{}] scale for {:?}",
+                self.shape[0], self.shape
+            )));
+        }
+        let (b, m, n) = (self.shape[0], self.shape[1], self.shape[2]);
+        let x = self.contiguous()?;
+        let scale = scale.contiguous()?;
+        let out = self.rt.zeros(&self.shape, TensorDType::F32)?;
+        if self.numel() == 0 {
+            return Ok(out);
+        }
+        self.rt.kernels().scale_heads(
+            self.rt.raw_stream(),
+            x.device_ptr(),
+            scale.device_ptr(),
+            out.device_ptr(),
+            m,
+            n,
+            b * m,
+        )?;
+        Ok(out)
+    }
+
     /// Partial-NeoX rope over an `[tokens, heads * head_dim]` activation.
     /// `cos`/`sin` are f32 `[tokens, rotary_dim / 2]`.
     pub fn rope(
@@ -1793,6 +1983,109 @@ impl LinearKernels {
         let block = kernel.constexpr("BLOCK")? as usize;
         let grid = (n.div_ceil(block) as u32, 1, 1);
         self.launch(name, grid, &mut params, stream)
+    }
+
+    fn cumsum_dim0(
+        &self,
+        stream: CUstream,
+        x: u64,
+        out: u64,
+        rows: usize,
+        cols: usize,
+    ) -> Result<(), MoEError> {
+        let kernel = self.abi.kernel(CUMSUM_DIM0_F32)?;
+        let mut pack = ArgPack::for_linear(kernel);
+        pack.ptr(x)?;
+        pack.ptr(out)?;
+        pack.u32(rows as u32)?;
+        pack.u32(cols as u32)?;
+        let mut params = pack.kernel_params()?;
+        let block = kernel.constexpr("BLOCK")? as usize;
+        self.launch(
+            CUMSUM_DIM0_F32,
+            (cols.div_ceil(block) as u32, 1, 1),
+            &mut params,
+            stream,
+        )
+    }
+
+    fn gdn_ratio_masks(
+        &self,
+        stream: CUstream,
+        g: u64,
+        lo: u64,
+        loeq: u64,
+        n: usize,
+        hv: usize,
+    ) -> Result<(), MoEError> {
+        let kernel = self.abi.kernel(GDN_RATIO_MASKS_F32)?;
+        let mut pack = ArgPack::for_linear(kernel);
+        pack.ptr(g)?;
+        pack.ptr(lo)?;
+        pack.ptr(loeq)?;
+        pack.u32(n as u32)?;
+        pack.u32(hv as u32)?;
+        let mut params = pack.kernel_params()?;
+        let block = kernel.constexpr("BLOCK")? as usize;
+        self.launch(
+            GDN_RATIO_MASKS_F32,
+            (hv as u32, (n * n).div_ceil(block) as u32, 1),
+            &mut params,
+            stream,
+        )
+    }
+
+    fn mul_mid(
+        &self,
+        stream: CUstream,
+        x: u64,
+        scale: u64,
+        out: u64,
+        cols: usize,
+        rows: usize,
+    ) -> Result<(), MoEError> {
+        let kernel = self.abi.kernel(MUL_MID_F32)?;
+        let mut pack = ArgPack::for_linear(kernel);
+        pack.ptr(x)?;
+        pack.ptr(scale)?;
+        pack.ptr(out)?;
+        pack.u32(cols as u32)?;
+        let mut params = pack.kernel_params()?;
+        let block = kernel.constexpr("BLOCK")? as usize;
+        self.launch(
+            MUL_MID_F32,
+            (rows as u32, cols.div_ceil(block) as u32, 1),
+            &mut params,
+            stream,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scale_heads(
+        &self,
+        stream: CUstream,
+        x: u64,
+        scale: u64,
+        out: u64,
+        rows_per_head: usize,
+        cols: usize,
+        rows: usize,
+    ) -> Result<(), MoEError> {
+        let kernel = self.abi.kernel(SCALE_HEADS_F32)?;
+        let mut pack = ArgPack::for_linear(kernel);
+        pack.ptr(x)?;
+        pack.ptr(scale)?;
+        pack.ptr(out)?;
+        pack.u32(rows_per_head as u32)?;
+        pack.u32(cols as u32)?;
+        let mut params = pack.kernel_params()?;
+        let block = kernel.constexpr("BLOCK")? as usize;
+        self.launch(
+            SCALE_HEADS_F32,
+            (rows as u32, cols.div_ceil(block) as u32, 1),
+            &mut params,
+            stream,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -7,7 +7,8 @@
 // `CachedModel` for the host-cache prefill/decode path over `DeviceCache`.
 // It is the serving forward behind the `cudarc` feature.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use crate::domain::dequant::{nvfp4_expert, nvfp4_globals};
 use crate::domain::expert_kernel::{MoEDeviceRequest, MoEError, MoEExecutor};
@@ -176,6 +177,152 @@ pub fn l2_normalize(x: &Tensor, eps: f32, scale: f32) -> Result<Tensor> {
 /// `[t, kb, dim] -> [t, kb * rep, dim]`, the GQA repeat-interleave.
 pub fn repeat_heads(x: &Tensor, kb: usize, rep: usize) -> Result<Tensor> {
     x.repeat_heads(kb, rep)
+}
+
+/// Tokens per chunk in the parallel prefill recurrence, and the shortest prompt
+/// that takes it. Below the floor the per-token fused kernel stays, both to
+/// avoid the chunk setup on a short prompt and to keep its numerics identical.
+const GDN_PREFILL_CHUNK: usize = 64;
+const GDN_PREFILL_MIN: usize = 128;
+
+fn gdn_chunked_flag() -> &'static AtomicBool {
+    static FLAG: OnceLock<AtomicBool> = OnceLock::new();
+    FLAG.get_or_init(|| {
+        let on = std::env::var("FERRUM_GDN_CHUNKED")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        AtomicBool::new(on)
+    })
+}
+
+fn gdn_chunked_enabled() -> bool {
+    gdn_chunked_flag().load(Ordering::Relaxed)
+}
+
+/// Test-only override: force the chunked prefill recurrence on or off. The
+/// differential gate flips this between forwards instead of reloading the model.
+pub fn set_gdn_chunked(enabled: bool) {
+    gdn_chunked_flag().store(enabled, Ordering::Relaxed);
+}
+
+/// Row-by-row forward substitution for `(I + a) delta = rhs`, used only when
+/// the tri-solve cubin refuses the chunk shape. Mirrors the reference's
+/// fallback: `[hv, 1, dv]` row updates rebuilt through `cat`.
+fn tri_solve_fallback(a: &Tensor, rhs: &Tensor, hv: usize, n: usize, dv: usize) -> Result<Tensor> {
+    let mut parts: Vec<Tensor> = Vec::with_capacity(n);
+    for i in 0..n {
+        let rhs_i = rhs.narrow(1, i, 1)?;
+        let d_i = if i == 0 {
+            rhs_i.contiguous()?
+        } else {
+            let a_i = a.narrow(1, i, 1)?.narrow(2, 0, i)?;
+            let prev = Tensor::cat(&parts)?.transpose(0, 1)?.contiguous()?;
+            rhs_i.add(&a_i.bmm(&prev)?.unary(Unary::Neg)?)?
+        };
+        parts.push(d_i.transpose(0, 1)?);
+    }
+    Tensor::cat(&parts)?
+        .reshape(&[n, hv, dv])?
+        .transpose(0, 1)?
+        .contiguous()
+}
+
+/// The chunked GDN recurrence, the prefill path the torch runtime used.
+///
+/// Chunks run sequentially from the previous chunk's state; inside a chunk the
+/// token dependency becomes a unit lower-triangular solve. `P_i = exp(sum_{l<=i}
+/// g_l)` and `khat`/`qhat` are the L2-normalized keys and queries, so the state
+/// after token `i` is `P_i S + sum_{j<=i} (P_i/P_j) khat_j delta_j^T` and
+/// `delta_i = beta_i (v_i - S_i^T khat_i)` gives the triangular system. q/k are
+/// already GQA-expanded to the value-head count.
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_chunked_prefill(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+    dk: usize,
+    state: &Tensor,
+    solve: &GdnDecode,
+) -> Result<(Tensor, Tensor)> {
+    if q.dim() != 3 || k.dim() != 3 || v.dim() != 3 {
+        return Err(moe_bad("chunked GDN wants q/k/v as [t, hv, d]"));
+    }
+    let t = q.shape()[0];
+    let hv = q.shape()[1];
+    let dv = v.shape()[2];
+    if q.shape()[2] != dk || k.shape() != q.shape() || v.shape() != [t, hv, dv].as_slice() {
+        return Err(moe_bad("chunked GDN head geometry mismatch"));
+    }
+    if g.shape() != [t, hv].as_slice() || beta.shape() != [t, hv].as_slice() {
+        return Err(moe_bad("chunked GDN wants f32 g/beta as [t, hv]"));
+    }
+    if state.shape() != [hv, dk, dv].as_slice() {
+        return Err(moe_bad("chunked GDN wants an f32 [hv, dk, dv] state"));
+    }
+    let scale = 1.0f32 / (dk as f32).sqrt();
+    let qhat = l2_normalize(&q.cast(TensorDType::F32)?, 1e-6, scale)?;
+    let khat = l2_normalize(&k.cast(TensorDType::F32)?, 1e-6, 1.0)?;
+    let vf = v.cast(TensorDType::F32)?;
+    let mut state = state.contiguous()?;
+
+    let mut out_chunks: Vec<Tensor> = Vec::with_capacity(t.div_ceil(GDN_PREFILL_CHUNK));
+    let mut start = 0usize;
+    while start < t {
+        let n = GDN_PREFILL_CHUNK.min(t - start);
+        let qc = qhat.narrow(0, start, n)?;
+        let kc = khat.narrow(0, start, n)?;
+        let vc = vf.narrow(0, start, n)?;
+        let bc = beta.narrow(0, start, n)?;
+        let gc = g.narrow(0, start, n)?;
+
+        let gcum = gc.cumsum_dim0()?;
+        let p = gcum.exp()?;
+        let (lo, loeq) = gcum.gdn_ratio_masks()?;
+
+        let kt = kc.transpose(0, 1)?.contiguous()?;
+        let kdot = kt.bmm(&kt.transpose(1, 2)?.contiguous()?)?;
+        let m = kdot.mul(&lo)?;
+        let bc_t = bc.transpose(0, 1)?;
+        let a = m.mul_mid(&bc_t)?;
+        let base = kt.bmm(&state)?.mul_mid(&p.transpose(0, 1)?)?;
+        let rhs = vc
+            .transpose(0, 1)?
+            .add(&base.unary(Unary::Neg)?)?
+            .mul_mid(&bc_t)?;
+        let mut delta = q.runtime().zeros(&[hv, n, dv], TensorDType::F32)?;
+        // SAFETY: a/rhs/delta are live f32 tensors in this runtime's context;
+        // the cubin bounds `n` and `dv`, and it overwrites all of `delta`.
+        if unsafe { solve.tri_solve(&a, &rhs, &delta) }.is_err() {
+            delta = tri_solve_fallback(&a, &rhs, hv, n, dv)?;
+        }
+
+        let qt = qc.transpose(0, 1)?.contiguous()?;
+        let obase = qt.bmm(&state)?.mul_mid(&p.transpose(0, 1)?)?;
+        let qk = qt.bmm(&kt.transpose(1, 2)?.contiguous()?)?;
+        let qmat = qk.mul(&loeq)?;
+        out_chunks.push(
+            obase
+                .add(&qmat.bmm(&delta)?)?
+                .transpose(0, 1)?
+                .contiguous()?,
+        );
+
+        let plast = p.select(0, n - 1)?;
+        let glast = gcum.select(0, n - 1)?;
+        let w = gcum.unary(Unary::Neg)?.add_col(&glast)?.exp()?;
+        let kw = kc.mul_mid(&w)?;
+        let update = kw
+            .transpose(0, 1)?
+            .contiguous()?
+            .transpose(1, 2)?
+            .contiguous()?
+            .bmm(&delta)?;
+        state = state.scale_heads(&plast)?.add(&update)?;
+        start += n;
+    }
+    Ok((Tensor::cat(&out_chunks)?.cast(TensorDType::Bf16)?, state))
 }
 
 /// Split the last dimension into two views of `a` and `b` columns.
@@ -433,7 +580,6 @@ impl CudarcQwen3_6 {
         };
         let conv_w = conv.reshape(&[conv_dim, k])?;
         let conv_row = conv_state.reshape(&[1, conv_dim, k - 1])?;
-        let rec_row = rec_state.reshape(&[1, vb, dk, dv])?;
 
         let mut mixed_rows = Vec::with_capacity(t);
         for i in 0..t {
@@ -456,24 +602,50 @@ impl CudarcQwen3_6 {
             .contiguous()?
             .reshape(&[t, vb, dv])?;
 
-        let mut core_rows = Vec::with_capacity(t);
-        for i in 0..t {
-            let ba_row = ba.narrow(0, i, 1)?;
-            let q_row = q.narrow(0, i, 1)?;
-            let k_row = k.narrow(0, i, 1)?;
-            let v_row = v.narrow(0, i, 1)?;
-            let out = self.rt.zeros(&[1, vb, dv], TensorDType::Bf16)?;
-            unsafe {
-                self.gdn.decode(
-                    &ba_row, a_log, dt_bias, &q_row, &k_row, &v_row, &rec_row, &out,
-                )
-            }?;
-            core_rows.push(out);
-        }
-        let core = if t == 1 {
-            core_rows.pop().expect("one core row")
+        // The chunked form needs q/k expanded to the value-head count and the
+        // tri-solve cubin's value dim (128); anything else stays on the fused
+        // per-token kernel.
+        let use_chunked =
+            gdn_chunked_enabled() && t >= GDN_PREFILL_MIN && dv == 128 && vb % kb == 0;
+        let core = if use_chunked {
+            let q_exp = q.repeat_heads(kb, vb / kb)?;
+            let k_exp = k.repeat_heads(kb, vb / kb)?;
+            let ba_f32 = ba.cast(TensorDType::F32)?;
+            let b_f32 = ba_f32.narrow(1, 0, vb)?.contiguous()?;
+            let a_f32 = ba_f32.narrow(1, vb, vb)?.contiguous()?;
+            let g = gdn_gate(
+                &a_f32,
+                &dt_bias.cast(TensorDType::F32)?,
+                &a_log.cast(TensorDType::F32)?,
+            )?;
+            let beta = gdn_beta(&b_f32)?;
+            let (core, new_state) =
+                gdn_chunked_prefill(&q_exp, &k_exp, &v, &g, &beta, dk, &rec_state, &self.gdn)?;
+            if matches!(access, Access::Cached { .. }) {
+                new_state.copy_to(&rec_state)?;
+            }
+            core
         } else {
-            Tensor::stack(&core_rows)?
+            let rec_row = rec_state.reshape(&[1, vb, dk, dv])?;
+            let mut core_rows = Vec::with_capacity(t);
+            for i in 0..t {
+                let ba_row = ba.narrow(0, i, 1)?;
+                let q_row = q.narrow(0, i, 1)?;
+                let k_row = k.narrow(0, i, 1)?;
+                let v_row = v.narrow(0, i, 1)?;
+                let out = self.rt.zeros(&[1, vb, dv], TensorDType::Bf16)?;
+                unsafe {
+                    self.gdn.decode(
+                        &ba_row, a_log, dt_bias, &q_row, &k_row, &v_row, &rec_row, &out,
+                    )
+                }?;
+                core_rows.push(out);
+            }
+            if t == 1 {
+                core_rows.pop().expect("one core row")
+            } else {
+                Tensor::stack(&core_rows)?
+            }
         };
         let core_n = rms_norm_last(&core, norm, p.rms_norm_eps)?.reshape(&[t, value_dim])?;
         let out = core_n.mul(&z.silu()?)?;

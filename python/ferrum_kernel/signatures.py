@@ -855,3 +855,61 @@ def causal_sdpa_f32_constexprs(
     q_heads: int = 16, kv_heads: int = 2, d: int = 256
 ) -> dict:
     return causal_sdpa_constexprs(q_heads, kv_heads, d, block_n=SDPA_BLOCK_N_F32)
+
+
+def cumsum_dim0() -> dict:
+    return {
+        "x_ptr": "*fp32",
+        "out_ptr": "*fp32",
+        "rows": "i32",
+        "cols": "i32",
+        "BLOCK": "constexpr",
+    }
+
+
+def cumsum_dim0_constexprs(block: int = SELECT_BLOCK) -> dict:
+    return {"BLOCK": block}
+
+
+def gdn_ratio_masks() -> dict:
+    return {
+        "g_ptr": "*fp32",
+        "lo_ptr": "*fp32",
+        "loeq_ptr": "*fp32",
+        "n": "i32",
+        "hv": "i32",
+        "BLOCK": "constexpr",
+    }
+
+
+def gdn_ratio_masks_constexprs(block: int = SELECT_BLOCK) -> dict:
+    return {"BLOCK": block}
+
+
+def mul_mid() -> dict:
+    return {
+        "x_ptr": "*fp32",
+        "scale_ptr": "*fp32",
+        "out_ptr": "*fp32",
+        "cols": "i32",
+        "BLOCK": "constexpr",
+    }
+
+
+def mul_mid_constexprs(block: int = SELECT_BLOCK) -> dict:
+    return {"BLOCK": block}
+
+
+def scale_heads() -> dict:
+    return {
+        "x_ptr": "*fp32",
+        "scale_ptr": "*fp32",
+        "out_ptr": "*fp32",
+        "rows_per_head": "i32",
+        "cols": "i32",
+        "BLOCK": "constexpr",
+    }
+
+
+def scale_heads_constexprs(block: int = SELECT_BLOCK) -> dict:
+    return {"BLOCK": block}

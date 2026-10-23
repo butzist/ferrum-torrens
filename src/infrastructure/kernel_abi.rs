@@ -626,8 +626,12 @@ pub const ROPE_BF16: &str = "rope_bf16";
 pub const REPEAT_HEADS_BF16: &str = "repeat_heads_bf16";
 pub const CAUSAL_SDPA_BF16: &str = "causal_sdpa_bf16";
 pub const CAUSAL_SDPA_F32: &str = "causal_sdpa_f32";
+pub const CUMSUM_DIM0_F32: &str = "cumsum_dim0_f32";
+pub const GDN_RATIO_MASKS_F32: &str = "gdn_ratio_masks_f32";
+pub const MUL_MID_F32: &str = "mul_mid_f32";
+pub const SCALE_HEADS_F32: &str = "scale_heads_f32";
 
-const LINEAR_NAMES: [&str; 39] = [
+const LINEAR_NAMES: [&str; 43] = [
     GDN_DECODE,
     CONV_DECODE,
     ADD_RMSNORM,
@@ -667,6 +671,10 @@ const LINEAR_NAMES: [&str; 39] = [
     REPEAT_HEADS_BF16,
     CAUSAL_SDPA_BF16,
     CAUSAL_SDPA_F32,
+    CUMSUM_DIM0_F32,
+    GDN_RATIO_MASKS_F32,
+    MUL_MID_F32,
+    SCALE_HEADS_F32,
 ];
 
 #[derive(Debug, Deserialize)]
@@ -861,6 +869,19 @@ pub fn linear_cubin(name: &str) -> Result<&'static [u8], MoEError> {
         CAUSAL_SDPA_F32 => {
             include_bytes!(concat!(env!("OUT_DIR"), "/kernel/causal_sdpa_f32.cubin"))
         }
+        CUMSUM_DIM0_F32 => {
+            include_bytes!(concat!(env!("OUT_DIR"), "/kernel/cumsum_dim0_f32.cubin"))
+        }
+        GDN_RATIO_MASKS_F32 => {
+            include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/kernel/gdn_ratio_masks_f32.cubin"
+            ))
+        }
+        MUL_MID_F32 => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/mul_mid_f32.cubin")),
+        SCALE_HEADS_F32 => {
+            include_bytes!(concat!(env!("OUT_DIR"), "/kernel/scale_heads_f32.cubin"))
+        }
         other => return Err(MoEError::Bad(format!("no committed cubin for {other}"))),
     })
 }
@@ -937,6 +958,16 @@ fn linear_ptx(name: &str) -> &'static str {
         }
         CAUSAL_SDPA_F32 => {
             include_str!(concat!(env!("OUT_DIR"), "/kernel/causal_sdpa_f32.ptx"))
+        }
+        CUMSUM_DIM0_F32 => {
+            include_str!(concat!(env!("OUT_DIR"), "/kernel/cumsum_dim0_f32.ptx"))
+        }
+        GDN_RATIO_MASKS_F32 => {
+            include_str!(concat!(env!("OUT_DIR"), "/kernel/gdn_ratio_masks_f32.ptx"))
+        }
+        MUL_MID_F32 => include_str!(concat!(env!("OUT_DIR"), "/kernel/mul_mid_f32.ptx")),
+        SCALE_HEADS_F32 => {
+            include_str!(concat!(env!("OUT_DIR"), "/kernel/scale_heads_f32.ptx"))
         }
         other => panic!("no committed ptx for {other}"),
     }

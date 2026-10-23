@@ -45,6 +45,10 @@ from .elementwise import (
     _index_select_rows_kernel,
     _gather_rows_kernel,
     _scatter_rows_kernel,
+    _cumsum_dim0_kernel,
+    _gdn_ratio_masks_kernel,
+    _mul_mid_kernel,
+    _scale_heads_kernel,
 )
 from .gdn import _gdn_decode_kernel, _gdn_tri_solve_kernel
 from .norm import _add_rmsnorm_kernel
@@ -62,6 +66,10 @@ from .signatures import copy_strided as _copy_strided_sig, copy_strided_constexp
 from .signatures import index_select as _index_select_sig, index_select_constexprs
 from .signatures import gather_rows as _gather_rows_sig, gather_rows_constexprs
 from .signatures import scatter_rows as _scatter_rows_sig, scatter_rows_constexprs
+from .signatures import cumsum_dim0 as _cumsum_dim0_sig, cumsum_dim0_constexprs
+from .signatures import gdn_ratio_masks as _gdn_ratio_masks_sig, gdn_ratio_masks_constexprs
+from .signatures import mul_mid as _mul_mid_sig, mul_mid_constexprs
+from .signatures import scale_heads as _scale_heads_sig, scale_heads_constexprs
 from .signatures import conv_decode_constexprs
 from .signatures import fp8_gemm as _fp8_gemm_sig
 from .signatures import fp8_gemm_constexprs
@@ -215,6 +223,23 @@ def main() -> int:
     except Exception as e:  # noqa: BLE001
         failures += 1
         print(f"gdn_tri_solve FAILED: {type(e).__name__}: {str(e)[:200]}")
+    # The GDN prefill chunk helpers: the scan and the three broadcasts.
+    for label, fn, sig, consts in (
+        ("cumsum_dim0", _cumsum_dim0_kernel, _cumsum_dim0_sig(), cumsum_dim0_constexprs()),
+        (
+            "gdn_ratio_masks",
+            _gdn_ratio_masks_kernel,
+            _gdn_ratio_masks_sig(),
+            gdn_ratio_masks_constexprs(),
+        ),
+        ("mul_mid", _mul_mid_kernel, _mul_mid_sig(), mul_mid_constexprs()),
+        ("scale_heads", _scale_heads_kernel, _scale_heads_sig(), scale_heads_constexprs()),
+    ):
+        try:
+            check(label, fn, sig, consts)
+        except Exception as e:  # noqa: BLE001
+            failures += 1
+            print(f"{label} FAILED: {type(e).__name__}: {str(e)[:200]}")
     # The fused add + RMSNorm (OPTIMIZATION.md R6: the norm launch tax).
     try:
         check(

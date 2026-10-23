@@ -56,6 +56,10 @@ from .elementwise import (
     _index_select_rows_kernel,
     _gather_rows_kernel,
     _scatter_rows_kernel,
+    _cumsum_dim0_kernel,
+    _gdn_ratio_masks_kernel,
+    _mul_mid_kernel,
+    _scale_heads_kernel,
 )
 from .gdn import _gdn_decode_kernel, _gdn_tri_solve_kernel
 from .norm import _add_rmsnorm_kernel
@@ -117,6 +121,14 @@ from .signatures import (
     causal_sdpa_f32_constexprs,
     repeat_heads,
     repeat_heads_constexprs,
+    cumsum_dim0,
+    cumsum_dim0_constexprs,
+    gdn_ratio_masks,
+    gdn_ratio_masks_constexprs,
+    mul_mid,
+    mul_mid_constexprs,
+    scale_heads,
+    scale_heads_constexprs,
     unary,
     unary_constexprs,
     index_select,
@@ -276,6 +288,30 @@ LINEAR_KERNELS: dict[str, dict] = {
         "fn": _gdn_tri_solve_kernel,
         "signature": gdn_tri_solve(),
         "constexprs": gdn_tri_solve_constexprs(),
+        "num_warps": 4,
+    },
+    "cumsum_dim0_f32": {
+        "fn": _cumsum_dim0_kernel,
+        "signature": cumsum_dim0(),
+        "constexprs": cumsum_dim0_constexprs(),
+        "num_warps": 4,
+    },
+    "gdn_ratio_masks_f32": {
+        "fn": _gdn_ratio_masks_kernel,
+        "signature": gdn_ratio_masks(),
+        "constexprs": gdn_ratio_masks_constexprs(),
+        "num_warps": 4,
+    },
+    "mul_mid_f32": {
+        "fn": _mul_mid_kernel,
+        "signature": mul_mid(),
+        "constexprs": mul_mid_constexprs(),
+        "num_warps": 4,
+    },
+    "scale_heads_f32": {
+        "fn": _scale_heads_kernel,
+        "signature": scale_heads(),
+        "constexprs": scale_heads_constexprs(),
         "num_warps": 4,
     },
     "nvfp4_dense_gemv": {
