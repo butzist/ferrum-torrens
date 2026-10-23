@@ -282,6 +282,18 @@ def main() -> int:
             _copy_strided_sig("i32"),
             copy_strided_constexprs(),
         ),
+        (
+            "copy_strided_i64",
+            _copy_strided_kernel,
+            _copy_strided_sig("i64"),
+            copy_strided_constexprs(),
+        ),
+        (
+            "copy_strided_u8",
+            _copy_strided_kernel,
+            _copy_strided_sig("u8"),
+            copy_strided_constexprs(),
+        ),
     ):
         try:
             check(label, fn, sig, consts)

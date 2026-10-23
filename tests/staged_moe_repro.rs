@@ -3,9 +3,9 @@
 // launch. Smaller and faster than the whole-step capture gate, so a staging
 // fault shows here first. Run with:
 //
-//   FT_MEM_CAP_GIB=80 cargo test --release --features cuda \
+//   FT_MEM_CAP_GIB=80 cargo test --release --features cudarc \
 //     --test staged_moe_repro -- --ignored --nocapture
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cudarc")]
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -17,8 +17,9 @@ use ferrum_torrens::domain::expert_kernel::{
 use ferrum_torrens::domain::weights::WeightsReader;
 use ferrum_torrens::infrastructure::banks::{FtwBanks, FtwPinnedBanks};
 use ferrum_torrens::infrastructure::cuda_moe::CudaMoE;
+use ferrum_torrens::infrastructure::cudarc::TensorDType;
 use ferrum_torrens::infrastructure::ftw::{FtwIndex, FtwReader};
-use ferrum_torrens::infrastructure::torch::{DevTensor, Device, to_f32_vec};
+use ferrum_torrens::infrastructure::torch::Device;
 
 const FTW_DIR: &str = ".model-cache/Qwen3.6-35B-A3B-NVFP4.ftw";
 const HIDDEN: usize = 2048;
@@ -43,6 +44,7 @@ fn staged_moe_step_does_not_fault() {
 
     let source: Arc<dyn ExpertSlabSource> = Arc::new(FtwBanks::new(reader.clone(), index.clone()));
     let mut adapter = CudaMoE::new(dev, source, shapes, SLOTS).unwrap();
+    let rt = adapter.runtime().clone();
     let pinned =
         FtwPinnedBanks::load(&adapter.driver(), &reader, &index, shapes, LAYERS, EXPERTS).unwrap();
     adapter
@@ -55,14 +57,14 @@ fn staged_moe_step_does_not_fault() {
     let x: Vec<f32> = (0..HIDDEN)
         .map(|i| ((i * 2654435761usize % 1009) as f32 / 1009.0) - 0.5)
         .collect();
-    let ids: Vec<f32> = (0..TOP_K).map(|i| ((i * 7 + 3) % EXPERTS) as f32).collect();
+    let ids: Vec<i32> = (0..TOP_K).map(|i| ((i * 7 + 3) % EXPERTS) as i32).collect();
     let weights: Vec<f32> = (0..TOP_K)
         .map(|i| 1.0 / TOP_K as f32 + i as f32 * 1e-3)
         .collect();
-    let xd = DevTensor::from_f32(&x, &[1, HIDDEN as i64], dev);
-    let ed = DevTensor::from_f32(&ids, &[1, TOP_K as i64], dev);
-    let wd = DevTensor::from_f32(&weights, &[1, TOP_K as i64], dev);
-    let mut out = DevTensor::zeros(&[1, HIDDEN as i64], dev);
+    let xd = rt.from_slice_f32(&x, &[1, HIDDEN]).unwrap();
+    let ed = rt.from_slice_i32(&ids, &[1, TOP_K]).unwrap();
+    let wd = rt.from_slice_f32(&weights, &[1, TOP_K]).unwrap();
+    let mut out = rt.zeros(&[1, HIDDEN], TensorDType::F32).unwrap();
 
     for layer in 0..8 {
         eprintln!("layer {layer}");
@@ -80,7 +82,7 @@ fn staged_moe_step_does_not_fault() {
         )
         .unwrap();
     }
-    let values = to_f32_vec(&out.0);
+    let values = out.to_host_f32().unwrap();
     let finite = values.iter().all(|v| v.is_finite());
     eprintln!("finite: {finite}; first {}", values[0]);
     assert!(finite);

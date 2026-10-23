@@ -149,7 +149,7 @@ stays pure: `Tensor` and CUDA handles never cross it (section 4).
 | Dense weights: embedding + all projections + `lm_head` (4.51 GiB bf16; the lm_head kept packed NVFP4 on CUDA) | Device | `models/qwen3_6/forward_torch.rs` |
 | Embedding gather, RMSNorm, RoPE, attention (GQA), GDN recurrence, `lm_head` | Device | `models/qwen3_6/forward_torch.rs` (libtorch) + `infrastructure/cuda_linear.rs` (dense NVFP4 head) |
 | Router: gate matmul + softmax + top-8 | Device | `forward_torch.rs::moe` (ids stay device) |
-| Routed experts: slot cache + grouped GEMV | Device | `infrastructure/cuda_moe.rs` (driver-API cubins) |
+| Routed experts: slot cache + grouped GEMV | Device | `infrastructure/cuda_moe.rs` (cudarc storage + driver-API cubins) |
 | Slot residency plan (`lru_ensure` / whole-layer) | Device (host plan fallback) | `python/ferrum_kernel/offload.py`, `application/run_experts.rs` |
 | KV pool, GDN state slabs, paged GQA attention | Device | `infrastructure/kvcache_dev.rs`, `infrastructure/cuda_attention.rs` |
 | CUDA-graph capture/replay, torch graph pool | Device | `infrastructure/decode_graph.rs`, `infrastructure/cuda_graph.rs`, `infrastructure/cuda_driver.rs` |
@@ -210,10 +210,12 @@ elementwise.py"]
   forward. `cargo fmt` + `cargo clippy` + `cargo test` stay green without the
   feature and must be re-run with it in the devshell.
 - **`cudarc` is a separate non-default feature.** It builds the M7.1 adapter
-  without `tch`, so it can be compiled and tested without libtorch. The devshell
-  points `CUDA_HOME` at a merged root whose `libcublas` is CUDA 13.4 (the 12.9
-  copy is the M7.0 prefill slowdown) and sets `CUDARC_CUDA_VERSION=13040`;
-  Triton keeps the 12.9 `ptxas`.
+  without `tch`, so it can be compiled and tested without libtorch. The NVFP4
+  MoE adapter (`cuda_moe.rs`) is on this storage too under `feature = "cudarc"`;
+  its gate is the real-hardware `tests/cuda_moe_matches_reference.rs`. The
+  devshell points `CUDA_HOME` at a merged root whose `libcublas` is CUDA 13.4
+  (the 12.9 copy is the M7.0 prefill slowdown) and sets
+  `CUDARC_CUDA_VERSION=13040`; Triton keeps the 12.9 `ptxas`.
 - **`build.rs` stages the cubins and compiles the capture bridge.** Every build
   copies `$FERRUM_KERNEL_DIR/kernel` (the `kernels` Nix derivation,
   `nix/kernels.nix`) into `OUT_DIR/kernel`; under `--features cuda` it also
@@ -476,7 +478,7 @@ flowchart TB
     CE["CachedExperts (MoEExecutor)\npath choice: staged vs host plan"]
   end
   subgraph Infra
-    CM["CudaMoE\nslot cache in libtorch tensors\n+ driver-API launches"]
+    CM["CudaMoE\nslot cache in cudarc tensors\n+ driver-API launches"]
     Res["Residency (state machine)\nDecode | Prefill\n+ PrefillHarness: copy stream,\n5 events, static row indices"]
     AB["kernel_abi\nmanifest + arg packs"]
     DR["cuda_driver\nload cubin, launch, pinned mem,\nowned stream/event"]

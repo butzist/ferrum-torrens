@@ -1,25 +1,17 @@
 // The NVFP4 expert adapter on the CUDA driver API: decision 36 slice 4, and the
 // replacement for the pyo3 `triton.rs` adapter.
 //
-// What changed with Python gone: the slot cache's banks are libtorch tensors on
-// the CUDA device, and the four kernels are launched through `cuda_driver` from
-// the cubins committed under `kernel/`. Decision 25's hazard -- two libtorch
-// builds having to agree on C++ ABI so tensors could be shared by pointer -- is
-// gone with the interpreter, because the banks now *are* libtorch tensors and the
-// launches run on libtorch's own stream.
-//
-// The banks are byte banks on purpose. The GEMV wants `*fp8e4nv` scales and
-// `*fp16` globals, and libtorch 2.9 cannot build those views from a host slice
-// through tch (`from_blob` is absent, and a dtype-reinterpreting `view` is a
-// newer C++ API than the bindings expose). A `uint8` tensor over the same bytes
-// is the same device memory with the same alignment, and the kernel reinterprets
-// the address itself, so bytes are all that has to cross. The one dtype this
-// adapter does use is bf16, for the activations and the intermediates: that is
-// what the cubins were specialized for and what the checkpoint itself stores.
+// The slot cache's banks are cudarc tensors on the CUDA device, and the four
+// kernels are launched through `cuda_driver` from the cubins committed under
+// `kernel/`. The banks are byte banks on purpose: the GEMV wants `*fp8e4nv`
+// scales and `*fp16` globals, and the kernel reinterprets the address itself, so
+// bytes are all that has to cross. The one dtype this adapter does use is bf16,
+// for the activations and the intermediates: that is what the cubins were
+// specialized for and what the checkpoint itself stores.
 
 use std::sync::{Arc, Mutex};
 
-use tch::Tensor;
+use half::bf16;
 
 use crate::domain::expert_kernel::{
     BANKS, ExpertGemm, ExpertShapes, ExpertSlabSource, ExpertSlotStore, MoEDeviceGroup,
@@ -30,26 +22,24 @@ use crate::infrastructure::cuda_driver::{
     CUstream, CudaError, CudaKernels, Driver, OwnedEvent, OwnedStream, STREAM_NON_BLOCKING,
     StagingKernels,
 };
+use crate::infrastructure::cudarc::{Runtime, Tensor, TensorDType};
 use crate::infrastructure::kernel_abi::{
     Abi, CopyArgs, GEMV_DOWN, GEMV_GATE_UP, GROUPED_DOWN, GROUPED_GATE_UP, INDEX_COPY, LRU_ENSURE,
     LruArgs, MoEArgs, SILU_MUL, SUM_REDUCE, StagingAbi, gemv_down_args, gemv_gate_up_args, grid,
     grouped_down_args, grouped_gate_up_args, index_copy_args, lru_ensure_args, silu_mul_args,
     sum_reduce_args,
 };
-use crate::infrastructure::torch::{DevTensor, Device, bf16_tensor, f32_tensor, to_f32_vec};
+use crate::infrastructure::torch::Device;
 
 /// The concrete buffer behind a port handle. The adapter is the one place
 /// allowed to know what a `MoETensor` is made of, so every copy it makes goes
 /// through here.
-fn device_tensor<'a>(t: &'a dyn MoETensor, what: &str) -> Result<&'a tch::Tensor, MoEError> {
-    t.as_any()
-        .downcast_ref::<DevTensor>()
-        .map(|d| &d.0)
-        .ok_or_else(|| {
-            MoEError::Bad(format!(
-                "the device MoE hand-off was handed {what} that is not a device tensor"
-            ))
-        })
+fn device_tensor<'a>(t: &'a dyn MoETensor, what: &str) -> Result<&'a Tensor, MoEError> {
+    t.as_any().downcast_ref::<Tensor>().ok_or_else(|| {
+        MoEError::Bad(format!(
+            "the device MoE hand-off was handed {what} that is not a device tensor"
+        ))
+    })
 }
 
 /// e2m1 magnitudes by nibble, the decode table the GEMV indexes. The low nibble
@@ -66,12 +56,38 @@ fn bad_abi(e: MoEError) -> MoEError {
     MoEError::Bad(format!("abi: {e}"))
 }
 
+fn bf16_tensor(rt: &Runtime, values: &[f32], shape: &[usize]) -> Result<Tensor, MoEError> {
+    let bits: Vec<bf16> = values.iter().map(|v| bf16::from_f32(*v)).collect();
+    rt.from_slice_bf16(&bits, shape)
+}
+
+fn host_i32(t: &Tensor) -> Result<Vec<i32>, MoEError> {
+    match t.dtype() {
+        TensorDType::I32 => t.to_host_i32(),
+        TensorDType::I64 => Ok(t.to_host_i64()?.into_iter().map(|v| v as i32).collect()),
+        TensorDType::F32 => Ok(t.to_host_f32()?.into_iter().map(|v| v as i32).collect()),
+        other => Err(MoEError::Bad(format!(
+            "expert ids cannot be {}",
+            other.name()
+        ))),
+    }
+}
+
+fn as_i32_ids(t: &Tensor, n: usize, rt: &Runtime) -> Result<Tensor, MoEError> {
+    let flat = t.contiguous()?.reshape(&[n])?;
+    if flat.dtype() == TensorDType::I32 {
+        return Ok(flat);
+    }
+    let host = host_i32(&flat)?;
+    rt.from_slice_i32(&host, &[n])
+}
+
 /// One part's device banks: `[slots, rows, cols / 2]` packed, `[slots, rows,
 /// cols / 16]` scales and `[slots, rows * 2]` globals, all uint8 bytes.
 ///
 /// Each slot is a contiguous run in all three, so `narrow` gives a view of exactly
-/// one expert's bytes. `copy_` does not flatten, so the staged host tensor's
-/// length has to match that view's element count or libtorch raises a shape error.
+/// one expert's bytes. `copy_to` writes the destination linearly, so the staged
+/// host tensor's length has to match that view's element count.
 struct Banks {
     packed: Tensor,
     scale: Tensor,
@@ -79,13 +95,13 @@ struct Banks {
 }
 
 impl Banks {
-    fn new(slots: usize, rows: usize, cols: usize, device: Device) -> Self {
-        let bytes = |n: usize| Tensor::zeros([n as i64], (tch::Kind::Uint8, device.to_tch()));
-        Self {
-            packed: bytes(slots * rows * cols / 2),
-            scale: bytes(slots * rows * cols / 16),
-            global: bytes(slots * rows * 2),
-        }
+    fn new(rt: &Runtime, slots: usize, rows: usize, cols: usize) -> Result<Self, MoEError> {
+        let bytes = |n: usize| rt.zeros(&[n], TensorDType::U8);
+        Ok(Self {
+            packed: bytes(slots * rows * cols / 2)?,
+            scale: bytes(slots * rows * cols / 16)?,
+            global: bytes(slots * rows * 2)?,
+        })
     }
 
     /// Copy one slab into `slot`: the H2D half of a cache miss.
@@ -96,22 +112,21 @@ impl Banks {
         rows: usize,
         cols: usize,
     ) -> Result<(), MoEError> {
-        stage_bytes(&mut self.packed, slot, &slab.packed, rows * cols / 2)?;
-        stage_bytes(&mut self.scale, slot, &slab.scale, rows * cols / 16)?;
-        stage_bytes(&mut self.global, slot, &slab.global, rows * 2)
+        stage_bytes(&self.packed, slot, &slab.packed, rows * cols / 2)?;
+        stage_bytes(&self.scale, slot, &slab.scale, rows * cols / 16)?;
+        stage_bytes(&self.global, slot, &slab.global, rows * 2)
     }
 }
 
-fn stage_bytes(bank: &mut Tensor, slot: usize, bytes: &[u8], len: usize) -> Result<(), MoEError> {
+fn stage_bytes(bank: &Tensor, slot: usize, bytes: &[u8], len: usize) -> Result<(), MoEError> {
     if bytes.len() != len {
         return Err(MoEError::Bad(format!(
             "slab is {} bytes for a {len}-byte slot row",
             bytes.len()
         )));
     }
-    bank.narrow(0, slot as i64 * len as i64, len as i64)
-        .copy_(&Tensor::from_slice(bytes));
-    Ok(())
+    let src = bank.runtime().from_slice_u8(bytes, &[len])?;
+    src.copy_to(&bank.narrow(0, slot * len, len)?)
 }
 
 /// The device slot cache, plus the launch path.
@@ -125,6 +140,7 @@ fn stage_bytes(bank: &mut Tensor, slot: usize, bytes: &[u8], len: usize) -> Resu
 /// (it rewrites banks) while one device cache serves every step, so the engine
 /// holds the adapter behind one lock and hands out the same handle as both ports.
 pub struct CudaMoE {
+    rt: Runtime,
     kernels: CudaKernels,
     abi: Abi,
     staging_abi: StagingAbi,
@@ -132,15 +148,13 @@ pub struct CudaMoE {
     source: Arc<dyn ExpertSlabSource>,
     shapes: ExpertShapes,
     slots: usize,
-    device: Device,
     /// The E2M1 decode table the GEMV reads. Resident and never moved, so a
     /// captured graph bakes one stable address instead of uploading it per
     /// step (decision 40 prerequisite 4).
     lut: Tensor,
-    /// libtorch's default stream, whose handle is 0 (the legacy stream). Torch's
-    /// own copies and our launches are therefore ordered by CUDA rather than by
-    /// an explicit sync. It is a field because CUDA-graph capture will need a
-    /// side stream, and torch's C API exports no `getCurrentCUDAStream` to ask.
+    /// The launch stream. It is the runtime's side stream unless a caller hands
+    /// in its own, and every copy this adapter makes runs on the same runtime,
+    /// so a launch is ordered behind the staging that fed it.
     stream: CUstream,
     gate_up: Option<Banks>,
     down: Option<Banks>,
@@ -159,10 +173,10 @@ pub struct CudaMoE {
     residency: Residency,
 }
 
-// SAFETY: the fields are libtorch tensors, Arcs, plain data, and driver handles
-// that are immutable after construction. Two concurrent `grouped_moe` calls
-// would read the same banks (read-only) and write their own activations, and
-// both launches land on the same stream in order anyway. The ports hand this out
+// SAFETY: the driver handles are immutable after construction, and the tensor
+// buffers are cudarc `Send + Sync`. Two concurrent `grouped_moe` calls would
+// read the same banks (read-only) and write their own activations, and both
+// launches land on the same stream in order anyway. The ports hand this out
 // behind a Mutex regardless.
 unsafe impl Send for CudaMoE {}
 unsafe impl Sync for CudaMoE {}
@@ -262,7 +276,7 @@ struct PrefillHarness {
     num: Vec<Tensor>,
     /// The `2 * experts` cache slots this prefill's buffer owns, chosen as the
     /// coldest contiguous window so the hottest decode experts stay resident.
-    victims: Tensor,
+    victims_host: Vec<i32>,
     /// The layer each half currently holds, `-1` when empty.
     half_layer: [i64; 2],
     /// Host copy plan: the pinned banks' device aliases and the device banks'
@@ -316,10 +330,6 @@ impl CudaMoE {
                 "the slot cache needs at least one slot".into(),
             ));
         }
-        // The banks are libtorch tensors, so ATen needs its CUDA kernels
-        // registered before the first allocation (see `load_cuda_backend`).
-        crate::infrastructure::torch::load_cuda_backend()
-            .map_err(|e| MoEError::Bad(format!("libtorch cuda: {e}")))?;
         let lib = Driver::open().map_err(driver)?;
         lib.init().map_err(driver)?;
         lib.attach_primary_context(ordinal as i32).map_err(driver)?;
@@ -327,10 +337,17 @@ impl CudaMoE {
         check_shapes(&shapes, &abi)?;
         let staging_abi = StagingAbi::committed().map_err(bad_abi)?;
         let lib = Arc::new(lib);
+        let rt = Runtime::open_with(Arc::clone(&lib), ordinal)?;
+        let stream = if stream.is_null() {
+            rt.raw_stream()
+        } else {
+            stream
+        };
         let kernels = CudaKernels::load(Arc::clone(&lib), abi.clone()).map_err(driver)?;
         let staging = StagingKernels::load(lib, staging_abi.clone()).map_err(driver)?;
-        let lut = f32_tensor(&E2M1, &[E2M1.len() as i64], device);
+        let lut = rt.from_slice_f32(&E2M1, &[E2M1.len()])?;
         Ok(Self {
+            rt,
             kernels,
             abi,
             staging_abi,
@@ -338,7 +355,6 @@ impl CudaMoE {
             source,
             shapes,
             slots,
-            device,
             lut,
             stream,
             gate_up: None,
@@ -352,6 +368,12 @@ impl CudaMoE {
 
     pub fn stream(&self) -> CUstream {
         self.stream
+    }
+
+    /// The runtime that owns this adapter's stream and buffers, so a caller
+    /// building device hand-off tensors shares the stream they are copied on.
+    pub fn runtime(&self) -> &Runtime {
+        &self.rt
     }
 
     /// The process-wide driver handle, so the composition root can build the
@@ -392,7 +414,7 @@ impl CudaMoE {
             .down
             .as_ref()
             .ok_or_else(|| MoEError::Bad("bank_ptrs before any expert was staged".into()))?;
-        let ptr = |t: &Tensor| t.data_ptr() as u64;
+        let ptr = |t: &Tensor| t.device_ptr();
         Ok([
             ptr(&gu.packed),
             ptr(&gu.scale),
@@ -412,7 +434,7 @@ impl CudaMoE {
             });
         }
         if self.gate_up.is_none() {
-            self.banks_for();
+            self.banks_for()?;
         }
         for part in [Part::GateUp, Part::Down] {
             let slab = self
@@ -432,14 +454,15 @@ impl CudaMoE {
 
     /// Allocate both banks once. Shapes are fixed by the cubins, so a bank built
     /// here serves every layer for the life of the adapter.
-    fn banks_for(&mut self) {
+    fn banks_for(&mut self) -> Result<(), MoEError> {
         if self.gate_up.is_some() {
-            return;
+            return Ok(());
         }
         let (gu_rows, gu_cols) = self.shapes.slab_shape(Part::GateUp);
         let (dn_rows, dn_cols) = self.shapes.slab_shape(Part::Down);
-        self.gate_up = Some(Banks::new(self.slots, gu_rows, gu_cols, self.device));
-        self.down = Some(Banks::new(self.slots, dn_rows, dn_cols, self.device));
+        self.gate_up = Some(Banks::new(&self.rt, self.slots, gu_rows, gu_cols)?);
+        self.down = Some(Banks::new(&self.rt, self.slots, dn_rows, dn_cols)?);
+        Ok(())
     }
 
     /// Allocate the device slot tables and the per-layer source-pointer arrays,
@@ -468,7 +491,7 @@ impl CudaMoE {
                 self.slots
             )));
         }
-        self.banks_for();
+        self.banks_for()?;
         let banks = pinned.banks()?;
         if banks.len() != BANKS.len() {
             return Err(MoEError::Bad("pinned source must report six banks".into()));
@@ -487,6 +510,7 @@ impl CudaMoE {
                 )));
             }
         }
+        let rt = self.rt.clone();
         let src_ptrs = (0..layers)
             .map(|layer| {
                 let ptrs: Vec<i64> = BANKS
@@ -496,28 +520,25 @@ impl CudaMoE {
                         (banks[i].addr + (layer * experts * banks[i].row_bytes) as u64) as i64
                     })
                     .collect();
-                Tensor::from_slice(&ptrs).to(self.device.to_tch())
+                rt.from_slice_i64(&ptrs, &[ptrs.len()])
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
         let dst: Vec<i64> = self.bank_ptrs()?.iter().map(|p| *p as i64).collect();
 
-        let dev = self.device.to_tch();
-        let int = (tch::Kind::Int, dev);
-        let long = (tch::Kind::Int64, dev);
-        let table = |n: usize, v: i32| Tensor::from_slice(&vec![v; n]).to(dev);
+        let table = |n: usize, v: i32| rt.from_slice_i32(&vec![v; n], &[n]);
         self.device_staging = Some(DeviceStaging {
             layers,
             experts,
             plan_cap: self.slots,
-            slot_for_id: table(rows, -1),
-            id_of_slot: table(self.slots, -1),
-            usage: Tensor::zeros([self.slots as i64], long),
-            step: Tensor::zeros([1], long),
-            misses: Tensor::zeros([self.slots as i64], int),
-            slots_out: Tensor::zeros([self.slots as i64], int),
-            num: Tensor::zeros([1], long),
-            dst_ptrs: Tensor::from_slice(&dst).to(dev),
-            feat_bytes: Tensor::from_slice(&feat).to(dev),
+            slot_for_id: table(rows, -1)?,
+            id_of_slot: table(self.slots, -1)?,
+            usage: rt.zeros(&[self.slots], TensorDType::I64)?,
+            step: rt.zeros(&[1], TensorDType::I64)?,
+            misses: rt.zeros(&[self.slots], TensorDType::I32)?,
+            slots_out: rt.zeros(&[self.slots], TensorDType::I32)?,
+            num: rt.zeros(&[1], TensorDType::I64)?,
+            dst_ptrs: rt.from_slice_i64(&dst, &[dst.len()])?,
+            feat_bytes: rt.from_slice_i64(&feat, &[feat.len()])?,
             src_ptrs,
         });
         self.pinned = Some(pinned);
@@ -561,7 +582,7 @@ impl CudaMoE {
             lib.owned_event().map_err(driver)?,
             lib.owned_event().map_err(driver)?,
         ];
-        let dev = self.device.to_tch();
+        let rt = self.rt.clone();
         let mut src_idx = Vec::with_capacity(groups);
         let mut dst_idx: [Vec<Tensor>; 2] =
             [Vec::with_capacity(groups), Vec::with_capacity(groups)];
@@ -569,19 +590,19 @@ impl CudaMoE {
         for g in 0..groups {
             let start = g * block_k;
             let n = (experts - start).min(block_k);
-            // `from_slice` infers the kind: `i32` for the row indices, `i64` for
-            // the count the copy kernel reads.
+            // The row indices are `i32` (the copy kernel's index type) and the
+            // count is `i64`.
             let src: Vec<i32> = (start..start + n).map(|r| r as i32).collect();
-            src_idx.push(Tensor::from_slice(&src).to(dev));
-            num.push(Tensor::from_slice(&[n as i64]).to(dev));
+            src_idx.push(rt.from_slice_i32(&src, &[src.len()])?);
+            num.push(rt.from_slice_i64(&[n as i64], &[1])?);
             for (half, dsts) in dst_idx.iter_mut().enumerate() {
                 let dst: Vec<i32> = (0..n)
                     .map(|r| (half * experts + start + r) as i32)
                     .collect();
-                dsts.push(Tensor::from_slice(&dst).to(dev));
+                dsts.push(rt.from_slice_i32(&dst, &[dst.len()])?);
             }
         }
-        let victims = Tensor::arange((2 * experts) as i64, (tch::Kind::Int, dev));
+        let victims_host: Vec<i32> = (0..2 * experts).map(|s| s as i32).collect();
         let banks = self
             .pinned
             .as_ref()
@@ -609,7 +630,7 @@ impl CudaMoE {
             src_idx,
             dst_idx,
             num,
-            victims,
+            victims_host,
             half_layer: [-1, -1],
             banks,
             dst_base,
@@ -631,13 +652,8 @@ impl CudaMoE {
         let Some(st) = self.device_staging.as_ref() else {
             return Ok(0);
         };
-        let n = st
-            .id_of_slot
-            .ge(0)
-            .to_kind(tch::Kind::Int64)
-            .sum(tch::Kind::Int64)
-            .int64_value(&[]);
-        Ok(n as usize)
+        let ids = st.id_of_slot.to_host_i32()?;
+        Ok(ids.iter().filter(|&&id| id >= 0).count())
     }
 
     /// Whether a step is prefill-shaped: more routes than one `lru_ensure`
@@ -669,19 +685,19 @@ impl CudaMoE {
         let Some(st) = self.device_staging.as_mut() else {
             return Ok(());
         };
-        let dev = self.device.to_tch();
-        let neg = |n: usize| Tensor::from_slice(&vec![-1i32; n]).to(dev);
-        let zero = |n: usize| Tensor::from_slice(&vec![0i64; n]).to(dev);
+        let rt = self.rt.clone();
         let n = st.slot_for_id.numel();
-        st.slot_for_id.copy_(&neg(n));
+        rt.from_slice_i32(&vec![-1; n], &[n])?
+            .copy_to(&st.slot_for_id)?;
         let n = st.id_of_slot.numel();
-        st.id_of_slot.copy_(&neg(n));
+        rt.from_slice_i32(&vec![-1; n], &[n])?
+            .copy_to(&st.id_of_slot)?;
         let n = st.usage.numel();
-        st.usage.copy_(&zero(n));
+        rt.from_slice_i64(&vec![0; n], &[n])?.copy_to(&st.usage)?;
         let n = st.step.numel();
-        st.step.copy_(&zero(n));
+        rt.from_slice_i64(&vec![0; n], &[n])?.copy_to(&st.step)?;
         let n = st.num.numel();
-        st.num.copy_(&zero(n));
+        rt.from_slice_i64(&vec![0; n], &[n])?.copy_to(&st.num)?;
         Ok(())
     }
 
@@ -707,9 +723,9 @@ impl CudaMoE {
                 st.layers
             )));
         }
-        let ptr = |t: &Tensor| t.data_ptr() as u64;
+        let ptr = |t: &Tensor| t.device_ptr();
         let args = LruArgs {
-            experts: experts.data_ptr() as u64,
+            experts: experts.device_ptr(),
             slot_for_id: ptr(&st.slot_for_id),
             id_of_slot: ptr(&st.id_of_slot),
             usage: ptr(&st.usage),
@@ -742,7 +758,7 @@ impl CudaMoE {
             .src_ptrs
             .get(layer)
             .ok_or_else(|| MoEError::Bad(format!("layer {layer} past the pinned source plan")))?;
-        let ptr = |t: &Tensor| t.data_ptr() as u64;
+        let ptr = |t: &Tensor| t.device_ptr();
         let args = CopyArgs {
             dst_ptrs: ptr(&st.dst_ptrs),
             src_ptrs: ptr(src),
@@ -829,21 +845,19 @@ impl CudaMoE {
 
         // Activations go over as bf16, which is what the cubins were specialized
         // for. The route weights stay f32: the down GEMV applies them as f32.
-        let dev = self.device;
-        let bf16 = (tch::Kind::BFloat16, dev.to_tch());
         Ok(StagedGroup {
             tokens,
             top_k,
             routes,
-            x: bf16_tensor(req.x, &[tokens as i64, hidden as i64], dev),
-            slot_t: Tensor::from_slice(&route_slot).to(dev.to_tch()),
-            token_t: Tensor::from_slice(&route_token).to(dev.to_tch()),
-            weight_t: f32_tensor(&req.weights[..routes], &[routes as i64], dev),
-            lut: self.lut.shallow_clone(),
-            ic1: Tensor::empty([routes as i64, (2 * inter) as i64], bf16),
-            ic2: Tensor::empty([routes as i64, inter as i64], bf16),
-            ic3: Tensor::empty([routes as i64, hidden as i64], bf16),
-            result: Tensor::empty([tokens as i64, hidden as i64], bf16),
+            x: bf16_tensor(&self.rt, req.x, &[tokens, hidden])?,
+            slot_t: self.rt.from_slice_i32(&route_slot, &[routes])?,
+            token_t: self.rt.from_slice_i32(&route_token, &[routes])?,
+            weight_t: self.rt.from_slice_f32(&req.weights[..routes], &[routes])?,
+            lut: self.lut.clone(),
+            ic1: self.rt.zeros(&[routes, 2 * inter], TensorDType::Bf16)?,
+            ic2: self.rt.zeros(&[routes, inter], TensorDType::Bf16)?,
+            ic3: self.rt.zeros(&[routes, hidden], TensorDType::Bf16)?,
+            result: self.rt.zeros(&[tokens, hidden], TensorDType::Bf16)?,
         })
     }
 
@@ -855,13 +869,13 @@ impl CudaMoE {
     pub fn stage_dev(&self, req: &MoEDeviceGroup<'_>) -> Result<StagedGroup, MoEError> {
         let tokens = self.check_dev(req)?;
         let top_k = req.top_k;
+        let routes = tokens * top_k;
         let (route_token, route_slot) = route_lists(req.routes, tokens, top_k)?;
-        let dev = self.device.to_tch();
         self.group_with_slots(
             req.x,
             req.weights,
-            Tensor::from_slice(&route_slot).to(dev),
-            Tensor::from_slice(&route_token).to(dev),
+            self.rt.from_slice_i32(&route_slot, &[routes])?,
+            self.rt.from_slice_i32(&route_token, &[routes])?,
             tokens,
             top_k,
         )
@@ -884,30 +898,31 @@ impl CudaMoE {
         let routes = tokens * top_k;
         let x = device_tensor(x, "the activations")?;
         let w = device_tensor(weights, "the weights")?;
-        let dev = self.device;
-        let bf16 = (tch::Kind::BFloat16, dev.to_tch());
-        let mut g = StagedGroup {
+        let g = StagedGroup {
             tokens,
             top_k,
             routes,
-            x: Tensor::zeros([tokens as i64, hidden as i64], bf16),
+            x: self.rt.zeros(&[tokens, hidden], TensorDType::Bf16)?,
             slot_t,
             token_t,
-            weight_t: Tensor::zeros([routes as i64], (tch::Kind::Float, dev.to_tch())),
-            lut: self.lut.shallow_clone(),
-            ic1: Tensor::empty([routes as i64, (2 * inter) as i64], bf16),
-            ic2: Tensor::empty([routes as i64, inter as i64], bf16),
-            ic3: Tensor::empty([routes as i64, hidden as i64], bf16),
-            result: Tensor::empty([tokens as i64, hidden as i64], bf16),
+            weight_t: self.rt.zeros(&[routes], TensorDType::F32)?,
+            lut: self.lut.clone(),
+            ic1: self.rt.zeros(&[routes, 2 * inter], TensorDType::Bf16)?,
+            ic2: self.rt.zeros(&[routes, inter], TensorDType::Bf16)?,
+            ic3: self.rt.zeros(&[routes, hidden], TensorDType::Bf16)?,
+            result: self.rt.zeros(&[tokens, hidden], TensorDType::Bf16)?,
         };
         // Device to device, narrowing to bf16 on the way in -- the conversion
         // the host path makes during its upload, made here instead.
-        g.x.copy_(
-            &x.reshape([tokens as i64, hidden as i64])
-                .to_kind(tch::Kind::BFloat16),
-        );
-        g.weight_t
-            .copy_(&w.reshape([-1]).narrow(0, 0, routes as i64));
+        let x = x.contiguous()?.reshape(&[tokens, hidden])?;
+        let x = if x.dtype() == TensorDType::Bf16 {
+            x
+        } else {
+            x.cast(TensorDType::Bf16)?
+        };
+        x.copy_to(&g.x)?;
+        let w = w.contiguous()?.reshape(&[w.numel()])?;
+        w.narrow(0, 0, routes)?.copy_to(&g.weight_t)?;
         Ok(g)
     }
 
@@ -924,20 +939,18 @@ impl CudaMoE {
                 g.tokens, g.top_k, req.top_k
             )));
         }
+        let routes = g.routes;
         let (route_token, route_slot) = route_lists(req.routes, tokens, req.top_k)?;
-        let dev = self.device;
-        g.x.copy_(&bf16_tensor(
-            req.x,
-            &[tokens as i64, self.shapes.hidden as i64],
-            dev,
-        ));
-        g.slot_t.copy_(&Tensor::from_slice(&route_slot));
-        g.token_t.copy_(&Tensor::from_slice(&route_token));
-        g.weight_t.copy_(&f32_tensor(
-            &req.weights[..g.routes],
-            &[g.routes as i64],
-            dev,
-        ));
+        bf16_tensor(&self.rt, req.x, &[tokens, self.shapes.hidden])?.copy_to(&g.x)?;
+        self.rt
+            .from_slice_i32(&route_slot, &[routes])?
+            .copy_to(&g.slot_t)?;
+        self.rt
+            .from_slice_i32(&route_token, &[routes])?
+            .copy_to(&g.token_t)?;
+        self.rt
+            .from_slice_f32(&req.weights[..routes], &[routes])?
+            .copy_to(&g.weight_t)?;
         Ok(())
     }
 
@@ -959,7 +972,7 @@ impl CudaMoE {
             .ok_or_else(|| MoEError::Bad("launch before any expert was staged".into()))?;
         let (tokens, routes) = (g.tokens, g.routes);
 
-        let ptr = |t: &Tensor| t.data_ptr() as u64;
+        let ptr = |t: &Tensor| t.device_ptr();
         let args = MoEArgs {
             tokens,
             routes,
@@ -1055,7 +1068,7 @@ impl CudaMoE {
         let (tokens, routes) = (g.tokens, g.routes);
         let segments = seg_ids.numel();
 
-        let ptr = |t: &Tensor| t.data_ptr() as u64;
+        let ptr = |t: &Tensor| t.device_ptr();
         let args = MoEArgs {
             tokens,
             routes,
@@ -1129,7 +1142,7 @@ impl CudaMoE {
             )));
         }
         // The host path's output is host memory, so the reduce has to be done.
-        let values = to_f32_vec(&g.result);
+        let values = g.result.to_host_f32()?;
         if values.len() < tokens * hidden {
             return Err(MoEError::Bad(format!(
                 "the reduce produced {} values for {tokens} tokens",
@@ -1146,22 +1159,20 @@ impl CudaMoE {
     /// widening the host readback does.
     pub fn collect_dev(&self, g: &StagedGroup, out: &mut dyn MoETensor) -> Result<(), MoEError> {
         let (tokens, hidden) = (g.tokens, self.shapes.hidden);
-        let t = out
-            .as_any_mut()
-            .downcast_mut::<DevTensor>()
-            .ok_or_else(|| {
-                MoEError::Bad(
-                    "the device MoE hand-off needs a device tensor for the routed sum".into(),
-                )
-            })?;
-        if t.0.size() != [tokens as i64, hidden as i64] {
+        let t = out.as_any_mut().downcast_mut::<Tensor>().ok_or_else(|| {
+            MoEError::Bad("the device MoE hand-off needs a device tensor for the routed sum".into())
+        })?;
+        if t.shape() != [tokens, hidden] {
             return Err(MoEError::Bad(format!(
                 "collect_dev: the routed sum is {:?}, wanted [{tokens}, {hidden}]",
-                t.0.size()
+                t.shape()
             )));
         }
-        t.0.copy_(&g.result);
-        Ok(())
+        if t.dtype() == g.result.dtype() {
+            g.result.copy_to(t)
+        } else {
+            g.result.cast(t.dtype())?.copy_to(t)
+        }
     }
 
     /// The port's whole step over fresh buffers: `stage` + `launch` +
@@ -1207,18 +1218,13 @@ impl CudaMoE {
         let x = device_tensor(req.x, "the activations")?;
         let experts = device_tensor(req.experts, "the expert ids")?;
         let weights = device_tensor(req.weights, "the weights")?;
-        let out_t = out
-            .as_any_mut()
-            .downcast_mut::<DevTensor>()
-            .ok_or_else(|| {
-                MoEError::Bad(
-                    "the device MoE hand-off needs a device tensor for the routed sum".into(),
-                )
-            })?;
-        if out_t.0.size() != [tokens as i64, self.shapes.hidden as i64] {
+        let out_t = out.as_any_mut().downcast_mut::<Tensor>().ok_or_else(|| {
+            MoEError::Bad("the device MoE hand-off needs a device tensor for the routed sum".into())
+        })?;
+        if out_t.shape() != [tokens, self.shapes.hidden] {
             return Err(MoEError::Bad(format!(
                 "grouped_moe_staged: the routed sum is {:?}, wanted [{tokens}, {}]",
-                out_t.0.size(),
+                out_t.shape(),
                 self.shapes.hidden
             )));
         }
@@ -1251,10 +1257,10 @@ impl CudaMoE {
         let mut start = 0usize;
         while start < tokens {
             let n = chunk.min(tokens - start);
-            let xc = x.narrow(0, start as i64, n as i64);
-            let ec = experts.narrow(0, start as i64, n as i64);
-            let wc = weights.narrow(0, start as i64, n as i64);
-            let mut oc = DevTensor(out_t.0.narrow(0, start as i64, n as i64));
+            let xc = x.narrow(0, start, n)?;
+            let ec = experts.narrow(0, start, n)?;
+            let wc = weights.narrow(0, start, n)?;
+            let mut oc = out_t.narrow(0, start, n)?;
             self.staged_group(req.layer, &xc, &ec, &wc, &mut oc, top_k)?;
             start += n;
         }
@@ -1277,7 +1283,12 @@ impl CudaMoE {
         if layer == 0 {
             TOTAL.store(0, Ordering::Relaxed);
         }
-        let n = st.num.int64_value(&[]) as u64;
+        let n = st
+            .num
+            .to_host_i64()
+            .ok()
+            .and_then(|v| v.first().copied())
+            .unwrap_or(0) as u64;
         let total = TOTAL.fetch_add(n, Ordering::Relaxed) + n;
         if layer + 1 == st.layers {
             eprintln!("[miss] step_experts={total}");
@@ -1345,34 +1356,37 @@ impl CudaMoE {
                 .ok_or_else(|| MoEError::Bad("select_buffer_slots before staging".into()))?;
             2 * st.experts
         };
-        let dev = self.device.to_tch();
+        let rt = self.rt.clone();
         let start = {
             let st = self.device_staging.as_ref().expect("checked above");
-            let usage: Vec<i64> = st
-                .usage
-                .to_kind(tch::Kind::Int64)
-                .to_device(tch::Device::Cpu)
-                .try_into()
-                .map_err(|e| {
-                    MoEError::Bad(format!("select_buffer_slots cannot read usage: {e}"))
-                })?;
+            let usage = st.usage.to_host_i64().map_err(|e| {
+                MoEError::Bad(format!("select_buffer_slots cannot read usage: {e}"))
+            })?;
             pick_window(&usage, buffer)
         };
-        let victims =
-            Tensor::arange_start(start as i64, (start + buffer) as i64, (tch::Kind::Int, dev));
+        let victims: Vec<i32> = (start..start + buffer).map(|s| s as i32).collect();
         {
             let st = self.device_staging.as_mut().expect("checked above");
-            let victims_i64 = victims.to_kind(tch::Kind::Int64);
-            let old = st.id_of_slot.index_select(0, &victims_i64);
-            let ids = old.masked_select(&old.ge(0)).to_kind(tch::Kind::Int64);
-            if ids.numel() > 0 {
-                let neg = Tensor::from_slice(&vec![-1i32; ids.numel()]).to(dev);
-                let _ = st.slot_for_id.index_put_(&[Some(&ids)], &neg, false);
+            let mut id_of_slot = st.id_of_slot.to_host_i32()?;
+            let mut slot_for_id = st.slot_for_id.to_host_i32()?;
+            let mut usage = st.usage.to_host_i64()?;
+            for &victim in &victims {
+                let slot = victim as usize;
+                let id = id_of_slot[slot];
+                if id >= 0 {
+                    slot_for_id[id as usize] = -1;
+                }
+                id_of_slot[slot] = -1;
+                usage[slot] = 0;
             }
-            let neg = Tensor::from_slice(&vec![-1i32; buffer]).to(dev);
-            let _ = st.id_of_slot.index_put_(&[Some(&victims_i64)], &neg, false);
-            let zero = Tensor::from_slice(&vec![0i64; buffer]).to(dev);
-            let _ = st.usage.index_put_(&[Some(&victims_i64)], &zero, false);
+            let n = slot_for_id.len();
+            rt.from_slice_i32(&slot_for_id, &[n])?
+                .copy_to(&st.slot_for_id)?;
+            let n = id_of_slot.len();
+            rt.from_slice_i32(&id_of_slot, &[n])?
+                .copy_to(&st.id_of_slot)?;
+            let n = usage.len();
+            rt.from_slice_i64(&usage, &[n])?.copy_to(&st.usage)?;
         }
         let experts = self
             .device_staging
@@ -1388,11 +1402,12 @@ impl CudaMoE {
             for (g, dst) in dsts.iter_mut().enumerate() {
                 let row_start = g * block_k;
                 let n = (experts - row_start).min(block_k);
-                let off = (half * experts + row_start) as i64;
-                *dst = victims.narrow(0, off, n as i64).contiguous();
+                let off = half * experts + row_start;
+                let host = &victims[off..off + n];
+                *dst = rt.from_slice_i32(host, &[n])?;
             }
         }
-        pf.victims = victims;
+        pf.victims_host = victims;
         pf.window_start = start;
         Ok(())
     }
@@ -1418,15 +1433,11 @@ impl CudaMoE {
                 .src_ptrs
                 .get(layer)
                 .ok_or_else(|| MoEError::Bad(format!("layer {layer} past the pinned source plan")))?
-                .shallow_clone();
-            (
-                src,
-                st.dst_ptrs.shallow_clone(),
-                st.feat_bytes.shallow_clone(),
-            )
+                .clone();
+            (src, st.dst_ptrs.clone(), st.feat_bytes.clone())
         };
         let copy = self.staging_abi.kernel(INDEX_COPY).map_err(bad_abi)?;
-        let ptr = |t: &Tensor| t.data_ptr() as u64;
+        let ptr = |t: &Tensor| t.device_ptr();
         let pf = self
             .prefill
             .as_mut()
@@ -1515,7 +1526,7 @@ impl CudaMoE {
         x: &Tensor,
         experts: &Tensor,
         weights: &Tensor,
-        out: &mut DevTensor,
+        out: &mut Tensor,
         top_k: usize,
     ) -> Result<(), MoEError> {
         let hidden = self.shapes.hidden;
@@ -1526,24 +1537,19 @@ impl CudaMoE {
             (st.experts, st.layers)
         };
         let half = layer % 2;
+        let victims = self.prefill.as_ref().expect("harness").victims_host.clone();
         // The grid runs over this half's buffer slots only: every route of the
-        // chunk names one of them (whole-layer staging), and `victims` is
+        // chunk names one of them (whole-layer staging), and `victims_host` is
         // ascending, so its ranges line up with the CSR's slot-sorted
         // `route_idx`. Launching over all cache slots made ~6x of the grid
         // retire on an empty segment.
-        let seg_ids = if prefill_all_segments() {
-            let dev = self.device.to_tch();
-            Tensor::arange(self.slot_capacity() as i64, (tch::Kind::Int, dev))
+        let seg_host: Vec<i32> = if prefill_all_segments() {
+            (0..self.slot_capacity()).map(|s| s as i32).collect()
         } else {
-            let pf = self.prefill.as_ref().expect("harness");
-            pf.victims
-                .narrow(
-                    0,
-                    (half * experts_per_layer) as i64,
-                    experts_per_layer as i64,
-                )
-                .contiguous()
+            let off = half * experts_per_layer;
+            victims[off..off + experts_per_layer].to_vec()
         };
+        let seg_ids = self.rt.from_slice_i32(&seg_host, &[seg_host.len()])?;
 
         // (1) This layer's half. Layer 0 has no lookahead, so it starts here; for
         // every later layer the previous step already prefetched it.
@@ -1575,20 +1581,21 @@ impl CudaMoE {
             crate::infrastructure::profile::end("pf_wait", sp);
         }
         let sp = crate::infrastructure::profile::begin("pf_gemm");
-        let offset = (half * experts_per_layer) as i64;
+        let offset = half * experts_per_layer;
         // The buffer's slot for `(half, expert_id)` is the selected victim, not
         // the fixed `half * E + id` range (decision 94 follow-up).
-        let idx = experts
-            .reshape([routes as i64])
-            .to_kind(tch::Kind::Int)
-            .contiguous()
-            .g_add_scalar(offset);
-        let slots = self
-            .prefill
-            .as_ref()
-            .expect("harness")
-            .victims
-            .index_select(0, &idx);
+        let experts_host = host_i32(experts)?;
+        let slots_host: Vec<i32> = experts_host
+            .iter()
+            .map(|&expert| {
+                victims.get(offset + expert as usize).copied().ok_or_else(|| {
+                    MoEError::Bad(format!(
+                        "prefill expert id {expert} is past the {experts_per_layer}-expert layer"
+                    ))
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        let slots = self.rt.from_slice_i32(&slots_host, &[routes])?;
         // The whole-layer path never runs `lru_ensure`, so `block_k` does not
         // bound it; the chunk only bounds the scratch and keeps the grouped
         // GEMV's route list small. A large chunk is a large win: with 16-token
@@ -1596,24 +1603,24 @@ impl CudaMoE {
         // per-route GEMV re-reads each expert from HBM, while a 256-token chunk
         // gives each expert enough routes that its weight is reused from L2.
         let chunk = prefill_chunk_tokens().min(tokens);
-        let dev = self.device.to_tch();
         let mut start = 0usize;
         while start < tokens {
             let n = chunk.min(tokens - start);
-            let xc = x.narrow(0, start as i64, n as i64);
-            let wc = weights.narrow(0, start as i64, n as i64);
-            let sc = slots.narrow(0, (start * top_k) as i64, (n * top_k) as i64);
-            let token_t = Tensor::arange(n as i64, (tch::Kind::Int, dev))
-                .unsqueeze(1)
-                .expand([n as i64, top_k as i64], false)
-                .contiguous()
-                .reshape([(n * top_k) as i64]);
-            let mut oc = DevTensor(out.0.narrow(0, start as i64, n as i64));
-            let g = self.group_with_slots(&DevTensor(xc), &DevTensor(wc), sc, token_t, n, top_k)?;
+            let xc = x.narrow(0, start, n)?;
+            let wc = weights.narrow(0, start, n)?;
+            let sc = slots.narrow(0, start * top_k, n * top_k)?;
+            let token_host: Vec<i32> = (0..n)
+                .flat_map(|t| std::iter::repeat_n(t as i32, top_k))
+                .collect();
+            let token_t = self.rt.from_slice_i32(&token_host, &[n * top_k])?;
+            let mut oc = out.narrow(0, start, n)?;
+            let g = self.group_with_slots(&xc, &wc, sc, token_t, n, top_k)?;
             if prefill_use_grouped() {
                 // The CSR lives as long as `g`: the queued launches read it
                 // asynchronously, the same lifetime the staged buffers have.
-                let (seg, route_idx) = build_grouped_csr(&g.slot_t, self.slot_capacity())?;
+                let chunk_slots = &slots_host[start * top_k..(start + n) * top_k];
+                let (seg, route_idx) =
+                    build_grouped_csr_host(chunk_slots, self.slot_capacity(), &self.rt)?;
                 self.launch_grouped(&g, &seg, &seg_ids, &route_idx)?;
                 self.collect_dev(&g, &mut oc)?;
             } else {
@@ -1650,7 +1657,7 @@ impl CudaMoE {
         x: &Tensor,
         experts: &Tensor,
         weights: &Tensor,
-        out: &mut DevTensor,
+        out: &mut Tensor,
         top_k: usize,
     ) -> Result<(), MoEError> {
         let hidden = self.shapes.hidden;
@@ -1661,12 +1668,9 @@ impl CudaMoE {
                 "staged chunk: {routes} routes for {tokens} tokens x top_k {top_k}"
             )));
         }
-        // The kernel rewrites this copy in place; the cast makes a fresh buffer,
-        // so the router's own `[tokens, top_k]` ids are untouched.
-        let slots = experts
-            .reshape([routes as i64])
-            .to_kind(tch::Kind::Int)
-            .contiguous();
+        // The kernel rewrites this copy in place; a fresh buffer keeps the
+        // router's own `[tokens, top_k]` ids untouched.
+        let slots = as_i32_ids(experts, routes, &self.rt)?;
         let sp = crate::infrastructure::profile::begin("moe_lru");
         self.ensure_experts(layer, &slots)?;
         crate::infrastructure::profile::end("moe_lru", sp);
@@ -1675,16 +1679,12 @@ impl CudaMoE {
         crate::infrastructure::profile::end("moe_copy", sp);
         self.probe_misses(layer);
 
-        let dev = self.device.to_tch();
-        let token_t = Tensor::arange(tokens as i64, (tch::Kind::Int, dev))
-            .unsqueeze(1)
-            .expand([tokens as i64, top_k as i64], false)
-            .contiguous()
-            .reshape([routes as i64]);
-        let xd = DevTensor(x.shallow_clone());
-        let wd = DevTensor(weights.shallow_clone());
+        let token_host: Vec<i32> = (0..tokens)
+            .flat_map(|t| std::iter::repeat_n(t as i32, top_k))
+            .collect();
+        let token_t = self.rt.from_slice_i32(&token_host, &[routes])?;
         let sp = crate::infrastructure::profile::begin("moe_gemm");
-        let g = self.group_with_slots(&xd, &wd, slots, token_t, tokens, top_k)?;
+        let g = self.group_with_slots(x, weights, slots, token_t, tokens, top_k)?;
         self.launch(&g)?;
         let out = self.collect_dev(&g, out);
         crate::infrastructure::profile::end("moe_gemm", sp);
@@ -1815,31 +1815,40 @@ fn pick_window(usage: &[i64], buffer: usize) -> usize {
 /// routes are always resident (whole-layer staging); the decode-only shapes a
 /// non-resident or out-of-bank slot produces are refused here rather than
 /// misread by a segment program.
-fn build_grouped_csr(route_slot: &Tensor, slots: usize) -> Result<(Tensor, Tensor), MoEError> {
-    let slot64 = route_slot.to_kind(tch::Kind::Int64);
-    let resident = slot64.ge(0).all();
-    if resident.int64_value(&[]) == 0 {
-        return Err(MoEError::Bad(
-            "prefill grouped CSR: a route is not resident".into(),
-        ));
+fn build_grouped_csr_host(
+    route_slot: &[i32],
+    slots: usize,
+    rt: &Runtime,
+) -> Result<(Tensor, Tensor), MoEError> {
+    let mut counts = vec![0i32; slots];
+    for &slot in route_slot {
+        if slot < 0 {
+            return Err(MoEError::Bad(
+                "prefill grouped CSR: a route is not resident".into(),
+            ));
+        }
+        let Some(count) = counts.get_mut(slot as usize) else {
+            return Err(MoEError::Bad(format!(
+                "prefill grouped CSR: a route names a slot past the {slots}-slot bank"
+            )));
+        };
+        *count += 1;
     }
-    let counts = slot64.bincount(Option::<Tensor>::None, slots as i64);
-    if counts.size() != [slots as i64] {
-        return Err(MoEError::Bad(format!(
-            "prefill grouped CSR: a route names a slot past the {slots}-slot bank"
-        )));
+    let mut seg = vec![0i32; slots + 1];
+    for s in 0..slots {
+        seg[s + 1] = seg[s] + counts[s];
     }
-    let seg = Tensor::zeros([slots as i64 + 1], (tch::Kind::Int, route_slot.device()));
-    let mut tail = seg.narrow(0, 1, slots as i64);
-    tail.copy_(
-        &counts
-            .cumsum(0, Some(tch::Kind::Int64))
-            .to_kind(tch::Kind::Int),
-    );
-    let route_idx = slot64
-        .argsort_stable(true, 0, false)
-        .to_kind(tch::Kind::Int);
-    Ok((seg, route_idx))
+    let mut cursor = seg[..slots].to_vec();
+    let mut route_idx = vec![0i32; route_slot.len()];
+    for (route, &slot) in route_slot.iter().enumerate() {
+        let at = &mut cursor[slot as usize];
+        route_idx[*at as usize] = route as i32;
+        *at += 1;
+    }
+    Ok((
+        rt.from_slice_i32(&seg, &[seg.len()])?,
+        rt.from_slice_i32(&route_idx, &[route_idx.len()])?,
+    ))
 }
 
 /// Packed plus scales plus globals for one expert's two slabs.
@@ -2043,29 +2052,36 @@ mod tests {
         }
     }
 
+    /// The adapter is device-only, so the tensor tests need a live runtime.
+    /// On a host with no device they are skipped rather than failed.
+    fn test_rt() -> Option<Runtime> {
+        Runtime::open(0).ok()
+    }
+
     /// The CSR the grouped launches read: bucketed per slot in stable route
     /// order, a complete permutation of the routes, and it refuses the shapes
     /// only the decode GEMV handles (a non-resident slot, a slot past the bank).
     #[test]
     fn a_grouped_csr_buckets_and_refuses_bad_slots() {
-        let slots_t = |flat: &[i64]| Tensor::from_slice(flat).to_kind(tch::Kind::Int);
-        let ints = |t: &Tensor| {
-            let flat = t.contiguous();
-            let mut out = vec![0i32; flat.numel()];
-            flat.copy_data(&mut out, flat.numel());
-            out
+        let Some(rt) = test_rt() else {
+            return;
         };
+        let ints = |t: &Tensor| t.to_host_i32().unwrap();
 
-        let (seg, route_idx) = build_grouped_csr(&slots_t(&[2, 0, 2, 0, 0, 1]), 3).unwrap();
+        let (seg, route_idx) = build_grouped_csr_host(&[2, 0, 2, 0, 0, 1], 3, &rt).unwrap();
         assert_eq!(ints(&seg), vec![0, 3, 4, 6]);
         assert_eq!(ints(&route_idx), vec![1, 3, 4, 5, 0, 2]);
 
-        let non_resident = slots_t(&[-1, 0]);
-        let err = build_grouped_csr(&non_resident, 3).unwrap_err().to_string();
+        let err = build_grouped_csr_host(&[-1, 0], 3, &rt)
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("not resident"), "{err}");
 
-        let past_bank = slots_t(&[3]);
-        let err = build_grouped_csr(&past_bank, 3).unwrap_err().to_string();
+        let err = build_grouped_csr_host(&[3], 3, &rt)
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("past the"), "{err}");
     }
 
@@ -2087,8 +2103,11 @@ mod tests {
     /// else.
     #[test]
     fn a_slab_lands_in_its_own_slot_row() {
+        let Some(rt) = test_rt() else {
+            return;
+        };
         let (rows, cols) = (32usize, 64usize);
-        let mut banks = Banks::new(4, rows, cols, Device::Cpu);
+        let mut banks = Banks::new(&rt, 4, rows, cols).unwrap();
         let n = |i: usize| (i % 251) as u8;
         let slab = Slab {
             packed: (0..rows * cols / 2).map(n).collect(),
@@ -2096,13 +2115,7 @@ mod tests {
             global: (0..rows * 2).map(|i| n(i + 13)).collect(),
         };
         banks.stage(2, &slab, rows, cols).unwrap();
-        let read = |t: &Tensor| {
-            let flat = t.flatten(0, -1).contiguous();
-            let mut out = vec![0u8; flat.numel()];
-            let len = out.len();
-            flat.copy_data_u8(&mut out, len);
-            out
-        };
+        let read = |t: &Tensor| t.to_host_u8().unwrap();
         let len = rows * cols / 2;
         assert_eq!(
             read(&banks.packed)[2 * len..3 * len],
@@ -2132,7 +2145,10 @@ mod tests {
         };
         let err = check_slab(&slab, rows, cols).unwrap_err().to_string();
         assert!(err.contains("slab bytes"), "{err}");
-        let mut banks = Banks::new(2, rows, cols, Device::Cpu);
+        let Some(rt) = test_rt() else {
+            return;
+        };
+        let mut banks = Banks::new(&rt, 2, rows, cols).unwrap();
         assert!(banks.stage(0, &slab, rows, cols).is_err());
     }
 

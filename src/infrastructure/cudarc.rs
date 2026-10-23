@@ -32,10 +32,10 @@ use crate::infrastructure::cuda_driver::{CUstream, CudaError, Driver, GdnKernels
 use crate::infrastructure::kernel_abi::{
     ADD_BF16, ADD_F32, ADD_RMSNORM, AddRmsnormArgs, ArgPack, CAST_BF16_F32, CAST_F32_BF16,
     CAUSAL_SDPA_BF16, COL_MUL_BF16, COL_MUL_F32, COPY_STRIDED_BF16, COPY_STRIDED_F32,
-    COPY_STRIDED_I32, GATHER_ROWS_BF16, GATHER_ROWS_F32, INDEX_SELECT_BF16, LinearAbi, MAX_ALL_F32,
-    MUL_BF16, MUL_F32, REPEAT_HEADS_BF16, ROPE_BF16, SCALAR_BF16, SCALAR_F32, SCATTER_ROWS_BF16,
-    SCATTER_ROWS_F32, SOFTMAX_LAST_F32, SUM_ALL_F32, SUM_LAST_F32, TOPK_LAST_F32, UNARY_BF16,
-    UNARY_F32, add_rmsnorm_args, add_rmsnorm_grid,
+    COPY_STRIDED_I32, COPY_STRIDED_I64, COPY_STRIDED_U8, GATHER_ROWS_BF16, GATHER_ROWS_F32,
+    INDEX_SELECT_BF16, LinearAbi, MAX_ALL_F32, MUL_BF16, MUL_F32, REPEAT_HEADS_BF16, ROPE_BF16,
+    SCALAR_BF16, SCALAR_F32, SCATTER_ROWS_BF16, SCATTER_ROWS_F32, SOFTMAX_LAST_F32, SUM_ALL_F32,
+    SUM_LAST_F32, TOPK_LAST_F32, UNARY_BF16, UNARY_F32, add_rmsnorm_args, add_rmsnorm_grid,
 };
 
 fn bad(e: impl std::fmt::Display) -> MoEError {
@@ -567,6 +567,18 @@ impl Tensor {
         let b = src.buf.i32()?;
         let view = b.slice(src.offset..src.offset + src.numel());
         self.rt.inner.stream.clone_dtoh(&view).map_err(bad)
+    }
+
+    pub fn to_host_i64(&self) -> Result<Vec<i64>, MoEError> {
+        let src = self.contiguous()?;
+        self.rt.synchronize()?;
+        match &src.buf {
+            Buffer::I64(s) => {
+                let view = s.slice(src.offset..src.offset + src.numel());
+                self.rt.inner.stream.clone_dtoh(&view).map_err(bad)
+            }
+            other => Err(bad(format!("want i64, got {}", other.dtype().name()))),
+        }
     }
 
     /// The bf16 storage, for the low-level launchers that still take a
@@ -1437,7 +1449,8 @@ impl Tensor {
             TensorDType::Bf16 => COPY_STRIDED_BF16,
             TensorDType::F32 => COPY_STRIDED_F32,
             TensorDType::I32 => COPY_STRIDED_I32,
-            other => return Err(bad(format!("no copy_to for {}", other.name()))),
+            TensorDType::I64 => COPY_STRIDED_I64,
+            TensorDType::U8 => COPY_STRIDED_U8,
         };
         self.rt.kernels().copy_strided(
             self.rt.raw_stream(),
@@ -2091,5 +2104,21 @@ mod tests {
         assert_eq!(TensorDType::F32.element_size(), 4);
         assert_eq!(TensorDType::I32.element_size(), 4);
         assert_eq!(TensorDType::I64.element_size(), 8);
+    }
+
+    #[test]
+    fn i64_and_u8_buffers_copy_and_read_back() {
+        let Ok(rt) = Runtime::open(0) else {
+            return;
+        };
+        let words = rt.from_slice_i64(&[1, -2, 3], &[3]).unwrap();
+        let dst = rt.zeros(&[3], TensorDType::I64).unwrap();
+        words.copy_to(&dst).unwrap();
+        assert_eq!(dst.to_host_i64().unwrap(), vec![1, -2, 3]);
+
+        let bytes = rt.from_slice_u8(&[4, 5, 6], &[3]).unwrap();
+        let dst = rt.zeros(&[3], TensorDType::U8).unwrap();
+        bytes.copy_to(&dst).unwrap();
+        assert_eq!(dst.to_host_u8().unwrap(), vec![4, 5, 6]);
     }
 }

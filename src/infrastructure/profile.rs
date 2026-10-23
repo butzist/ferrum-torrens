@@ -13,7 +13,7 @@
 //! `/tmp/ft_profile.json` / `.txt` by default. Nothing here runs unless the env
 //! var is set, so the normal path has no event overhead.
 
-#![cfg(feature = "cuda")]
+#![cfg(any(feature = "cuda", feature = "cudarc"))]
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -66,6 +66,7 @@ pub fn enabled() -> bool {
 /// device-to-host read per layer, so it forces a sync and must run eager
 /// (`FERRUM_SMOKE_NOGRAPH=1`); it exists to collect routing traces for the
 /// speculative-prefetch study (OPTIMIZATION.md R3b), never in serving.
+#[cfg(feature = "cuda")]
 pub fn trace_routes(layer: usize, ids: &tch::Tensor) {
     static PATH: OnceLock<Option<std::ffi::OsString>> = OnceLock::new();
     let Some(path) = PATH
@@ -93,6 +94,7 @@ pub fn trace_routes(layer: usize, ids: &tch::Tensor) {
 
 /// Open the driver and install the timer. Idempotent; `false` when disabled or
 /// the driver/context cannot be set up, in which case every `begin` is a no-op.
+#[cfg(feature = "cuda")]
 pub fn init(device: usize) -> bool {
     if !enabled() {
         return false;
@@ -124,9 +126,20 @@ pub fn init(device: usize) -> bool {
     P.set(Mutex::new(inner)).is_ok()
 }
 
+#[cfg(not(feature = "cuda"))]
+pub fn init(_device: usize) -> bool {
+    false
+}
+
+#[cfg(feature = "cuda")]
 fn current(g: &Inner) -> CUstream {
     // SAFETY: torch owns this thread-local stream; the timer only reads it.
     unsafe { crate::infrastructure::cuda_graph::current_stream(g.device) }
+}
+
+#[cfg(not(feature = "cuda"))]
+fn current(_g: &Inner) -> CUstream {
+    std::ptr::null_mut()
 }
 
 /// A fresh timing event recorded on the model's current stream. `None` when the

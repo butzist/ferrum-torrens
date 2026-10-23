@@ -609,6 +609,8 @@ pub const SCATTER_ROWS_F32: &str = "scatter_rows_f32";
 pub const COPY_STRIDED_BF16: &str = "copy_strided_bf16";
 pub const COPY_STRIDED_F32: &str = "copy_strided_f32";
 pub const COPY_STRIDED_I32: &str = "copy_strided_i32";
+pub const COPY_STRIDED_I64: &str = "copy_strided_i64";
+pub const COPY_STRIDED_U8: &str = "copy_strided_u8";
 pub const UNARY_BF16: &str = "unary_bf16";
 pub const UNARY_F32: &str = "unary_f32";
 pub const SCALAR_BF16: &str = "scalar_bf16";
@@ -624,7 +626,7 @@ pub const ROPE_BF16: &str = "rope_bf16";
 pub const REPEAT_HEADS_BF16: &str = "repeat_heads_bf16";
 pub const CAUSAL_SDPA_BF16: &str = "causal_sdpa_bf16";
 
-const LINEAR_NAMES: [&str; 36] = [
+const LINEAR_NAMES: [&str; 38] = [
     GDN_DECODE,
     CONV_DECODE,
     ADD_RMSNORM,
@@ -647,6 +649,8 @@ const LINEAR_NAMES: [&str; 36] = [
     COPY_STRIDED_BF16,
     COPY_STRIDED_F32,
     COPY_STRIDED_I32,
+    COPY_STRIDED_I64,
+    COPY_STRIDED_U8,
     UNARY_BF16,
     UNARY_F32,
     SCALAR_BF16,
@@ -826,6 +830,12 @@ pub fn linear_cubin(name: &str) -> Result<&'static [u8], MoEError> {
         COPY_STRIDED_I32 => {
             include_bytes!(concat!(env!("OUT_DIR"), "/kernel/copy_strided_i32.cubin"))
         }
+        COPY_STRIDED_I64 => {
+            include_bytes!(concat!(env!("OUT_DIR"), "/kernel/copy_strided_i64.cubin"))
+        }
+        COPY_STRIDED_U8 => {
+            include_bytes!(concat!(env!("OUT_DIR"), "/kernel/copy_strided_u8.cubin"))
+        }
         UNARY_BF16 => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/unary_bf16.cubin")),
         UNARY_F32 => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/unary_f32.cubin")),
         SCALAR_BF16 => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/scalar_bf16.cubin")),
@@ -893,6 +903,12 @@ fn linear_ptx(name: &str) -> &'static str {
         }
         COPY_STRIDED_I32 => {
             include_str!(concat!(env!("OUT_DIR"), "/kernel/copy_strided_i32.ptx"))
+        }
+        COPY_STRIDED_I64 => {
+            include_str!(concat!(env!("OUT_DIR"), "/kernel/copy_strided_i64.ptx"))
+        }
+        COPY_STRIDED_U8 => {
+            include_str!(concat!(env!("OUT_DIR"), "/kernel/copy_strided_u8.ptx"))
         }
         UNARY_BF16 => include_str!(concat!(env!("OUT_DIR"), "/kernel/unary_bf16.ptx")),
         UNARY_F32 => include_str!(concat!(env!("OUT_DIR"), "/kernel/unary_f32.ptx")),

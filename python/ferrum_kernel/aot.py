@@ -476,6 +476,18 @@ LINEAR_KERNELS: dict[str, dict] = {
         "constexprs": copy_strided_constexprs(),
         "num_warps": 4,
     },
+    "copy_strided_i64": {
+        "fn": _copy_strided_kernel,
+        "signature": copy_strided("i64"),
+        "constexprs": copy_strided_constexprs(),
+        "num_warps": 4,
+    },
+    "copy_strided_u8": {
+        "fn": _copy_strided_kernel,
+        "signature": copy_strided("u8"),
+        "constexprs": copy_strided_constexprs(),
+        "num_warps": 4,
+    },
 }
 
 # Triton bakes absolute source paths into the PTX `.file` directives and the

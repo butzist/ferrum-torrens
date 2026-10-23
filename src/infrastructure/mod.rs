@@ -14,7 +14,7 @@ pub mod cuda_gdn;
 pub mod cuda_graph;
 #[cfg(feature = "cudarc")]
 pub mod cuda_linear;
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cudarc")]
 pub mod cuda_moe;
 #[cfg(feature = "cudarc")]
 pub mod cudarc;
@@ -27,7 +27,7 @@ pub mod http;
 pub mod kernel_abi;
 #[cfg(feature = "cudarc")]
 pub mod kvcache_dev;
-#[cfg(feature = "cudarc")]
+#[cfg(any(feature = "cuda", feature = "cudarc"))]
 pub mod profile;
 pub mod tokenizers_hf;
 pub mod tool_call;

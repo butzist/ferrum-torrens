@@ -1,10 +1,10 @@
 // Gated GPU validation of the driver-API NVFP4 grouped-MoE path against the
 // scalar oracle on the real converted checkpoint. Run with:
-//   cargo test --release --features cuda --test cuda_moe_matches_reference -- --ignored --nocapture
+//   cargo test --release --features cudarc --test cuda_moe_matches_reference -- --ignored --nocapture
 // (needs a CUDA device and .model-cache/Qwen3.6-35B-A3B-NVFP4.ftw)
 //
 // This is decision 36 slice 5, and it is the gate that retires the pyo3 one: the
-// real expert slabs out of the mmap banks, staged H2D into libtorch device
+// real expert slabs out of the mmap banks, staged H2D into cudarc device
 // tensors by `FtwBanks` -> `CudaMoE`, planned and copied by `run_experts`, the
 // committed sm_120 cubins launched over the slot routes through the driver API,
 // and `grouped_moe_reference` over the same host bytes. No python anywhere.
@@ -14,7 +14,7 @@
 // measured against the route terms rather than the surviving sum, because every
 // route contributes a term far larger than the total they cancel into.
 
-#![cfg(feature = "cuda")]
+#![cfg(feature = "cudarc")]
 
 use serial_test::serial;
 use std::path::Path;
@@ -30,8 +30,9 @@ use ferrum_torrens::domain::expert_kernel::{
 use ferrum_torrens::domain::weights::WeightsReader;
 use ferrum_torrens::infrastructure::banks::FtwBanks;
 use ferrum_torrens::infrastructure::cuda_moe::CudaMoE;
+use ferrum_torrens::infrastructure::cudarc::TensorDType;
 use ferrum_torrens::infrastructure::ftw::{FtwIndex, FtwReader};
-use ferrum_torrens::infrastructure::torch::{DevTensor, Device, to_f32_vec};
+use ferrum_torrens::infrastructure::torch::Device;
 
 const FTW_DIR: &str = ".model-cache/Qwen3.6-35B-A3B-NVFP4.ftw";
 const LAYER: usize = 17;
@@ -449,6 +450,7 @@ fn a_chunked_prefill_step_matches_the_host_plan() {
             std::ptr::null_mut(),
         ),
     );
+    let rt = adapter.runtime().clone();
     let driver = adapter.driver();
     let pinned = gate(
         "pinned expert banks",
@@ -478,12 +480,23 @@ fn a_chunked_prefill_step_matches_the_host_plan() {
 
     // The staged path, chunked internally because routes > BLOCK_K.
     let exec = CachedExperts::with_device_staging(moe.clone(), moe, L + 1, EXPERTS, SLOTS2);
-    let dev = Device::Cuda(0);
-    let ids: Vec<f32> = routed.iter().map(|&e| e as f32).collect();
-    let xd = DevTensor::from_f32(&x, &[TOKENS2 as i64, hidden as i64], dev);
-    let ed = DevTensor::from_f32(&ids, &[TOKENS2 as i64, TOP_K as i64], dev);
-    let wd = DevTensor::from_f32(&weights, &[TOKENS2 as i64, TOP_K as i64], dev);
-    let mut out = DevTensor::zeros(&[TOKENS2 as i64, hidden as i64], dev);
+    let ids: Vec<i32> = routed.iter().map(|&e| e as i32).collect();
+    let xd = gate(
+        "activations on device",
+        rt.from_slice_f32(&x, &[TOKENS2, hidden]),
+    );
+    let ed = gate(
+        "expert ids on device",
+        rt.from_slice_i32(&ids, &[TOKENS2, TOP_K]),
+    );
+    let wd = gate(
+        "weights on device",
+        rt.from_slice_f32(&weights, &[TOKENS2, TOP_K]),
+    );
+    let mut out = gate(
+        "output buffer",
+        rt.zeros(&[TOKENS2, hidden], TensorDType::F32),
+    );
     gate(
         "execute_device (chunked staged prefill)",
         exec.execute_device(
@@ -499,7 +512,7 @@ fn a_chunked_prefill_step_matches_the_host_plan() {
             &mut out,
         ),
     );
-    let staged = to_f32_vec(&out.0);
+    let staged = out.to_host_f32().unwrap();
     assert_eq!(
         staged, host_out,
         "a chunked prefill step must be byte for byte the host plan's output"
@@ -553,6 +566,7 @@ fn a_cache_above_the_old_ceiling_stages_on_device() {
             std::ptr::null_mut(),
         ),
     );
+    let rt = adapter.runtime().clone();
     let driver = adapter.driver();
     let pinned = gate(
         "pinned expert banks",
@@ -580,12 +594,23 @@ fn a_cache_above_the_old_ceiling_stages_on_device() {
     );
 
     let exec = CachedExperts::with_device_staging(moe.clone(), moe, L + 1, EXPERTS, SLOTS2);
-    let dev = Device::Cuda(0);
-    let ids: Vec<f32> = routed.iter().map(|&e| e as f32).collect();
-    let xd = DevTensor::from_f32(&x, &[TOKENS2 as i64, hidden as i64], dev);
-    let ed = DevTensor::from_f32(&ids, &[TOKENS2 as i64, TOP_K as i64], dev);
-    let wd = DevTensor::from_f32(&weights, &[TOKENS2 as i64, TOP_K as i64], dev);
-    let mut out = DevTensor::zeros(&[TOKENS2 as i64, hidden as i64], dev);
+    let ids: Vec<i32> = routed.iter().map(|&e| e as i32).collect();
+    let xd = gate(
+        "activations on device",
+        rt.from_slice_f32(&x, &[TOKENS2, hidden]),
+    );
+    let ed = gate(
+        "expert ids on device",
+        rt.from_slice_i32(&ids, &[TOKENS2, TOP_K]),
+    );
+    let wd = gate(
+        "weights on device",
+        rt.from_slice_f32(&weights, &[TOKENS2, TOP_K]),
+    );
+    let mut out = gate(
+        "output buffer",
+        rt.zeros(&[TOKENS2, hidden], TensorDType::F32),
+    );
     gate(
         "execute_device",
         exec.execute_device(
@@ -601,7 +626,7 @@ fn a_cache_above_the_old_ceiling_stages_on_device() {
             &mut out,
         ),
     );
-    let staged = to_f32_vec(&out.0);
+    let staged = out.to_host_f32().unwrap();
     assert_eq!(
         staged, host_out,
         "a staged step in a {SLOTS2}-slot cache must be byte for byte the host plan"
@@ -649,6 +674,7 @@ fn a_whole_layer_prefill_overlap_matches_the_host_plan() {
         "driver API + committed cubins",
         CudaMoE::new_with_stream(Device::Cuda(0), source, shapes, SLOTS, std::ptr::null_mut()),
     );
+    let rt = adapter.runtime().clone();
     let driver = adapter.driver();
     let pinned = gate(
         "pinned expert banks",
@@ -684,13 +710,24 @@ fn a_whole_layer_prefill_overlap_matches_the_host_plan() {
 
     // The device whole-layer overlap: layer 0 prefetches layer 1 while it runs.
     let exec = CachedExperts::with_device_staging(moe.clone(), moe.clone(), LAYERS, EXPERTS, SLOTS);
-    let dev = Device::Cuda(0);
-    let ids: Vec<f32> = routed.iter().map(|&e| e as f32).collect();
-    let xd = DevTensor::from_f32(&x, &[TOKENS as i64, hidden as i64], dev);
-    let ed = DevTensor::from_f32(&ids, &[TOKENS as i64, TOP_K as i64], dev);
-    let wd = DevTensor::from_f32(&weights, &[TOKENS as i64, TOP_K as i64], dev);
+    let ids: Vec<i32> = routed.iter().map(|&e| e as i32).collect();
+    let xd = gate(
+        "activations on device",
+        rt.from_slice_f32(&x, &[TOKENS, hidden]),
+    );
+    let ed = gate(
+        "expert ids on device",
+        rt.from_slice_i32(&ids, &[TOKENS, TOP_K]),
+    );
+    let wd = gate(
+        "weights on device",
+        rt.from_slice_f32(&weights, &[TOKENS, TOP_K]),
+    );
     for layer in 0..LAYERS {
-        let mut out = DevTensor::zeros(&[TOKENS as i64, hidden as i64], dev);
+        let mut out = gate(
+            "output buffer",
+            rt.zeros(&[TOKENS, hidden], TensorDType::F32),
+        );
         gate(
             "execute_device (whole-layer overlap)",
             exec.execute_device(
@@ -706,7 +743,7 @@ fn a_whole_layer_prefill_overlap_matches_the_host_plan() {
                 &mut out,
             ),
         );
-        let got = to_f32_vec(&out.0);
+        let got = out.to_host_f32().unwrap();
         let want = &host_out[layer * TOKENS * hidden..(layer + 1) * TOKENS * hidden];
         // The GEMV prefill (FERRUM_PF_GEMV=1) is the exact f32 reduction the
         // host plan is, so it matches bit for bit. The grouped GEMM is the
@@ -752,11 +789,23 @@ fn a_whole_layer_prefill_overlap_matches_the_host_plan() {
         "run_experts (decode host plan)",
         run_experts(&mut host_cache, &*moe, &*moe, 0, &d_step, &mut d_host),
     );
-    let d_ids: Vec<f32> = d_routed.iter().map(|&e| e as f32).collect();
-    let dxd = DevTensor::from_f32(&d_x, &[1, hidden as i64], dev);
-    let ded = DevTensor::from_f32(&d_ids, &[1, TOP_K as i64], dev);
-    let dwd = DevTensor::from_f32(&d_weights, &[1, TOP_K as i64], dev);
-    let mut d_out = DevTensor::zeros(&[1, hidden as i64], dev);
+    let d_ids: Vec<i32> = d_routed.iter().map(|&e| e as i32).collect();
+    let dxd = gate(
+        "decode activations on device",
+        rt.from_slice_f32(&d_x, &[1, hidden]),
+    );
+    let ded = gate(
+        "decode expert ids on device",
+        rt.from_slice_i32(&d_ids, &[1, TOP_K]),
+    );
+    let dwd = gate(
+        "decode weights on device",
+        rt.from_slice_f32(&d_weights, &[1, TOP_K]),
+    );
+    let mut d_out = gate(
+        "decode output buffer",
+        rt.zeros(&[1, hidden], TensorDType::F32),
+    );
     gate(
         "execute_device (decode after prefill)",
         exec.execute_device(
@@ -773,7 +822,7 @@ fn a_whole_layer_prefill_overlap_matches_the_host_plan() {
         ),
     );
     assert_eq!(
-        to_f32_vec(&d_out.0),
+        d_out.to_host_f32().unwrap(),
         d_host,
         "a decode step after a prefill must match the host plan"
     );
@@ -807,6 +856,7 @@ fn a_prefill_retains_the_decode_expert_cache() {
         "driver API + committed cubins",
         CudaMoE::new_with_stream(Device::Cuda(0), source, shapes, SLOTS, std::ptr::null_mut()),
     );
+    let rt = adapter.runtime().clone();
     let driver = adapter.driver();
     let pinned = gate(
         "pinned expert banks",
@@ -819,7 +869,6 @@ fn a_prefill_retains_the_decode_expert_cache() {
     gate("enable prefill overlap", adapter.enable_prefill_overlap());
     let moe = Arc::new(Mutex::new(adapter));
     let exec = CachedExperts::with_device_staging(moe.clone(), moe.clone(), LAYERS, EXPERTS, SLOTS);
-    let dev = Device::Cuda(0);
 
     let run = |exec: &CachedExperts, layer: usize, tokens: usize, expert: usize| {
         let x: Vec<f32> = (0..tokens * hidden)
@@ -829,11 +878,19 @@ fn a_prefill_retains_the_decode_expert_cache() {
             .map(|i| ((i * 7 + expert) % EXPERTS) as u32)
             .collect();
         let weights: Vec<f32> = vec![1.0 / TOP_K as f32; tokens * TOP_K];
-        let ids: Vec<f32> = routed.iter().map(|&e| e as f32).collect();
-        let xd = DevTensor::from_f32(&x, &[tokens as i64, hidden as i64], dev);
-        let ed = DevTensor::from_f32(&ids, &[tokens as i64, TOP_K as i64], dev);
-        let wd = DevTensor::from_f32(&weights, &[tokens as i64, TOP_K as i64], dev);
-        let mut out = DevTensor::zeros(&[tokens as i64, hidden as i64], dev);
+        let ids: Vec<i32> = routed.iter().map(|&e| e as i32).collect();
+        let xd = rt
+            .from_slice_f32(&x, &[tokens, hidden])
+            .expect("activations on device");
+        let ed = rt
+            .from_slice_i32(&ids, &[tokens, TOP_K])
+            .expect("expert ids on device");
+        let wd = rt
+            .from_slice_f32(&weights, &[tokens, TOP_K])
+            .expect("weights on device");
+        let mut out = rt
+            .zeros(&[tokens, hidden], TensorDType::F32)
+            .expect("output buffer");
         gate(
             "execute_device",
             exec.execute_device(
@@ -945,14 +1002,20 @@ fn the_device_handoff_agrees_with_the_host_handoff() {
     }
 
     // The device hand-off: the same four buffers, wrapped instead of copied.
-    let dev = Device::Cuda(0);
-    let shape = [TOKENS as i64, hidden as i64];
-    let route_shape = [TOKENS as i64, TOP_K as i64];
-    let ids: Vec<f32> = case.routed.iter().map(|&e| e as f32).collect();
-    let x = DevTensor::from_f32(&case.x, &shape, dev);
-    let experts = DevTensor::from_f32(&ids, &route_shape, dev);
-    let weights = DevTensor::from_f32(&case.weights, &route_shape, dev);
-    let mut out = DevTensor::zeros(&shape, dev);
+    let rt = moe.lock().unwrap().runtime().clone();
+    let shape = [TOKENS, hidden];
+    let route_shape = [TOKENS, TOP_K];
+    let ids: Vec<i32> = case.routed.iter().map(|&e| e as i32).collect();
+    let x = gate("activations on device", rt.from_slice_f32(&case.x, &shape));
+    let experts = gate(
+        "expert ids on device",
+        rt.from_slice_i32(&ids, &route_shape),
+    );
+    let weights = gate(
+        "weights on device",
+        rt.from_slice_f32(&case.weights, &route_shape),
+    );
+    let mut out = gate("output buffer", rt.zeros(&shape, TensorDType::F32));
     let exec = CachedExperts::new(moe.clone(), moe, LAYER + 1, SLOTS, SLOTS);
     gate(
         "execute_device through the driver-API adapter",
@@ -969,7 +1032,7 @@ fn the_device_handoff_agrees_with_the_host_handoff() {
             &mut out,
         ),
     );
-    let device_out = to_f32_vec(&out.0);
+    let device_out = out.to_host_f32().unwrap();
     assert_eq!(
         device_out, host_out,
         "the device hand-off must be byte for byte the host one"
