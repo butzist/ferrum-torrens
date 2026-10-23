@@ -177,8 +177,10 @@ still the compacted nonempty-segment grid (proposal in `OPTIMIZATION.md`
 R10.8).
 M7.1 landed the torch-less `cudarc` tensor adapter behind the non-default
 `cudarc` feature (decision 126): GEMM/rms_norm/gather/elementwise parity and
-capture replay are gated, and the devshell links CUDA 13.4 cuBLAS. It is not on
-the serving path; M7.2/M7.3 (load and forward) are next.
+capture replay are gated, and the devshell links CUDA 13.4 cuBLAS. M7.2 now
+loads the dense tower through cudarc with the serving storage policy and no
+libtorch in the process (decision 129). Neither is on the serving path; M7.3
+(the forward port) is next.
 
 Progress history and the full decision log (numbers 1..126) live in `DONE.md`;
 read that for the "why" behind any decision number referenced in code or tests.
@@ -479,8 +481,15 @@ any port.
   `CUDARC_CUDA_VERSION=13040`; Triton keeps its 12.9 ptxas. Remaining for M7.3:
   the non-dense tch surface (exp/log/reductions/topk/softmax, f32 matmul/bmm,
   prefill conv1d, plain causal SDPA, cat/stack/expand/select and friends).
-- [ ] **M7.2 weights/load.** FTW dense widening and upload through candle;
-  `domain::dequant` stays the host transform.
+- [x] **M7.2 weights/load -- landed (2026-10-23, decision 129).**
+  `models/qwen3_6/load_cudarc.rs` builds the typed text tower through cudarc with
+  the same storage policy as the serving `tch` loader: bf16 widened, FP8 kept
+  packed with its f32 row scale, the NVFP4 shared expert keeps its K-major banks
+  plus the bf16 prefill weight, and the NVFP4 lm_head stays packed. The gated
+  real-checkpoint load (`tests/cudarc_load.rs`) checks the three policies against
+  the FTW bytes, reports 2.80 GiB logical / 3059 MiB VRAM, and asserts a
+  cudarc-only process maps no libtorch. `domain::dequant` stays the host
+  transform.
 - [ ] **M7.3 forward.** Port `forward_torch.rs` off `tch::Tensor`; the scalar
   oracle stays the gate.
 - [ ] **M7.4 kernels/capture.** Launchers take the candle stream and raw storage;

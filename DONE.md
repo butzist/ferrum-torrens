@@ -4028,3 +4028,38 @@ subsection names are kept verbatim.
        (the full verify line), `a_whole_layer_prefill_overlap_matches_the_host_plan`
        in both the grouped and `FERRUM_PF_GEMV=1` arms, the batching gate, and
        the 342/455 CPU and CUDA unit suites. Logs `/tmp/opencode/r10_10/`.
+
+129. **M7.2 loads the dense text tower through cudarc** (2026-10-23). New
+     module `models/qwen3_6/load_cudarc.rs` behind the non-default `cudarc`
+     feature; no serving path changed.
+     - **Storage policy matches the tch loader**, because M7.3/M7.4 consume the
+       same tensors: bf16 weights stay bf16, FP8 projections keep the
+       checkpoint's e4m3 bytes plus the f32 `[rows]` scale (W8A16), the NVFP4
+       shared expert keeps its K-major banks and also gets the widened bf16
+       weight plus the f16 row global (prefill), and the NVFP4 lm_head stays
+       packed K-major. `domain::dequant` is still the only host widening path;
+       the FTW reader and every kernel ABI are unchanged.
+     - **Adapter additions.** `TensorDType::U8` / `Buffer::U8` carry the packed
+       e4m3, NVFP4 scale and f16-global banks exactly, plus `to_host_u8` and
+       `to_host_i32` for the gates. `Tensor::nbytes` was added for the budget
+       report. Nothing else about the M7.1 surface moved.
+     - **Gated real-checkpoint load** (`tests/cudarc_load.rs`, `--ignored`,
+       `--features cudarc`, one process): 40 layers load; embedding row 0, the
+       final norm, the router f32 tensor, layer 0's FP8 qkvz bytes and scale,
+       the shared expert's K-major packed/scale words and widened row, and the
+       lm_head K-major word all match the FTW bytes (or `domain::dequant` for
+       the widened row within 1e-3). Reported footprint **2.80 GiB logical /
+       3059 MiB VRAM** (free 7528 -> 4648 MiB), under the 6 GiB gate, and the
+       process maps **no libtorch, libc10 or libpython**. The example
+       `m7_2_load_cudarc` prints the same report.
+     - **Remaining for M7.3** is unchanged: the forward still talks to `tch`
+       and needs the rest of the tensor surface (exp/log/softmax/topk/
+       reductions, f32 matmul/bmm, prefill conv1d, plain causal SDPA,
+       cat/stack/expand/select/split, comparisons/masked_fill,
+       zeros_like/empty). M7.4 then points the kernel launchers at cudarc
+       storage and the engine stream.
+     - Gates: `cargo fmt --check`, clippy default and `--features cudarc`,
+       `cargo test` (342), `cargo test --features cudarc --lib` (359),
+       `cargo test --features cuda --lib` (455), the cudarc capture-replay and
+       tch-matmul adapter gates, and the new real-checkpoint load gate. Logs
+       `/tmp/opencode/m7_2_test.log`.

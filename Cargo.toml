@@ -28,6 +28,11 @@ name = "m7_1a_gemm"
 path = "examples/m7_1a_gemm.rs"
 required-features = ["cuda", "cudarc"]
 
+[[example]]
+name = "m7_2_load_cudarc"
+path = "examples/m7_2_load_cudarc.rs"
+required-features = ["cudarc"]
+
 [features]
 default = []
 # GPU compute backend. Off by default because tch's build script needs

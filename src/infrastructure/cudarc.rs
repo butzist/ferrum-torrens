@@ -70,6 +70,7 @@ pub enum TensorDType {
     F32,
     I32,
     I64,
+    U8,
 }
 
 impl TensorDType {
@@ -78,6 +79,7 @@ impl TensorDType {
             Self::Bf16 => 2,
             Self::F32 | Self::I32 => 4,
             Self::I64 => 8,
+            Self::U8 => 1,
         }
     }
 
@@ -87,6 +89,7 @@ impl TensorDType {
             Self::F32 => "f32",
             Self::I32 => "i32",
             Self::I64 => "i64",
+            Self::U8 => "u8",
         }
     }
 }
@@ -338,6 +341,9 @@ impl Runtime {
             TensorDType::I64 => Buffer::I64(Arc::new(
                 self.inner.stream.alloc_zeros::<i64>(numel).map_err(bad)?,
             )),
+            TensorDType::U8 => Buffer::U8(Arc::new(
+                self.inner.stream.alloc_zeros::<u8>(numel).map_err(bad)?,
+            )),
         };
         Ok(Tensor::new(self.clone(), buf, shape.to_vec()))
     }
@@ -365,6 +371,12 @@ impl Runtime {
         let buf = Buffer::I64(Arc::new(self.inner.stream.clone_htod(values).map_err(bad)?));
         Ok(Tensor::new(self.clone(), buf, shape.to_vec()))
     }
+
+    pub fn from_slice_u8(&self, values: &[u8], shape: &[usize]) -> Result<Tensor, MoEError> {
+        check_len(values.len(), shape)?;
+        let buf = Buffer::U8(Arc::new(self.upload_u8(values)?));
+        Ok(Tensor::new(self.clone(), buf, shape.to_vec()))
+    }
 }
 
 #[derive(Clone)]
@@ -373,6 +385,7 @@ enum Buffer {
     F32(Arc<CudaSlice<f32>>),
     I32(Arc<CudaSlice<i32>>),
     I64(Arc<CudaSlice<i64>>),
+    U8(Arc<CudaSlice<u8>>),
 }
 
 impl Buffer {
@@ -382,6 +395,7 @@ impl Buffer {
             Self::F32(_) => TensorDType::F32,
             Self::I32(_) => TensorDType::I32,
             Self::I64(_) => TensorDType::I64,
+            Self::U8(_) => TensorDType::U8,
         }
     }
 
@@ -391,6 +405,7 @@ impl Buffer {
             Self::F32(s) => s.device_ptr(stream).0,
             Self::I32(s) => s.device_ptr(stream).0,
             Self::I64(s) => s.device_ptr(stream).0,
+            Self::U8(s) => s.device_ptr(stream).0,
         }
     }
 
@@ -398,6 +413,20 @@ impl Buffer {
         match self {
             Self::Bf16(s) => Ok(s),
             other => Err(bad(format!("want bf16, got {}", other.dtype().name()))),
+        }
+    }
+
+    fn u8(&self) -> Result<&Arc<CudaSlice<u8>>, MoEError> {
+        match self {
+            Self::U8(s) => Ok(s),
+            other => Err(bad(format!("want u8, got {}", other.dtype().name()))),
+        }
+    }
+
+    fn i32(&self) -> Result<&Arc<CudaSlice<i32>>, MoEError> {
+        match self {
+            Self::I32(s) => Ok(s),
+            other => Err(bad(format!("want i32, got {}", other.dtype().name()))),
         }
     }
 }
@@ -450,6 +479,10 @@ impl Tensor {
         self.shape.iter().product()
     }
 
+    pub fn nbytes(&self) -> usize {
+        self.numel() * self.dtype().element_size()
+    }
+
     pub fn is_contiguous(&self) -> bool {
         self.strides == contiguous_strides(&self.shape)
     }
@@ -483,7 +516,27 @@ impl Tensor {
                 let values: Vec<i64> = self.rt.inner.stream.clone_dtoh(&view).map_err(bad)?;
                 Ok(values.into_iter().map(|v| v as f32).collect())
             }
+            Buffer::U8(_) => Err(bad("no f32 view of a u8 tensor")),
         }
+    }
+
+    /// The packed checkpoint bytes (FP8, NVFP4, f16 globals), exactly as read.
+    pub fn to_host_u8(&self) -> Result<Vec<u8>, MoEError> {
+        let src = self.contiguous()?;
+        self.rt.synchronize()?;
+        let b = src.buf.u8()?;
+        let view = b.slice(src.offset..src.offset + src.numel());
+        self.rt.inner.stream.clone_dtoh(&view).map_err(bad)
+    }
+
+    /// `i32` words, for the K-major NVFP4 bank whose words are bit patterns and
+    /// must not round-trip through f32.
+    pub fn to_host_i32(&self) -> Result<Vec<i32>, MoEError> {
+        let src = self.contiguous()?;
+        self.rt.synchronize()?;
+        let b = src.buf.i32()?;
+        let view = b.slice(src.offset..src.offset + src.numel());
+        self.rt.inner.stream.clone_dtoh(&view).map_err(bad)
     }
 
     /// The bf16 storage, for the low-level launchers that still take a
@@ -491,6 +544,10 @@ impl Tensor {
     /// passing a raw address.
     pub fn as_bf16_slice(&self) -> Result<&CudaSlice<bf16>, MoEError> {
         Ok(self.buf.bf16()?.as_ref())
+    }
+
+    pub fn as_u8_slice(&self) -> Result<&CudaSlice<u8>, MoEError> {
+        Ok(self.buf.u8()?.as_ref())
     }
 
     pub fn to_host_bf16_bits(&self) -> Result<Vec<u16>, MoEError> {

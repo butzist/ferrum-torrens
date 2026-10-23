@@ -175,3 +175,12 @@ M7.3 still needs the rest of the `tch` surface: exp/log/softmax/topk/reductions,
 f32 matmul and `bmm`, prefill `conv1d`, the plain causal SDPA path,
 cat/stack/expand/repeat/select/split, comparisons/masked_fill, and the
 `zeros_like`/`empty` constructors. The adapter is not on the serving path.
+
+## M7.2 result (2026-10-23): the dense tower loads through cudarc
+
+See `DONE.md` 129. `models/qwen3_6/load_cudarc.rs` builds the typed tower with
+the serving storage policy (bf16 widened, FP8 packed, NVFP4 K-major, the shared
+expert's bf16 prefill weight plus banks) over a cudarc `Tensor` surface that now
+also carries u8. The gated real-checkpoint load (`tests/cudarc_load.rs`) matches
+the FTW bytes for every storage kind, reports 2.80 GiB logical / 3059 MiB VRAM,
+and runs in a process that maps no libtorch. M7.3 is the remaining forward port.

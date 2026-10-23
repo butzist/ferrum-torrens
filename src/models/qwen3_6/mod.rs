@@ -6,6 +6,8 @@ pub mod config;
 pub mod forward;
 #[cfg(feature = "cuda")]
 pub mod forward_torch;
+#[cfg(feature = "cudarc")]
+pub mod load_cudarc;
 pub mod weights;
 
 use crate::domain::kvcache::CachedModel;
