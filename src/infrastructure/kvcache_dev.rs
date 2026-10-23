@@ -565,6 +565,13 @@ impl DeviceCache {
         &self.slabs.state
     }
 
+    /// The runtime that owns the pool's stream and buffers. A model reading or
+    /// writing these slabs has to run on the same stream or the two are
+    /// unordered.
+    pub fn runtime(&self) -> &Runtime {
+        &self._rt
+    }
+
     /// Bytes the whole cache holds, for the config's memory arithmetic.
     pub fn bytes(&self) -> usize {
         self.slabs.mha.bytes() + self.slabs.state.bytes()

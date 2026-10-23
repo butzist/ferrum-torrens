@@ -6,7 +6,7 @@ use crate::domain::decode::CapturedDecode;
 use crate::domain::kvcache::CachedModel;
 use crate::domain::model::Model;
 use crate::domain::weights::WeightsReader;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "cudarc"))]
 use crate::domain::{expert_kernel::MoEExecutor, model::ModelParams};
 use crate::infrastructure::ftw::FtwIndex;
 use crate::infrastructure::torch::Device;
@@ -55,7 +55,10 @@ pub fn arch_of(config_json: &Value) -> Result<&str, RegistryError> {
 /// `config` supplies the `[kernel]` and `[moe]` sections, so the tower can be
 /// handed the engine's MoE port when the kernel is on; with it off the tower
 /// keeps widening routed experts on the host itself.
-#[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
+#[cfg_attr(
+    not(any(feature = "cuda", feature = "cudarc")),
+    allow(unused_variables)
+)]
 pub fn build(
     config_json: &Value,
     index: Arc<FtwIndex>,
@@ -68,7 +71,58 @@ pub fn build(
             let tc = config_json
                 .get("text_config")
                 .ok_or(RegistryError::NoArch)?;
-            #[cfg(feature = "cuda")]
+            #[cfg(feature = "cudarc")]
+            {
+                // The torchless runtime has no CPU compute path in the serving
+                // composition root, but the scalar reference still answers on a
+                // CPU-only host, so `auto` keeps working there.
+                let Device::Cuda(_) = device else {
+                    return scalar_built(tc, index, reader, config);
+                };
+                // The torchless path widens and uploads every weight itself, so
+                // it takes the parsed params plus the reader rather than the
+                // scalar path's pre-loaded dense store.
+                let params = crate::models::qwen3_6::config::parse_text_config(tc)
+                    .map_err(|e| RegistryError::Build(e.to_string()))?;
+                if config.model.cuda_graph {
+                    eprintln!(
+                        "warning: cuda_graph is unavailable on the torchless runtime; decode stays eager"
+                    );
+                }
+                // The pool owns the runtime this whole path runs on: the model,
+                // the dense launchers and the MoE adapter all launch on its
+                // stream, so a step's writes and its next reads stay ordered.
+                let cache = Arc::new(kv_cache(config, &params, device, false));
+                let rt = cache.runtime().clone();
+                let stream = rt.raw_stream();
+                let driver = rt.driver().clone();
+                let head_gemv = head_port(device, stream)?;
+                let fp8_linear = fp8_port(device, stream)?;
+                // Load the tower with the MoE port detached: the auto cache
+                // budget (item 12) reads the free VRAM after the tower, the KV
+                // pool and the ports are all resident, then sizes the expert
+                // cache and attaches it.
+                let mut model = crate::models::qwen3_6::forward_cudarc::CudarcQwen3_6::load(
+                    params.clone(),
+                    rt,
+                    index.clone(),
+                    reader.clone(),
+                    None,
+                    head_gemv,
+                    fp8_linear,
+                    cache,
+                )
+                .map_err(|e| RegistryError::Build(e.to_string()))?;
+                let slots = resolve_cache_slots(config, &params, device, Some(driver.as_ref()))?;
+                let moe = moe_port(config, &params, index, reader, device, stream, slots)?;
+                model.attach_moe(moe);
+                Ok(BuiltModel {
+                    model: Box::new(model),
+                    captured: None,
+                    cache_size_slots: slots,
+                })
+            }
+            #[cfg(all(feature = "cuda", not(feature = "cudarc")))]
             {
                 // The libtorch path widens and uploads every weight itself, so
                 // it takes the parsed params plus the reader rather than the
@@ -122,28 +176,40 @@ pub fn build(
                     cache_size_slots: slots,
                 })
             }
-            #[cfg(not(feature = "cuda"))]
-            Ok(BuiltModel {
-                model: Box::new(
-                    Qwen3_6::from_text_config(tc, index, reader)
-                        .map_err(|e| RegistryError::Build(e.to_string()))?,
-                ),
-                captured: None,
-                cache_size_slots: config
-                    .moe
-                    .cache_size_slots
-                    .explicit()
-                    .unwrap_or(crate::config::DEFAULT_CACHE_SIZE_SLOTS),
-            })
+            #[cfg(all(not(feature = "cuda"), not(feature = "cudarc")))]
+            scalar_built(tc, index, reader, config)
         }
         other => Err(RegistryError::Unsupported(other.to_string())),
     }
 }
 
+/// The scalar reference model, the answer on a host with no CUDA device and on
+/// a build with no compute backend at all.
+#[cfg(any(feature = "cudarc", not(feature = "cuda")))]
+fn scalar_built(
+    tc: &Value,
+    index: Arc<FtwIndex>,
+    reader: Arc<dyn WeightsReader>,
+    config: &crate::config::Config,
+) -> Result<BuiltModel, RegistryError> {
+    Ok(BuiltModel {
+        model: Box::new(
+            Qwen3_6::from_text_config(tc, index, reader)
+                .map_err(|e| RegistryError::Build(e.to_string()))?,
+        ),
+        captured: None,
+        cache_size_slots: config
+            .moe
+            .cache_size_slots
+            .explicit()
+            .unwrap_or(crate::config::DEFAULT_CACHE_SIZE_SLOTS),
+    })
+}
+
 /// The process-wide driver and the non-legacy side stream a capture records on,
 /// or `(None, null)` when capture is off. Creating the stream attaches the
 /// primary context of `device`, which the MoE adapter then reuses.
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cudarc")))]
 fn capture_driver(
     device: Device,
 ) -> Result<
@@ -169,7 +235,7 @@ fn capture_driver(
 }
 
 /// The side stream a capture records on, or `(None, null)` when capture is off.
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cudarc")))]
 fn side_stream(
     capture: bool,
     device: Device,
@@ -191,7 +257,7 @@ fn side_stream(
 /// Record one decode graph per batch size and wrap them in the engine's service.
 /// The padding row claims a reserved state slot and pool location, and the
 /// reservation itself is moved into the service so nothing else can take them.
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cudarc")))]
 fn capture_decode(
     config: &crate::config::Config,
     model: &crate::models::qwen3_6::forward_torch::TorchQwen3_6,
@@ -247,7 +313,7 @@ fn capture_decode(
 /// The batch sizes to capture: `1`, `2`, `4` and `max_running`, deduplicated and
 /// capped at `max_running`. A step of `n` rows replays on the smallest captured
 /// size at or above `n`.
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cudarc")))]
 fn graph_batch_sizes(max_running: usize) -> Vec<usize> {
     let mut sizes = vec![1usize];
     for s in [2usize, 4, max_running] {
@@ -265,7 +331,7 @@ fn graph_batch_sizes(max_running: usize) -> Vec<usize> {
 /// the 4.51 GiB resident tower and the pool coexist on the 8 GB device; `f32`
 /// stays available because the cached forward's contract is to reproduce a
 /// re-fed forward and that is the lossless option (DONE.md decision 33).
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "cudarc"))]
 fn kv_cache(
     config: &crate::config::Config,
     params: &ModelParams,
@@ -297,7 +363,7 @@ fn kv_cache(
 /// Composition root work on purpose: this is the one place that knows both the
 /// config and the adapter, and it is arch-agnostic -- a new MoE arch with the
 /// same bank layout gets the same executor.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "cudarc"))]
 fn moe_port(
     config: &crate::config::Config,
     params: &ModelParams,
@@ -370,7 +436,7 @@ fn moe_port(
 /// a reserve for the captured decode graphs and transient activations. The
 /// result is clamped to `[MIN_CACHE_SIZE_SLOTS, the cubin's BLOCK_C ceiling]` and
 /// rounded down to a multiple of 128.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "cudarc"))]
 fn resolve_cache_slots(
     config: &crate::config::Config,
     params: &ModelParams,
@@ -429,7 +495,7 @@ fn resolve_cache_slots(
 
 /// Slot count from the free VRAM after the tower and KV pool are resident,
 /// rounded down to the 128-slot LRU block. `free` and `slot_bytes` are bytes.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "cudarc"))]
 fn auto_cache_slots(free: usize, slot_bytes: usize, ceiling: usize) -> usize {
     let budget = free.saturating_sub(AUTO_CACHE_RESERVE_BYTES);
     let slots = (budget / slot_bytes.max(1)).clamp(crate::config::MIN_CACHE_SIZE_SLOTS, ceiling);
@@ -442,7 +508,7 @@ fn auto_cache_slots(free: usize, slot_bytes: usize, ceiling: usize) -> usize {
 /// a 2057-token prefill runs out during the silu/cat scratch, while 1920
 /// (529 MiB free after load) fits. Keeping 512 MiB resolves 1920 here; the
 /// larger caches this buys cut the decode miss rate (+8% tg at 1920 vs 1664).
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "cudarc"))]
 const AUTO_CACHE_RESERVE_BYTES: usize = 512 * 1024 * 1024;
 
 /// The paged attention launcher, when the engine runs on a CUDA device. The
@@ -451,7 +517,7 @@ const AUTO_CACHE_RESERVE_BYTES: usize = 512 * 1024 * 1024;
 /// what keeps `cargo test --features cuda` meaningful without a device
 /// (decision 21). `stream` is the capture side stream when the engine captures,
 /// otherwise stream 0 (the legacy default stream).
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cudarc")))]
 fn attention_port(
     params: &ModelParams,
     device: Device,
@@ -471,7 +537,7 @@ fn attention_port(
 /// device decode path folds the linear-attention mixer into one kernel per layer
 /// through it; a CPU device gets `None` and keeps the op-by-op libtorch path
 /// (decision 21), the same shape as `attention_port`.
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cudarc")))]
 fn gdn_port(
     params: &ModelParams,
     device: Device,
@@ -491,7 +557,7 @@ fn gdn_port(
 /// CUDA device. It keeps the checkpoint's packed lm_head and streams it once per
 /// token instead of widening it to bf16 (TODO.md item 18); a CPU device gets
 /// `None` and keeps the widened-bf16 head, the same shape as `gdn_port`.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "cudarc"))]
 fn head_port(
     device: Device,
     stream: crate::infrastructure::cuda_driver::CUstream,
@@ -508,7 +574,7 @@ fn head_port(
 /// The vendored W8A16 FP8 projection launcher (decision 82 slice 2), when the
 /// engine runs on a CUDA device. With it an FP8 weight stays packed and the
 /// kernel reads it; a CPU device gets `None` and widens every projection to bf16.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "cudarc"))]
 fn fp8_port(
     device: Device,
     stream: crate::infrastructure::cuda_driver::CUstream,

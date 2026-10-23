@@ -66,6 +66,8 @@ impl GdnDecode {
     /// Open the driver, load the committed GDN cubin, and check that it was built
     /// for `params`' GDN geometry. `stream` is the stream every launch lands on;
     /// pass the capture side stream when a graph is recorded.
+    // The stream is an opaque driver handle, not a pointer this code derefs.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn new(device: Device, params: &ModelParams, stream: CUstream) -> Result<Self, MoEError> {
         let Device::Cuda(ordinal) = device else {
             return Err(MoEError::Bad(
@@ -74,13 +76,18 @@ impl GdnDecode {
         };
         // The launcher owns a cudarc runtime so its tensors and cubin launches
         // share one primary context and stream; no libtorch backend is needed.
-        let rt = Runtime::open(ordinal)?;
-        let lib = Driver::open().map_err(driver)?;
-        lib.init().map_err(driver)?;
-        lib.attach_primary_context(ordinal as i32).map_err(driver)?;
+        // A caller-provided stream is the model's, and the launcher's own ops
+        // must land there too or a launch can read a tensor mid-write.
+        let lib = Arc::new(Driver::open().map_err(driver)?);
+        let rt = if stream.is_null() {
+            Runtime::open_with(Arc::clone(&lib), ordinal)?
+        } else {
+            // SAFETY: the caller owns `stream` for the launcher's lifetime.
+            unsafe { Runtime::open_with_stream(Arc::clone(&lib), ordinal, stream)? }
+        };
         let abi = LinearAbi::committed().map_err(bad_abi)?;
         check_geometry(params, &abi)?;
-        let kernels = GdnKernels::load(Arc::new(lib), abi.clone()).map_err(driver)?;
+        let kernels = GdnKernels::load(lib, abi.clone()).map_err(driver)?;
         let (k_heads, v_heads) = (params.linear_num_key_heads, params.linear_num_value_heads);
         let (kd, vdim) = (params.linear_key_head_dim, params.linear_value_head_dim);
         Ok(Self {

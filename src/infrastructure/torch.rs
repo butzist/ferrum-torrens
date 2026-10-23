@@ -152,7 +152,7 @@ pub fn load_cuda_backend() -> Result<(), String> {
 /// Inspect the host. Returns `available = false` with a zero count rather than
 /// erroring when libtorch was built with CUDA but no device is visible, so a
 /// CPU-only run needs no config change.
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(feature = "cudarc")))]
 pub fn probe_cuda() -> CudaProbe {
     // The probe is the first thing in the process to ask libtorch about CUDA, so
     // it is where the backend gets loaded. A failure means no CUDA kernels are
@@ -165,9 +165,35 @@ pub fn probe_cuda() -> CudaProbe {
     }
 }
 
+/// Inspect the host through the CUDA driver, with no libtorch in the process.
+/// `init` is what distinguishes "no driver" from "driver but no visible device",
+/// and the count is only meaningful once it succeeds.
+#[cfg(feature = "cudarc")]
+pub fn probe_cuda() -> CudaProbe {
+    use crate::infrastructure::cuda_driver::Driver;
+
+    let Ok(lib) = Driver::open() else {
+        return CudaProbe::default();
+    };
+    if lib.init().is_err() {
+        return CudaProbe::default();
+    }
+    let count = lib.device_count().unwrap_or(0).max(0) as usize;
+    if count == 0 {
+        return CudaProbe::default();
+    }
+    if lib.attach_primary_context(0).is_err() {
+        return CudaProbe::default();
+    }
+    CudaProbe {
+        available: count > 0,
+        device_count: count,
+    }
+}
+
 /// The device a test or a load should use: whatever `Auto` resolves to on this
 /// host. Device-agnostic so one test body runs in the sandbox and in a devshell.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "cudarc"))]
 pub fn auto_device() -> Device {
     resolve_device(DeviceRequest::Auto, 0, probe_cuda()).expect("auto never fails")
 }
@@ -393,6 +419,18 @@ mod tests {
         let c = a.matmul(&b);
         assert_eq!(c.size(), vec![2, 4]);
         assert!(c.sum(tch::Kind::Double).double_value(&[]) == 24.0);
+    }
+
+    #[cfg(feature = "cudarc")]
+    #[test]
+    fn the_cudarc_probe_is_self_consistent() {
+        let probe = probe_cuda();
+        assert_eq!(probe.available, probe.device_count > 0);
+        for request in [DeviceRequest::Auto, DeviceRequest::Cpu, DeviceRequest::Cuda] {
+            for gpu in [0, 1] {
+                let _ = resolve_device(request, gpu, probe);
+            }
+        }
     }
 
     #[cfg(feature = "cuda")]

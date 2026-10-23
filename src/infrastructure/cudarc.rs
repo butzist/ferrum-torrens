@@ -170,6 +170,42 @@ impl Runtime {
         })
     }
 
+    /// Open a runtime whose tensor ops and launches run on `stream`, which the
+    /// caller owns. The driver-API launchers use this so their own staging and
+    /// their kernel launches stay ordered with the model that hands them
+    /// tensors: a second stream would let the launch read a buffer the model
+    /// has not finished writing.
+    ///
+    /// # Safety
+    /// `stream` must be a live non-blocking stream in `ordinal`'s primary
+    /// context and must outlive the returned runtime.
+    pub unsafe fn open_with_stream(
+        lib: Arc<Driver>,
+        ordinal: usize,
+        stream: CUstream,
+    ) -> Result<Self, MoEError> {
+        lib.init().map_err(driver)?;
+        lib.attach_primary_context(ordinal as i32).map_err(driver)?;
+        let ctx = CudaContext::new(ordinal).map_err(bad)?;
+        // SAFETY: this adapter owns all stream ordering for its buffers, so
+        // cudarc does not need its per-tensor events.
+        unsafe { ctx.disable_event_tracking() };
+        // SAFETY: the caller guarantees a live stream in this context that
+        // outlives the borrowed wrapper.
+        let stream = unsafe { ctx.wrap_borrowed_stream(stream.cast()) };
+        let blas = CudaBlas::new(stream.clone()).map_err(bad)?;
+        let kernels = LinearKernels::load(Arc::clone(&lib))?;
+        Ok(Self {
+            inner: Arc::new(RuntimeInner {
+                driver: lib,
+                ctx,
+                stream,
+                blas,
+                kernels,
+            }),
+        })
+    }
+
     pub fn driver(&self) -> &Arc<Driver> {
         &self.inner.driver
     }

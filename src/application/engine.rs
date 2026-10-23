@@ -186,8 +186,8 @@ pub fn resolve_compute_device_with(
     )?)
 }
 
-/// Resolve against the real host. A build without the `cuda` feature has no
-/// libtorch at all, so the only device it can serve is the CPU: `auto` and
+/// Resolve against the real host. A build without a compute backend has no
+/// CUDA runtime at all, so the only device it can serve is the CPU: `auto` and
 /// `cpu` both land there (a default config must start in every build), while an
 /// explicit `cuda` is an error rather than a silent CPU run the operator did not
 /// ask for.
@@ -195,9 +195,9 @@ pub fn resolve_compute_device(config: &crate::config::Config) -> Result<Device, 
     if matches!(config.model.device, crate::config::ComputeDevice::Cpu) {
         return Ok(Device::Cpu);
     }
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "cudarc"))]
     let probe = crate::infrastructure::torch::probe_cuda();
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(all(not(feature = "cuda"), not(feature = "cudarc")))]
     let probe = match config.model.device {
         crate::config::ComputeDevice::Cuda => {
             return Err(LoadError::Device(
@@ -1187,13 +1187,13 @@ mod tests {
         ));
     }
 
-    /// Without the `cuda` feature there is no libtorch, so the only device such
-    /// a build can serve is the CPU. A default config still has to start, but an
-    /// explicit `cuda` must fail rather than quietly run somewhere the operator
-    /// did not choose.
+    /// Without a compute backend there is no CUDA runtime, so the only device
+    /// such a build can serve is the CPU. A default config still has to start,
+    /// but an explicit `cuda` must fail rather than quietly run somewhere the
+    /// operator did not choose.
     #[test]
-    #[cfg(not(feature = "cuda"))]
-    fn without_the_cuda_feature_only_cpu_is_loadable() {
+    #[cfg(all(not(feature = "cuda"), not(feature = "cudarc")))]
+    fn without_a_compute_backend_only_cpu_is_loadable() {
         for d in ["auto", "cpu"] {
             assert_eq!(
                 resolve_compute_device(&device_config(d, 0)).unwrap(),

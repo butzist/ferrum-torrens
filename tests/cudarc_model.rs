@@ -14,7 +14,6 @@ use ferrum_torrens::domain::kvcache::CachedModel;
 use ferrum_torrens::domain::model::{ForwardInput, Model};
 use ferrum_torrens::domain::weights::WeightsReader;
 use ferrum_torrens::infrastructure::cuda_linear::{DenseGemv, Fp8Linear};
-use ferrum_torrens::infrastructure::cudarc::Runtime;
 use ferrum_torrens::infrastructure::ftw::{FtwIndex, FtwReader};
 use ferrum_torrens::infrastructure::kvcache_dev::{DeviceCache, KvDType};
 use ferrum_torrens::infrastructure::torch::Device;
@@ -59,11 +58,13 @@ fn the_cudarc_forward_matches_the_scalar_oracle() {
     let text_config = config_json.get("text_config").expect("text_config").clone();
     let params = config::parse_text_config(&text_config).expect("parse text_config");
 
-    let rt = Runtime::open(0).expect("open cudarc runtime");
     let device = Device::Cuda(0);
+    // The pool owns the stream: the cached forward and the launchers must run on
+    // it or a token's KV write can race the attention that reads it back.
+    let cache = Arc::new(DeviceCache::new(&params, 128, 1, KvDType::F32, device));
+    let rt = cache.runtime().clone();
     let head_gemv = Arc::new(DenseGemv::new(device, rt.raw_stream()).expect("dense gemv"));
     let fp8 = Arc::new(Fp8Linear::new(device, rt.raw_stream()).expect("fp8 linear"));
-    let cache = Arc::new(DeviceCache::new(&params, 128, 1, KvDType::F32, device));
 
     let start = Instant::now();
     let model = CudarcQwen3_6::load(

@@ -313,6 +313,8 @@ impl CudaMoE {
         Self::new_with_stream(device, source, shapes, slots, std::ptr::null_mut())
     }
 
+    // The stream is an opaque driver handle, not a pointer this code derefs.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn new_with_stream(
         device: Device,
         source: Arc<dyn ExpertSlabSource>,
@@ -337,7 +339,12 @@ impl CudaMoE {
         check_shapes(&shapes, &abi)?;
         let staging_abi = StagingAbi::committed().map_err(bad_abi)?;
         let lib = Arc::new(lib);
-        let rt = Runtime::open_with(Arc::clone(&lib), ordinal)?;
+        let rt = if stream.is_null() {
+            Runtime::open_with(Arc::clone(&lib), ordinal)?
+        } else {
+            // SAFETY: the caller owns `stream` for the adapter's lifetime.
+            unsafe { Runtime::open_with_stream(Arc::clone(&lib), ordinal, stream)? }
+        };
         let stream = if stream.is_null() {
             rt.raw_stream()
         } else {

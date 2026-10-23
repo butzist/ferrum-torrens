@@ -55,19 +55,24 @@ unsafe impl Sync for DenseGemv {}
 
 impl DenseGemv {
     /// Open the driver and load the committed dense-gemv cubin.
+    // The stream is an opaque driver handle, not a pointer this code derefs.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn new(device: Device, stream: CUstream) -> Result<Self, MoEError> {
         let Device::Cuda(ordinal) = device else {
             return Err(MoEError::Bad(
                 "the dense NVFP4 gemv launcher needs a CUDA device".into(),
             ));
         };
-        let rt = Runtime::open(ordinal)?;
-        let lib = Driver::open().map_err(driver)?;
-        lib.init().map_err(driver)?;
-        lib.attach_primary_context(ordinal as i32).map_err(driver)?;
+        let lib = Arc::new(Driver::open().map_err(driver)?);
+        let rt = if stream.is_null() {
+            Runtime::open_with(Arc::clone(&lib), ordinal)?
+        } else {
+            // SAFETY: the caller owns `stream` for the launcher's lifetime.
+            unsafe { Runtime::open_with_stream(Arc::clone(&lib), ordinal, stream)? }
+        };
         let abi = LinearAbi::committed().map_err(bad_abi)?;
         abi.kernel(NVFP4_DENSE_GEMV).map_err(bad_abi)?;
-        let kernels = GdnKernels::load(Arc::new(lib), abi.clone()).map_err(driver)?;
+        let kernels = GdnKernels::load(lib, abi.clone()).map_err(driver)?;
         Ok(Self {
             kernels,
             abi,
@@ -176,21 +181,26 @@ unsafe impl Send for Fp8Linear {}
 unsafe impl Sync for Fp8Linear {}
 
 impl Fp8Linear {
+    // The stream is an opaque driver handle, not a pointer this code derefs.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn new(device: Device, stream: CUstream) -> Result<Self, MoEError> {
         let Device::Cuda(ordinal) = device else {
             return Err(MoEError::Bad(
                 "the fp8 linear launcher needs a CUDA device".into(),
             ));
         };
-        let rt = Runtime::open(ordinal)?;
-        let lib = Driver::open().map_err(driver)?;
-        lib.init().map_err(driver)?;
-        lib.attach_primary_context(ordinal as i32).map_err(driver)?;
+        let lib = Arc::new(Driver::open().map_err(driver)?);
+        let rt = if stream.is_null() {
+            Runtime::open_with(Arc::clone(&lib), ordinal)?
+        } else {
+            // SAFETY: the caller owns `stream` for the launcher's lifetime.
+            unsafe { Runtime::open_with_stream(Arc::clone(&lib), ordinal, stream)? }
+        };
         let abi = LinearAbi::committed().map_err(bad_abi)?;
         for name in [FP8_GEMV, FP8_SPLITK_REDUCE, FP8_GEMM] {
             abi.kernel(name).map_err(bad_abi)?;
         }
-        let kernels = GdnKernels::load(Arc::new(lib), abi.clone()).map_err(driver)?;
+        let kernels = GdnKernels::load(lib, abi.clone()).map_err(driver)?;
         Ok(Self {
             kernels,
             abi,
