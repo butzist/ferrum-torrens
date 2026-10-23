@@ -372,3 +372,90 @@ def launch_repeat_heads(x: torch.Tensor, out: torch.Tensor, kb: int, rep: int) -
         x, out, kb, rep, dim,
         BLOCK=triton.next_power_of_2(dim), num_warps=4,
     )
+
+
+@triton.jit
+def _causal_sdpa_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    out_ptr,
+    q_offset,
+    q_t,
+    kv_t,
+    stride_qt,
+    stride_qh,
+    stride_kt,
+    stride_kh,
+    stride_vt,
+    stride_vh,
+    NUM_Q_HEADS: tl.constexpr,
+    NUM_KV_HEADS: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Causal GQA attention for one query row: `q` is `[q_t, q_heads, D]`,
+    `k`/`v` are `[kv_t, kv_heads, D]`, and query `i` may read keys up to
+    `q_offset + i`. Online softmax in f32, store in the activation dtype."""
+    i_t = tl.program_id(0)
+    i_h = tl.program_id(1)
+    i_kv = i_h // (NUM_Q_HEADS // NUM_KV_HEADS)
+    pos = q_offset + i_t
+    o_d = tl.arange(0, BLOCK_D)
+    mask_d = o_d < D
+    q = tl.load(
+        q_ptr + i_t * stride_qt + i_h * stride_qh + o_d, mask=mask_d, other=0.0
+    ).to(tl.float32)
+    scale = 1.0 / (D ** 0.5)
+
+    m = -float("inf")
+    l = 0.0
+    acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
+    for start in range(0, kv_t, BLOCK_N):
+        n = start + tl.arange(0, BLOCK_N)
+        mask_n = (n < kv_t) & (n <= pos)
+        k = tl.load(
+            k_ptr
+            + n[:, None] * stride_kt
+            + i_kv * stride_kh
+            + o_d[None, :],
+            mask=mask_n[:, None] & mask_d[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        s = tl.sum(q[None, :] * k, 1) * scale
+        s = tl.where(mask_n, s, -float("inf"))
+        m_new = tl.maximum(m, tl.max(s, 0))
+        p = tl.exp(s - m_new)
+        l = l * tl.exp(m - m_new) + tl.sum(p, 0)
+        v = tl.load(
+            v_ptr
+            + n[:, None] * stride_vt
+            + i_kv * stride_vh
+            + o_d[None, :],
+            mask=mask_n[:, None] & mask_d[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        acc = acc * tl.exp(m - m_new) + tl.sum(p[:, None] * v, 0)
+        m = m_new
+    out = acc / l
+    tl.store(out_ptr + i_t * (NUM_Q_HEADS * D) + i_h * D + o_d, out, mask=mask_d)
+
+
+def launch_causal_sdpa(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    q_offset: int,
+    q_heads: int,
+    kv_heads: int,
+    head_dim: int,
+) -> None:
+    q_t, kv_t = q.shape[0], k.shape[0]
+    _causal_sdpa_kernel[(q_t, q_heads)](
+        q, k, v, out, q_offset, q_t, kv_t,
+        q.stride(0), q.stride(1), k.stride(0), k.stride(1), v.stride(0), v.stride(1),
+        NUM_Q_HEADS=q_heads, NUM_KV_HEADS=kv_heads, D=head_dim,
+        BLOCK_N=64, BLOCK_D=triton.next_power_of_2(head_dim), num_warps=4,
+    )

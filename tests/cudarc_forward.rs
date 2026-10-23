@@ -5,7 +5,7 @@
 //!     -- --ignored --nocapture --test-threads=1
 #![cfg(all(feature = "cudarc", feature = "cuda"))]
 
-use ferrum_torrens::infrastructure::cudarc::{Runtime, TensorDType, Unary};
+use ferrum_torrens::infrastructure::cudarc::{Runtime, Tensor, TensorDType, Unary};
 use ferrum_torrens::infrastructure::torch::{
     Device, bf16_tensor, f32_tensor, load_cuda_backend, to_f32_vec,
 };
@@ -172,6 +172,47 @@ fn tch_rope(
     )
 }
 
+fn tch_causal_attention(
+    q: &tch::Tensor,
+    k: &tch::Tensor,
+    v: &tch::Tensor,
+    offset: usize,
+) -> tch::Tensor {
+    let (q, k, v) = (
+        q.to_kind(Kind::Float),
+        k.to_kind(Kind::Float),
+        v.to_kind(Kind::Float),
+    );
+    let (qt, qh, d) = (q.size()[0], q.size()[1], q.size()[2]);
+    let kt = k.size()[0];
+    let pos = tch::Tensor::arange_start(
+        offset as i64,
+        (offset + qt as usize) as i64,
+        (Kind::Int64, q.device()),
+    );
+    let keys = tch::Tensor::arange(kt as i64, (Kind::Int64, q.device()));
+    let allowed = keys.unsqueeze(0).le_tensor(&pos.unsqueeze(1));
+    let mask = allowed;
+    let rep = qh as i64 / k.size()[1];
+    let kt_heads = k
+        .transpose(0, 1)
+        .unsqueeze(1)
+        .expand([k.size()[1], rep, kt as i64, d as i64], false)
+        .reshape([qh as i64, kt as i64, d as i64]);
+    let vt_heads = v
+        .transpose(0, 1)
+        .unsqueeze(1)
+        .expand([k.size()[1], rep, kt as i64, d as i64], false)
+        .reshape([qh as i64, kt as i64, d as i64]);
+    let scores = q
+        .transpose(0, 1)
+        .matmul(&kt_heads.transpose(1, 2))
+        .g_div_scalar((d as f64).sqrt())
+        .masked_fill(&mask.logical_not(), f64::NEG_INFINITY)
+        .softmax(-1, Kind::Float);
+    scores.matmul(&vt_heads).transpose(0, 1)
+}
+
 #[test]
 #[ignore = "needs a CUDA device and libtorch"]
 fn rope_gdn_gate_and_gqa_match_tch() -> Res<()> {
@@ -263,5 +304,85 @@ fn rope_gdn_gate_and_gqa_match_tch() -> Res<()> {
         0.0,
         "gqa expand",
     );
+    Ok(())
+}
+
+#[test]
+#[ignore = "needs a CUDA device and libtorch"]
+fn sdpa_and_shape_ops_match_tch() -> Res<()> {
+    let rt = Runtime::open(0)?;
+    load_cuda_backend();
+    let dev = Device::Cuda(0);
+    let (qt, kt, qh, kvh, d) = (5usize, 7usize, 16usize, 2usize, 256usize);
+
+    let qh_host = values(qt * qh * d, 53, -1.0, 1.0);
+    let kh_host = values(kt * kvh * d, 59, -1.0, 1.0);
+    let vh_host = values(kt * kvh * d, 61, -1.0, 1.0);
+    let q_bits: Vec<bf16> = qh_host.iter().map(|v| bf16::from_f32(*v)).collect();
+    let k_bits: Vec<bf16> = kh_host.iter().map(|v| bf16::from_f32(*v)).collect();
+    let v_bits: Vec<bf16> = vh_host.iter().map(|v| bf16::from_f32(*v)).collect();
+    let q = rt.from_slice_bf16(&q_bits, &[qt, qh, d])?;
+    let k = rt.from_slice_bf16(&k_bits, &[kt, kvh, d])?;
+    let v = rt.from_slice_bf16(&v_bits, &[kt, kvh, d])?;
+    let tq = bf16_tensor(&qh_host, &[qt as i64, qh as i64, d as i64], dev);
+    let tk = bf16_tensor(&kh_host, &[kt as i64, kvh as i64, d as i64], dev);
+    let tv = bf16_tensor(&vh_host, &[kt as i64, kvh as i64, d as i64], dev);
+    let offset = 1usize;
+    let want = to_f32_vec(&tch_causal_attention(&tq, &tk, &tv, offset));
+    close(
+        &q.causal_sdpa(&k, &v, offset)?.to_host_f32()?,
+        &want,
+        2e-2,
+        "causal sdpa",
+    );
+
+    // cat/stack/select/permute/copy_to written through the views.
+    let a = rt.from_slice_f32(&values(2 * 3, 67, -1.0, 1.0), &[2, 3])?;
+    let b = rt.from_slice_f32(&values(1 * 3, 71, -1.0, 1.0), &[1, 3])?;
+    let c = Tensor::cat(&[a.clone(), b.clone()])?;
+    let ta = f32_tensor(&a.to_host_f32()?, &[2, 3], dev);
+    let tb = f32_tensor(&b.to_host_f32()?, &[1, 3], dev);
+    close(
+        &c.to_host_f32()?,
+        &to_f32_vec(&tch::Tensor::cat(&[&ta, &tb], 0)),
+        0.0,
+        "cat",
+    );
+    let a2 = rt.from_slice_f32(&values(2 * 3, 69, -1.0, 1.0), &[2, 3])?;
+    let ta2 = f32_tensor(&a2.to_host_f32()?, &[2, 3], dev);
+    close(
+        &Tensor::stack(&[a.clone(), a2.clone()])?.to_host_f32()?,
+        &to_f32_vec(&tch::Tensor::stack(&[&ta, &ta2], 0)),
+        0.0,
+        "stack",
+    );
+    let x_host = values(2 * 3 * 4, 73, -1.0, 1.0);
+    let x = rt.from_slice_f32(&x_host, &[2, 3, 4])?;
+    let tx = f32_tensor(&x_host, &[2, 3, 4], dev);
+    close(
+        &x.select(1, 2)?.to_host_f32()?,
+        &to_f32_vec(&tx.select(1, 2)),
+        0.0,
+        "select",
+    );
+    close(
+        &x.permute(&[2, 0, 1])?.contiguous()?.to_host_f32()?,
+        &to_f32_vec(&tx.permute([2, 0, 1]).contiguous()),
+        0.0,
+        "permute",
+    );
+    let dst = rt.zeros(&[3, 2], TensorDType::F32)?;
+    x.narrow(2, 1, 1)?
+        .squeeze(2)?
+        .transpose(0, 1)?
+        .contiguous()?
+        .copy_to(&dst)?;
+    let want_dst = to_f32_vec(
+        &tx.narrow(2, 1, 1)
+            .squeeze_dim(2)
+            .transpose(0, 1)
+            .contiguous(),
+    );
+    close(&dst.to_host_f32()?, &want_dst, 0.0, "copy_to");
     Ok(())
 }

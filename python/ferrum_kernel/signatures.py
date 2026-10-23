@@ -776,3 +776,32 @@ def repeat_heads(dtype: str = SERVING_DTYPE) -> dict:
 
 def repeat_heads_constexprs(dim: int = 128) -> dict:
     return {"BLOCK": dim}
+
+
+def causal_sdpa(dtype: str = SERVING_DTYPE) -> dict:
+    return {
+        "q_ptr": f"*{dtype}",
+        "k_ptr": f"*{dtype}",
+        "v_ptr": f"*{dtype}",
+        "out_ptr": f"*{dtype}",
+        "q_offset": "i32",
+        "q_t": "i32",
+        "kv_t": "i32",
+        "stride_qt": "i32",
+        "stride_qh": "i32",
+        "stride_kt": "i32",
+        "stride_kh": "i32",
+        "stride_vt": "i32",
+        "stride_vh": "i32",
+        "NUM_Q_HEADS": "constexpr",
+        "NUM_KV_HEADS": "constexpr",
+        "D": "constexpr",
+        "BLOCK_N": "constexpr",
+        "BLOCK_D": "constexpr",
+    }
+
+
+def causal_sdpa_constexprs(
+    q_heads: int = 16, kv_heads: int = 2, d: int = 256
+) -> dict:
+    return {"NUM_Q_HEADS": q_heads, "NUM_KV_HEADS": kv_heads, "D": d, "BLOCK_N": 64, "BLOCK_D": d}

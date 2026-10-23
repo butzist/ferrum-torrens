@@ -31,10 +31,10 @@ use crate::domain::expert_kernel::MoEError;
 use crate::infrastructure::cuda_driver::{CUstream, CudaError, Driver, GdnKernels};
 use crate::infrastructure::kernel_abi::{
     ADD_BF16, ADD_F32, ADD_RMSNORM, AddRmsnormArgs, ArgPack, CAST_BF16_F32, CAST_F32_BF16,
-    COL_MUL_BF16, COL_MUL_F32, COPY_STRIDED_BF16, COPY_STRIDED_F32, INDEX_SELECT_BF16, LinearAbi,
-    MAX_ALL_F32, MUL_BF16, MUL_F32, REPEAT_HEADS_BF16, ROPE_BF16, SCALAR_BF16, SCALAR_F32,
-    SOFTMAX_LAST_F32, SUM_ALL_F32, SUM_LAST_F32, TOPK_LAST_F32, UNARY_BF16, UNARY_F32,
-    add_rmsnorm_args, add_rmsnorm_grid,
+    CAUSAL_SDPA_BF16, COL_MUL_BF16, COL_MUL_F32, COPY_STRIDED_BF16, COPY_STRIDED_F32,
+    INDEX_SELECT_BF16, LinearAbi, MAX_ALL_F32, MUL_BF16, MUL_F32, REPEAT_HEADS_BF16, ROPE_BF16,
+    SCALAR_BF16, SCALAR_F32, SOFTMAX_LAST_F32, SUM_ALL_F32, SUM_LAST_F32, TOPK_LAST_F32,
+    UNARY_BF16, UNARY_F32, add_rmsnorm_args, add_rmsnorm_grid,
 };
 
 fn bad(e: impl std::fmt::Display) -> MoEError {
@@ -1294,6 +1294,174 @@ impl Tensor {
     }
 }
 
+impl Tensor {
+    /// `dim` selected at `index`, with the dimension dropped. The view is made
+    /// contiguous because every consumer reshapes it next.
+    pub fn select(&self, dim: usize, index: usize) -> Result<Tensor, MoEError> {
+        self.narrow(dim, index, 1)?.squeeze(dim)
+    }
+
+    pub fn squeeze(&self, dim: usize) -> Result<Tensor, MoEError> {
+        if dim >= self.dim() || self.shape[dim] != 1 {
+            return Err(bad(format!("squeeze {dim} on {:?}", self.shape)));
+        }
+        let mut shape = self.shape.clone();
+        shape.remove(dim);
+        self.contiguous()?.reshape(&shape)
+    }
+
+    pub fn unsqueeze(&self, dim: usize) -> Result<Tensor, MoEError> {
+        let mut shape = self.shape.clone();
+        shape.insert(dim, 1);
+        self.contiguous()?.reshape(&shape)
+    }
+
+    /// Reorder the dimensions; a view, no copy.
+    pub fn permute(&self, dims: &[usize]) -> Result<Tensor, MoEError> {
+        if dims.len() != self.dim() {
+            return Err(bad(format!("permute {dims:?} on {:?}", self.shape)));
+        }
+        let mut seen = vec![false; dims.len()];
+        for &d in dims {
+            if d >= dims.len() || seen[d] {
+                return Err(bad(format!("permute {dims:?} on {:?}", self.shape)));
+            }
+            seen[d] = true;
+        }
+        Ok(Tensor {
+            rt: self.rt.clone(),
+            buf: self.buf.clone(),
+            shape: dims.iter().map(|&d| self.shape[d]).collect(),
+            strides: dims.iter().map(|&d| self.strides[d]).collect(),
+            offset: self.offset,
+        })
+    }
+
+    /// Copy this tensor into `dst`, which must be a contiguous view of the same
+    /// shape and dtype. The strided copy kernel writes `dst` linearly.
+    pub fn copy_to(&self, dst: &Tensor) -> Result<(), MoEError> {
+        if !dst.is_contiguous() {
+            return Err(bad("copy_to needs a contiguous destination"));
+        }
+        if self.shape != dst.shape || self.dtype() != dst.dtype() {
+            return Err(bad(format!(
+                "copy_to {:?} {} -> {:?} {}",
+                self.shape,
+                self.dtype().name(),
+                dst.shape,
+                dst.dtype().name()
+            )));
+        }
+        let mut shape = self.shape.clone();
+        let mut strides = self.strides.clone();
+        while shape.len() < 4 {
+            shape.push(1);
+            strides.push(0);
+        }
+        let name = match self.dtype() {
+            TensorDType::Bf16 => COPY_STRIDED_BF16,
+            TensorDType::F32 => COPY_STRIDED_F32,
+            other => return Err(bad(format!("no copy_to for {}", other.name()))),
+        };
+        self.rt.kernels().copy_strided(
+            self.rt.raw_stream(),
+            name,
+            self.device_ptr(),
+            dst.device_ptr(),
+            [shape[0], shape[1], shape[2], shape[3]],
+            [strides[0], strides[1], strides[2], strides[3]],
+            self.numel(),
+        )
+    }
+
+    /// Concatenate along dim 0. Each part must have the same trailing shape and
+    /// dtype; `self` is the first part, the rest follow in order.
+    pub fn cat(parts: &[Tensor]) -> Result<Tensor, MoEError> {
+        let first = parts.first().ok_or_else(|| bad("cat of no parts"))?;
+        let tail = first.shape[1..].to_vec();
+        let rows: usize = parts.iter().map(|p| p.shape[0]).sum();
+        if parts
+            .iter()
+            .any(|p| p.shape[1..] != tail || p.dtype() != first.dtype())
+        {
+            return Err(bad("cat parts disagree on shape or dtype"));
+        }
+        let mut shape = vec![rows];
+        shape.extend_from_slice(&tail);
+        let out = first.rt.zeros(&shape, first.dtype())?;
+        let mut at = 0;
+        for p in parts {
+            p.copy_to(&out.narrow(0, at, p.shape[0])?)?;
+            at += p.shape[0];
+        }
+        Ok(out)
+    }
+
+    /// Stack rank-`n` parts into one rank-`n + 1` tensor along a new dim 0.
+    pub fn stack(parts: &[Tensor]) -> Result<Tensor, MoEError> {
+        let first = parts.first().ok_or_else(|| bad("stack of no parts"))?;
+        let tail = first.shape.clone();
+        if parts
+            .iter()
+            .any(|p| p.shape != tail || p.dtype() != first.dtype())
+        {
+            return Err(bad("stack parts disagree on shape or dtype"));
+        }
+        let mut shape = vec![parts.len()];
+        shape.extend_from_slice(&tail);
+        let out = first.rt.zeros(&shape, first.dtype())?;
+        for (i, p) in parts.iter().enumerate() {
+            let row = out.narrow(0, i, 1)?.reshape(&tail)?;
+            p.copy_to(&row)?;
+        }
+        Ok(out)
+    }
+
+    /// Causal GQA attention for `q` `[qt, q_heads, head_dim]` against `k`/`v`
+    /// `[kt, kv_heads, head_dim]`, with query `i` reading keys up to
+    /// `q_offset + i`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn causal_sdpa(&self, k: &Tensor, v: &Tensor, q_offset: usize) -> Result<Tensor, MoEError> {
+        if self.dtype() != TensorDType::Bf16 || self.dim() != 3 {
+            return Err(bad("causal_sdpa wants a bf16 [qt, q_heads, d]"));
+        }
+        let (qt, q_heads, d) = (self.shape[0], self.shape[1], self.shape[2]);
+        let kv_heads = k.shape.get(1).copied().unwrap_or(0);
+        if k.shape != [k.shape[0], kv_heads, d] || v.shape != k.shape || k.shape[0] < qt {
+            return Err(bad("causal_sdpa k/v shape mismatch"));
+        }
+        let kernel = self.rt.kernels().abi.kernel(CAUSAL_SDPA_BF16)?;
+        let c = |n: &str| kernel.constexpr(n);
+        if c("NUM_Q_HEADS")? as usize != q_heads
+            || c("NUM_KV_HEADS")? as usize != kv_heads
+            || c("D")? as usize != d
+        {
+            return Err(bad("causal_sdpa cubin geometry mismatch"));
+        }
+        let q = self.contiguous()?;
+        let k = k.contiguous()?;
+        let v = v.contiguous()?;
+        let out = self.rt.zeros(&self.shape, TensorDType::Bf16)?;
+        if qt == 0 {
+            return Ok(out);
+        }
+        self.rt.kernels().causal_sdpa(
+            self.rt.raw_stream(),
+            q.device_ptr(),
+            k.device_ptr(),
+            v.device_ptr(),
+            out.device_ptr(),
+            q_offset,
+            qt,
+            k.shape[0],
+            q_heads,
+            kv_heads,
+            d,
+        )?;
+        Ok(out)
+    }
+}
+
 fn numel_of(shape: &[usize]) -> Result<usize, MoEError> {
     let mut n = 1usize;
     for &d in shape {
@@ -1545,6 +1713,45 @@ impl LinearKernels {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn causal_sdpa(
+        &self,
+        stream: CUstream,
+        q: u64,
+        k: u64,
+        v: u64,
+        out: u64,
+        q_offset: usize,
+        qt: usize,
+        kt: usize,
+        q_heads: usize,
+        kv_heads: usize,
+        d: usize,
+    ) -> Result<(), MoEError> {
+        let kernel = self.abi.kernel(CAUSAL_SDPA_BF16)?;
+        let mut pack = ArgPack::for_linear(kernel);
+        pack.ptr(q)?;
+        pack.ptr(k)?;
+        pack.ptr(v)?;
+        pack.ptr(out)?;
+        pack.u32(q_offset as u32)?;
+        pack.u32(qt as u32)?;
+        pack.u32(kt as u32)?;
+        pack.u32((q_heads * d) as u32)?;
+        pack.u32(d as u32)?;
+        pack.u32((kv_heads * d) as u32)?;
+        pack.u32(d as u32)?;
+        pack.u32((kv_heads * d) as u32)?;
+        pack.u32(d as u32)?;
+        let mut params = pack.kernel_params()?;
+        self.launch(
+            CAUSAL_SDPA_BF16,
+            (qt as u32, q_heads as u32, 1),
+            &mut params,
+            stream,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn rope(
         &self,
         stream: CUstream,
@@ -1686,6 +1893,49 @@ impl LinearKernels {
     pub fn hidden(&self) -> Result<usize, MoEError> {
         let k = self.abi.kernel(ADD_RMSNORM)?;
         Ok(k.constexpr("HIDDEN")? as usize)
+    }
+}
+
+/// The domain's opaque device buffer over a cudarc tensor: what the ported MoE
+/// adapter copies out of and into, so the domain still never sees a device type.
+impl crate::domain::expert_kernel::MoETensor for Tensor {
+    fn numel(&self) -> usize {
+        Tensor::numel(self)
+    }
+
+    fn to_host_f32(&self) -> Result<Vec<f32>, MoEError> {
+        Tensor::to_host_f32(self)
+    }
+
+    fn set_host_f32(&mut self, values: &[f32]) -> Result<(), MoEError> {
+        if values.len() != self.numel() {
+            return Err(bad(format!(
+                "set_host_f32 got {} values for {} elements",
+                values.len(),
+                self.numel()
+            )));
+        }
+        let numel = self.numel();
+        self.buf = match self.dtype() {
+            TensorDType::Bf16 => {
+                let bits: Vec<bf16> = values.iter().map(|v| bf16::from_f32(*v)).collect();
+                Buffer::Bf16(Arc::new(self.rt.upload_bf16(&bits)?))
+            }
+            TensorDType::F32 => Buffer::F32(Arc::new(self.rt.upload_f32(values)?)),
+            other => return Err(bad(format!("no host write for {}", other.name()))),
+        };
+        self.shape = vec![numel];
+        self.strides = vec![1];
+        self.offset = 0;
+        Ok(())
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
     }
 }
 

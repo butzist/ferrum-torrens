@@ -617,8 +617,9 @@ pub const SOFTMAX_LAST_F32: &str = "softmax_last_f32";
 pub const TOPK_LAST_F32: &str = "topk_last_f32";
 pub const ROPE_BF16: &str = "rope_bf16";
 pub const REPEAT_HEADS_BF16: &str = "repeat_heads_bf16";
+pub const CAUSAL_SDPA_BF16: &str = "causal_sdpa_bf16";
 
-const LINEAR_NAMES: [&str; 30] = [
+const LINEAR_NAMES: [&str; 31] = [
     GDN_DECODE,
     CONV_DECODE,
     ADD_RMSNORM,
@@ -649,6 +650,7 @@ const LINEAR_NAMES: [&str; 30] = [
     TOPK_LAST_F32,
     ROPE_BF16,
     REPEAT_HEADS_BF16,
+    CAUSAL_SDPA_BF16,
 ];
 
 #[derive(Debug, Deserialize)]
@@ -816,6 +818,9 @@ pub fn linear_cubin(name: &str) -> Result<&'static [u8], MoEError> {
         REPEAT_HEADS_BF16 => {
             include_bytes!(concat!(env!("OUT_DIR"), "/kernel/repeat_heads_bf16.cubin"))
         }
+        CAUSAL_SDPA_BF16 => {
+            include_bytes!(concat!(env!("OUT_DIR"), "/kernel/causal_sdpa_bf16.cubin"))
+        }
         other => return Err(MoEError::Bad(format!("no committed cubin for {other}"))),
     })
 }
@@ -865,6 +870,9 @@ fn linear_ptx(name: &str) -> &'static str {
         ROPE_BF16 => include_str!(concat!(env!("OUT_DIR"), "/kernel/rope_bf16.ptx")),
         REPEAT_HEADS_BF16 => {
             include_str!(concat!(env!("OUT_DIR"), "/kernel/repeat_heads_bf16.ptx"))
+        }
+        CAUSAL_SDPA_BF16 => {
+            include_str!(concat!(env!("OUT_DIR"), "/kernel/causal_sdpa_bf16.ptx"))
         }
         other => panic!("no committed ptx for {other}"),
     }
