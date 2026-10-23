@@ -4063,3 +4063,32 @@ subsection names are kept verbatim.
        `cargo test --features cuda --lib` (455), the cudarc capture-replay and
        tch-matmul adapter gates, and the new real-checkpoint load gate. Logs
        `/tmp/opencode/m7_2_test.log`.
+
+130. **M7.3 starts with the dense forward primitives and the tensor surface they
+     need** (2026-10-23). The adapter is still not on the serving path.
+     - **Ported to cudarc** (`models/qwen3_6/forward_cudarc.rs`): `rms_norm`
+       (the fused `add_rmsnorm` cubin), `sigmoid`, `softplus` (the branch-free
+       `max(x,0) + log1p(exp(-|x|))` form), `linear` (bf16 cuBLAS GEMM, f32
+       post-scale, bf16 out) and `topk_renorm` (top-k, row sum, reciprocal,
+       row-broadcast weights). Against the exact `tch` formulations on the
+       serving hidden size (2048) they are **bit-exact for `rms_norm`, `linear`,
+       and `linear` with a row scale**; sigmoid/softplus are within 1.2e-7 and
+       the top-k weights within 3e-8 (`tests/cudarc_forward.rs`).
+     - **Adapter surface added.** One runtime-`OP` unary kernel per dtype
+       (`exp`, `log`, `sqrt`, `rsqrt`, `neg`, `sigmoid`, `silu`, `softplus`,
+       `abs`, `cos`, `sin`, `square`, `reciprocal`), a scalar add/mul/div, a
+       column-scale multiply (per-column and broadcast) plus a row-broadcast
+       form for top-k renormalization, `sum_last`, `sum_all`, `max_all`,
+       `softmax_last`, `topk_last` (BLOCK covers the router's 256 experts), and
+       f32 `matmul_nt` on `CUBLAS_COMPUTE_32F`. Ten new kernels joined the
+       `linear` manifest section; the existing ABI/PTX check covers them and
+       `scripts/check-kernels.sh` passes for every committed kernel.
+     - **Gates** (`tests/cudarc_adapter.rs`): all new ops match tch on a
+       positive/signed f32 table (max|d| 0 for the exact ops, <=4.8e-6 for the
+       reductions) and top-k indices match exactly. `cargo fmt --check`, clippy
+       default/`cudarc`/`cuda`, `cargo test` (342), `cudarc --lib` (359),
+       `cuda --lib` (455), `check-kernels.sh` all green.
+     - **Remaining M7.3** is the large part: rope precompute/apply (cat/select),
+       GDN/attention/MoE hand-offs, the cache/decode-buffer path, and wiring the
+       primitives into the forward. M7.4 must move the kernel launchers to
+       cudarc storage/stream before the full forward can run without tch.

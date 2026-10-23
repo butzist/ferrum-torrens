@@ -184,3 +184,14 @@ expert's bf16 prefill weight plus banks) over a cudarc `Tensor` surface that now
 also carries u8. The gated real-checkpoint load (`tests/cudarc_load.rs`) matches
 the FTW bytes for every storage kind, reports 2.80 GiB logical / 3059 MiB VRAM,
 and runs in a process that maps no libtorch. M7.3 is the remaining forward port.
+
+## M7.3 result so far (2026-10-23): dense primitives, not the full forward
+
+See `DONE.md` 130. `models/qwen3_6/forward_cudarc.rs` ports `rms_norm`,
+`sigmoid`, `softplus`, `linear` and `topk_renorm`, bit-exact against the `tch`
+formulations on the serving hidden size. The cudarc adapter gained the
+unary/scalar/column-scale/reduction/softmax/top-k/f32-GEMM surface they need
+(ten new `linear`-section kernels). The forward itself is still in
+`forward_torch.rs`: rope, the GDN/attention/MoE hand-offs and the cache path
+remain, and M7.4 must move the kernel launchers onto cudarc storage before the
+whole forward can run torch-less.

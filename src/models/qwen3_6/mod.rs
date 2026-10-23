@@ -4,6 +4,8 @@
 
 pub mod config;
 pub mod forward;
+#[cfg(feature = "cudarc")]
+pub mod forward_cudarc;
 #[cfg(feature = "cuda")]
 pub mod forward_torch;
 #[cfg(feature = "cudarc")]

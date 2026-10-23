@@ -604,8 +604,19 @@ pub const CAST_F32_BF16: &str = "cast_f32_bf16";
 pub const INDEX_SELECT_BF16: &str = "index_select_bf16";
 pub const COPY_STRIDED_BF16: &str = "copy_strided_bf16";
 pub const COPY_STRIDED_F32: &str = "copy_strided_f32";
+pub const UNARY_BF16: &str = "unary_bf16";
+pub const UNARY_F32: &str = "unary_f32";
+pub const SCALAR_BF16: &str = "scalar_bf16";
+pub const SCALAR_F32: &str = "scalar_f32";
+pub const COL_MUL_BF16: &str = "col_mul_bf16";
+pub const COL_MUL_F32: &str = "col_mul_f32";
+pub const SUM_LAST_F32: &str = "sum_last_f32";
+pub const MAX_ALL_F32: &str = "max_all_f32";
+pub const SUM_ALL_F32: &str = "sum_all_f32";
+pub const SOFTMAX_LAST_F32: &str = "softmax_last_f32";
+pub const TOPK_LAST_F32: &str = "topk_last_f32";
 
-const LINEAR_NAMES: [&str; 17] = [
+const LINEAR_NAMES: [&str; 28] = [
     GDN_DECODE,
     CONV_DECODE,
     ADD_RMSNORM,
@@ -623,6 +634,17 @@ const LINEAR_NAMES: [&str; 17] = [
     INDEX_SELECT_BF16,
     COPY_STRIDED_BF16,
     COPY_STRIDED_F32,
+    UNARY_BF16,
+    UNARY_F32,
+    SCALAR_BF16,
+    SCALAR_F32,
+    COL_MUL_BF16,
+    COL_MUL_F32,
+    SUM_LAST_F32,
+    MAX_ALL_F32,
+    SUM_ALL_F32,
+    SOFTMAX_LAST_F32,
+    TOPK_LAST_F32,
 ];
 
 #[derive(Debug, Deserialize)]
@@ -773,6 +795,19 @@ pub fn linear_cubin(name: &str) -> Result<&'static [u8], MoEError> {
         COPY_STRIDED_F32 => {
             include_bytes!(concat!(env!("OUT_DIR"), "/kernel/copy_strided_f32.cubin"))
         }
+        UNARY_BF16 => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/unary_bf16.cubin")),
+        UNARY_F32 => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/unary_f32.cubin")),
+        SCALAR_BF16 => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/scalar_bf16.cubin")),
+        SCALAR_F32 => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/scalar_f32.cubin")),
+        COL_MUL_BF16 => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/col_mul_bf16.cubin")),
+        COL_MUL_F32 => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/col_mul_f32.cubin")),
+        SUM_LAST_F32 => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/sum_last_f32.cubin")),
+        MAX_ALL_F32 => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/max_all_f32.cubin")),
+        SUM_ALL_F32 => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/sum_all_f32.cubin")),
+        SOFTMAX_LAST_F32 => {
+            include_bytes!(concat!(env!("OUT_DIR"), "/kernel/softmax_last_f32.cubin"))
+        }
+        TOPK_LAST_F32 => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/topk_last_f32.cubin")),
         other => return Err(MoEError::Bad(format!("no committed cubin for {other}"))),
     })
 }
@@ -806,6 +841,19 @@ fn linear_ptx(name: &str) -> &'static str {
         COPY_STRIDED_F32 => {
             include_str!(concat!(env!("OUT_DIR"), "/kernel/copy_strided_f32.ptx"))
         }
+        UNARY_BF16 => include_str!(concat!(env!("OUT_DIR"), "/kernel/unary_bf16.ptx")),
+        UNARY_F32 => include_str!(concat!(env!("OUT_DIR"), "/kernel/unary_f32.ptx")),
+        SCALAR_BF16 => include_str!(concat!(env!("OUT_DIR"), "/kernel/scalar_bf16.ptx")),
+        SCALAR_F32 => include_str!(concat!(env!("OUT_DIR"), "/kernel/scalar_f32.ptx")),
+        COL_MUL_BF16 => include_str!(concat!(env!("OUT_DIR"), "/kernel/col_mul_bf16.ptx")),
+        COL_MUL_F32 => include_str!(concat!(env!("OUT_DIR"), "/kernel/col_mul_f32.ptx")),
+        SUM_LAST_F32 => include_str!(concat!(env!("OUT_DIR"), "/kernel/sum_last_f32.ptx")),
+        MAX_ALL_F32 => include_str!(concat!(env!("OUT_DIR"), "/kernel/max_all_f32.ptx")),
+        SUM_ALL_F32 => include_str!(concat!(env!("OUT_DIR"), "/kernel/sum_all_f32.ptx")),
+        SOFTMAX_LAST_F32 => {
+            include_str!(concat!(env!("OUT_DIR"), "/kernel/softmax_last_f32.ptx"))
+        }
+        TOPK_LAST_F32 => include_str!(concat!(env!("OUT_DIR"), "/kernel/topk_last_f32.ptx")),
         other => panic!("no committed ptx for {other}"),
     }
 }

@@ -179,8 +179,9 @@ M7.1 landed the torch-less `cudarc` tensor adapter behind the non-default
 `cudarc` feature (decision 126): GEMM/rms_norm/gather/elementwise parity and
 capture replay are gated, and the devshell links CUDA 13.4 cuBLAS. M7.2 now
 loads the dense tower through cudarc with the serving storage policy and no
-libtorch in the process (decision 129). Neither is on the serving path; M7.3
-(the forward port) is next.
+libtorch in the process (decision 129), and M7.3 has started: the dense math
+primitives (`rms_norm`, `linear`, `sigmoid`, `softplus`, `topk_renorm`) are
+ported and bit-exact (decision 130). None is on the serving path yet.
 
 Progress history and the full decision log (numbers 1..126) live in `DONE.md`;
 read that for the "why" behind any decision number referenced in code or tests.
@@ -490,8 +491,15 @@ any port.
   the FTW bytes, reports 2.80 GiB logical / 3059 MiB VRAM, and asserts a
   cudarc-only process maps no libtorch. `domain::dequant` stays the host
   transform.
-- [ ] **M7.3 forward.** Port `forward_torch.rs` off `tch::Tensor`; the scalar
-  oracle stays the gate.
+- [ ] **M7.3 forward -- PARTIAL (2026-10-23, decision 130).**
+  `models/qwen3_6/forward_cudarc.rs` ports the first dense primitives
+  (`rms_norm`, `sigmoid`, `softplus`, `linear`, `topk_renorm`); they are
+  bit-exact against the `tch` formulations on the serving hidden size
+  (`tests/cudarc_forward.rs`). The adapter gained the elementwise/scalar/
+  column-scale/reduction/softmax/top-k/f32-GEMM surface they need. Still to
+  port: rope, the GDN/attention/MoE kernel hand-offs (M7.4), the cache path,
+  and wiring the new ops into the serving forward; the scalar oracle stays the
+  gate.
 - [ ] **M7.4 kernels/capture.** Launchers take the candle stream and raw storage;
   disable event tracking for capture; delete `shim/c10_graph_shim.cpp`.
 - [ ] **M7.5 remove libtorch.** Drop `tch`, `torch-sys`, the C++ build script and

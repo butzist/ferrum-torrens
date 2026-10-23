@@ -641,3 +641,105 @@ def copy_strided(dtype: str = SERVING_DTYPE) -> dict:
 
 def copy_strided_constexprs(block: int = COPY_BLOCK) -> dict:
     return {"BLOCK": block}
+
+
+def unary(dtype: str = SERVING_DTYPE) -> dict:
+    """Elementwise unary; `OP` is a runtime arg so one cubin serves the set."""
+    return {
+        "src_ptr": f"*{dtype}",
+        "out_ptr": f"*{dtype}",
+        "n": "i32",
+        "OP": "i32",
+        "BLOCK": "constexpr",
+    }
+
+
+def unary_constexprs(block: int = ELEM_BLOCK) -> dict:
+    return {"BLOCK": block}
+
+
+def scalar(dtype: str = SERVING_DTYPE) -> dict:
+    """Elementwise `x + s`, `x * s` or `x / s` with a runtime f32 `scalar`."""
+    return {
+        "src_ptr": f"*{dtype}",
+        "out_ptr": f"*{dtype}",
+        "n": "i32",
+        "scalar": "fp32",
+        "OP": "i32",
+        "BLOCK": "constexpr",
+    }
+
+
+def scalar_constexprs(block: int = ELEM_BLOCK) -> dict:
+    return {"BLOCK": block}
+
+
+def col_mul(dtype: str = SERVING_DTYPE) -> dict:
+    """Multiply every output column by a `[cols]` (or broadcast `[1]`) scale."""
+    return {
+        "x_ptr": f"*{dtype}",
+        "scale_ptr": "*fp32",
+        "out_ptr": f"*{dtype}",
+        "cols": "i32",
+        "OP": "i32",
+        "BLOCK": "constexpr",
+    }
+
+
+def col_mul_constexprs(block: int = SELECT_BLOCK) -> dict:
+    return {"BLOCK": block}
+
+
+def sum_last() -> dict:
+    return {
+        "x_ptr": "*fp32",
+        "out_ptr": "*fp32",
+        "cols": "i32",
+        "BLOCK": "constexpr",
+    }
+
+
+def sum_last_constexprs(block: int = SELECT_BLOCK) -> dict:
+    return {"BLOCK": block}
+
+
+def reduce_all() -> dict:
+    return {
+        "x_ptr": "*fp32",
+        "out_ptr": "*fp32",
+        "n": "i32",
+        "MAX": "constexpr",
+        "BLOCK": "constexpr",
+    }
+
+
+def reduce_all_constexprs(max: bool, block: int = SELECT_BLOCK) -> dict:
+    return {"MAX": 1 if max else 0, "BLOCK": block}
+
+
+def softmax_last() -> dict:
+    return {
+        "x_ptr": "*fp32",
+        "out_ptr": "*fp32",
+        "cols": "i32",
+        "BLOCK": "constexpr",
+    }
+
+
+def softmax_last_constexprs(block: int = SELECT_BLOCK) -> dict:
+    return {"BLOCK": block}
+
+
+def topk_last() -> dict:
+    return {
+        "x_ptr": "*fp32",
+        "val_ptr": "*fp32",
+        "idx_ptr": "*i32",
+        "cols": "i32",
+        "k": "i32",
+        "BLOCK": "constexpr",
+    }
+
+
+def topk_last_constexprs(block: int = SELECT_BLOCK) -> dict:
+    return {"BLOCK": block}

@@ -31,8 +31,9 @@ use crate::domain::expert_kernel::MoEError;
 use crate::infrastructure::cuda_driver::{CUstream, CudaError, Driver, GdnKernels};
 use crate::infrastructure::kernel_abi::{
     ADD_BF16, ADD_F32, ADD_RMSNORM, AddRmsnormArgs, ArgPack, CAST_BF16_F32, CAST_F32_BF16,
-    COPY_STRIDED_BF16, COPY_STRIDED_F32, INDEX_SELECT_BF16, LinearAbi, MUL_BF16, MUL_F32,
-    add_rmsnorm_args, add_rmsnorm_grid,
+    COL_MUL_BF16, COL_MUL_F32, COPY_STRIDED_BF16, COPY_STRIDED_F32, INDEX_SELECT_BF16, LinearAbi,
+    MAX_ALL_F32, MUL_BF16, MUL_F32, SCALAR_BF16, SCALAR_F32, SOFTMAX_LAST_F32, SUM_ALL_F32,
+    SUM_LAST_F32, TOPK_LAST_F32, UNARY_BF16, UNARY_F32, add_rmsnorm_args, add_rmsnorm_grid,
 };
 
 fn bad(e: impl std::fmt::Display) -> MoEError {
@@ -59,6 +60,33 @@ impl Default for GemmTuning {
             compute: cublasComputeType_t::CUBLAS_COMPUTE_32F,
         }
     }
+}
+
+/// The elementwise unary ops `_unary_kernel` implements. The discriminants are
+/// the kernel's runtime `OP`, so the order is the ABI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unary {
+    Exp = 0,
+    Log = 1,
+    Sqrt = 2,
+    Rsqrt = 3,
+    Neg = 4,
+    Sigmoid = 5,
+    Silu = 6,
+    Softplus = 7,
+    Abs = 8,
+    Cos = 9,
+    Sin = 10,
+    Square = 11,
+    Reciprocal = 12,
+}
+
+/// The elementwise scalar ops `_scalar_kernel` implements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalarOp {
+    Add = 0,
+    Mul = 1,
+    Div = 2,
 }
 
 /// The dtypes the dense tower stores. The checkpoint's narrow formats stay
@@ -674,6 +702,265 @@ impl Tensor {
         Ok(out)
     }
 
+    /// Elementwise unary on this tensor; bf16 and f32 only, same dtype out.
+    pub fn unary(&self, op: Unary) -> Result<Tensor, MoEError> {
+        let name = match self.dtype() {
+            TensorDType::Bf16 => UNARY_BF16,
+            TensorDType::F32 => UNARY_F32,
+            other => return Err(bad(format!("no unary for {}", other.name()))),
+        };
+        let src = self.contiguous()?;
+        let out = self.rt.zeros(&self.shape, self.dtype())?;
+        if self.numel() == 0 {
+            return Ok(out);
+        }
+        self.rt.kernels().unary(
+            self.rt.raw_stream(),
+            name,
+            src.device_ptr(),
+            out.device_ptr(),
+            self.numel(),
+            op as u32,
+        )?;
+        Ok(out)
+    }
+
+    pub fn exp(&self) -> Result<Tensor, MoEError> {
+        self.unary(Unary::Exp)
+    }
+
+    pub fn sqrt(&self) -> Result<Tensor, MoEError> {
+        self.unary(Unary::Sqrt)
+    }
+
+    pub fn sigmoid(&self) -> Result<Tensor, MoEError> {
+        self.unary(Unary::Sigmoid)
+    }
+
+    pub fn silu(&self) -> Result<Tensor, MoEError> {
+        self.unary(Unary::Silu)
+    }
+
+    pub fn softplus(&self) -> Result<Tensor, MoEError> {
+        self.unary(Unary::Softplus)
+    }
+
+    /// `x + scalar`, `x * scalar` or `x / scalar`, in fp32 then stored back.
+    pub fn scalar_op(&self, op: ScalarOp, scalar: f32) -> Result<Tensor, MoEError> {
+        let name = match self.dtype() {
+            TensorDType::Bf16 => SCALAR_BF16,
+            TensorDType::F32 => SCALAR_F32,
+            other => return Err(bad(format!("no scalar op for {}", other.name()))),
+        };
+        let src = self.contiguous()?;
+        let out = self.rt.zeros(&self.shape, self.dtype())?;
+        if self.numel() == 0 {
+            return Ok(out);
+        }
+        self.rt.kernels().scalar(
+            self.rt.raw_stream(),
+            name,
+            src.device_ptr(),
+            out.device_ptr(),
+            self.numel(),
+            scalar,
+            op as u32,
+        )?;
+        Ok(out)
+    }
+
+    pub fn add_scalar(&self, scalar: f32) -> Result<Tensor, MoEError> {
+        self.scalar_op(ScalarOp::Add, scalar)
+    }
+
+    pub fn mul_scalar(&self, scalar: f32) -> Result<Tensor, MoEError> {
+        self.scalar_op(ScalarOp::Mul, scalar)
+    }
+
+    pub fn div_scalar(&self, scalar: f32) -> Result<Tensor, MoEError> {
+        self.scalar_op(ScalarOp::Div, scalar)
+    }
+
+    /// `self[r, c] * scale[c]`, the post-GEMM weight scale. `scale` is f32 with
+    /// one value per column, or a single value for the broadcast form.
+    pub fn col_mul(&self, scale: &Tensor) -> Result<Tensor, MoEError> {
+        if self.dim() != 2 || scale.dtype() != TensorDType::F32 || scale.dim() != 1 {
+            return Err(bad("col_mul wants [rows, cols] and its f32 [cols] scale"));
+        }
+        let cols = self.shape[1];
+        let op = if scale.shape[0] == 1 {
+            1
+        } else if scale.shape[0] == cols {
+            0
+        } else {
+            return Err(bad(format!(
+                "col_mul scale has {} values for {cols} columns",
+                scale.shape[0]
+            )));
+        };
+        let name = match self.dtype() {
+            TensorDType::Bf16 => COL_MUL_BF16,
+            TensorDType::F32 => COL_MUL_F32,
+            other => return Err(bad(format!("no col_mul for {}", other.name()))),
+        };
+        let x = self.contiguous()?;
+        let scale = scale.contiguous()?;
+        let out = self.rt.zeros(&self.shape, self.dtype())?;
+        if self.numel() == 0 {
+            return Ok(out);
+        }
+        self.rt.kernels().col_mul(
+            self.rt.raw_stream(),
+            name,
+            x.device_ptr(),
+            scale.device_ptr(),
+            out.device_ptr(),
+            self.shape[0],
+            cols,
+            op,
+        )?;
+        Ok(out)
+    }
+
+    /// Row sums of a f32 `[rows, cols]`.
+    pub fn sum_last(&self) -> Result<Tensor, MoEError> {
+        if self.dim() != 2 || self.dtype() != TensorDType::F32 {
+            return Err(bad("sum_last wants a f32 [rows, cols]"));
+        }
+        let x = self.contiguous()?;
+        let out = self.rt.zeros(&[self.shape[0]], TensorDType::F32)?;
+        if self.numel() == 0 {
+            return Ok(out);
+        }
+        self.rt.kernels().sum_last(
+            self.rt.raw_stream(),
+            SUM_LAST_F32,
+            x.device_ptr(),
+            out.device_ptr(),
+            self.shape[0],
+            self.shape[1],
+        )?;
+        Ok(out)
+    }
+
+    /// The sum of every f32 element, as a `[1]` tensor.
+    pub fn sum_all(&self) -> Result<Tensor, MoEError> {
+        self.reduce_all(SUM_ALL_F32)
+    }
+
+    /// The maximum f32 element, as a `[1]` tensor.
+    pub fn max_all(&self) -> Result<Tensor, MoEError> {
+        self.reduce_all(MAX_ALL_F32)
+    }
+
+    fn reduce_all(&self, name: &str) -> Result<Tensor, MoEError> {
+        if self.dtype() != TensorDType::F32 {
+            return Err(bad("reduce_all wants f32"));
+        }
+        let x = self.contiguous()?;
+        let out = self.rt.zeros(&[1], TensorDType::F32)?;
+        if self.numel() == 0 {
+            return Err(bad("reduce_all on an empty tensor"));
+        }
+        self.rt.kernels().reduce_all(
+            self.rt.raw_stream(),
+            name,
+            x.device_ptr(),
+            out.device_ptr(),
+            self.numel(),
+        )?;
+        Ok(out)
+    }
+
+    /// Stable softmax over the last dimension of a f32 `[rows, cols]`.
+    pub fn softmax_last(&self) -> Result<Tensor, MoEError> {
+        if self.dim() != 2 || self.dtype() != TensorDType::F32 {
+            return Err(bad("softmax_last wants a f32 [rows, cols]"));
+        }
+        let x = self.contiguous()?;
+        let out = self.rt.zeros(&self.shape, TensorDType::F32)?;
+        if self.numel() == 0 {
+            return Ok(out);
+        }
+        self.rt.kernels().softmax_last(
+            self.rt.raw_stream(),
+            SOFTMAX_LAST_F32,
+            x.device_ptr(),
+            out.device_ptr(),
+            self.shape[0],
+            self.shape[1],
+        )?;
+        Ok(out)
+    }
+
+    pub fn reciprocal(&self) -> Result<Tensor, MoEError> {
+        self.unary(Unary::Reciprocal)
+    }
+
+    /// `self[r, c] * scale[r]`, the row-broadcast form (`total` in top-k
+    /// renormalization).
+    pub fn row_mul(&self, scale: &Tensor) -> Result<Tensor, MoEError> {
+        if self.dim() != 2 || scale.dtype() != TensorDType::F32 || scale.dim() != 1 {
+            return Err(bad("row_mul wants [rows, cols] and its f32 [rows] scale"));
+        }
+        if scale.shape[0] != self.shape[0] {
+            return Err(bad(format!(
+                "row_mul scale has {} values for {} rows",
+                scale.shape[0], self.shape[0]
+            )));
+        }
+        let name = match self.dtype() {
+            TensorDType::Bf16 => COL_MUL_BF16,
+            TensorDType::F32 => COL_MUL_F32,
+            other => return Err(bad(format!("no row_mul for {}", other.name()))),
+        };
+        let x = self.contiguous()?;
+        let scale = scale.contiguous()?;
+        let out = self.rt.zeros(&self.shape, self.dtype())?;
+        if self.numel() == 0 {
+            return Ok(out);
+        }
+        self.rt.kernels().col_mul(
+            self.rt.raw_stream(),
+            name,
+            x.device_ptr(),
+            scale.device_ptr(),
+            out.device_ptr(),
+            self.shape[0],
+            self.shape[1],
+            2,
+        )?;
+        Ok(out)
+    }
+
+    /// Descending top-k over the last dimension of a f32 `[rows, cols]`.
+    /// `cols` must fit one kernel block (1024, the router's expert count).
+    pub fn topk_last(&self, k: usize) -> Result<(Tensor, Tensor), MoEError> {
+        if self.dim() != 2 || self.dtype() != TensorDType::F32 {
+            return Err(bad("topk_last wants a f32 [rows, cols]"));
+        }
+        let (rows, cols) = (self.shape[0], self.shape[1]);
+        if cols > 1024 || k == 0 || k > cols {
+            return Err(bad(format!("topk_last k={k} on cols={cols}")));
+        }
+        let x = self.contiguous()?;
+        let vals = self.rt.zeros(&[rows, k], TensorDType::F32)?;
+        let idx = self.rt.zeros(&[rows, k], TensorDType::I32)?;
+        if rows == 0 {
+            return Ok((vals, idx));
+        }
+        self.rt.kernels().topk_last(
+            self.rt.raw_stream(),
+            x.device_ptr(),
+            vals.device_ptr(),
+            idx.device_ptr(),
+            rows,
+            cols,
+            k,
+        )?;
+        Ok((vals, idx))
+    }
+
     pub fn add(&self, other: &Tensor) -> Result<Tensor, MoEError> {
         self.binary(other, 0)
     }
@@ -780,6 +1067,63 @@ impl Tensor {
 
     /// `rms_norm(self) * w` through the committed add_rmsnorm cubin, with a
     /// zero residual. The result is bf16, the activation stream's dtype.
+    /// `self @ w.T` for f32 `[m, k] x [n, k]`, mirroring `matmul_nt`.
+    pub fn matmul_nt_f32(&self, w: &Tensor) -> Result<Tensor, MoEError> {
+        if self.dim() != 2 || w.dim() != 2 {
+            return Err(bad("matmul_nt_f32 wants 2-d operands"));
+        }
+        if self.dtype() != TensorDType::F32 || w.dtype() != TensorDType::F32 {
+            return Err(bad("matmul_nt_f32 is f32 only"));
+        }
+        let (m, k) = (self.shape[0], self.shape[1]);
+        let (n, wk) = (w.shape[0], w.shape[1]);
+        if k != wk {
+            return Err(bad(format!("matmul_nt_f32 k mismatch {k} vs {wk}")));
+        }
+        let x = self.contiguous()?;
+        let w = w.contiguous()?;
+        if m == 0 || n == 0 {
+            return self.rt.zeros(&[m, n], TensorDType::F32);
+        }
+        let mut out = self.rt.alloc_f32(m * n)?;
+        let xp = x.device_ptr();
+        let wp = w.device_ptr();
+        let (op, _ro) = out.device_ptr_mut(&self.rt.inner.stream);
+        let (alpha, beta) = (1.0f32, 0.0f32);
+        // SAFETY: the shape check bounds both operands, `out` is exactly m*n,
+        // and all three pointers live in this runtime's context.
+        unsafe {
+            ::cudarc::cublas::result::gemm_ex(
+                *self.rt.inner.blas.handle(),
+                cublasOperation_t::CUBLAS_OP_T,
+                cublasOperation_t::CUBLAS_OP_N,
+                n as i32,
+                m as i32,
+                k as i32,
+                (&alpha) as *const f32 as *const _,
+                wp as *const _,
+                cudaDataType_t::CUDA_R_32F,
+                k as i32,
+                xp as *const _,
+                cudaDataType_t::CUDA_R_32F,
+                k as i32,
+                (&beta) as *const f32 as *const _,
+                op as *mut _,
+                cudaDataType_t::CUDA_R_32F,
+                n as i32,
+                cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+            )
+        }
+        .map_err(bad)?;
+        drop(_ro);
+        Ok(Tensor::new(
+            self.rt.clone(),
+            Buffer::F32(Arc::new(out)),
+            vec![m, n],
+        ))
+    }
+
     pub fn rms_norm(&self, w: &Tensor, eps: f32) -> Result<Tensor, MoEError> {
         let zero = self.rt.zeros(&self.shape, TensorDType::Bf16)?;
         let (_, out) = self.add_rms_norm(&zero, w, eps)?;
@@ -1010,6 +1354,150 @@ impl LinearKernels {
         let block = kernel.constexpr("BLOCK")? as usize;
         let grid = (n.div_ceil(block) as u32, 1, 1);
         self.launch(name, grid, &mut params, stream)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn unary(
+        &self,
+        stream: CUstream,
+        name: &str,
+        src: u64,
+        out: u64,
+        n: usize,
+        op: u32,
+    ) -> Result<(), MoEError> {
+        let kernel = self.abi.kernel(name)?;
+        let mut pack = ArgPack::for_linear(kernel);
+        pack.ptr(src)?;
+        pack.ptr(out)?;
+        pack.u32(n as u32)?;
+        pack.u32(op)?;
+        let mut params = pack.kernel_params()?;
+        let block = kernel.constexpr("BLOCK")? as usize;
+        self.launch(name, (n.div_ceil(block) as u32, 1, 1), &mut params, stream)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scalar(
+        &self,
+        stream: CUstream,
+        name: &str,
+        src: u64,
+        out: u64,
+        n: usize,
+        scalar: f32,
+        op: u32,
+    ) -> Result<(), MoEError> {
+        let kernel = self.abi.kernel(name)?;
+        let mut pack = ArgPack::for_linear(kernel);
+        pack.ptr(src)?;
+        pack.ptr(out)?;
+        pack.u32(n as u32)?;
+        pack.f32(scalar)?;
+        pack.u32(op)?;
+        let mut params = pack.kernel_params()?;
+        let block = kernel.constexpr("BLOCK")? as usize;
+        self.launch(name, (n.div_ceil(block) as u32, 1, 1), &mut params, stream)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn col_mul(
+        &self,
+        stream: CUstream,
+        name: &str,
+        x: u64,
+        scale: u64,
+        out: u64,
+        rows: usize,
+        cols: usize,
+        op: u32,
+    ) -> Result<(), MoEError> {
+        let kernel = self.abi.kernel(name)?;
+        let mut pack = ArgPack::for_linear(kernel);
+        pack.ptr(x)?;
+        pack.ptr(scale)?;
+        pack.ptr(out)?;
+        pack.u32(cols as u32)?;
+        pack.u32(op)?;
+        let mut params = pack.kernel_params()?;
+        let block = kernel.constexpr("BLOCK")? as usize;
+        let grid = (rows as u32, cols.div_ceil(block) as u32, 1);
+        self.launch(name, grid, &mut params, stream)
+    }
+
+    fn sum_last(
+        &self,
+        stream: CUstream,
+        name: &str,
+        x: u64,
+        out: u64,
+        rows: usize,
+        cols: usize,
+    ) -> Result<(), MoEError> {
+        let kernel = self.abi.kernel(name)?;
+        let mut pack = ArgPack::for_linear(kernel);
+        pack.ptr(x)?;
+        pack.ptr(out)?;
+        pack.u32(cols as u32)?;
+        let mut params = pack.kernel_params()?;
+        self.launch(name, (rows as u32, 1, 1), &mut params, stream)
+    }
+
+    fn reduce_all(
+        &self,
+        stream: CUstream,
+        name: &str,
+        x: u64,
+        out: u64,
+        n: usize,
+    ) -> Result<(), MoEError> {
+        let kernel = self.abi.kernel(name)?;
+        let mut pack = ArgPack::for_linear(kernel);
+        pack.ptr(x)?;
+        pack.ptr(out)?;
+        pack.u32(n as u32)?;
+        let mut params = pack.kernel_params()?;
+        self.launch(name, (1, 1, 1), &mut params, stream)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn topk_last(
+        &self,
+        stream: CUstream,
+        x: u64,
+        vals: u64,
+        idx: u64,
+        rows: usize,
+        cols: usize,
+        k: usize,
+    ) -> Result<(), MoEError> {
+        let kernel = self.abi.kernel(TOPK_LAST_F32)?;
+        let mut pack = ArgPack::for_linear(kernel);
+        pack.ptr(x)?;
+        pack.ptr(vals)?;
+        pack.ptr(idx)?;
+        pack.u32(cols as u32)?;
+        pack.u32(k as u32)?;
+        let mut params = pack.kernel_params()?;
+        self.launch(TOPK_LAST_F32, (rows as u32, 1, 1), &mut params, stream)
+    }
+
+    fn softmax_last(
+        &self,
+        stream: CUstream,
+        name: &str,
+        x: u64,
+        out: u64,
+        rows: usize,
+        cols: usize,
+    ) -> Result<(), MoEError> {
+        let kernel = self.abi.kernel(name)?;
+        let mut pack = ArgPack::for_linear(kernel);
+        pack.ptr(x)?;
+        pack.ptr(out)?;
+        pack.u32(cols as u32)?;
+        let mut params = pack.kernel_params()?;
+        self.launch(name, (rows as u32, 1, 1), &mut params, stream)
     }
 
     /// `add_rmsnorm` on raw addresses: the same cubin, grid and argument pack

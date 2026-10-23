@@ -97,6 +97,10 @@ mod torch_side {
         to_f32_vec(t)
     }
 
+    pub fn f32_tensor(values: &[f32], shape: &[i64]) -> tch::Tensor {
+        ferrum_torrens::infrastructure::torch::f32_tensor(values, shape, Device::Cuda(0))
+    }
+
     pub fn cuda_backend() {
         ferrum_torrens::infrastructure::torch::load_cuda_backend().expect("libtorch cuda backend");
     }
@@ -439,5 +443,155 @@ fn cubin_interop_matches_the_tch_launch() -> Res<()> {
     rt.synchronize()?;
     assert_exact(&sum.to_host_f32()?, &want_sum, "add_rmsnorm sum");
     assert_exact(&out.to_host_f32()?, &want_out, "add_rmsnorm out");
+    Ok(())
+}
+
+#[test]
+#[ignore = "needs a CUDA device and libtorch"]
+#[cfg(feature = "cuda")]
+fn unary_scalar_reduction_parity_with_tch() -> Res<()> {
+    use ferrum_torrens::infrastructure::cudarc::{ScalarOp, Unary};
+
+    let Some(rt) = open() else { return Ok(()) };
+    torch_side::cuda_backend();
+
+    // Positive inputs for log/sqrt, and a signed row for the rest.
+    let xs: Vec<f32> = (0..64).map(|i| 0.1 + i as f32 * 0.017).collect();
+    let t = torch_side::f32_tensor(&xs, &[8, 8]);
+    let x = rt.from_slice_f32(&xs, &[8, 8])?;
+    for (op, name) in [
+        (Unary::Exp, "exp"),
+        (Unary::Log, "log"),
+        (Unary::Sqrt, "sqrt"),
+        (Unary::Rsqrt, "rsqrt"),
+        (Unary::Neg, "neg"),
+        (Unary::Sigmoid, "sigmoid"),
+        (Unary::Silu, "silu"),
+        (Unary::Softplus, "softplus"),
+        (Unary::Abs, "abs"),
+        (Unary::Cos, "cos"),
+        (Unary::Sin, "sin"),
+        (Unary::Square, "square"),
+        (Unary::Reciprocal, "reciprocal"),
+    ] {
+        let got = x.unary(op)?.to_host_f32()?;
+        let want = match name {
+            "exp" => torch_side::f32(&t.exp()),
+            "log" => torch_side::f32(&t.log()),
+            "sqrt" => torch_side::f32(&t.sqrt()),
+            "rsqrt" => torch_side::f32(&t.rsqrt()),
+            "neg" => torch_side::f32(&t.neg()),
+            "sigmoid" => torch_side::f32(&t.sigmoid()),
+            "silu" => torch_side::f32(&t.silu()),
+            "softplus" => torch_side::f32(&t.softplus()),
+            "abs" => torch_side::f32(&t.abs()),
+            "cos" => torch_side::f32(&t.cos()),
+            "sin" => torch_side::f32(&t.sin()),
+            "square" => torch_side::f32(&(&t * &t)),
+            _ => torch_side::f32(&t.reciprocal()),
+        };
+        assert_close(&got, &want, 1e-5, name);
+    }
+
+    for (op, name, want) in [
+        (ScalarOp::Add, "add", torch_side::f32(&(&t + 0.25))),
+        (ScalarOp::Mul, "mul", torch_side::f32(&(&t * 0.5))),
+        (ScalarOp::Div, "div", torch_side::f32(&(&t / 2.0))),
+    ] {
+        let scalar = match op {
+            ScalarOp::Add => 0.25,
+            ScalarOp::Mul => 0.5,
+            ScalarOp::Div => 2.0,
+        };
+        let got = x.scalar_op(op, scalar)?.to_host_f32()?;
+        assert_close(&got, &want, 1e-6, name);
+    }
+
+    // Per-column and broadcast scale, the `linear` post-GEMM factor.
+    let scale: Vec<f32> = (0..8).map(|i| 1.0 + i as f32 * 0.125).collect();
+    let s = rt.from_slice_f32(&scale, &[8])?;
+    let ts = torch_side::f32_tensor(&scale, &[1, 8]);
+    assert_close(
+        &x.col_mul(&s)?.to_host_f32()?,
+        &torch_side::f32(&(&t * &ts)),
+        1e-6,
+        "col_mul",
+    );
+    let one = rt.from_slice_f32(&[0.5], &[1])?;
+    assert_close(
+        &x.col_mul(&one)?.to_host_f32()?,
+        &torch_side::f32(&(&t * 0.5)),
+        1e-6,
+        "col_mul broadcast",
+    );
+
+    // Reductions and softmax are f32 (the router/GDN math).
+    let sums = x.sum_last()?.to_host_f32()?;
+    let want = torch_side::f32(&t.sum_dim_intlist(-1, false, torch_side::kind_f32()));
+    assert_close(&sums, &want, 1e-5, "sum_last");
+    assert_close(
+        &x.sum_all()?.to_host_f32()?,
+        &torch_side::f32(&t.sum(torch_side::kind_f32())),
+        1e-5,
+        "sum_all",
+    );
+    assert_close(
+        &x.max_all()?.to_host_f32()?,
+        &torch_side::f32(&t.max()),
+        0.0,
+        "max_all",
+    );
+    assert_close(
+        &x.softmax_last()?.to_host_f32()?,
+        &torch_side::f32(&t.softmax(-1, torch_side::kind_f32())),
+        1e-6,
+        "softmax_last",
+    );
+
+    // Row-broadcast scale and the router's top-k renormalization.
+    let row_total = x.sum_last()?;
+    assert_close(
+        &x.row_mul(&row_total)?.to_host_f32()?,
+        &torch_side::f32(&(&t * t.sum_dim_intlist(-1, true, torch_side::kind_f32()))),
+        1e-5,
+        "row_mul",
+    );
+    let inv = row_total.reciprocal()?;
+    let (vals, idx) = x.topk_last(3)?;
+    let (tvals, tidx) = t.topk(3, -1, true, true);
+    assert_close(
+        &vals.to_host_f32()?,
+        &torch_side::f32(&tvals),
+        0.0,
+        "topk values",
+    );
+    let got_idx: Vec<i32> = idx.to_host_f32()?.into_iter().map(|v| v as i32).collect();
+    let want_idx: Vec<i32> = torch_side::f32(&tidx.to_kind(torch_side::kind_f32()))
+        .into_iter()
+        .map(|v| v as i32)
+        .collect();
+    assert_eq!(got_idx, want_idx, "topk indices");
+    let one = rt.from_slice_f32(&[1.0], &[1])?;
+    let _ = one;
+    assert_close(
+        &inv.to_host_f32()?,
+        &torch_side::f32(
+            &t.sum_dim_intlist(-1, false, torch_side::kind_f32())
+                .reciprocal(),
+        ),
+        1e-6,
+        "row reciprocal",
+    );
+
+    // f32 matmul_nt, the router/GDN path.
+    let w: Vec<f32> = (0..8 * 8).map(|i| (i as f32 * 0.01) - 0.3).collect();
+    let tw = torch_side::f32_tensor(&w, &[8, 8]);
+    let wt = rt.from_slice_f32(&w, &[8, 8])?;
+    assert_close(
+        &x.matmul_nt_f32(&wt)?.to_host_f32()?,
+        &torch_side::f32(&t.matmul(&tw.transpose(0, 1))),
+        1e-5,
+        "matmul_nt_f32",
+    );
     Ok(())
 }
