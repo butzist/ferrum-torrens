@@ -14,6 +14,15 @@ the ordered plan.
 > capture is parked, so captured numbers are history, not reproducible, until a
 > capture path is ported. Eager numbers and all prefill numbers remain the
 > measured reference for the current runtime.
+>
+> **Torchless eager baseline (2026-10-23, decision 132).** RTX 5060 Laptop,
+> bf16 KV, 512-slot explicit cache, 7574 MiB at load: **517-token pp 399.2
+> tok/s, tg 31.8 tok/s; 2057-token pp 512.2 tok/s, tg 29.9 tok/s.** The 517
+> pp matches the old libtorch path; the 2057 pp is 47% below it because the
+> port runs the GDN prefill token-at-a-time through `gdn_decode` (no chunked
+> recurrence) and uses the naive causal SDPA. Those two are the next levers,
+> in that order; restore the chunked recurrence and a tiled causal attention
+> before re-running R10/R11 comparisons.
 
 ## Why
 

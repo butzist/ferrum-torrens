@@ -4165,7 +4165,16 @@ subsection names are kept verbatim.
        `throughput_smoke` with `FERRUM_SMOKE_TOKENS=8
        FERRUM_SMOKE_PREFILL=128`: captured graph false, VRAM 7574 MiB,
        **pp 132 tokens / 1.28 s = 103.5 tok/s**, **tg 8 tokens / 7 decoded /
-       0.18 s = 39.9 tok/s**, 640 expert steps, GPU 99% busy.
+       0.18 s = 39.9 tok/s**, 640 expert steps, GPU 99% busy. The 128-token pp
+       figure is fixed-overhead dominated; at the standard lengths the eager
+       torchless path is **517 tokens in 1.30 s = 399.2 pp / 31.8 tg** and
+       **2057 tokens in 4.02 s = 512.2 pp / 29.9 tg** (VRAM 7574 MiB, 960
+       expert steps). The 517 pp matches the removed libtorch path (401); the
+       2057 pp is 47% below it (958) because the port runs the masked GDN
+       prefill token-at-a-time through the fused decode kernel and uses a
+       naive causal SDPA instead of the chunked recurrence and the tuned
+       attention. Decode is within ~9% of the old 32.8 tg. Closing that gap is
+       the next optimization slice, not an M7 blocker.
        Logs `/tmp/opencode/{gate-cudarc-engine,gate-engine-real-generate,
        gate-engine-real-kernel,gate-engine-real-chat,gate-throughput}.log`.
      - **Docs.** README/AGENTS build lines use `--features cudarc`;
