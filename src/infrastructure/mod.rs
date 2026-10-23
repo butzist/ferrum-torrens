@@ -6,7 +6,7 @@ pub mod banks;
 pub mod candle;
 #[cfg(feature = "cuda")]
 pub mod cuda_attention;
-#[cfg(any(feature = "cuda", feature = "candle"))]
+#[cfg(any(feature = "cuda", feature = "candle", feature = "cudarc"))]
 pub mod cuda_driver;
 #[cfg(feature = "cuda")]
 pub mod cuda_gdn;
@@ -16,6 +16,8 @@ pub mod cuda_graph;
 pub mod cuda_linear;
 #[cfg(feature = "cuda")]
 pub mod cuda_moe;
+#[cfg(feature = "cudarc")]
+pub mod cudarc;
 #[cfg(feature = "cuda")]
 pub mod decode_buffers;
 #[cfg(feature = "cuda")]

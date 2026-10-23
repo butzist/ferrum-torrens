@@ -626,6 +626,7 @@ dependencies = [
  "candle-core",
  "candle-nn",
  "cc",
+ "cudarc 0.19.10",
  "futures-core",
  "half",
  "minijinja",

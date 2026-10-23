@@ -3887,3 +3887,34 @@ subsection names are kept verbatim.
        features as the evidence; it is never on the serving path. Logs
        `/tmp/opencode/m7_0/`.
 
+125. **M7.1a is a go for the minimal-cudarc tensor layer, but only with a
+     CUDA 13.4+ cuBLAS** (2026-10-23, branch `m7-torchless`). The direct
+     `cudarc` -> `cublasGemmEx` spike re-ran the M7.0 shape table and separated
+     the tensor layer from the library version.
+     - **The devshell's CUDA 12.9 cuBLAS is the cause of M7.0's GEMM failure.**
+       With CUDA 12.9 `libcublas.so.12`, direct cudarc reproduces candle's
+       pattern: `H->H` 512/2057 +21.4%/+18.1%, `H->2I` +44.2%, `I->H` +21.4%.
+       With CUDA 13.4 `libcublas` 13.8.0.4 (the version libtorch 2.9 already
+       bundles) the same calls are **bit-exact and within 1.1% of tch** on
+       every prefill shape (worst +1.10%, most -0.1..-1.1%). M=1 is mixed but
+       not decisive. Candle's gate 1 should be re-read as a CUDA 12.9 result,
+       not a candle defect; re-testing candle under 13.8 is optional, and
+       cudarc remains the lower-code path.
+     - **Capture is green with engine-owned buffers.** A BF16 GEMM captured on
+       a cudarc side stream into a preallocated `CudaSlice`, no allocation or
+       host sync inside the region, replays eager-equal and replay-to-replay
+       equal (1048576/1048576, max|d| 0), including after a new D2D input;
+       the output pointer is stable. Graph instantiate flags 0 suffice (no
+       `AUTO_FREE_ON_LAUNCH`, unlike candle).
+     - **Cubin interop is green.** `add_rmsnorm` on cudarc pointers/stream is
+       bit-exact against the tch-fed launch (sum and out, 1048576/1048576).
+     - **Consequence.** The torch-less path pins `cudarc = 0.19.10` with
+       `cuda-13040` semantics and must link a CUDA 13.4+ libcublas. For
+       development the libtorch-bundled 13.8 root works; M7.5 (delete libtorch)
+       needs the devshell to provide `cudaPackages_13_4.libcublas` (or a 13.4+
+       toolkit) and `CUDARC_CUDA_VERSION=13040`, while Triton keeps its 12.9
+       ptxas. Then M7.1 ports the `ComputeRuntime` surface over the cudarc
+       runtime; `forward_torch.rs` is untouched until M7.3.
+     - Logs `/tmp/opencode/m7_1a/` (`gate1_cuda13nix_steady.log` is the
+       headline; `gate1_cuda12_steady.log` is the failure).
+

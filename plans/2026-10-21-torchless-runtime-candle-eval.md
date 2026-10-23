@@ -137,3 +137,11 @@ becomes the minimal cudarc tensor layer: direct cuBLAS BF16 GEMM, engine-owned
 buffers for capture, and the same kernel ABI. Re-run the gate-1 shape table
 before porting anything.
 
+## M7.1a result (2026-10-23): cudarc is a go; pin CUDA 13.4 cuBLAS
+
+See `DONE.md` 125. Direct cudarc with CUDA 12.9 cuBLAS reproduces the M7.0
+slowdown; with CUDA 13.4 `libcublas` 13.8.0.4 it is bit-exact and within 1.1%
+of tch on every prefill shape. Engine-owned-buffer capture and cubin interop are
+exact. Proceed with M7.1 on cudarc, pin `cuda-13040`, and add a CUDA 13.4+
+libcublas to the devshell before M7.5.
+

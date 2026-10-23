@@ -457,10 +457,15 @@ any port.
   projections, and a captured graph containing `rms_norm` is not replay-exact
   because candle owns the intermediate buffers. The kernel-ABI and memory/load
   gates passed. The torch-less runtime takes the minimal-`cudarc` fallback.
-- [ ] **M7.1 runtime adapter (cudarc).** Minimal tensor layer over `cudarc`
-  (device/owned buffer/stream/GEMM/cast/slice/gather), direct cuBLAS BF16 GEMM
-  on the real shapes, engine-owned buffers for capture; port
-  `infrastructure/torch.rs` and `Device`. Prove the GEMM speed gate first.
+- [x] **M7.1a GEMM/capture spike -- GO (2026-10-23, decision 125).**
+  cudarc + CUDA 13.4 libcublas 13.8.0.4 is bit-exact and within 1.1% of tch on
+  the prefill shapes; CUDA 12.9 cuBLAS is the 16-44% slowdown M7.0 blamed on
+  candle. Engine-owned-buffer capture and cubin interop are exact.
+- [ ] **M7.1 runtime adapter (cudarc).** Pin `cuda-13040`; port the
+  `ComputeRuntime` surface (device/owned buffer/stream/GEMM/cast/slice/gather)
+  over `src/infrastructure/cudarc.rs` and prove it against tch on small shapes.
+  The devshell must ship a CUDA 13.4+ libcublas for M7.5 (Triton keeps 12.9
+  ptxas); until then the libtorch-bundled 13.8 root is the test loader.
 - [ ] **M7.2 weights/load.** FTW dense widening and upload through candle;
   `domain::dequant` stays the host transform.
 - [ ] **M7.3 forward.** Port `forward_torch.rs` off `tch::Tensor`; the scalar
