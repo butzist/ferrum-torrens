@@ -2,7 +2,8 @@
 name = "ferrum-torrens"
 version = "0.1.0"
 edition = "2024"
-description = "Minimal single-GPU MoE serving engine (FreeToken port)"
+description = "Torch-less Rust reimplementation of FreeToken for single-GPU MoE serving"
+repository = "https://github.com/butzist/ferrum-torrens"
 
 [[bin]]
 name = "ferrum-torrens"

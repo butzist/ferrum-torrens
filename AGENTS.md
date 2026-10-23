@@ -79,8 +79,8 @@ Instructions for AI coding agents working in this repository.
 - Every module is covered by unit tests. Mock external boundaries with
   `mockall`: the FTW reader, CUDA device, clock, scheduler interaction, and
   any other trait boundary.
-- Port FreeToken python tests that are relevant (`FreeToken/tests/` mirrors the
-  subsystems). The numeric oracles live in this repo as Rust counterparts:
+- Port relevant upstream FreeToken tests from an external checkout (the
+  upstream `tests/` tree mirrors the subsystems; it is not vendored here). The numeric oracles live in this repo as Rust counterparts:
   `gdn_reference`, radix prefix tree invariants, offload LRU/eviction rules,
   FTW index parsing. Adapt python seeding/expected values to Rust property tests
   where exact float equality does not apply (use the same tolerances FreeToken
@@ -109,7 +109,7 @@ Instructions for AI coding agents working in this repository.
   `rustfmt`, lint with `clippy`.
 - No comments unless they explain a non-obvious "why". Configuration gets no
   comments. ASCII only (no em-dash, no arrows).
-- **Do not transliterate the Python reference.** `FreeToken/` is a porting
+- **Do not transliterate the Python reference.** Upstream FreeToken is a porting
   guide, not a line-by-line spec. Reach for the Rust-native shape of each idea:
   ownership instead of manual refcounts where it fits, `Rc`/`Arc` for genuinely
   shared state, `Cow` for copy-on-write, RAII (`Drop`, guard types) instead of
@@ -165,7 +165,12 @@ Instructions for AI coding agents working in this repository.
 
 ## Reference and tooling
 
-- `FreeToken/` is the reference implementation. It is READ-ONLY. Never edit it.
+- Upstream FreeToken (<https://github.com/FlashML-org/FreeToken>) is the
+  reference implementation and the source of the Triton kernels. It is NOT
+  vendored here (no submodule); clone it outside the tree if you need the
+  reference/probe scripts, and never vendor or edit it. The in-repo kernels
+  under `python/ferrum_kernel/` are ports; see `NOTICE` and
+  `LICENSE-FreeToken`.
 - GPU runtime facts and target defaults live in `README.md` and the
   "Config defaults" block at the end of `TODO.md` (RTX 5060 Mobile 8 GB VRAM,
   sm_120) and in `ALGORITHM.md` section 0.
@@ -191,11 +196,13 @@ Instructions for AI coding agents working in this repository.
   runtime closure of `basePackages` (decision 52), not the whole `/nix/store`,
   so for the gated tests agents run the Rust converter into the r/w-mounted
   `$FLAKE_ROOT` (`.model-cache/`), not the store copy.
-- Python venv (flake provides python312 + uv), already installed:
-  `cd FreeToken && uv venv --python 3.12 && FREETOKEN_ALLOW_CUDA_MISMATCH=1 uv pip install -e ".[accel]"`.
+- Optional FreeToken reference venv (flake provides python312 + uv), for the
+  probe scripts only. The submodule is gone, so clone upstream outside the
+  tree and point `FREETOKEN_REF` at it:
+  `cd "${FREETOKEN_REF:?set FREETOKEN_REF to an external FreeToken checkout}" && uv venv --python 3.12 && FREETOKEN_ALLOW_CUDA_MISMATCH=1 uv pip install -e ".[accel]"`.
   Outside the devshell, export the loader path *before* the install too: uv's
   build isolation imports torch in `setup.py`, so it fails the same way. A
-  refreshed `FreeToken/` checkout takes the untracked venv with it.
+  refreshed external checkout takes the untracked venv with it.
   The devShell's `shellHook` already puts a matching `libstdc++.so.6` and the
   driver mount (`/run/opengl-driver/lib`) on `LD_LIBRARY_PATH`, which torch from
   the venv needs: its manylinux RPATH points at paths that do not exist here. It
@@ -248,7 +255,7 @@ Instructions for AI coding agents working in this repository.
     `kernel/*.ptx` into the gitignored local `kernel/` for inspection. The
     committed build uses the `kernels` Nix derivation, which compiles the same
     sources into the store output that `FERRUM_KERNEL_DIR` points at.
-  Do **not** run the kernel toolchain out of `FreeToken/.venv`: that environment
+  Do **not** run the kernel toolchain out of an external FreeToken reference venv: that environment
   is only for the FTW conversion (decision 35) and carries a different
   torch/triton. Use `--interp` before running the gated
   `tests/cuda_moe_matches_reference.rs`, which is the real-hardware gate for the
@@ -301,4 +308,4 @@ context lean; do the writing in the workers.
 - Conventional Commits, one line, imperative, lowercase, no trailing period:
   `feat(offload): map expert id space for the GPU slot cache`
 - One commit per feature; stage only the files that change is about. Never
-  commit the FreeToken venv or the FTW checkpoint output.
+  commit an external FreeToken reference venv or the FTW checkpoint output.

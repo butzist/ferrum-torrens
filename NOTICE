@@ -1,0 +1,14 @@
+FerrumTorrens
+https://github.com/butzist/ferrum-torrens
+
+This project is an independent, torch-less Rust reimplementation inspired by
+FreeToken. The Triton kernel sources under python/ferrum_kernel/ are ports and
+derivatives of FreeToken's kernel sources (python/freetoken/kernel/triton/).
+
+FreeToken
+https://github.com/FlashML-org/FreeToken
+Copyright (c) the FreeToken authors (FlashML Team)
+Licensed under the Apache License, Version 2.0.
+A copy of the license is in LICENSE-FreeToken.
+
+The upstream FreeToken project is not vendored in this repository.

@@ -1,99 +1,251 @@
 # FerrumTorrens
 
-A **minimal, fast, single-GPU** Rust serving engine for **one model**:
-`Qwen3.6-35B-A3B-NVFP4` (MoE + hybrid GatedDeltaNet/attention). It loads
-FreeToken's converted FTW checkpoint and serves it with FreeToken's `offload`
-expert strategy. No benchmarks, no multimodal, no runtime cache management, no
-multi-GPU.
+**A torch-less Rust reimplementation of [FreeToken](https://github.com/FlashML-org/FreeToken)**
+for persistent, single-GPU model serving.
 
-The target is an RTX 5060 Mobile (8 GB, sm_120). Dense compute is the cudarc
-tensor runtime via the `cudarc` feature; the hand-written GPU kernels (NVFP4
-grouped-MoE GEMV, plus their staging and paged-attention peers) are authored in
-Triton and AOT-compiled by the `kernels` Nix derivation into `kernel/*.cubin`;
-the Rust build copies that tree in and launches it through the CUDA driver API.
-There is no Python or libtorch at runtime and no committed binary artifact.
+Repository: <https://github.com/butzist/ferrum-torrens>
 
-## NixOS service
+FerrumTorrens loads a FreeToken FTW checkpoint and serves it in one Rust
+process: a Rust tensor runtime (`cudarc` + cuBLAS), hand-written Triton kernels
+AOT-compiled to cubins and embedded in the binary, and a Rust HF -> FTW
+converter. There is no Python, torch, libtorch, pyo3 or JIT compiler in the
+serving process.
 
-`nix build .#ferrum-torrens` builds the binary with the sm_120 cubins **baked
-in** (`nix/package.nix` depends on the `kernels` derivation; `build.rs` embeds
-its `kernel/` tree), so the deployed executable needs no devshell, no
-`FERRUM_KERNEL_DIR`, no Python and no libtorch. The flake exposes a NixOS
-module that runs it as a systemd service:
+Today it supports **Qwen3.6-35B-A3B-NVFP4** (MoE + hybrid GatedDeltaNet/full
+attention, NVFP4 experts) on **one RTX 5060 Mobile (8 GB, sm_120)**. Other GPUs
+and models are welcome; see [Scope](#scope-and-extending).
+
+## Why this exists
+
+Python is excellent for training, data analysis and kernel authoring. I am not a
+fan of it in a service that runs persistently on a machine: an interpreter, a
+wheel closure and a JIT stack in the request loop are a large, stateful
+dependency for a server. Here Python exists only at build time, to compile the
+Triton kernels. At inference the process is the Rust binary, `libcuda` and
+`libcublas`, nothing else.
+
+The kernels are compiled ahead of time by the `kernels` Nix derivation, copied
+into `OUT_DIR`, and embedded with `include_bytes!`. The deployed executable
+needs no `FERRUM_KERNEL_DIR`, no Python and no kernel cache directory.
+
+## Credits
+
+FreeToken is the inspiration for this project and the source of its Triton
+kernels. The files under `python/ferrum_kernel/` are ports/derivatives of
+FreeToken's `python/freetoken/kernel/triton/` sources; the FTW format and the
+serving strategy (offload expert cache, paged KV/radix, GDN state) also follow
+it. FreeToken is Apache-2.0; see [`NOTICE`](NOTICE) and
+[`LICENSE-FreeToken`](LICENSE-FreeToken). Upstream is **not vendored** here.
+
+The Rust engine, the cudarc tensor layer, the FTW reader/writer and the HF -> FTW
+converter are this project's work.
+
+## How it works
+
+- **Checkpoint:** FTW (FreeToken Weight), the aligned/sharded format FreeToken
+  converts HF checkpoints to. The engine memory-maps it and reads tensors
+  directly through the CUDA driver.
+- **Tensor runtime:** `cudarc` owns bf16/f32/i32/i64/u8 buffers, cuBLAS GEMM, the
+  KV/state slabs and the elementwise/reduction surface. There is no libtorch.
+- **Custom kernels:** NVFP4 grouped MoE (prefill GEMM and decode GEMV), paged GQA
+  decode attention, tiled causal prefill SDPA, fused GDN conv/decode/chunk
+  pieces, FP8 W8A16 projections. Authored in Triton, compiled for sm_120 at
+  build time, launched through the CUDA driver API.
+- **Serving:** OpenAI-compatible HTTP API, scheduler, radix prefix cache, GDN
+  state snapshots, expert slot cache with whole-layer prefill streaming, and
+  optional CUDA-graph capture for the decode step.
+- **Conversion:** `ferrum-torrens-convert`, a CPU-only Rust binary, turns an HF
+  safetensors snapshot into FTW. No Python venv.
+
+## Performance vs FreeToken
+
+RTX 5060 Mobile (8 GB, sm_120), one request, bf16 KV, FreeToken's `offload`
+expert strategy. `pp` is prompt processing and `tg` is decode. The FreeToken
+column is the measured reference in `OPTIMIZATION.md`; the old libtorch column
+is this project before the torch-less port, kept to show the port did not lose
+the baseline.
+
+| workload | FerrumTorrens | FreeToken reference | old libtorch port |
+|---|---|---|---|
+| 517-token pp | **~402 tok/s** | 366.2 | 401 |
+| 2057-token pp | **~915-935 tok/s** | 725 | 958 |
+| 517-prefix tg | **~32.3 tok/s** (33.0 captured) | 30.3 | 32.8 |
+| 2057-prefix tg | **~29 tok/s** (1664 slots) | not recorded at this prefix | -- |
+
+So prefill is 1.10x FreeToken at 517 and ~1.3x at 2057, and decode at a 517
+prefix is ~1.07x (1.09x captured). It is within ~2-5% of the old libtorch
+prefill at 2057 (the best run is 2.4% down) and at parity at 517. The 2057-prefix tg follows a different
+cache/window than the 517 measurement, so it is not a like-for-like FreeToken
+comparison.
+
+Conditions and caveats:
+- 2057-token prefill needs a 1664-slot expert cache on 8 GB. The auto 1920-slot
+  cache OOMs that prefill's scratch in this configuration; 517 fits with auto.
+- Decode capture is worth ~2% at bs=1 (eager decode is already launch-light);
+  the 2057 eager/captured pair was 28.4/28.9 tg.
+- Run-to-run prefill variance is ~3%; the table reports the measured band, not a
+  peak. No 5090-class numbers are claimed: the target is the 8 GB laptop GPU.
+
+## Memory footprint
+
+Measured on the same 8 GB card; the expert cache is the main adjustable block.
+
+| item | size | notes |
+|---|---|---|
+| VRAM, server after load | 7416 MiB eager / 7546 MiB captured | 2057-token prefill config, 1664 slots, bf16 KV |
+| VRAM, 517 + auto cache | 7640 MiB eager / 7770 MiB captured | auto resolves 1920 slots; capture adds ~130 MiB |
+| dense text tower, VRAM | 3059 MiB | 2.80 GiB logical weights (M7.2 load report) |
+| expert cache slot | ~1.69 MiB | gate_up + down NVFP4 banks, scales, globals |
+| KV pool, 16k tokens | ~320 MiB | bf16, 10 full-attention layers, 2 KV heads x 256 |
+| KV pool, 4k tokens | ~80 MiB | the throughput-smoke configuration |
+| FTW checkpoint on disk | 21 GB | 3 shards, mmap'd by the server |
+| HF snapshot | 22 GB | only needed at conversion/build time |
+| host expert banks | 16.93 GiB | mmap'd from the FTW and streamed to the cache |
+| server binary | ~16 MiB | cubins embedded; no Python/torch closure |
+
+The service default `kvTokens = 16384` reserves the ~320 MiB pool; lower it for
+more expert-cache headroom, raise it only with a larger GPU. The Nix model
+derivation needs ~43 GB of store space for the FOD snapshot plus the FTW.
+
+## Limitations
+
+**GPU architecture.** The kernels are AOT cubins for **sm_120** (RTX 50 series)
+only and the flake is x86_64-linux. There is no runtime PTX JIT. Another SM
+generation needs the kernel ABI/cubins rebuilt and revalidated, and the memory
+budget retuned; the engine binary itself is not a portable fatbin. The target is
+a single 8 GB card; 2057-token prefill already needs a reduced 1664-slot cache,
+and longer contexts need a smaller `kvTokens`/cache or a larger GPU.
+
+**Model.** Only **Qwen3.6-35B-A3B-NVFP4** (`Qwen3_5MoeForConditionalGeneration`,
+NVFP4 routed experts, FP8 attention projections) is supported. Text-only: the
+vision tensors are copied by the converter but not served. There is no other
+architecture, no bf16/GGUF/other quant variant, and no training. Adding a model
+means a new `src/models/<arch>/` (config, weight names, forward) and a registry
+entry, plus conversion mapping; adding another quant layout means new kernels.
+
+**Serving.** One GPU, one process. No tensor/pipeline/multi-node parallelism, no
+multimodal inputs, and no CPU serving of the real model (the scalar forward is
+an oracle, not a fast path). Prefill attention uses the tiled causal SDPA and a
+full K/V gather; decode has optional CUDA-graph capture. The conversion path is
+HF safetensors only, for this model.
+
+**Python.** None at inference. Python/Triton exist only to compile the kernels
+at build time (and optionally to run the upstream FreeToken reference/probes).
+
+## Install
+
+### NixOS (flake)
 
 ```nix
 {
-  inputs.ferrum-torrens.url = "path:/path/to/ferrum-torrens";
-  imports = [ inputs.ferrum-torrens.nixosModules.default ];
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    ferrum-torrens.url = "github:butzist/ferrum-torrens";
+  };
 
-  services.ferrum-torrens = {
-    enable = true;
-    # Defaults: nvidia/Qwen3.6-35B-A3B-NVFP4 at revision main, the pinned
-    # snapshot hash, port 1919 on 127.0.0.1, cuda_graph = true, kv 16384.
+  outputs = { self, nixpkgs, ferrum-torrens, ... }@inputs: {
+    nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        ferrum-torrens.nixosModules.default
+        {
+          services.ferrum-torrens = {
+            enable = true;
+            host = "0.0.0.0";       # default 127.0.0.1
+            port = 1919;
+            openFirewall = true;
+            gpu = 0;
+            cudaGraph = true;
+            kvTokens = 16384;
+            # model.path = "/srv/models/Qwen3.6-35B-A3B-NVFP4.ftw";
+            # model.source = /srv/hf/Qwen3.6-35B-A3B-NVFP4;
+          };
+        }
+        ./hardware-configuration.nix
+      ];
+    };
   };
 }
 ```
 
-The flake also exposes `ferrum-torrens-convert`, the CPU-only Rust HF -> FTW
-converter, and `ferrum-torrens-model`, the converted FTW checkpoint as a store
-path. The latter downloads the HF snapshot as a fixed-output derivation
-(~22 GB) and runs the converter over it at build time (~21 GB in the store,
-roughly 90 s of CPU). Nothing Python, uv or FreeToken reaches run time: the
-serving process is the only runtime.
+`nixos-rebuild switch` builds the server and the model. The model derivation
+downloads the HF snapshot as a fixed-output derivation (~22 GB), runs the Rust
+converter at build time (~90 s CPU) and stores the FTW (~21 GB); the server reads
+that store path and has no first-run conversion service. The snapshot is pinned
+by `model.hash`; update `model.repo`/`model.revision`/`model.hash` together to
+follow a new checkpoint. Use `model.source` for a local HF snapshot, or
+`model.path` (+ `model.autoConvert = false`) for an existing FTW.
 
-`model.hash` is the recursive NAR hash of the downloaded snapshot and must
-match `model.repo`/`model.revision`; update all three together (with `nix
-build` to obtain the new hash). To convert a local snapshot instead, set
-`model.source`; to serve an existing FTW checkpoint and skip the build
-entirely, set `model.path` (and optionally `model.autoConvert = false`). A
-null `model.path` with `autoConvert = false` is a configuration error. The
-service runs as a system user in the `video` and `render` groups and reads the
-FTW dir read-only.
+The flake also exposes:
 
-## Documentation map
+```
+ferrum-torrens            # server, cubins embedded
+ferrum-torrens-convert    # CPU-only HF -> FTW converter
+ferrum-torrens-model      # converted FTW checkpoint
+kernels                   # compiled sm_120 cubins
+```
 
-- **`TODO.md`** -- the open plan: scope, repo layout, config schema, the open
-  feature checklist, milestones, the backlog, and the decisions that bind open
-  work. Start here.
-- **`DONE.md`** -- history: the full confirmed-decision log (numbers are stable
-  and referenced from code and tests), the completed feature checklist, and the
-  progress narrative. Look here for the "why" behind a `decision N`.
-- **`ARCHITECTURE.md`** -- the description of record: building blocks, build
-  process, and a static plus dynamic view of each subsystem.
-- **`ALGORITHM.md`** -- the algorithm of record: exact forward math, the MoE
-  offload cache, and KV/radix and GDN state algorithms.
-- **`AGENTS.md`** -- how AI coding agents work in this repository.
-- **`FreeToken/`** -- the reference implementation (Apache-2.0). Read-only.
-
-## Build and test
-
-The CPU-only path needs no CUDA toolkit and must stay green. The cubins come
-from the `kernels` flake derivation (`FERRUM_KERNEL_DIR`, set by the devshell),
-so run cargo inside `nix develop`:
+### Standalone
 
 ```sh
+nix build .#ferrum-torrens
+nix build .#ferrum-torrens-model
+./result/bin/ferrum-torrens ./ferrum-torrens.toml
+```
+
+Point `[model] path` at the `ferrum-torrens-model` output, or convert a local
+snapshot:
+
+```sh
+nix run .#ferrum-torrens-convert -- \
+  --model /path/to/hf-snapshot \
+  --out /path/to/model.ftw \
+  --shard-gib 8
+```
+
+The package is a Nix wrapper that puts the CUDA 13.4 cuBLAS root and
+`/run/opengl-driver/lib` on `LD_LIBRARY_PATH`; on a non-NixOS host, provide the
+equivalent driver/toolkit paths.
+
+### Development
+
+```sh
+nix develop
 cargo fmt --check
 cargo clippy --all-targets
 cargo test
-```
-
-The GPU serving adapter is behind the non-default `cudarc` feature. Inside the
-devshell (which exports `CUDA_HOME` and `CUDARC_CUDA_VERSION`):
-
-```sh
 cargo clippy --all-targets --features cudarc
 cargo test --features cudarc --lib
 ```
 
-The gated real-checkpoint tests need the converted checkpoint in
-`.model-cache/` and, for the GPU ones, a device. Run one through the capped
-wrapper (it serializes and applies `RLIMIT_AS`):
+The gated real-checkpoint tests expect `.model-cache/Qwen3.6-35B-A3B-NVFP4.ftw`
+and a CUDA device; run them one at a time through `scripts/run-gated.sh`.
 
-```sh
-scripts/run-gated.sh --release --features cudarc <test_name>
-```
+## Scope and extending
 
-Kernel work has a CPU inner loop in the devshell (`kernel-selftest`,
-`kernel-compile-check`, `kernel-aot`); any change under `python/ferrum_kernel/`
-must pass `scripts/check-kernels.sh` before committing. See
-`AGENTS.md` for the exact environment and aliases.
+Supported now: one model (Qwen3.6-35B-A3B-NVFP4), one GPU class (sm_120, 8 GB
+target), text-only, single-GPU, single-process. The limits above are precise;
+this is not a drop-in for every FreeToken checkpoint.
+
+The engine is model-agnostic where it can be: the FTW reader, tensor runtime,
+cache, scheduler and kernel ABI are shared. A new model means a new
+`src/models/<arch>/` (config, weight names, forward) plus a registry entry and
+conversion mapping; a new GPU means rebuilding the cubins for its architecture
+and validating the kernels and memory budget. There are no other quant formats
+or multimodal paths yet. Contributions and testing on other hardware are
+welcome.
+
+## Documentation
+
+- [`TODO.md`](TODO.md) -- open work and the binding decisions.
+- [`DONE.md`](DONE.md) -- completed decisions and measurements.
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) -- build blocks and subsystem views.
+- [`ALGORITHM.md`](ALGORITHM.md) -- forward math, cache and GDN algorithms.
+- [`OPTIMIZATION.md`](OPTIMIZATION.md) -- performance baseline and plan.
+- [`AGENTS.md`](AGENTS.md) -- repository conventions for contributors/agents.
+
+## License and attribution
+
+FreeToken is Apache-2.0; the derived Triton kernels retain that license. See
+[`NOTICE`](NOTICE) and [`LICENSE-FreeToken`](LICENSE-FreeToken). This repository
+itself does not yet declare a separate license.

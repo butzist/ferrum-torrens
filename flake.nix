@@ -241,7 +241,7 @@
               # only work behind a hand-exported env.
               export TRITON_PTXAS_PATH="${pkgs.cudatoolkit}/bin/ptxas"
               export TRITON_PTXAS_BLACKWELL_PATH="${pkgs.cudatoolkit}/bin/ptxas"
-              # torch from FreeToken/.venv is a manylinux wheel whose RPATH points
+              # torch from an external FreeToken reference venv is a manylinux wheel whose RPATH points
               # at paths that do not exist here, so importing it (from the venv's
               # python, which only the FTW conversion uses) dies with
               # "libstdc++.so.6: cannot open shared object file" unless a
@@ -264,8 +264,8 @@
               # its own site-packages on sys.path, so only our module is added.
               export PYTHONPATH="$FLAKE_ROOT/python''${PYTHONPATH:+:$PYTHONPATH}"
               # The kernel toolchain python (torch + triton), not the bare
-              # `python3` on PATH (python312, which carries the FreeToken venv's
-              # interpreter use but not the kernel deps).
+              # `python3` on PATH (python312, which carries the reference venv's
+              # interpreter but not the kernel deps).
               export FERRUM_PYTHON="${pythonEnv}/bin/python3"
               # via bash, not the shebang: the jail has no /usr/bin/env.
               alias ft-gate="bash $FLAKE_ROOT/scripts/run-gate.sh"

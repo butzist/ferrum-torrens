@@ -3,9 +3,11 @@
 This document explains, for a Rust port, (1) the exact math of the Qwen3.5/3.6
 hybrid-attention MoE forward pass, (2) how FreeToken serves it (prefill vs decode,
 paged KV + radix reuse, GDN state), and (3) the expert memory hierarchy and caching
-algorithms of the `offload` strategy. It mirrors the behaviour in `./FreeToken`
-and the design section of the paper (arXiv:2608.16157, §3). Line references are to
-`./FreeToken/python/freetoken/...` for wherever the exact semantics are defined.
+algorithms of the `offload` strategy. It mirrors the behaviour of the upstream
+FreeToken reference (<https://github.com/FlashML-org/FreeToken>, not vendored)
+and the design section of the paper (arXiv:2608.16157, §3). References to
+`python/freetoken/...` name that upstream tree wherever the exact semantics are
+defined.
 
 ## 0. Reference model: Qwen3.6-35B-A3B (NVFP4)
 

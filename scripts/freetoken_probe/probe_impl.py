@@ -1,6 +1,6 @@
-"""Non-invasive timing and memory-layout probe for the read-only FreeToken tree.
+"""Non-invasive timing and memory-layout probe for an external FreeToken checkout.
 
-FreeToken is a read-only reference checkout, so this tool monkeypatches it at
+FreeToken is an external reference checkout (not vendored), so this tool monkeypatches it at
 import time instead of editing it. It is loaded by ``sitecustomize.py`` when
 ``FT_PROBE_OUT`` points at an output directory.
 

@@ -1,6 +1,6 @@
 """FP8 W8A16 dense linear (per-output-row scale), vendored from FreeToken.
 
-Origin: `FreeToken/python/freetoken/kernel/triton/fp8_pertensor_linear.py`
+Origin: upstream FreeToken's `python/freetoken/kernel/triton/fp8_pertensor_linear.py` (not vendored)
 (Apache-2.0), the `_gemv_splitk_kernel` / `_splitk_reduce_kernel` / `_gemm_kernel`
 W8A16 path only. FreeToken's own docstring records why this exists: the dense
 attention/GatedDeltaNet projections are per-tensor FP8 (`weight` e4m3 + a

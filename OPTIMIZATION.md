@@ -409,7 +409,7 @@ before E1/E2 free the VRAM (item 12).
 
 The gap is a **substrate difference**, not a missing trick: FreeToken authors the
 mixer as a handful of Triton kernels, we compose libtorch ops. Auditing
-`FreeToken/` against this repo shows the formats already line up, so the path is
+the upstream FreeToken reference against this repo shows the formats already line up, so the path is
 to **vendor FreeToken's own Triton sources** into `python/ferrum_kernel/` and AOT
 them through our pipeline (FLA is MIT, FreeToken Apache-2.0; attribute the
 origin), keeping libtorch as the generic/CPU fallback and our own paged-attention
@@ -450,7 +450,7 @@ routed-expert and dense-head GEMVs were fine to keep. The `FT_PROFILE=1` stage
 profile says otherwise: at 512 slots our `moe_gemm` is 29.0 ms/token vs the
 reference's `_decode_nvfp4_marlin_kernel` 3.5, and our `head` 12.6 vs its
 `_nvfp4_gemv_kernel` 0.8. These are ordinary Triton kernels in
-`FreeToken/python/freetoken/kernel/triton/nvfp4_linear.py`, so they are
+upstream FreeToken's `python/freetoken/kernel/triton/nvfp4_linear.py`, so they are
 vendor-able like the others; doing so is item 22 and the current top decode
 lever, ahead of cache growth.
 
@@ -934,7 +934,7 @@ Answered, with the code path:
 
 ## R8 -- Kernel quality, dtypes, and the miss-rate question (operator request, 2026-10-17)
 
-Findings are from reading `FreeToken/` (read-only) plus our `FT_PROFILE` and the
+Findings are from reading the upstream FreeToken reference plus our `FT_PROFILE` and the
 decision-95 `FT_ROUTE_TRACE`. Our post-R7 stage profile (auto, bs=1): copy 29.6,
 gdn 9.8, attn 4.37, moe_gemm 4.2, shared 2.26, router 1.8, moe_lru 1.4, head
 1.06. Reference (auto, their AIME): copy 15.1, gdn 6.6-8.2, attn 2.1-2.8,

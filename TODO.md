@@ -382,9 +382,9 @@ prefill double-buffer path active.
 
 Legend: **P0** first runnable pipeline. **P1** performance must-haves. **[opt]** intended but undecided / optional.
 
-### Conversion (one-time, python)
+### Conversion (one-time, Rust)
 
-- [ ] P0 note: running the converter requires building FreeToken once (torch + flashinfer + nvcc deps, see `FreeToken/README.md`). If that is undesirable on the target machine, a standalone converter (safetensors -> FTW) is a P2 fallback; it does not change the Rust side because FTW is the input format either way.
+- [x] **standalone HF -> FTW converter -- DONE (decision 137).** `ferrum-torrens-convert` is CPU-only and byte-identical to the reference FTW; it needs no FreeToken checkout, torch or GPU. See `DONE.md` 137.
 
 ### Weights / model load
 

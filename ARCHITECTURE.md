@@ -753,7 +753,7 @@ step, and `tests/cudarc_engine_generate.rs` gates the registry-built path.
 | Triton (cubins) | build-time authoring; artifacts embedded at compile time | `python/ferrum_kernel/*`, `nix/kernels.nix` | The hand-written NVFP4 grouped-MoE GEMV, the silu/sum-reduce, the offload staging and prefill CSR kernels, and the paged GQA decode attention kernel. Authored and AOT-compiled in Python; launched by `cuda_driver` with no interpreter at runtime |
 | `axum` + `tokio` | runtime | `infrastructure/http.rs`, `main.rs` | HTTP server, SSE streaming, and the async runtime that offloads forwards to blocking threads |
 | `tokenizers` + `minijinja` | runtime | `infrastructure/tokenizers_hf.rs` | HF byte-level BPE tokenizer and the checkpoint's chat template (Python string methods rewritten to filters; `json` feature for the template's `tojson`) |
-| Python + `uv` (FreeToken venv) | build-time only | `scripts/convert_hf_to_ftw.py`, `FreeToken/` | The one-time HF -> FTW conversion via `ft checkpoint`; never in the serving process |
+| Rust converter | build-time only | `src/converter/`, `src/bin/convert.rs`, `nix/convert.nix` | The CPU-only HF -> FTW conversion (`ferrum-torrens-convert`); never in the serving process |
 
 Boundary note: the cudarc `Tensor` and the CUDA driver handles live entirely in
 `infrastructure`; the domain sees only `MoETensor`, counts and opaque bytes.

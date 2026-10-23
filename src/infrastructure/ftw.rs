@@ -1,6 +1,6 @@
 // FreeToken Weight (FTW) checkpoint index: parse ``freetoken_weight.json`` and
 // resolve tensor byte ranges to per-shard reads. Schema mirrors
-// ``FreeToken/python/freetoken/checkpoint/ftw.py`` (read-only reference).
+// upstream FreeToken's ``python/freetoken/checkpoint/ftw.py`` (not vendored).
 //
 // On-disk layout (see ftw.py docstring): one logical contiguous byte region of
 // all tensors, sliced into shard files of at most ``shard_limit`` bytes. Every
