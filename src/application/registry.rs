@@ -37,6 +37,9 @@ pub struct BuiltModel {
     pub model: Box<dyn CachedModel>,
     /// The resolved expert-cache slot count (explicit or auto-sized, item 12).
     pub cache_size_slots: usize,
+    /// The arch's vision tower, when the checkpoint declares a `vision_config`,
+    /// loaded for multimodal requests. `None` for a text-only checkpoint.
+    pub vision: Option<Arc<dyn crate::domain::model::VisionTower>>,
 }
 
 /// The arch label from `config.json` `architectures[0]`, used to dispatch.
@@ -80,7 +83,7 @@ pub fn build(
                 // composition root, but the scalar reference still answers on a
                 // CPU-only host, so `auto` keeps working there.
                 let Device::Cuda(_) = device else {
-                    return scalar_built(tc, index, reader, config);
+                    return scalar_built(config_json, tc, index, reader, config);
                 };
                 // The cudarc path widens and uploads every weight itself, so
                 // it takes the parsed params plus the reader rather than the
@@ -119,7 +122,7 @@ pub fn build(
                 )
                 .map_err(|e| RegistryError::Build(e.to_string()))?;
                 let slots = resolve_cache_slots(config, &params, device, Some(driver.as_ref()))?;
-                let moe = moe_port(config, &params, index, reader, device, stream, slots)?;
+                let moe = moe_port(config, &params, index.clone(), reader.clone(), device, stream, slots)?;
                 model.attach_moe(moe);
                 let captured = if capture {
                     match capture_decode(config, &model, &cache, model.runtime()) {
@@ -140,10 +143,11 @@ pub fn build(
                     captured,
                     model: Box::new(model),
                     cache_size_slots: slots,
+                    vision: load_vision(config_json, index, reader)?,
                 })
             }
             #[cfg(not(feature = "cudarc"))]
-            scalar_built(tc, index, reader, config)
+            scalar_built(config_json, tc, index, reader, config)
         }
         other => Err(RegistryError::Unsupported(other.to_string())),
     }
@@ -152,6 +156,7 @@ pub fn build(
 /// The scalar reference model, the answer on a host with no CUDA device and on
 /// a build with no compute backend at all.
 fn scalar_built(
+    config_json: &Value,
     tc: &Value,
     index: Arc<FtwIndex>,
     reader: Arc<dyn WeightsReader>,
@@ -164,7 +169,7 @@ fn scalar_built(
     }
     Ok(BuiltModel {
         model: Box::new(
-            Qwen3_6::from_text_config(tc, index, reader)
+            Qwen3_6::from_text_config(tc, index.clone(), reader.clone())
                 .map_err(|e| RegistryError::Build(e.to_string()))?,
         ),
         captured: None,
@@ -173,7 +178,37 @@ fn scalar_built(
             .cache_size_slots
             .explicit()
             .unwrap_or(crate::config::DEFAULT_CACHE_SIZE_SLOTS),
+        vision: load_vision(config_json, index, reader)?,
     })
+}
+
+/// Load the arch's vision tower when the checkpoint declares one: parse the
+/// `vision_config`, load its `visual.*` weights on the host with a registry
+/// error if anything is missing — this runs once at build time, so a missing
+/// tensor is a hard failure, not a request-time surprise.
+pub fn load_vision(
+    config_json: &Value,
+    index: Arc<FtwIndex>,
+    reader: Arc<dyn WeightsReader>,
+) -> Result<Option<Arc<dyn crate::domain::model::VisionTower>>, RegistryError> {
+    let Some(vc) = config_json.get("vision_config") else {
+        return Ok(None);
+    };
+    let id = config_json
+        .get("image_token_id")
+        .and_then(Value::as_u64)
+        .and_then(|v| u32::try_from(v).ok())
+        .ok_or_else(|| {
+            RegistryError::Build("vision_config present but image_token_id is not a u32".into())
+        })?;
+    let vcfg = crate::models::qwen3_6::config::parse_vision_config(vc)
+        .map_err(|e| RegistryError::Build(e.to_string()))?;
+    let weights = crate::models::qwen3_6::weights::VisionWeights::load(&index, reader.as_ref())
+        .map_err(|e| RegistryError::Build(e.to_string()))?;
+    let tower = crate::models::qwen3_6::vision::VisionTower::new(vcfg, weights);
+    Ok(Some(std::sync::Arc::new(
+        crate::models::qwen3_6::vision::Qwen3_6Vision::new(tower, id),
+    )))
 }
 
 /// Record one decode graph per batch size and wrap them in the engine's service.

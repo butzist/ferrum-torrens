@@ -196,6 +196,8 @@ fn logit_lens_locates_the_first_bad_layer() {
         positions: (0..ids.len() as u32).collect(),
         input_ids: ids,
         answers: vec![],
+        image_embeddings: None,
+        image_positions: None,
     };
     let start = Instant::now();
     let (_logits, lenses) = engine.probe_layers(&input, EVERY);
@@ -235,6 +237,7 @@ fn per_step_cost_scales_with_prefix_length() {
             uid: 1,
             ids: &ids,
             params: &params,
+            images: None,
         };
         let start = Instant::now();
         let token = engine.run_forward(&[row()], &mut rng).unwrap()[0].1;

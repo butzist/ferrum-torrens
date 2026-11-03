@@ -139,6 +139,68 @@ pub fn parse_text_config(tc: &Value) -> Result<ModelParams, ConfigError> {
     })
 }
 
+/// Parsed `vision_config` from the checkpoint `config.json`. Multimodal plans
+/// (branch `feat/multimodal-vision`): the tower encodes images into per-token
+/// rows spliced into the LLM embedding stream at `<|image_pad|>` positions.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VisionConfig {
+    pub depth: usize,
+    pub hidden_size: usize,
+    pub intermediate_size: usize,
+    pub num_heads: usize,
+    pub num_position_embeddings: usize,
+    pub out_hidden_size: usize,
+    pub patch_size: usize,
+    pub spatial_merge_size: usize,
+    pub temporal_patch_size: usize,
+    pub in_channels: usize,
+    pub hidden_act: String,
+    pub deepstack_visual_indexes: Vec<usize>,
+}
+
+/// Parse `vision_config` (the `vision_config` value of the checkpoint `config.json`).
+pub fn parse_vision_config(vc: &Value) -> Result<VisionConfig, ConfigError> {
+    let depth = get_u64(vc, "depth")? as usize;
+    let hidden_size = get_u64(vc, "hidden_size")? as usize;
+    let intermediate_size = get_u64(vc, "intermediate_size")? as usize;
+    let num_heads = get_u64(vc, "num_heads")? as usize;
+    let num_position_embeddings = get_u64(vc, "num_position_embeddings")? as usize;
+    let out_hidden_size = get_u64(vc, "out_hidden_size")? as usize;
+    let patch_size = get_u64(vc, "patch_size")? as usize;
+    let spatial_merge_size = get_u64(vc, "spatial_merge_size").unwrap_or(1) as usize;
+    let temporal_patch_size = get_u64(vc, "temporal_patch_size").unwrap_or(1) as usize;
+    let in_channels = get_u64(vc, "in_channels").unwrap_or(3) as usize;
+    let hidden_act = vc
+        .get("hidden_act")
+        .and_then(Value::as_str)
+        .unwrap_or("gelu")
+        .to_string();
+    let deepstack_visual_indexes = vc
+        .get("deepstack_visual_indexes")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_u64)
+                .map(|v| v as usize)
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(VisionConfig {
+        depth,
+        hidden_size,
+        intermediate_size,
+        num_heads,
+        num_position_embeddings,
+        out_hidden_size,
+        patch_size,
+        spatial_merge_size,
+        temporal_patch_size,
+        in_channels,
+        hidden_act,
+        deepstack_visual_indexes,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,5 +305,54 @@ mod tests {
             vec![3, 7],
             "layers (i+1) % 4 == 0 -> ids 3,7 for 8 layers"
         );
+    }
+
+    const VISION_CONFIG: &str = r#"{
+      "deepstack_visual_indexes": [],
+      "depth": 27,
+      "dtype": "bfloat16",
+      "hidden_act": "gelu_pytorch_tanh",
+      "hidden_size": 1152,
+      "in_channels": 3,
+      "initializer_range": 0.02,
+      "intermediate_size": 4304,
+      "model_type": "qwen3_5_moe_vision",
+      "num_heads": 16,
+      "num_position_embeddings": 2304,
+      "out_hidden_size": 2048,
+      "patch_size": 16,
+      "spatial_merge_size": 2,
+      "temporal_patch_size": 2
+    }"#;
+
+    #[test]
+    fn parses_real_vision_config() {
+        let v: serde_json::Value = serde_json::from_str(VISION_CONFIG).unwrap();
+        let c = parse_vision_config(&v).unwrap();
+        assert_eq!(c.depth, 27);
+        assert_eq!(c.hidden_size, 1152);
+        assert_eq!(c.intermediate_size, 4304);
+        assert_eq!(c.num_heads, 16);
+        assert_eq!(c.num_position_embeddings, 2304);
+        assert_eq!(c.out_hidden_size, 2048);
+        assert_eq!(c.patch_size, 16);
+        assert_eq!(c.spatial_merge_size, 2);
+        assert_eq!(c.temporal_patch_size, 2);
+        assert_eq!(c.in_channels, 3);
+        assert_eq!(c.hidden_act, "gelu_pytorch_tanh");
+        assert!(c.deepstack_visual_indexes.is_empty());
+    }
+
+    #[test]
+    fn parses_deepstack_indexes() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{ "depth": 27, "hidden_size": 1152, "intermediate_size": 4304,
+                 "num_heads": 16, "num_position_embeddings": 2304,
+                 "out_hidden_size": 2048, "patch_size": 16,
+                 "deepstack_visual_indexes": [8, 16, 24] }"#,
+        )
+        .unwrap();
+        let c = parse_vision_config(&v).unwrap();
+        assert_eq!(c.deepstack_visual_indexes, vec![8, 16, 24]);
     }
 }

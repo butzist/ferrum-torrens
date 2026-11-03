@@ -58,6 +58,55 @@ pub enum EngineError {
     },
     #[error("captured decode failed: {0}")]
     Captured(String),
+    #[error("vision tower: {0}")]
+    Vision(String),
+}
+
+/// A request's image data, computed once at request build time: `rows[i]` is
+/// the embedding row the LLM stream splices in at the global token index
+/// `positions[i]` of the request's expanded id sequence.
+pub type ImageSplice = (Vec<Vec<f32>>, Vec<usize>);
+
+#[derive(Debug, Clone)]
+pub struct RequestImages {
+    pub rows: Vec<Vec<f32>>,
+    pub positions: Vec<usize>,
+}
+
+impl RequestImages {
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// The splice a forward over `window` (a slice of the session's id
+    /// sequence starting at `window.start`) needs: the rows whose global
+    /// positions fall inside, re-based into window-local coordinates.
+    /// `Ok(None)` when the window carries no image tokens.
+    pub fn slice_for_window(
+        &self,
+        window: std::ops::Range<usize>,
+    ) -> Result<Option<ImageSplice>, EngineError> {
+        let mut rows = Vec::new();
+        let mut local = Vec::new();
+        for (i, &g) in self.positions.iter().enumerate() {
+            if g >= window.start && g < window.end {
+                rows.push(
+                    self.rows
+                        .get(i)
+                        .ok_or_else(|| {
+                            EngineError::Vision(format!("no row for image position {}", g))
+                        })?
+                        .clone(),
+                );
+                local.push(g - window.start);
+            }
+        }
+        if rows.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some((rows, local)))
+        }
+    }
 }
 
 /// One row of a forward batch: a request's full id sequence plus the sampling
@@ -66,22 +115,31 @@ pub struct BatchRow<'a> {
     pub uid: u64,
     pub ids: &'a [u32],
     pub params: &'a SamplingParams,
+    /// A single-row image request's splice; `None` for a text row.
+    pub images: Option<&'a RequestImages>,
 }
 
 /// One request's step against its own KV page table: only the tokens this step
 /// adds, at the position they belong to. `cache` must hold everything before
-/// `ids`, i.e. `cache.cached() == start`; the engine reserves the rest.
+/// `ids`, i.e. `cache.cached() == start`; the engine reserves the rest. An
+/// image-carrying request hands its `RequestImages` along so a chunk that
+/// straddles an image's placeholder run splices those rows in.
 pub struct CachedStep<'a> {
     pub uid: u64,
     pub ids: &'a [u32],
     pub start: usize,
     pub cache: &'a mut SequenceCache,
     pub params: &'a SamplingParams,
+    pub images: Option<&'a RequestImages>,
 }
 
 pub struct Engine {
     model: Arc<dyn CachedModel>,
     cache: Option<Arc<dyn KvCache>>,
+    /// The arch's vision tower for multimodal requests, behind the domain port
+    /// so the engine never names a concrete `models/` type. `None` for a
+    /// text-only checkpoint or any build the composition root did not load it.
+    vision: Option<Arc<dyn crate::domain::model::VisionTower>>,
     /// The captured decode graphs the engine owns, when the composition root
     /// built them. `None` on a CPU build or any device without capture, and then
     /// decode stays the per-request cached forward.
@@ -90,6 +148,49 @@ pub struct Engine {
     eos_ids: Vec<u32>,
     limits: EngineLimits,
     device: Device,
+}
+
+/// Replace each `<|image_pad|>` run in an encoded prompt with the image's
+/// visual tokens, and record the splice the prefill forward needs. The pad is
+/// repeated per visual token rather than merged into one id, so the KV page
+/// table, the radix tree and the chunked prefill all see the real token count.
+/// The n-th pad run in the ids takes the n-th image; there must be exactly one
+/// run per image and one image per run.
+fn expand_image_pads<E>(
+    prompt_ids: &[u32],
+    images: &[Vec<u8>],
+    pad: u32,
+    mut encode: E,
+) -> Result<(Vec<u32>, RequestImages), EngineError>
+where
+    E: FnMut(&[u8]) -> Result<Vec<Vec<f32>>, String>,
+{
+    let pads = prompt_ids.iter().filter(|&&i| i == pad).count();
+    if pads != images.len() {
+        return Err(EngineError::Vision(format!(
+            "prompt has {} <|image_pad|> runs but the request carries {} images",
+            pads,
+            images.len()
+        )));
+    }
+    let mut ids = Vec::with_capacity(prompt_ids.len());
+    let mut rows: Vec<Vec<f32>> = Vec::new();
+    let mut positions: Vec<usize> = Vec::new();
+    let mut image_i = 0usize;
+    for &id in prompt_ids {
+        if id != pad {
+            ids.push(id);
+            continue;
+        }
+        let visual = encode(images[image_i].as_slice()).map_err(EngineError::Vision)?;
+        image_i += 1;
+        for row in visual {
+            positions.push(ids.len());
+            rows.push(row);
+            ids.push(pad);
+        }
+    }
+    Ok((ids, RequestImages { rows, positions }))
 }
 
 /// An id or the list of ids, the shape `generation_config.json` uses for
@@ -277,14 +378,18 @@ pub fn load_engine(config: &crate::config::Config) -> Result<Engine, LoadError> 
     )?;
     let eos_ids = eos_ids_from_ftw_dir(dir)?;
 
-    Ok(Engine::with_captured(
+    let mut engine = Engine::with_captured(
         std::sync::Arc::from(model),
         std::sync::Arc::new(tokenizer),
         eos_ids,
         limits,
         device,
         built.captured,
-    ))
+    );
+    if let Some(vision) = built.vision {
+        engine.vision = Some(vision);
+    }
+    Ok(engine)
 }
 
 impl Engine {
@@ -321,12 +426,25 @@ impl Engine {
         Self {
             model,
             cache,
+            vision: None,
             captured,
             tokenizer,
             eos_ids,
             limits,
             device,
         }
+    }
+
+    /// Attach the arch's vision tower, loaded by the composition root. Kept as
+    /// a builder step so the capture-free constructor signature stays put.
+    pub fn with_vision(mut self, vision: Arc<dyn crate::domain::model::VisionTower>) -> Self {
+        self.vision = Some(vision);
+        self
+    }
+
+    /// The vision tower port, when the engine's checkpoint declares one.
+    pub fn vision(&self) -> Option<&Arc<dyn crate::domain::model::VisionTower>> {
+        self.vision.as_ref()
     }
 
     /// The engine's captured decode service, when it has one. The generation
@@ -425,6 +543,32 @@ impl Engine {
         self.model.probe_layers(input, every)
     }
 
+    /// Build a multimodal request: run every image through the vision tower,
+    /// replace each `<|image_pad|>` placeholder in the encoded prompt with one
+    /// placeholder token per visual token of its image, and record the splice
+    /// (embedding rows and their global positions) the prefill forwards eat.
+    /// Rows are produced by `VisionTower::encode` in image order; the pad runs
+    /// in the ids appear in the same order, so the i-th pad run takes image i.
+    pub fn make_request_with_images(
+        &self,
+        uid: u64,
+        prompt_ids: Vec<u32>,
+        images: Vec<Vec<u8>>,
+        params: SamplingParams,
+        seed: u64,
+    ) -> Result<crate::application::generation::Request, EngineError> {
+        let vision = self
+            .vision
+            .as_ref()
+            .ok_or_else(|| EngineError::Vision("this checkpoint has no vision tower".into()))?;
+        let pad = vision.image_token_id();
+        let (ids, splice) =
+            expand_image_pads(&prompt_ids, &images, pad, |bytes| vision.encode(bytes))?;
+        let images = std::sync::Arc::new(splice);
+        crate::application::generation::make_request_with_images(
+            self, uid, ids, images, params, seed,
+        )
+    }
     /// One step of one request off its page table: reserve pages for `ids`,
     /// forward them at position `start`, sample from the logits.
     ///
@@ -437,7 +581,7 @@ impl Engine {
         row: CachedStep<'_>,
         rng: &mut Rng,
     ) -> Result<(u64, u32), EngineError> {
-        let logits = self.extend_cached(row.uid, row.ids, row.start, row.cache)?;
+        let logits = self.extend_cached(row.uid, row.ids, row.start, row.cache, row.images)?;
         Ok((row.uid, sample(&logits, row.params, rng)))
     }
 
@@ -446,7 +590,7 @@ impl Engine {
     /// that make a chunked run diverge from an unchunked one. The model still
     /// computes the answer row (its forward is fixed-shape), which is discarded.
     pub fn run_prefill_cached(&self, row: CachedStep<'_>) -> Result<(), EngineError> {
-        self.extend_cached(row.uid, row.ids, row.start, row.cache)?;
+        self.extend_cached(row.uid, row.ids, row.start, row.cache, row.images)?;
         Ok(())
     }
 
@@ -456,6 +600,7 @@ impl Engine {
         ids: &[u32],
         start: usize,
         cache: &mut SequenceCache,
+        images: Option<&RequestImages>,
     ) -> Result<Vec<f32>, EngineError> {
         let kv = self.cache.as_ref().ok_or(EngineError::NoKvCache)?.clone();
         if ids.is_empty() {
@@ -471,10 +616,27 @@ impl Engine {
         kv.reserve(cache, ids.len())
             .map_err(|e| EngineError::KvCache(e.to_string()))?;
         let n = ids.len();
+        let (image_embeddings, image_positions) = match images {
+            Some(imgs) => imgs
+                .slice_for_window(start..start + n)?
+                .unwrap_or((Vec::new(), Vec::new())),
+            None => (Vec::new(), Vec::new()),
+        };
+        let has_images = !image_positions.is_empty();
         let input = crate::domain::model::ForwardInput {
             input_ids: ids.to_vec(),
             positions: (start..start + n).map(|p| p as u32).collect(),
             answers: vec![n - 1],
+            image_embeddings: if has_images {
+                Some(image_embeddings)
+            } else {
+                None
+            },
+            image_positions: if has_images {
+                Some(image_positions)
+            } else {
+                None
+            },
         };
         let logits = self
             .model
@@ -498,6 +660,21 @@ impl Engine {
         if rows.is_empty() {
             return Ok(Vec::new());
         }
+        // Image rows carry their own embedding rows, so they cannot share a
+        // flat input with text rows: the positions/image table would be
+        // ambiguous across a flattened batch. The scheduler keeps every image
+        // request alone (a single-row batch), and this is the backstop.
+        let images = match rows {
+            [single] => single.images,
+            _ => {
+                if rows.iter().any(|r| r.images.is_some()) {
+                    return Err(EngineError::Vision(
+                        "an image request cannot be batched with other rows".into(),
+                    ));
+                }
+                None
+            }
+        };
         let mut input_ids = Vec::new();
         let mut positions = Vec::new();
         let mut answers = Vec::with_capacity(rows.len());
@@ -509,11 +686,29 @@ impl Engine {
             }
             answers.push(input_ids.len() - 1);
         }
-
+        let mut image_embeddings = Vec::new();
+        let mut image_positions = Vec::new();
+        if let Some(imgs) = images
+            && !imgs.rows.is_empty()
+        {
+            image_embeddings = imgs.rows.clone();
+            image_positions = imgs.positions.clone();
+        }
+        let has_images = !image_positions.is_empty();
         let logits = self.model.forward(&crate::domain::model::ForwardInput {
             input_ids,
             positions,
             answers,
+            image_embeddings: if has_images {
+                Some(image_embeddings)
+            } else {
+                None
+            },
+            image_positions: if has_images {
+                Some(image_positions)
+            } else {
+                None
+            },
         });
         let vocab = self.model.params().vocab_size;
         if logits.len() != rows.len() * vocab {
@@ -958,6 +1153,7 @@ mod tests {
             uid: 7,
             ids: &[10, 20],
             params,
+            images: None,
         }]
     }
 
@@ -980,11 +1176,13 @@ mod tests {
                 uid: 1,
                 ids: &[5, 6],
                 params: &p,
+                images: None,
             },
             BatchRow {
                 uid: 2,
                 ids: &[9, 8, 7],
                 params: &p,
+                images: None,
             },
         ];
         let out = e.run_forward(&batch, &mut rng).unwrap();

@@ -13,3 +13,6 @@ __pycache__/
 # Local direnv/devshell state
 .direnv/
 .envrc
+
+# Per-project jailed-agent home
+.home/

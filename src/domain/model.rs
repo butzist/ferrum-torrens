@@ -99,6 +99,28 @@ pub struct ForwardInput {
     pub input_ids: Vec<u32>,
     pub positions: Vec<u32>,
     pub answers: Vec<usize>,
+    /// Visual embeddings spliced in at `image_positions`: rows of the LLM's
+    /// `hidden_size`, produced by the arch's vision tower. `image_positions`
+    /// indexes those rows against the positions of `positions` -- i.e. they are
+    /// local to this forward, so a request's global image slots are re-based
+    /// into per-step coordinates by whoever slices a window out of a session.
+    /// `run_forward`-shaped callers pass `None` for every field of a text-only
+    /// batch.
+    pub image_embeddings: Option<Vec<Vec<f32>>>,
+    /// Indices into `input_ids` whose embedding row comes from
+    /// `image_embeddings` (row i for the i-th entry) instead of the table.
+    pub image_positions: Option<Vec<usize>>,
+}
+
+/// The vision tower port: encode one image into the per-visual-token rows the
+/// LLM stream splices in. Arch-specific (only multimodal arches have a tower),
+/// so the engine holds `Arc<dyn VisionTower>` behind this trait and never sees
+/// the concrete `models/` type. Also declares the placeholder token id the
+/// arch's chat template emits for an image, so the order of the encoded
+/// `<|image_pad|>` runs in a prompt pins the order of an image list.
+pub trait VisionTower: Send + Sync {
+    fn encode(&self, image_bytes: &[u8]) -> Result<Vec<Vec<f32>>, String>;
+    fn image_token_id(&self) -> u32;
 }
 
 /// One logit-lens reading of the residual stream at a given depth: what the

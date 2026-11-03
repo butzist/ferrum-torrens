@@ -41,12 +41,15 @@ pub struct Generation {
 
 /// A request as handed to the engine: ids already tokenized, params not yet
 /// clamped, and the sampler seed (each request carries its own, so batching a
-/// request with others never changes the tokens it draws).
+/// request with others never changes the tokens it draws). An image request
+/// also carries the vision tower's output; the ids already expanded each
+/// `<|image_pad|>` to its visual token count.
 pub struct Request {
     pub uid: u64,
     pub prompt_ids: Vec<u32>,
     pub params: SamplingParams,
     pub seed: u64,
+    pub images: Option<std::sync::Arc<crate::application::engine::RequestImages>>,
 }
 
 /// Engine-side per-request state the domain `Req` cannot hold (it stays pure):
@@ -59,6 +62,8 @@ struct Session {
     /// and for a model with no cache at all.
     cache: Option<SequenceCache>,
     rng: Rng,
+    /// An image request's splice, shared from the `Request`.
+    images: Option<Arc<crate::application::engine::RequestImages>>,
 }
 
 /// Build a request, clamping `max_tokens` by the engine's output limit and by
@@ -69,6 +74,31 @@ pub fn make_request(
     prompt_ids: Vec<u32>,
     params: SamplingParams,
     seed: u64,
+) -> Result<Request, EngineError> {
+    make_request_impl(engine, uid, prompt_ids, params, seed, None)
+}
+
+/// `make_request` with the vision tower's output attached: a multimodal
+/// request. `images` was already computed against the *expanded* `prompt_ids`
+/// by `Engine::make_request_with_images`, which then calls through here.
+pub fn make_request_with_images(
+    engine: &Engine,
+    uid: u64,
+    prompt_ids: Vec<u32>,
+    images: Arc<crate::application::engine::RequestImages>,
+    params: SamplingParams,
+    seed: u64,
+) -> Result<Request, EngineError> {
+    make_request_impl(engine, uid, prompt_ids, params, seed, Some(images))
+}
+
+fn make_request_impl(
+    engine: &Engine,
+    uid: u64,
+    prompt_ids: Vec<u32>,
+    params: SamplingParams,
+    seed: u64,
+    images: Option<Arc<crate::application::engine::RequestImages>>,
 ) -> Result<Request, EngineError> {
     let limits = engine.limits();
     if prompt_ids.is_empty() {
@@ -91,6 +121,7 @@ pub fn make_request(
         prompt_ids,
         params,
         seed,
+        images,
     })
 }
 
@@ -207,6 +238,7 @@ fn run_batch(
             prompt_ids,
             params,
             seed,
+            images,
         } = r;
         let req = Req::new(uid, prompt_ids.len(), params);
         sessions.insert(
@@ -217,6 +249,7 @@ fn run_batch(
                 generated: Vec::new(),
                 cache: None,
                 rng: Rng::new(seed),
+                images,
             },
         );
         pending.push(req);
@@ -225,6 +258,17 @@ fn run_batch(
     let mut finished: Vec<u64> = Vec::new();
 
     while !pending.is_empty() || !decoding.is_empty() {
+        // An image request's embedding rows belong to it alone, so the batch
+        // that runs one is always a single row: one forward, one sequence.
+        let images_only = sessions.values().any(|s| s.images.is_some());
+        let budget = if images_only {
+            Budget {
+                max_running_requests: 1,
+                ..budget
+            }
+        } else {
+            budget
+        };
         let batch = schedule_next_batch(&mut pending, &mut decoding, &budget);
         let Some(phase) = batch.phase else {
             break;
@@ -257,9 +301,18 @@ fn run_batch(
                         cache: slot,
                         req,
                         rng,
+                        images,
                     } = s;
                     if slot.is_none() {
-                        let opened = open_cache(&kv, ids);
+                        // Prefix adoption matches token ids only, so an image
+                        // request must not adopt: the same placeholder pattern
+                        // can stand for a different image. It fills its own
+                        // pages instead.
+                        let opened = if images.is_some() {
+                            kv.begin()
+                        } else {
+                            open_cache(&kv, ids)
+                        };
                         // A matched prefix already covers tokens the scheduler
                         // counted as pending; realign so chunking resumes past it.
                         req.prefilled = req.prefilled.max(opened.cached());
@@ -278,8 +331,14 @@ fn run_batch(
                             start,
                             cache,
                             params: &req.sampling,
+                            images: images.as_deref(),
                         })?;
-                        kv.commit(cache, &ids[..end], false);
+                        // An image boundary snapshot would donate KV pages the
+                        // radix could later hand to another request with the
+                        // same placeholder pattern; skip it like the donations.
+                        if images.is_none() {
+                            kv.commit(cache, &ids[..end], false);
+                        }
                         req.advance_prefill(chunk);
                         continuations.push(req.clone());
                         continue;
@@ -291,6 +350,7 @@ fn run_batch(
                             start,
                             cache,
                             params: &req.sampling,
+                            images: images.as_deref(),
                         },
                         rng,
                     )?;
@@ -314,6 +374,7 @@ fn run_batch(
                         uid: s.req.uid,
                         ids: &s.ids,
                         params: &s.req.sampling,
+                        images: s.images.as_deref(),
                     }
                 })
                 .collect();
@@ -361,7 +422,12 @@ fn run_batch(
         if let (Some(kv), Some(mut cache)) = (engine.cache(), s.cache.take()) {
             // Donate the finished request's full sequence (prompt + generated)
             // and its final GDN state to the prefix tree before releasing it.
-            kv.commit(&mut cache, &s.ids, true);
+            // An image request's pages are keyed by its placeholder token ids
+            // only, so a donation would let a later request with the same
+            // pattern adopt a different image's KV; it keeps its pages private.
+            if s.images.is_none() {
+                kv.commit(&mut cache, &s.ids, true);
+            }
             kv.end(&mut cache);
         }
         let text = finish_text(engine, &s)?;

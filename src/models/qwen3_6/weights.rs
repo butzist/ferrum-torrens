@@ -77,6 +77,61 @@ pub fn bank_name(part: &str, layer: usize) -> String {
     format!("{part}#L{layer:05}")
 }
 
+/// Vision-tower weights (the `visual.*` tensors). Loaded on demand for
+/// multimodal prefill and freed before the LLM runs, so they do not stay
+/// resident. Mirrors `DenseWeights` but restricted to the `visual.` prefix.
+#[derive(Debug)]
+pub struct VisionWeights {
+    bytes: Vec<(String, Vec<u8>)>,
+}
+
+impl VisionWeights {
+    pub fn load(index: &FtwIndex, reader: &dyn WeightsReader) -> Result<Self, LoadError> {
+        let mut out = Vec::new();
+        for t in &index.tensors {
+            if t.kind != TensorKind::Weight {
+                continue;
+            }
+            if !t.name.starts_with("visual.") {
+                continue;
+            }
+            let mut buf = vec![0u8; t.nbytes as usize];
+            reader
+                .read_range(t.global_off, t.nbytes, &mut buf)
+                .map_err(|e| LoadError::Read(t.name.clone(), e))?;
+            out.push((t.name.clone(), buf));
+        }
+        Ok(Self { bytes: out })
+    }
+
+    pub fn from_pairs(pairs: Vec<(String, Vec<u8>)>) -> Self {
+        Self { bytes: pairs }
+    }
+
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.bytes.iter().any(|(n, _)| n == name)
+    }
+
+    pub fn bytes(&self, name: &str) -> Option<&[u8]> {
+        self.bytes
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, b)| b.as_slice())
+    }
+
+    pub fn names(&self) -> Vec<String> {
+        self.bytes.iter().map(|(n, _)| n.clone()).collect()
+    }
+}
+
 /// Split a bank name into (part, layer); None for non-bank names.
 pub fn parse_bank_name(name: &str) -> Option<(String, usize)> {
     layer_bank_entry(name).map(|(part, l)| (part, l as usize))

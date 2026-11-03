@@ -792,6 +792,9 @@ fn run_sequence(
     tokens: &[u32],
     positions: &[u32],
     mut lens: Option<&mut Vec<Lens>>,
+    image_embeddings: Option<&[Vec<f32>]>,
+    image_positions: Option<&[usize]>,
+    global_offset: usize,
 ) -> Result<Vec<f32>> {
     let p = ctx.params;
     let t = tokens.len();
@@ -800,6 +803,26 @@ fn run_sequence(
     let emb = ctx.dense("model.embed_tokens.weight")?;
     let mut x = vec![0.0f32; t * h];
     for (i, &tok) in tokens.iter().enumerate() {
+        let global = global_offset + i;
+        let is_img = image_positions
+            .map(|ps| ps.contains(&global))
+            .unwrap_or(false);
+        if is_img
+            && let Some(imgs) = image_embeddings
+        {
+                // find index among image_positions
+                let idx = image_positions
+                    .unwrap()
+                    .iter()
+                    .position(|&p| p == global)
+                    .unwrap();
+                if idx < imgs.len() {
+                    for k in 0..h {
+                        x[i * h + k] = imgs[idx][k];
+                    }
+                    continue;
+                }
+        }
         let row = tok as usize * h;
         for k in 0..h {
             x[i * h + k] = bf16_to_f32(u16::from_le_bytes([
@@ -994,6 +1017,9 @@ pub fn forward_reference(
                 &input.input_ids[s..i],
                 &input.positions[s..i],
                 None,
+                input.image_embeddings.as_deref(),
+                input.image_positions.as_deref(),
+                s,
             )?);
             s = i;
         }
@@ -1023,6 +1049,9 @@ pub fn logit_lens(
         &input.input_ids,
         &input.positions,
         if every == 0 { None } else { Some(&mut lenses) },
+        input.image_embeddings.as_deref(),
+        input.image_positions.as_deref(),
+        0,
     )?;
     Ok((logits, lenses))
 }

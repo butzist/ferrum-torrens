@@ -37,6 +37,8 @@ fn real_checkpoint_reference_forward_is_finite_and_deterministic() {
         input_ids: vec![248044, 19593, 48128, 16, 2177],
         positions: vec![0, 1, 2, 3, 4],
         answers: vec![4],
+        image_embeddings: None,
+        image_positions: None,
     };
     let m = model();
     let vocab = m.params().vocab_size;

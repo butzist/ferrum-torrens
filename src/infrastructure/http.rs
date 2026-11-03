@@ -281,11 +281,33 @@ impl ChatToolSpec {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum ChatContent {
+    Text(String),
+    Parts(Vec<ChatContentPart>),
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ChatContentPart {
+    #[serde(rename = "type", default)]
+    pub kind: String,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub image_url: Option<ChatImageUrl>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ChatImageUrl {
+    pub url: String,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChatTurn {
     pub role: String,
     #[serde(default)]
-    pub content: Option<String>,
+    pub content: Option<ChatContent>,
     /// Assistant tool calls answered later by a `role: "tool"` turn.
     #[serde(default)]
     pub tool_calls: Option<Vec<TurnToolCall>>,
@@ -311,11 +333,59 @@ pub struct TurnFunction {
     pub arguments: Option<serde_json::Value>,
 }
 
+/// What one image part carries, after the `data:` URL is decoded. Only inline
+/// `data:` URLs are accepted; an http(s) image would make the server fetch
+/// network content, which this engine does not do.
+#[derive(Debug)]
+pub struct ImagePart {
+    pub bytes: Vec<u8>,
+}
+
+impl ImagePart {
+    fn from_url(url: &str) -> Result<Self, ApiError> {
+        let Some(rest) = url.strip_prefix("data:") else {
+            return Err(ApiError::bad_request(
+                "image_url must be a data: URL; this server does not fetch remote images",
+            ));
+        };
+        let Some((meta, payload)) = rest.split_once(',') else {
+            return Err(ApiError::bad_request(
+                "image_url data: URL has no ,data section",
+            ));
+        };
+        if !meta.rsplit(';').any(|p| p == "base64") {
+            return Err(ApiError::bad_request("image_url data: URL must be base64"));
+        }
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(payload.trim())
+            .map_err(|e| ApiError::bad_request(format!("image_url base64 payload: {e}")))?;
+        if bytes.is_empty() {
+            return Err(ApiError::bad_request("image_url payload is empty"));
+        }
+        Ok(Self { bytes })
+    }
+}
+
 impl ChatTurn {
     fn to_domain(&self) -> ChatMessage {
         ChatMessage {
             role: self.role.clone(),
-            content: self.content.clone(),
+            content: self.content.as_ref().map(|c| match c {
+                ChatContent::Text(t) => t.clone(),
+                // The template renders one image item as this literal; a
+                // string-only message cannot carry parts, so the flatten
+                // replicates the template's own image branch. Real images move
+                // to the engine through `image_parts`, in the same order.
+                ChatContent::Parts(parts) => parts
+                    .iter()
+                    .map(|p| match &p.image_url {
+                        Some(_) => VISION_MARKER.to_string(),
+                        None => p.text.clone().unwrap_or_default(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(""),
+            }),
             tool_calls: self
                 .tool_calls
                 .as_ref()
@@ -333,7 +403,32 @@ impl ChatTurn {
             tool_call_id: self.tool_call_id.clone(),
         }
     }
+
+    /// The image parts, in content order, that this turn carries. A system
+    /// turn with images is refused like the template refuses it.
+    fn image_parts(&self) -> Result<Vec<ImagePart>, ApiError> {
+        let Some(ChatContent::Parts(parts)) = self.content.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        for p in parts {
+            if let Some(u) = &p.image_url {
+                if self.role == "system" {
+                    return Err(ApiError::bad_request(
+                        "system message cannot contain images",
+                    ));
+                }
+                out.push(ImagePart::from_url(&u.url)?);
+            }
+        }
+        Ok(out)
+    }
 }
+
+/// The literal the checkpoint's chat template emits for one image item
+/// (`<|vision_start|><|image_pad|><|vision_end|>`); the engine expands the pad
+/// run to the image's visual token count.
+const VISION_MARKER: &str = "<|vision_start|><|image_pad|><|vision_end|>";
 
 /// A client sends `arguments` as a JSON string (OpenAI's shape); accept an
 /// object too. The domain wants the wire JSON string either way.
@@ -1410,6 +1505,7 @@ impl From<EngineError> for ApiError {
             }
             Tokenize(m) => ApiError::bad_request(format!("prompt could not be tokenized: {m}")),
             Chat(m) => ApiError::bad_request(m),
+            Vision(m) => ApiError::unprocessable(m),
             BadLogits { got, want } => {
                 ApiError::unprocessable(format!("model returned {got} logits, expected {want}"))
             }
@@ -1966,15 +2062,26 @@ async fn chat_completions(
     let streaming = req.stream.unwrap_or(false);
     let messages: Vec<ChatMessage> = req.messages.iter().map(ChatTurn::to_domain).collect();
     let tools: Vec<ChatTool> = req.tools.iter().map(ChatToolSpec::to_domain).collect();
+    let mut images: Vec<Vec<u8>> = Vec::new();
+    for turn in &req.messages {
+        for img in turn.image_parts()? {
+            images.push(img.bytes);
+        }
+    }
 
     // Rendering the template and tokenizing it both run off the runtime, and both
-    // still have to answer with a status code rather than a frame.
+    // still have to answer with a status code rather than a frame. An image
+    // request's tower pass is the heaviest piece of preparation, which is exactly
+    // what spawn_blocking is here for.
     let worker = Arc::clone(&engine);
     let prepared =
         tokio::task::spawn_blocking(move || -> Result<generation::Request, EngineError> {
             let prompt = worker.render_chat(&messages, &tools)?;
             let ids = worker.encode(&prompt)?;
-            make_request(&worker, uid, ids, params, seed)
+            if images.is_empty() {
+                return make_request(&worker, uid, ids, params, seed);
+            }
+            worker.make_request_with_images(uid, ids, images, params, seed)
         })
         .await
         .expect("preparation task is not cancellable");

@@ -6,8 +6,11 @@ pub mod config;
 pub mod forward;
 #[cfg(feature = "cudarc")]
 pub mod forward_cudarc;
+pub mod image_prep;
 #[cfg(feature = "cudarc")]
 pub mod load_cudarc;
+pub mod mrope;
+pub mod vision;
 pub mod weights;
 
 use crate::domain::kvcache::CachedModel;

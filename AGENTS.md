@@ -178,23 +178,24 @@ Instructions for AI coding agents working in this repository.
   `/run/opengl-driver/lib/libcuda.so.1` and `cuInit` succeeds), so the gated GPU
   tests run here. The agent jail inherits `CUDA_HOME`, `CUDARC_CUDA_VERSION`,
   `LD_LIBRARY_PATH`, `PYTHONPATH` and the `TRITON_*` knobs from the devshell
-  (`fwdEnv` in `nix/agents.nix`, jail.nix `try-fwd-env`), so launching the agent from
-  a `nix develop` shell needs no manual export; from elsewhere, export them (see
+  automatically by the system-installed jailed opencode launcher (devshell
+  `IN_NIX_SHELL` / direnv env forwarding), so launching `opencode` from a
+  `nix develop` shell needs no manual export; from elsewhere, export them (see
   below). The compute runtime still auto-detects and falls back to CPU, which is
   what keeps `cargo test --features cudarc` meaningful on a box with no device
   (`DONE.md` decision 21). `model.device = "cuda"` forces the GPU. Decode capture
   is parked on the cudarc runtime; `cuda_graph = true` only warns.
-- The jailed opencode gets its **own** config, baked into the package by
-  `agent-toolbox` from the toolbox's default opencode settings plus the
-  project's model and provider; no host config or state dirs are bound. The
-  opencode-go credential is read on the host from its file (following any
-  symlink) by `envFromFile` and forwarded as `OPENCODE_GO_API_KEY`, so the
-  value never reaches the nix store.
+- The jailed opencode is the **system-installed launcher** from the
+  NixOS/home-manager config, not a package built by this flake. Project-specific
+  settings live in `opencode.json` (currently the opencode-go model); the work
+  user's system config provides the opencode-go credential via `envFromFile`,
+  forwarding it as `OPENCODE_GO_API_KEY` so the value never reaches the nix
+  store.
 - The FTW checkpoint is served from the Nix store: `nix build
   .#ferrum-torrens-model` downloads and converts it at build time, and the
-  module uses that derivation when `model.path` is null. The jail binds only the
-  runtime closure of `basePackages` (decision 52), not the whole `/nix/store`,
-  so for the gated tests agents run the Rust converter into the r/w-mounted
+  module uses that derivation when `model.path` is null. The system launcher's
+  jail mounts `/nix` read-only; the devshell PATH supplies `basePackages` from
+  the store. For the gated tests agents run the Rust converter into the r/w-mounted
   `$FLAKE_ROOT` (`.model-cache/`), not the store copy.
 - Optional FreeToken reference venv (flake provides python312 + uv), for the
   probe scripts only. The submodule is gone, so clone upstream outside the
