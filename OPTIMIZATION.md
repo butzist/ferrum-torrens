@@ -1680,3 +1680,13 @@ count exceeds it. Blocked on: running the router over the full prompt before
 staging, and a variable-size copy-row rebuild. Parked until measured; the
 current cost is only the coldest-slot churn, which LRU pressure already
 reclaims.
+
+## Candidate: vision tower on cudarc (host f32 -> device)
+
+The tower runs as a plain dense f32 forward on the host (~50 s for a 256x256
+image). Move it onto the cudarc runtime (reuse the dense GEMM/RMSNorm kernels
+already used by the text tower) so it runs on the GPU, and keep a CPU fallback
+for the no-device path. Expected: encode from ~50 s to < 1 s. Blocked on: a
+cudarc-backed ViT forward (patch embed conv, bicubic pos-embed, transformer
+blocks, merger) plus a host/device weight upload path. Parked as the next
+multimodal slice.

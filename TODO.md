@@ -558,6 +558,11 @@ history.
   they need. Parked: needs router-before-staging and a variable copy-row rebuild;
   cost today is coldest-slot churn that LRU pressure already reclaims. See
   `OPTIMIZATION.md` "Candidate: dynamic prefill buffer".
+- **139 (follow-up)** -- **vision tower runs host f32 (~50 s per image).** Move
+  it onto the cudarc runtime (reuse the text tower's dense GEMM/RMSNorm
+  kernels) with a CPU fallback for the no-device path; expected encode < 1 s.
+  Parked as the next multimodal slice. See `OPTIMIZATION.md`
+  "Candidate: vision tower on cudarc".
 
 - **94** -- the whole-layer prefill's buffer is the `2 * num_experts` **coldest**
   slots chosen by `usage.argsort` (`select_buffer_slots`); it frees exactly those
