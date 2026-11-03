@@ -11,6 +11,8 @@ pub mod image_prep;
 pub mod load_cudarc;
 pub mod mrope;
 pub mod vision;
+#[cfg(feature = "cudarc")]
+pub mod vision_cudarc;
 pub mod weights;
 
 use crate::domain::kvcache::CachedModel;
