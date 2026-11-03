@@ -1668,3 +1668,15 @@ the binding constraint. Interleaved n=3/arm at bs=1: tg **30.2 -> 32.8 tok/s
 bs=1 decode is now **1.08x**. Prefill is flat at 517 (401.0) and 958.5 at 2057
 on the auto cache. `FERRUM_SMOKE_CACHE=1984`/`2048` remain useful diagnostics
 for a larger prefill chunk budget. Logs `/tmp/opencode/r10_10/`.
+
+## Candidate: dynamic prefill buffer (vision + short prompts)
+
+The whole-layer prefill buffer is fixed at `2 * num_experts` slots
+(`select_buffer_slots`), freed on every prefill even when the prompt only
+touches a handful of experts (e.g. a vision prompt's 49 visual tokens). Size
+the buffer from the routed expert ids of the prefilled tokens instead, floor at
+`num_experts`, and only fall back to `2 * num_experts` when the distinct-expert
+count exceeds it. Blocked on: running the router over the full prompt before
+staging, and a variable-size copy-row rebuild. Parked until measured; the
+current cost is only the coldest-slot churn, which LRU pressure already
+reclaims.

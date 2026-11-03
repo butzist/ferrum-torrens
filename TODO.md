@@ -552,6 +552,12 @@ history.
   eagerly. `BuiltModel` declares `captured` before `model` so the graphs (which
   bake weight/pool addresses) drop first. A capture that fails at load warns and
   falls back to eager rather than failing the build.
+- **138 (follow-up)** -- **prefill double-buffer is fixed at `2 * num_experts`
+  slots** (`select_buffer_slots`). Size it from the routed expert ids of the
+  prefilled tokens (floor `num_experts`) so short/vision prompts free only what
+  they need. Parked: needs router-before-staging and a variable copy-row rebuild;
+  cost today is coldest-slot churn that LRU pressure already reclaims. See
+  `OPTIMIZATION.md` "Candidate: dynamic prefill buffer".
 
 - **94** -- the whole-layer prefill's buffer is the `2 * num_experts` **coldest**
   slots chosen by `usage.argsort` (`select_buffer_slots`); it frees exactly those
