@@ -338,7 +338,7 @@ fn dense(
 /// The patch feature ordered like the conv kernel `[C, t, kh, kw]`: channel
 /// major, then the duplicated time frame, then the patch's own 2D layout. A
 /// still image puts the same picture in every time frame.
-fn stretch_to_time(patch: &[f32], c: usize, kf: usize, p: usize) -> Vec<f32> {
+pub fn stretch_to_time(patch: &[f32], c: usize, kf: usize, p: usize) -> Vec<f32> {
     let mut out = vec![0f32; c * kf * p * p];
     for ci in 0..c {
         for y in 0..p {
@@ -539,7 +539,7 @@ pub fn vit_block(
 }
 
 /// The largest `n` with `n*n == v`.
-fn isqrt(v: usize) -> Option<usize> {
+pub fn isqrt(v: usize) -> Option<usize> {
     let n = (v as f64).sqrt().round() as usize;
     (n.checked_mul(n) == Some(v)).then_some(n)
 }

@@ -1,6 +1,7 @@
 # FerrumTorrens -- FreeToken MVP port to Rust: TODO
 
-Status (2026-10-23): **M7 is complete: the cudarc runtime is the serving path,
+Status (2026-11-03): **M7 complete and the vision tower runs on the device (decision 139 -> DONE.md 139, gate `tests/vision_cudarc_tower.rs`; `mrope.rs` is loaded but still TODO for decode).**
+Old status (2026-10-23): **M7 is complete: the cudarc runtime is the serving path,
 libtorch/tch/candle are gone (decision 132), and decode CUDA-graph capture is
 ported (decision 134).** `CudarcQwen3_6::forward_decode_into` runs the batched
 device-addressed step, and `EngineDecodeGraphs` records it per batch size on the
@@ -558,11 +559,8 @@ history.
   they need. Parked: needs router-before-staging and a variable copy-row rebuild;
   cost today is coldest-slot churn that LRU pressure already reclaims. See
   `OPTIMIZATION.md` "Candidate: dynamic prefill buffer".
-- **139 (follow-up)** -- **vision tower runs host f32 (~50 s per image).** Move
-  it onto the cudarc runtime (reuse the text tower's dense GEMM/RMSNorm
-  kernels) with a CPU fallback for the no-device path; expected encode < 1 s.
-  Parked as the next multimodal slice. See `OPTIMIZATION.md`
-  "Candidate: vision tower on cudarc".
+- **139 (completed)** -- vision tower moved onto the cudarc runtime (f32
+  device forward, `vision_cudarc.rs`), see `DONE.md` 140.
 
 - **94** -- the whole-layer prefill's buffer is the `2 * num_experts` **coldest**
   slots chosen by `usage.argsort` (`select_buffer_slots`); it frees exactly those

@@ -121,6 +121,37 @@ pub struct ForwardInput {
 pub trait VisionTower: Send + Sync {
     fn encode(&self, image_bytes: &[u8]) -> Result<Vec<Vec<f32>>, String>;
     fn image_token_id(&self) -> u32;
+    /// Stage probes for parity gates: patch-embed/pos-embed state, the
+    /// post-first-block state, the first token-norm, the first Q/K/V
+    /// projections, the permuted-head Q and the first attention context.
+    /// Only the port with an inspectable forward answers; default is none.
+    fn debug_x0(&self, _pixels: &[f32], _h: usize, _w: usize) -> Option<Vec<f32>> {
+        None
+    }
+    fn debug_x1(&self, _pixels: &[f32], _h: usize, _w: usize) -> Option<Vec<f32>> {
+        None
+    }
+    fn debug_ln0(&self, _pixels: &[f32], _h: usize, _w: usize) -> Option<Vec<f32>> {
+        None
+    }
+    fn debug_q0(&self, _pixels: &[f32], _h: usize, _w: usize) -> Option<Vec<f32>> {
+        None
+    }
+    fn debug_kv0(&self, _pixels: &[f32], _h: usize, _w: usize) -> Option<Vec<f32>> {
+        None
+    }
+    fn debug_heads0(&self, _pixels: &[f32], _h: usize, _w: usize) -> Option<Vec<f32>> {
+        None
+    }
+    fn debug_ctx0(&self, _pixels: &[f32], _h: usize, _w: usize) -> Option<Vec<f32>> {
+        None
+    }
+    fn debug_xf(&self, _pixels: &[f32], _h: usize, _w: usize) -> Option<Vec<f32>> {
+        None
+    }
+    fn debug_xn(&self, _pixels: &[f32], _h: usize, _w: usize, _n: usize) -> Option<Vec<f32>> {
+        None
+    }
 }
 
 /// One logit-lens reading of the residual stream at a given depth: what the

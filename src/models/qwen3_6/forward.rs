@@ -807,21 +807,19 @@ fn run_sequence(
         let is_img = image_positions
             .map(|ps| ps.contains(&global))
             .unwrap_or(false);
-        if is_img
-            && let Some(imgs) = image_embeddings
-        {
-                // find index among image_positions
-                let idx = image_positions
-                    .unwrap()
-                    .iter()
-                    .position(|&p| p == global)
-                    .unwrap();
-                if idx < imgs.len() {
-                    for k in 0..h {
-                        x[i * h + k] = imgs[idx][k];
-                    }
-                    continue;
+        if is_img && let Some(imgs) = image_embeddings {
+            // find index among image_positions
+            let idx = image_positions
+                .unwrap()
+                .iter()
+                .position(|&p| p == global)
+                .unwrap();
+            if idx < imgs.len() {
+                for k in 0..h {
+                    x[i * h + k] = imgs[idx][k];
                 }
+                continue;
+            }
         }
         let row = tok as usize * h;
         for k in 0..h {

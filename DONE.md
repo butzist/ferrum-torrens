@@ -4385,3 +4385,33 @@ subsection names are kept verbatim.
      - **Gates.** `cargo test` (9 converter unit tests), clippy default and
        `cudarc`, `cargo fmt --check`, the subset gate (50 tensors byte-exact)
        and the full golden gate.
+
+139. **The vision tower runs on the device (cudarc), not on the host** (2026-11-03).
+     Decision 139 in `TODO.md` moves `models/qwen3_6/vision_cudarc.rs` - the
+     port - and `registry.rs`'s cudarc build path to it: the image preprocessing
+     (decode, resize, normalize, patchify) stays on the host, the ViT blocks and
+     the merger run f32 on the device without any new Triton cubins. Uses the
+     committed elementwise/reduce kernels only, and the batched GEMM path:
+     the dense projections are f32 `matmul_nt`, the attention core is 2 `bmm`s 
+     sandwiching `softmax_last`, LayerNorm is a composition of `sum_last`, scalarops/mul,
+     outer-product mean with ones column broadcast, and row/column scale-shift.
+     - **Full stack** blob uploads widened from the raw bf16 checkpoint tensor, 
+       and the LayerNorm's variance comes from the CENTERED data, never from 
+       `E[x^2] - mean^2` (that is, a token whose mean dominates its variance
+       cancels catastrophically into an exponential error blow-up across depth, 
+       which `f32_mats` fix removes). Also: **`matmul_nt` now computes with the 
+       f32/element-offset view pointers with their element offset, not a slab's 
+       head pointer**.
+     - **Gates.** `cargo test` (376 passed), clippy default + cudarc,
+       `cargo fmt --check` (CPU-only without CUDA); on device the parity gate
+       `tests/vision_cudarc_tower.rs` (host f64 oracle chain, decaying gates) and
+       `cargo test --test vision_smoke -- --features cudarc -- --ignored`.
+       This smoke test exercises the same engine path the HTTP handler calls,
+       now running the device tower when the trait object answers `debug_*`
+       (parity probes) but the port's `encode` in production.
+     - **Measurements.** A/B on a 384x384 gradient image, a 49-token board:
+       host forward 52.6 s -> device 0.066 s steady state, ~800x. At parity 
+       gates the mean relative error is 1e-5 and the max 2.8e-4 vs f64 host 
+       chain `part()`, with bf16 relating only the smoke answer's own tolerance.
+       Budget note: the f32 tower's weight upload (~1.7 GiB) increases the 
+       expert-cache auto-sizing.

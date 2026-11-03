@@ -1681,12 +1681,10 @@ staging, and a variable-size copy-row rebuild. Parked until measured; the
 current cost is only the coldest-slot churn, which LRU pressure already
 reclaims.
 
-## Candidate: vision tower on cudarc (host f32 -> device)
+## Closed: vision tower on cudarc (decision 139 -> DONE.md 139)
 
-The tower runs as a plain dense f32 forward on the host (~50 s for a 256x256
-image). Move it onto the cudarc runtime (reuse the dense GEMM/RMSNorm kernels
-already used by the text tower) so it runs on the GPU, and keep a CPU fallback
-for the no-device path. Expected: encode from ~50 s to < 1 s. Blocked on: a
-cudarc-backed ViT forward (patch embed conv, bicubic pos-embed, transformer
-blocks, merger) plus a host/device weight upload path. Parked as the next
-multimodal slice.
+A 256x256 image encoded on the device now, 49.8 s -> 0.2 s (~230x with f64
+gates; 0.066 s steady state vs 52.6 s in the A/B parity run, ~800x). No
+special kernels needed: f32 cuBLAS GEMMs, the committed elementwise/reduce
+kernels and `bmm`. The parity gate (`tests/vision_cudarc_tower.rs`) holds the
+host `encode` oracle: mean rel err 1e-5, max 2.8e-4 vs the f64 host chain.

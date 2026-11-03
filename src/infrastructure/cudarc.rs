@@ -318,7 +318,54 @@ impl Runtime {
         n: usize,
         k: usize,
     ) -> Result<(), MoEError> {
-        self.gemm_bf16_nt_tuned(x, w, out, m, n, k, GemmTuning::default())
+        let (xp, _rx) = x.device_ptr(&self.inner.stream);
+        let (wp, _rw) = w.device_ptr(&self.inner.stream);
+        let (op, _ro) = out.device_ptr_mut(&self.inner.stream);
+        drop(_ro);
+        self.gemm_bf16_nt_ptr(xp, wp, op, m, n, k)
+    }
+
+    /// `out[m, n] = x[m, k] * w[n, k]^T` over raw device pointers, so a view
+    /// operand can contribute its element offset (the tensor-level
+    /// `matmul_nt` passes that).
+    pub fn gemm_bf16_nt_ptr(
+        &self,
+        xp: u64,
+        wp: u64,
+        op: u64,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<(), MoEError> {
+        let (alpha, beta) = (1.0f32, 0.0f32);
+        // SAFETY: the callers bound every read via the shape checks in
+        // `gemm_bf16_nt`/`matmul_nt`, and the pointers are live allocations in
+        // this handle's context. The operands match `gemm_bf16_nt`'s
+        // column-major derivation.
+        unsafe {
+            ::cudarc::cublas::result::gemm_ex(
+                *self.inner.blas.handle(),
+                cublasOperation_t::CUBLAS_OP_T,
+                cublasOperation_t::CUBLAS_OP_N,
+                n as i32,
+                m as i32,
+                k as i32,
+                (&alpha) as *const f32 as *const _,
+                wp as *const _,
+                cudaDataType_t::CUDA_R_16BF,
+                k as i32,
+                xp as *const _,
+                cudaDataType_t::CUDA_R_16BF,
+                k as i32,
+                (&beta) as *const f32 as *const _,
+                op as *mut _,
+                cudaDataType_t::CUDA_R_16BF,
+                n as i32,
+                GemmTuning::default().compute,
+                GemmTuning::default().algo,
+            )
+        }
+        .map_err(bad)
     }
 
     /// The same GEMM with an explicit cuBLAS algorithm and compute type, so
@@ -1113,15 +1160,22 @@ impl Tensor {
         }
         let x = self.contiguous()?;
         let w = w.contiguous()?;
-        let mut out = self.rt.zeros(&[m, n], TensorDType::Bf16)?;
-        let xb = x.buf.bf16()?;
-        let wb = w.buf.bf16()?;
-        let ob = match &mut out.buf {
-            Buffer::Bf16(s) => Arc::get_mut(s).ok_or_else(|| bad("matmul out is shared"))?,
-            _ => return Err(bad("matmul out is not bf16")),
-        };
-        self.rt.gemm_bf16_nt(xb, wb, ob, m, n, k)?;
-        Ok(out)
+        if m == 0 || n == 0 {
+            return self.rt.zeros(&[m, n], TensorDType::Bf16);
+        }
+        let mut out_buf = self.rt.alloc_bf16(m * n)?;
+        let xp = x.device_ptr();
+        let wp = w.device_ptr();
+        let (op, _ro) = out_buf.device_ptr_mut(&self.rt.inner.stream);
+        // A narrowed slab stays a view: its device pointer carries the element
+        // offset, so the GEMM reads the slab rather than the buffer head.
+        self.rt.gemm_bf16_nt_ptr(xp, wp, op, m, n, k)?;
+        drop(_ro);
+        Ok(Tensor::new(
+            self.rt.clone(),
+            Buffer::Bf16(Arc::new(out_buf)),
+            vec![m, n],
+        ))
     }
 
     /// `rms_norm(self) * w` through the committed add_rmsnorm cubin, with a

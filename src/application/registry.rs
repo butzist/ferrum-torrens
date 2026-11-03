@@ -106,6 +106,16 @@ pub fn build(
                 let driver = rt.driver().clone();
                 let head_gemv = head_port(device, stream)?;
                 let fp8_linear = fp8_port(device, stream)?;
+                // The vision tower uploads its bf16 weights eagerly, before
+                // the auto expert-cache budget reads the free VRAM, so the
+                // budget sees it resident just like the dense tower.
+                let vision = crate::models::qwen3_6::vision_cudarc::build_device_vision(
+                    config_json,
+                    index.clone(),
+                    reader.clone(),
+                    rt.clone(),
+                )
+                .map_err(RegistryError::Build)?;
                 // Load the tower with the MoE port detached: the auto cache
                 // budget (item 12) reads the free VRAM after the tower, the KV
                 // pool and the ports are all resident, then sizes the expert
@@ -122,7 +132,15 @@ pub fn build(
                 )
                 .map_err(|e| RegistryError::Build(e.to_string()))?;
                 let slots = resolve_cache_slots(config, &params, device, Some(driver.as_ref()))?;
-                let moe = moe_port(config, &params, index.clone(), reader.clone(), device, stream, slots)?;
+                let moe = moe_port(
+                    config,
+                    &params,
+                    index.clone(),
+                    reader.clone(),
+                    device,
+                    stream,
+                    slots,
+                )?;
                 model.attach_moe(moe);
                 let captured = if capture {
                     match capture_decode(config, &model, &cache, model.runtime()) {
@@ -143,7 +161,7 @@ pub fn build(
                     captured,
                     model: Box::new(model),
                     cache_size_slots: slots,
-                    vision: load_vision(config_json, index, reader)?,
+                    vision,
                 })
             }
             #[cfg(not(feature = "cudarc"))]
