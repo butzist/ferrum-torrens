@@ -605,14 +605,16 @@ Ordered slices, each its own gated change:
   reference variant is unchanged. README and `ARCHITECTURE.md` 2 are updated.
   **Blocker: `nix/checkpoints.nix` still carries `hash =
   "__ORNITH_HF_HASH__"`**, so `nix build .#ferrum-torrens-model-ornith` cannot
-  evaluate yet. The hash comes from `scripts/fetch-hf-hash.sh` (new: it fetches
-  the snapshot the way `nix/model.nix` does, resumes with `curl -C -`, verifies
-  every file against the Hub API's size and LFS sha256, then prints
-  `nix hash path`); the method is proven, because hashing the reference snapshot
+  evaluate yet. The hash comes from `bash scripts/fetch-hf-hash.sh <repo> <dir>`
+  (new: it fetches the snapshot the way `nix/model.nix` does, resumes with
+  `curl -C -`, verifies every file against the Hub API's size and LFS sha256,
+  then prints `nix hash path`; run it through `bash`, the jail has no
+  `/usr/bin/env`); the method is proven, because hashing the reference snapshot
   minus `.cache` reproduces the pinned reference hash exactly
-  (`sha256-JTcnVr...`). **The fetch was interrupted at 12.4 of ~24 GB** (the
+  (`sha256-JTcnVr...`). **The fetch was interrupted at 12.4 of ~23.5 GB** (the
   shell that ran it was cancelled and `/tmp` was cleaned, so its log and the
-  ad-hoc script are gone; the script now lives in the repo). The partial tree is
+  ad-hoc script are gone; the script now lives in the repo and logs to
+  `.model-cache/fetch-ornith.log`). The partial tree is
   `.model-cache/hf-hf/Ornith-1.5-35B-A3B-NVFP4`: `model-00001` 4,743,331,840 of
   10,005,851,848 bytes, `model-00002` 4,245,229,568 of 10,006,454,416,
   `model-00003` complete at 3,408,113,436 (the repo is 23,460,228,712 bytes,
