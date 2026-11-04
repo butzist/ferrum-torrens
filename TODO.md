@@ -565,18 +565,33 @@ sizes and configs checked 2026-11-04):
 
 Ordered slices, each its own gated change:
 
-- [ ] **M8.1 Class A -- serve `Ornith-1.5-35B-A3B-NVFP4`.** No kernel work: the
-  shapes are identical, so the committed cubins apply. Steps: run the Rust
-  converter over it end to end (expect no code change; the things to verify are
-  the `mtp*` tensors the quant config ignores and the vision tower's `visual.*`
-  keys, both of which the converter already meets on the served checkpoint),
-  then make the gated device tests parameterized by the checkpoint
-  (`FERRUM_FTW_DIR`, defaulting to the current `.model-cache` path) and run them
-  on both: a 32-token greedy generation and the vision smoke, with
-  decode/prefill within noise (identical shapes and recipe). Acceptance:
-  `nix/model.nix` instantiated for both checkpoints builds and serves, and the
-  gates pass on both. This is what turns "model-agnostic" from a claim into a
-  gate.
+- [x] **M8.1a Class A -- convert and gate `Ornith-1.5-35B-A3B-NVFP4` (eager
+  path) -- DONE (2026-11-04).** The converter needed no change: 1148 dense + 240
+  expert-bank tensors, 21,785,153,536 bytes in 3 shards (byte-identical layout
+  to the reference), 167.6 s. Gates on the second checkpoint: `ftw_real_checkpoint`
+  (layout invariants), `engine_real_load`, all five `engine_real_generate` tests
+  (greedy answer " Paris"), `vision_smoke` (49 visual tokens, coherent
+  description), and every `cuda_moe_matches_reference` gate (host plan, 256-token
+  whole-layer prefill, decode-cache retention). The gates take the checkpoint
+  from `FERRUM_FTW_DIR` (`tests/common`); the exact token-id pins stay on the
+  reference checkpoint and a second checkpoint asserts semantics instead.
+- [ ] **M8.1b Class A -- the second checkpoint as a store path.** `nix/model.nix`
+  instantiated for `ornith-ai/Ornith-1.5-35B-A3B-NVFP4` (its own `repo` and
+  fixed-output `hash`; one `nix build` pass fills the hash), plus the flake
+  package attribute. Needs ~45 GB of store space for the snapshot and the FTW.
+  Acceptance: `nix build .#ferrum-torrens-model-ornith` yields a servable FTW.
+- [ ] **M8.1c Captured decode on a second checkpoint.** `cuda_graph = true`
+  fails `cudarc_engine_generate` on Ornith: eager and captured replay agree on
+  the first three tokens and diverge on the fourth (`[11751, 13, 198, 760, ...]`
+  vs `[11751, 13, 198, 32, ...]`), which reads like a near-tie flip rather than
+  a replay bug -- but it is unproven, and capture is opt-in and parked
+  (`cuda_graph = false` by default). Until it is explained, captured decode is
+  validated on the reference checkpoint only. Next step: log the top-2 logits at
+  the divergence for both arms, then either pin the near-tie or find the
+  checkpoint-dependent capture assumption.
+- [ ] **M8.1d Speed benchmark of the second checkpoint.** `throughput_smoke`
+  (pp at 512 prompt tokens, tg at 128 decoded tokens, eager and captured, two
+  reps per checkpoint) against the reference, recorded in `DONE.md`.
 - [ ] **M8.2 Class B -- per-checkpoint cubin set.** Only for a checkpoint whose
   shapes differ. Move the serving shapes out of module constants into an
   explicit profile (`ServingShapes` in `signatures.py`), thread it through

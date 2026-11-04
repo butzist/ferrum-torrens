@@ -116,18 +116,25 @@ budget retuned; the engine binary itself is not a portable fatbin. The target is
 a single 8 GB card; 2057-token prefill already needs a reduced 1664-slot cache,
 and longer contexts need a smaller `kvTokens`/cache or a larger GPU.
 
-**Model.** Only **Qwen3.6-35B-A3B-NVFP4** (`Qwen3_5MoeForConditionalGeneration`,
-NVFP4 routed experts, FP8 attention projections) is supported. Text-only: the
-vision tensors are copied by the converter but not served. There is no other
-architecture, no bf16/GGUF/other quant variant, and no training. Adding a model
-means a new `src/models/<arch>/` (config, weight names, forward) and a registry
-entry, plus conversion mapping; adding another quant layout means new kernels.
+**Model.** Two checkpoints are supported, both
+`Qwen3_5MoeForConditionalGeneration` with NVFP4 routed experts and FP8
+attention projections: **Qwen3.6-35B-A3B-NVFP4** (the reference) and
+**Ornith-1.5-35B-A3B-NVFP4**, which is dimension-for-dimension and
+quant-recipe identical, so it runs on the same cubins. Image input is served on
+both: the vision tower runs on the device and its rows are spliced into the
+prefill (decisions 139, 142). There is no other architecture, no bf16/GGUF/other
+quant variant, and no training. A checkpoint with a different
+hidden/inter/top_k/head/GDN geometry needs its own AOT cubin set (the `SERVING_*`
+shapes in `python/ferrum_kernel/signatures.py` are constexprs baked into the
+cubins); a different architecture needs a new `src/models/<arch>/` plus a
+registry entry. `TODO.md` section 6c scopes both.
 
-**Serving.** One GPU, one process. No tensor/pipeline/multi-node parallelism, no
-multimodal inputs, and no CPU serving of the real model (the scalar forward is
-an oracle, not a fast path). Prefill attention uses the tiled causal SDPA and a
-full K/V gather; decode has optional CUDA-graph capture. The conversion path is
-HF safetensors only, for this model.
+**Serving.** One GPU, one process. No tensor/pipeline/multi-node parallelism, and
+no CPU serving of the real model (the scalar forward is an oracle, not a fast
+path). Image input is served; video input is out of scope (decision 143).
+Prefill attention uses the tiled causal SDPA and a full K/V gather; decode has
+optional CUDA-graph capture. The conversion path is HF safetensors only, for
+this model family.
 
 **Python.** None at inference. Python/Triton exist only to compile the kernels
 at build time (and optionally to run the upstream FreeToken reference/probes).
@@ -220,20 +227,28 @@ cargo test --features cudarc --lib
 
 The gated real-checkpoint tests expect `.model-cache/Qwen3.6-35B-A3B-NVFP4.ftw`
 and a CUDA device; run them one at a time through `scripts/run-gated.sh`.
+`FERRUM_FTW_DIR` points a gate at another converted checkpoint (for example
+`.model-cache/Ornith-1.5-35B-A3B-NVFP4.ftw`); the exact token-id pins then give
+way to semantic checks, because there is no reference oracle for a second model.
 
 ## Scope and extending
 
-Supported now: one model (Qwen3.6-35B-A3B-NVFP4), one GPU class (sm_120, 8 GB
-target), text-only, single-GPU, single-process. The limits above are precise;
-this is not a drop-in for every FreeToken checkpoint.
+Supported now: two shape-identical checkpoints (`Qwen3.6-35B-A3B-NVFP4` and
+`Ornith-1.5-35B-A3B-NVFP4`), one GPU class (sm_120, 8 GB target),
+single-GPU, single-process, image input yes (video no). The limits above are
+precise; this is not a drop-in for every FreeToken checkpoint.
 
 The engine is model-agnostic where it can be: the FTW reader, tensor runtime,
-cache, scheduler and kernel ABI are shared. A new model means a new
-`src/models/<arch>/` (config, weight names, forward) plus a registry entry and
-conversion mapping; a new GPU means rebuilding the cubins for its architecture
-and validating the kernels and memory budget. There are no other quant formats
-or multimodal paths yet. Contributions and testing on other hardware are
-welcome.
+cache, scheduler and kernel ABI are shared. A checkpoint with the same family
+shapes and quant recipe needs only a conversion run (point `model.path` at its
+FTW; the device gates take `FERRUM_FTW_DIR`). A checkpoint whose
+hidden/inter/top_k/head/GDN geometry differs needs its own cubin set, built by
+the same `nix/kernels.nix` from that shape profile; one binary serves one
+checkpoint (decision 146). A new architecture means a new
+`src/models/<arch>/` (config, weight names, forward) plus a registry entry, and
+a new quant layout means new kernels. A new GPU means rebuilding the cubins for
+its architecture and validating the kernels and memory budget. Contributions and
+testing on other hardware are welcome.
 
 ## Documentation
 
