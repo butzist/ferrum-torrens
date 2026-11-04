@@ -5,7 +5,6 @@
     flake-parts.url = "github:hercules-ci/flake-parts";
     flake-root.url = "github:srid/flake-root";
     rust-overlay.url = "github:oxalica/rust-overlay";
-    agent-toolbox.url = "github:butzist/agent-toolbox";
   };
 
   outputs =
@@ -14,7 +13,6 @@
       nixpkgs,
       flake-parts,
       rust-overlay,
-      agent-toolbox,
       ...
     }:
     flake-parts.lib.mkFlake { inherit inputs; } {
@@ -173,10 +171,6 @@
             pkgs.ninja
           ];
 
-          # Jailed agents, their jail options and the forwarded devshell env.
-          agents = import ./nix/agents.nix {
-            inherit pkgs agent-toolbox basePackages;
-          };
         in
         {
           packages = {
@@ -190,9 +184,7 @@
           };
           devShells.default = pkgs.mkShell {
             name = "ferrum-torrens";
-            packages = basePackages ++ [
-              agents.opencode
-            ];
+            packages = basePackages;
 
             inputsFrom = [ config.flake-root.devShell ];
 
