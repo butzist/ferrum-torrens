@@ -4609,3 +4609,48 @@ subsection names are kept verbatim.
        cudarc --lib` 490 passed, clippy `--all-targets` clean (default and
        `cudarc`), `cargo fmt --check` clean. Device: both retargeted MoE gates
        and the vision smoke pass under `prlimit --as=68719476736`.
+
+147. **The second checkpoint is a drop-in with no speed cost, and captured
+     decode is the one thing it does not reproduce** (2026-11-04). M8.1's
+     premise was that `ornith-ai/Ornith-1.5-35B-A3B-NVFP4` shares every
+     dimension and the modelopt recipe with the served checkpoint, so the
+     committed cubins apply. That held: the Rust converter turned the 24.16 GB
+     HF snapshot into 1148 dense + 240 expert-bank tensors, 21,785,153,536 bytes
+     in 3 shards, byte-identical layout to the reference, in 167.6 s with no
+     code change.
+     - **Gates on the second checkpoint.** `ftw_real_checkpoint` (layout
+       invariants: alignment, piece coverage, required names, quant format),
+       `engine_real_load`, all five `engine_real_generate` tests (greedy
+       " Paris" for the one-token gate and the kernel gate, the chat template,
+       the logit lens, the per-step scaling), `vision_smoke` (49 visual tokens,
+       coherent description) and every `cuda_moe_matches_reference` gate (host
+       plan, 256-token whole-layer prefill, decode-cache retention, bank
+       addresses, device handoff). The gates read the checkpoint from
+       `FERRUM_FTW_DIR` (`tests/common`); the numeric pins stay on the reference
+       checkpoint, and an overridden run asserts semantics instead.
+     - **Speed** (`throughput_smoke`, 517 prompt tokens, 128 decoded, bs=1, two
+       reps per arm alternating checkpoint order, auto cache):
+
+       | mode | checkpoint | pp tok/s | tg tok/s |
+       | --- | --- | --- | --- |
+       | eager | reference | 397.4 | 20.75 |
+       | eager | Ornith | 392.3 | 19.80 |
+       | captured | reference | 393.4 | 20.60 |
+       | captured | Ornith | 391.4 | 20.05 |
+
+       Prefill is identical (-1.3%, within run noise). Decode is 3-5% lower on
+       Ornith, consistently across reps and both decode modes; the expert-step
+       count is identical (5440), so the difference is in what the expert cache
+       hits -- a different weight set routes differently -- not in a path change.
+       The absolute numbers are below the recorded 32.8 tok/s R11 baseline
+       because this box is power/thermally capped right now (SM clock ~1.0 of
+       3.09 GHz, `SW Power Cap`/`SW Thermal Slowdown` counters at ~7.5 h of the
+       session), which is why the ratio, not the absolute, is the result.
+     - **Captured decode diverges.** `cudarc_engine_generate` fails on Ornith at
+       `cuda_graph = true`: the eager and captured arms agree on tokens 0-2 and
+       diverge on token 3 (`[11751, 13, 198, 760, ...]` vs
+       `[11751, 13, 198, 32, ...]`). Capture is opt-in and off by default
+       (`cuda_graph = false`), so eager serving is unaffected; but until the
+       divergence is explained (near-tie versus a checkpoint-dependent capture
+       assumption), captured decode stays validated on the reference checkpoint
+       only. Tracked as TODO.md M8.1c.

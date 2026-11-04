@@ -589,9 +589,14 @@ Ordered slices, each its own gated change:
   validated on the reference checkpoint only. Next step: log the top-2 logits at
   the divergence for both arms, then either pin the near-tie or find the
   checkpoint-dependent capture assumption.
-- [ ] **M8.1d Speed benchmark of the second checkpoint.** `throughput_smoke`
-  (pp at 512 prompt tokens, tg at 128 decoded tokens, eager and captured, two
-  reps per checkpoint) against the reference, recorded in `DONE.md`.
+- [x] **M8.1d Speed benchmark of the second checkpoint -- DONE.** `throughput_smoke`
+  (517 prompt tokens, 128 decoded, eager and captured, two reps per checkpoint,
+  alternating order): pp identical within noise (397.4 vs 392.3 tok/s eager),
+  tg 3-5% lower on the second checkpoint (20.75 vs 19.80 eager, 20.60 vs 20.05
+  captured) with an identical expert-step count, so the difference is routing,
+  not a path change. Absolute numbers sit below the 32.8 tok/s baseline because
+  the card was power/thermally capped during the session. Details in `DONE.md`
+  147.
 - [ ] **M8.2 Class B -- per-checkpoint cubin set.** Only for a checkpoint whose
   shapes differ. Move the serving shapes out of module constants into an
   explicit profile (`ServingShapes` in `signatures.py`), thread it through
