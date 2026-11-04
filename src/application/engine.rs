@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use crate::domain::decode::{CapturedDecode, DecodeError, DecodeRow};
 use crate::domain::kvcache::{CachedModel, KvCache, SequenceCache};
-use crate::domain::model::{ForwardInput, LayerProbe, Model, ModelParams};
+use crate::domain::model::{ForwardInput, LayerProbe, ModelParams};
 use crate::domain::sampling::{Rng, SamplingParams, sample};
 use crate::domain::tokenizer::{ChatMessage, Tokenizer, TokenizerError};
 use crate::infrastructure::torch::{CudaProbe, Device, DeviceRequest};
@@ -65,6 +65,12 @@ pub enum EngineError {
     /// `Retry-After`.
     #[error("server busy, retry in {retry_after_ms} ms")]
     Busy { retry_after_ms: u64 },
+    #[error("the device model is not resident and this engine cannot rebuild it")]
+    NotResident,
+    #[error("rebuilding the device model failed: {0}")]
+    Rebuild(String),
+    #[error("moe: {0}")]
+    Moe(#[from] crate::domain::expert_kernel::MoEError),
 }
 
 /// A request's image data, computed once at request build time: `rows[i]` is
@@ -138,21 +144,88 @@ pub struct CachedStep<'a> {
     pub images: Option<&'a RequestImages>,
 }
 
-pub struct Engine {
+/// Everything the engine needs on the device, as one droppable unit.
+///
+/// `captured` is first on purpose: a decode graph bakes the model's weight, KV
+/// pool and expert-bank addresses into its nodes, so it has to drop before any
+/// of the allocations it replays over. Dropping the whole residency is how the
+/// server gives the GPU back after an idle timeout; `Engine::rebuild` puts it
+/// back on the next request.
+pub struct Residency {
+    captured: std::sync::Mutex<Option<Arc<dyn CapturedDecode>>>,
+    /// Rebuilds `captured` after a MoE release dropped it. `None` when the
+    /// engine was built without capture.
+    recapture: Option<crate::domain::decode::Recapture>,
     model: Arc<dyn CachedModel>,
     cache: Option<Arc<dyn KvCache>>,
-    /// The arch's vision tower for multimodal requests, behind the domain port
-    /// so the engine never names a concrete `models/` type. `None` for a
-    /// text-only checkpoint or any build the composition root did not load it.
     vision: Option<Arc<dyn crate::domain::model::VisionTower>>,
-    /// The captured decode graphs the engine owns, when the composition root
-    /// built them. `None` on a CPU build or any device without capture, and then
-    /// decode stays the per-request cached forward.
-    captured: Option<Arc<dyn CapturedDecode>>,
+    /// The routed-expert executor, when the composition root attached one. The
+    /// engine keeps its own handle so it can free the expert banks without
+    /// naming the arch's concrete model.
+    moe: Option<Arc<dyn crate::domain::expert_kernel::MoEExecutor>>,
+}
+
+impl Residency {
+    /// A residency over an already-built model. `cache` comes from the model so
+    /// the engine and the forward read the same pool.
+    pub fn new(
+        model: Arc<dyn CachedModel>,
+        vision: Option<Arc<dyn crate::domain::model::VisionTower>>,
+        moe: Option<Arc<dyn crate::domain::expert_kernel::MoEExecutor>>,
+        captured: Option<Arc<dyn CapturedDecode>>,
+        recapture: Option<crate::domain::decode::Recapture>,
+    ) -> Self {
+        let cache = model.cache();
+        Self {
+            captured: std::sync::Mutex::new(captured),
+            recapture,
+            model,
+            cache,
+            vision,
+            moe,
+        }
+    }
+}
+
+pub struct Engine {
+    /// The device model, or `None` after an idle release. `residency()` rebuilds
+    /// it on demand through `rebuild`.
+    residency: std::sync::RwLock<Option<Arc<Residency>>>,
+    /// Rebuilds the device model from the checkpoint after `release_residency`.
+    /// `None` for an engine that owns its model forever (every unit test).
+    rebuild: Option<Arc<dyn Fn() -> Result<Residency, String> + Send + Sync>>,
+    /// Host-only model shape, kept across a residency release so `params()` and
+    /// the engine limits still answer while the device is cold.
+    params: ModelParams,
     tokenizer: Arc<dyn Tokenizer>,
     eos_ids: Vec<u32>,
     limits: EngineLimits,
     device: Device,
+    /// Admission lease: a running batch holds it shared, a vision pass that
+    /// borrows the expert cache holds it exclusively. `exclusive` mirrors the
+    /// writer so a handler can answer 503 without blocking on the lock.
+    lease: std::sync::RwLock<()>,
+    exclusive: std::sync::atomic::AtomicBool,
+}
+
+/// A shared admission lease held for one batch. Nothing may free the residency
+/// or borrow the expert cache while it is alive.
+pub struct BatchLease<'a>(#[allow(dead_code)] std::sync::RwLockReadGuard<'a, ()>);
+
+/// The exclusive lease a vision pass takes: it may release the expert banks for
+/// the encode, and no batch runs until it drops.
+pub struct ExclusiveLease<'a> {
+    #[allow(dead_code)]
+    guard: std::sync::RwLockWriteGuard<'a, ()>,
+    engine: &'a Engine,
+}
+
+impl Drop for ExclusiveLease<'_> {
+    fn drop(&mut self) {
+        self.engine
+            .exclusive
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 
 /// Replace each `<|image_pad|>` run in an encoded prompt with the image's
@@ -347,7 +420,7 @@ pub fn load_engine(config: &crate::config::Config) -> Result<Engine, LoadError> 
     let limits = engine_limits_from_config(config)?;
     let index_text = std::fs::read_to_string(dir.join("freetoken_weight.json"))
         .map_err(|e| LoadError::Io(format!("{}/freetoken_weight.json: {e}", dir.display())))?;
-    let index = crate::infrastructure::ftw::FtwIndex::parse(&index_text)?;
+    let index = std::sync::Arc::new(crate::infrastructure::ftw::FtwIndex::parse(&index_text)?);
     let reader = std::sync::Arc::new(crate::infrastructure::ftw::FtwReader::open(dir)?);
     let config_json_text = std::fs::read_to_string(dir.join("config.json"))
         .map_err(|e| LoadError::Io(format!("{}/config.json: {e}", dir.display())))?;
@@ -356,13 +429,12 @@ pub fn load_engine(config: &crate::config::Config) -> Result<Engine, LoadError> 
     let device = resolve_compute_device(config)?;
     let built = crate::application::registry::build(
         &config_json,
-        std::sync::Arc::new(index),
-        reader,
+        std::sync::Arc::clone(&index),
+        reader.clone(),
         device,
         config,
     )?;
-    let model = built.model;
-    let params = model.params().clone();
+    let params = built.model.params().clone();
 
     if config.model.max_seq_len > params.max_position_embeddings {
         return Err(LoadError::SeqLenOverContext(
@@ -383,18 +455,47 @@ pub fn load_engine(config: &crate::config::Config) -> Result<Engine, LoadError> 
     )?;
     let eos_ids = eos_ids_from_ftw_dir(dir)?;
 
-    let mut engine = Engine::with_captured(
-        std::sync::Arc::from(model),
-        std::sync::Arc::new(tokenizer),
+    // A released residency is rebuilt from the index and reader already open,
+    // so giving the GPU back costs a tower upload and a capture, not a re-read
+    // of the checkpoint index.
+    let rebuild: Arc<dyn Fn() -> Result<Residency, String> + Send + Sync> = {
+        let config = config.clone();
+        let index = std::sync::Arc::clone(&index);
+        let reader = reader.clone();
+        let config_json = config_json.clone();
+        Arc::new(move || {
+            let built = crate::application::registry::build(
+                &config_json,
+                std::sync::Arc::clone(&index),
+                reader.clone(),
+                device,
+                &config,
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(Residency::new(
+                built.model,
+                built.vision,
+                built.moe,
+                built.captured,
+                built.recapture,
+            ))
+        })
+    };
+    let residency = Residency::new(
+        built.model,
+        built.vision,
+        built.moe,
+        built.captured,
+        built.recapture,
+    );
+    Ok(Engine::with_residency(
+        residency,
+        Some(rebuild),
+        Arc::new(tokenizer),
         eos_ids,
         limits,
         device,
-        built.captured,
-    );
-    if let Some(vision) = built.vision {
-        engine.vision = Some(vision);
-    }
-    Ok(engine)
+    ))
 }
 
 impl Engine {
@@ -423,40 +524,170 @@ impl Engine {
         device: Device,
         captured: Option<Arc<dyn CapturedDecode>>,
     ) -> Self {
+        let residency = Residency::new(model, None, None, captured, None);
+        Self::with_residency(residency, None, tokenizer, eos_ids, limits, device)
+    }
+
+    /// The composition root's constructor: a residency that may be released and
+    /// rebuilt, the arch's vision tower and MoE executor, and the capture
+    /// service over the model's own KV pool.
+    pub fn with_residency(
+        residency: Residency,
+        rebuild: Option<Arc<dyn Fn() -> Result<Residency, String> + Send + Sync>>,
+        tokenizer: Arc<dyn Tokenizer>,
+        eos_ids: Vec<u32>,
+        limits: EngineLimits,
+        device: Device,
+    ) -> Self {
         assert!(limits.max_seq_len > 0);
         assert!(limits.max_output_tokens > 0);
         assert!(limits.max_running_requests > 0);
         assert!(limits.max_prefill_length > 0);
-        let cache = model.cache();
+        let params = residency.model.params().clone();
         Self {
-            model,
-            cache,
-            vision: None,
-            captured,
+            residency: std::sync::RwLock::new(Some(Arc::new(residency))),
+            rebuild,
+            params,
             tokenizer,
             eos_ids,
             limits,
             device,
+            lease: std::sync::RwLock::new(()),
+            exclusive: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
     /// Attach the arch's vision tower, loaded by the composition root. Kept as
     /// a builder step so the capture-free constructor signature stays put.
     pub fn with_vision(mut self, vision: Arc<dyn crate::domain::model::VisionTower>) -> Self {
-        self.vision = Some(vision);
+        if let Some(res) = self.residency.get_mut().ok().and_then(Option::as_mut) {
+            Arc::get_mut(res).expect("one residency at build").vision = Some(vision);
+        }
         self
     }
 
+    /// The resident device model, rebuilding it if an idle release dropped it.
+    fn residency(&self) -> Result<Arc<Residency>, EngineError> {
+        if let Some(res) = self.peek() {
+            return Ok(res);
+        }
+        self.rehydrate()
+    }
+
+    /// The residency without rebuilding. `None` means the device model was
+    /// released and the next forward has to put it back.
+    fn peek(&self) -> Option<Arc<Residency>> {
+        self.residency
+            .read()
+            .expect("residency lock")
+            .as_ref()
+            .map(Arc::clone)
+    }
+
+    /// Rebuild the released device model through the composition root's
+    /// closure. A no-op when it is already resident.
+    pub fn rehydrate(&self) -> Result<Arc<Residency>, EngineError> {
+        let mut slot = self.residency.write().expect("residency lock");
+        if let Some(res) = slot.as_ref() {
+            return Ok(Arc::clone(res));
+        }
+        let rebuild = self.rebuild.as_ref().ok_or(EngineError::NotResident)?;
+        let res = Arc::new(rebuild().map_err(EngineError::Rebuild)?);
+        *slot = Some(Arc::clone(&res));
+        Ok(res)
+    }
+
+    /// Give the GPU back: drop the model, KV pool, vision tower and graphs. The
+    /// next request rebuilds them. Only call this while no forward is running
+    /// (the dispatcher does it between batches).
+    pub fn release_residency(&self) {
+        let mut slot = self.residency.write().expect("residency lock");
+        *slot = None;
+    }
+
+    /// Whether a device model is currently resident.
+    pub fn is_resident(&self) -> bool {
+        self.peek().is_some()
+    }
+
+    /// Take the shared admission lease for one batch.
+    pub fn batch_lease(&self) -> BatchLease<'_> {
+        BatchLease(self.lease.read().expect("lease lock"))
+    }
+
+    /// Take the exclusive lease for a vision pass, or `None` while a batch or
+    /// another vision pass holds the device. Never blocks a handler thread.
+    pub fn try_exclusive(&self) -> Option<ExclusiveLease<'_>> {
+        let guard = self.lease.try_write().ok()?;
+        self.exclusive
+            .store(true, std::sync::atomic::Ordering::Release);
+        Some(ExclusiveLease {
+            guard,
+            engine: self,
+        })
+    }
+
+    /// Whether a vision pass currently owns the device exclusively. A request
+    /// that cannot be admitted behind it gets a 503 instead of a long wait.
+    pub fn exclusive(&self) -> bool {
+        self.exclusive.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Free the expert banks (and the decode graphs that bake their addresses)
+    /// while keeping the dense tower and KV pool resident. Used before a vision
+    /// encode borrows the device and by the idle timer's first stage.
+    pub fn release_moe(&self) -> Result<(), EngineError> {
+        let Some(res) = self.peek() else {
+            return Ok(());
+        };
+        // The graphs point into the banks, so they must go first.
+        res.captured.lock().expect("captured lock").take();
+        if let Some(moe) = &res.moe {
+            moe.release_cache().map_err(EngineError::Moe)?;
+        }
+        Ok(())
+    }
+
+    /// Put the expert banks back after `release_moe` and recapture decode when
+    /// the build had capture on.
+    pub fn rehydrate_moe(&self) -> Result<(), EngineError> {
+        let Some(res) = self.peek() else {
+            return Ok(());
+        };
+        if let Some(moe) = &res.moe {
+            moe.rehydrate_cache().map_err(EngineError::Moe)?;
+        }
+        let mut slot = res.captured.lock().expect("captured lock");
+        if slot.is_none()
+            && let Some(recapture) = &res.recapture
+        {
+            match recapture() {
+                Ok(captured) => *slot = Some(captured),
+                Err(e) => eprintln!("warning: decode recapture after MoE rehydrate failed: {e}"),
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the expert banks are resident.
+    pub fn moe_resident(&self) -> bool {
+        self.peek()
+            .and_then(|res| res.moe.clone())
+            .map(|moe| moe.cache_resident())
+            .unwrap_or(true)
+    }
+
     /// The vision tower port, when the engine's checkpoint declares one.
-    pub fn vision(&self) -> Option<&Arc<dyn crate::domain::model::VisionTower>> {
-        self.vision.as_ref()
+    pub fn vision(&self) -> Option<Arc<dyn crate::domain::model::VisionTower>> {
+        self.peek().and_then(|res| res.vision.clone())
     }
 
     /// The engine's captured decode service, when it has one. The generation
     /// loop takes the batched captured path for a decode step whenever this is
     /// `Some`.
-    pub fn captured(&self) -> Option<&Arc<dyn CapturedDecode>> {
-        self.captured.as_ref()
+    pub fn captured(&self) -> Option<Arc<dyn CapturedDecode>> {
+        self.peek()
+            .and_then(|res| res.captured.lock().expect("captured lock").clone())
     }
 
     /// One captured decode step over `rows`, each with its own KV window. The
@@ -467,26 +698,26 @@ impl Engine {
         rows: &[DecodeRow],
         windows: &[&[u32]],
     ) -> Result<Vec<Vec<f32>>, EngineError> {
-        let captured = self
-            .captured
-            .as_ref()
-            .ok_or(EngineError::NoCapturedDecode)?;
+        let captured = self.captured().ok_or(EngineError::NoCapturedDecode)?;
         captured.step(rows, windows).map_err(engine_decode_error)
     }
 
     /// The KV cache, `None` for a forward that has none (the scalar reference,
     /// or a model built without one). Callers branch on it: with a cache, decode
     /// steps only the new token; without one, every step re-feeds the prefix.
-    pub fn cache(&self) -> Option<&Arc<dyn KvCache>> {
-        self.cache.as_ref()
+    pub fn cache(&self) -> Option<Arc<dyn KvCache>> {
+        self.residency().ok()?.cache.clone()
     }
 
-    pub fn model(&self) -> &dyn Model {
-        &*self.model
+    pub fn model(&self) -> Arc<dyn CachedModel> {
+        self.residency()
+            .ok()
+            .map(|res| Arc::clone(&res.model))
+            .expect("the device model is not resident")
     }
 
     pub fn params(&self) -> &ModelParams {
-        self.model.params()
+        &self.params
     }
 
     pub fn tokenizer(&self) -> &dyn Tokenizer {
@@ -506,7 +737,9 @@ impl Engine {
     /// Steps this engine's forward has run through the MoE kernel port. Zero
     /// means the routed experts were widened on the host.
     pub fn expert_steps(&self) -> u64 {
-        self.model.expert_steps()
+        self.peek()
+            .map(|res| res.model.expert_steps())
+            .unwrap_or(0)
     }
 
     pub fn device(&self) -> Device {
@@ -545,7 +778,10 @@ impl Engine {
 
     /// Diagnostic: logit-lens probes every `every`-th layer. Not a serving path.
     pub fn probe_layers(&self, input: &ForwardInput, every: usize) -> (Vec<f32>, Vec<LayerProbe>) {
-        self.model.probe_layers(input, every)
+        match self.residency() {
+            Ok(res) => res.model.probe_layers(input, every),
+            Err(_) => (Vec::new(), Vec::new()),
+        }
     }
 
     /// Build a multimodal request: run every image through the vision tower,
@@ -562,7 +798,8 @@ impl Engine {
         params: SamplingParams,
         seed: u64,
     ) -> Result<crate::application::generation::Request, EngineError> {
-        let vision = self
+        let res = self.residency()?;
+        let vision = res
             .vision
             .as_ref()
             .ok_or_else(|| EngineError::Vision("this checkpoint has no vision tower".into()))?;
@@ -607,7 +844,8 @@ impl Engine {
         cache: &mut SequenceCache,
         images: Option<&RequestImages>,
     ) -> Result<Vec<f32>, EngineError> {
-        let kv = self.cache.as_ref().ok_or(EngineError::NoKvCache)?.clone();
+        let res = self.residency()?;
+        let kv = res.cache.as_ref().ok_or(EngineError::NoKvCache)?.clone();
         if ids.is_empty() {
             return Err(EngineError::EmptyStep { uid });
         }
@@ -643,11 +881,11 @@ impl Engine {
                 None
             },
         };
-        let logits = self
+        let logits = res
             .model
             .forward_cached(&input, cache)
             .map_err(|e| EngineError::KvCache(e.to_string()))?;
-        let vocab = self.model.params().vocab_size;
+        let vocab = self.params.vocab_size;
         if logits.len() != vocab {
             return Err(EngineError::BadLogits {
                 got: logits.len(),
@@ -700,7 +938,8 @@ impl Engine {
             image_positions = imgs.positions.clone();
         }
         let has_images = !image_positions.is_empty();
-        let logits = self.model.forward(&crate::domain::model::ForwardInput {
+        let res = self.residency()?;
+        let logits = res.model.forward(&crate::domain::model::ForwardInput {
             input_ids,
             positions,
             answers,
@@ -715,7 +954,7 @@ impl Engine {
                 None
             },
         });
-        let vocab = self.model.params().vocab_size;
+        let vocab = self.params.vocab_size;
         if logits.len() != rows.len() * vocab {
             return Err(EngineError::BadLogits {
                 got: logits.len(),
@@ -744,7 +983,7 @@ fn engine_decode_error(e: DecodeError) -> EngineError {
 #[cfg(test)]
 pub(crate) mod fake {
     use super::*;
-    use crate::domain::model::{ForwardInput, LayerType, ModelParams};
+    use crate::domain::model::{ForwardInput, LayerType, Model, ModelParams};
     use crate::domain::tokenizer::TokenizerError;
     use crate::domain::weights::DType;
     use std::sync::Mutex;

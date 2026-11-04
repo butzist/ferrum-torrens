@@ -34,7 +34,7 @@ const PROMPT: [u32; 7] = [248044, 19593, 48128, 16, 2177, 42, 42];
 const CHUNKS: [usize; 2] = [3, 4];
 const DECODE_STEPS: usize = 4;
 
-fn model() -> Box<dyn CachedModel> {
+fn model() -> Arc<dyn CachedModel> {
     let config = ferrum_torrens::config::Config::from_str(&format!(
         "[model]\npath = \".model-cache\"\ndevice = \"cuda\"\n[kv]\nnum_tokens = {}\ndtype = \"f32\"\n",
         PROMPT.len() + DECODE_STEPS + 8

@@ -10,6 +10,8 @@
 // request; a captured batch is padded to its fixed size with a reserved dummy
 // row.
 
+use std::sync::Arc;
+
 /// One request's row in a decode step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecodeRow {
@@ -70,6 +72,11 @@ pub trait CapturedDecode: Send + Sync {
     /// window is longer than the captured `window`.
     fn step(&self, rows: &[DecodeRow], windows: &[&[u32]]) -> Result<Vec<Vec<f32>>, DecodeError>;
 }
+
+/// Rebuild a dropped captured decode service over the same model and KV pool.
+/// A residency that released its expert banks also had to drop the graphs (their
+/// nodes bake the bank addresses), so it carries this to put capture back.
+pub type Recapture = Arc<dyn Fn() -> Result<Arc<dyn CapturedDecode>, String> + Send + Sync>;
 
 #[cfg(test)]
 mod tests {

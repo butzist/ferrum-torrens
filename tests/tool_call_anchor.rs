@@ -29,7 +29,7 @@ const CAP: usize = 200;
 const SYSTEM: &str = "You are a helpful assistant with tools.";
 const USER: &str = "What is the weather in Paris? Use the get_weather tool.";
 
-fn model() -> Box<dyn CachedModel> {
+fn model() -> Arc<dyn CachedModel> {
     // `[kernel] triton = true` is the serving path; without it the host MoE plan
     // makes a 276-token prefill take minutes.
     let config = ferrum_torrens::config::Config::from_str(

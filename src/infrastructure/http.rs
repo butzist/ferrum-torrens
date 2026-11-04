@@ -1540,7 +1540,10 @@ impl From<EngineError> for ApiError {
             | KvCache(_)
             | NoCapturedDecode
             | DecodeStepNotOne { .. }
-            | Captured(_)) => ApiError::unprocessable(format!("engine kv cache: {e}")),
+            | Captured(_)
+            | NotResident
+            | Rebuild(_)
+            | Moe(_)) => ApiError::unprocessable(format!("engine kv cache: {e}")),
         }
     }
 }

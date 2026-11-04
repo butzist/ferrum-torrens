@@ -124,6 +124,24 @@ pub trait ExpertSlabSource: Send + Sync {
 pub trait ExpertSlotStore: Send + Sync {
     fn load(&self, layer: usize, expert: u32, slot: usize) -> Result<(), MoEError>;
     fn slots(&self) -> usize;
+
+    /// Free the device expert banks, if this store owns any. The slot tables
+    /// and the pinned host source stay put, so `rehydrate_banks` can rebuild the
+    /// banks at the same slot count. A host-only store has nothing to free.
+    fn release_banks(&self) -> Result<(), MoEError> {
+        Ok(())
+    }
+
+    /// Reallocate the device expert banks after `release_banks`. Every slot is
+    /// empty again, which is why the caller also resets its slot machine.
+    fn rehydrate_banks(&self) -> Result<(), MoEError> {
+        Ok(())
+    }
+
+    /// Whether the device banks are currently allocated.
+    fn banks_resident(&self) -> bool {
+        true
+    }
 }
 
 /// One layer's grouped MoE GEMM input: every `(token, top_k)` route is one
@@ -325,6 +343,24 @@ pub trait MoEExecutor: Send + Sync {
     /// can tell which one actually happened. No default: an adapter that cannot
     /// count must say so rather than report zero.
     fn steps(&self) -> u64;
+
+    /// Free the device expert cache and forget which expert sits in which slot.
+    /// The next step stages its misses again. Used by the residency controller
+    /// before a vision pass borrows the device; a host-only executor is a no-op.
+    fn release_cache(&self) -> Result<(), MoEError> {
+        Ok(())
+    }
+
+    /// Reallocate the device expert cache at its configured slot count after
+    /// `release_cache`.
+    fn rehydrate_cache(&self) -> Result<(), MoEError> {
+        Ok(())
+    }
+
+    /// Whether the device expert cache is currently allocated.
+    fn cache_resident(&self) -> bool {
+        true
+    }
 }
 
 /// Slot-major banks for the reference path: `packed [slots, rows, cols/2]`, the

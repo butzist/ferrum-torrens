@@ -34,7 +34,11 @@ pub enum RegistryError {
 /// Rust drops fields in declaration order, which is why `captured` is first.
 pub struct BuiltModel {
     pub captured: Option<Arc<dyn CapturedDecode>>,
-    pub model: Box<dyn CachedModel>,
+    pub recapture: Option<crate::domain::decode::Recapture>,
+    pub model: Arc<dyn CachedModel>,
+    /// The routed-expert executor attached to the model, when the composition
+    /// root built one (cudarc device staging). `None` on a CPU build.
+    pub moe: Option<Arc<dyn crate::domain::expert_kernel::MoEExecutor>>,
     /// The resolved expert-cache slot count (explicit or auto-sized, item 12).
     pub cache_size_slots: usize,
     /// The arch's vision tower, when the checkpoint declares a `vision_config`,
@@ -141,7 +145,9 @@ pub fn build(
                     stream,
                     slots,
                 )?;
-                model.attach_moe(moe);
+                let moe_for_model = moe.clone();
+                model.attach_moe(moe_for_model);
+                let model = Arc::new(model);
                 let captured = if capture {
                     match capture_decode(config, &model, &cache, model.runtime()) {
                         Ok(graphs) => Some(Arc::new(graphs) as Arc<dyn CapturedDecode>),
@@ -157,9 +163,32 @@ pub fn build(
                 } else {
                     None
                 };
+                let recapture = if capture {
+                    let weak_model = std::sync::Arc::downgrade(&model);
+                    let weak_cache = std::sync::Arc::downgrade(&cache);
+                    let config = config.clone();
+                    Some(Arc::new(move || {
+                        let m = weak_model
+                            .upgrade()
+                            .ok_or_else(|| "the model was dropped".to_string())?;
+                        let c = weak_cache
+                            .upgrade()
+                            .ok_or_else(|| "the kv pool was dropped".to_string())?;
+                        capture_decode(&config, &m, &c, m.runtime())
+                            .map(|g| Arc::new(g) as Arc<dyn CapturedDecode>)
+                            .map_err(|e| e.to_string())
+                    })
+                        as Arc<
+                            dyn Fn() -> Result<Arc<dyn CapturedDecode>, String> + Send + Sync,
+                        >)
+                } else {
+                    None
+                };
                 Ok(BuiltModel {
                     captured,
-                    model: Box::new(model),
+                    recapture,
+                    model: model as Arc<dyn CachedModel>,
+                    moe,
                     cache_size_slots: slots,
                     vision,
                 })
@@ -186,11 +215,13 @@ fn scalar_built(
         );
     }
     Ok(BuiltModel {
-        model: Box::new(
+        captured: None,
+        recapture: None,
+        model: Arc::new(
             Qwen3_6::from_text_config(tc, index.clone(), reader.clone())
                 .map_err(|e| RegistryError::Build(e.to_string()))?,
         ),
-        captured: None,
+        moe: None,
         cache_size_slots: config
             .moe
             .cache_size_slots

@@ -132,10 +132,10 @@ fn stage_bytes(bank: &Tensor, slot: usize, bytes: &[u8], len: usize) -> Result<(
 
 /// The device slot cache, plus the launch path.
 ///
-/// The banks are allocated once, on the first staging, and never dropped: a
-/// layer switch overwrites bytes at the same addresses (decision 40
-/// prerequisite 2), which is both what lets one bank serve every layer and what
-/// makes the addresses a captured graph bakes in stay valid.
+/// The banks are allocated on the first staging and reused across layer
+/// switches (decision 40 prerequisite 2). `release_banks` frees them and the
+/// tables that bake their addresses, which is what lets a vision pass borrow
+/// the device; `rehydrate_banks` rebuilds them from the pinned host source.
 ///
 /// The ports are implemented for `Mutex<CudaMoE>`: staging a miss is `&mut self`
 /// (it rewrites banks) while one device cache serves every step, so the engine
@@ -176,6 +176,13 @@ pub struct CudaMoE {
     prefill_groups: Vec<StagedGroup>,
     /// Route token tables, one per `(tokens, top_k)` chunk shape.
     prefill_tokens: Vec<TokenTable>,
+    /// The `(layers, experts)` device staging was built for, kept after a
+    /// release so `rehydrate_banks` can rebuild the same tables from the pinned
+    /// source. `None` for the host-plan adapter, which allocates lazily.
+    staging_dims: Option<(usize, usize)>,
+    /// Whether the whole-layer prefill harness was enabled, so a rehydrate can
+    /// put it back.
+    prefill_enabled: bool,
     /// The live residency policy over the shared slot banks.
     residency: Residency,
 }
@@ -405,6 +412,8 @@ impl CudaMoE {
             prefill: None,
             prefill_groups: Vec::new(),
             prefill_tokens: Vec::new(),
+            staging_dims: None,
+            prefill_enabled: false,
             residency: Residency::Decode,
         })
     }
@@ -508,6 +517,46 @@ impl CudaMoE {
         Ok(())
     }
 
+    /// Free the device expert banks and everything that bakes their addresses:
+    /// the slot tables, the prefill harness and its static row tables. The
+    /// pinned host banks stay, so `rehydrate_banks` rebuilds the same staging
+    /// without touching the checkpoint. A captured graph must already be gone;
+    /// its nodes point into the banks this drops.
+    pub fn release_banks(&mut self) {
+        self.gate_up = None;
+        self.down = None;
+        self.device_staging = None;
+        self.prefill = None;
+        self.prefill_groups.clear();
+        self.prefill_tokens.clear();
+        self.residency = Residency::Decode;
+    }
+
+    /// Rebuild the banks and the staging tables `release_banks` dropped. Every
+    /// slot is empty, so the caller also resets its host slot plan.
+    pub fn rehydrate_banks(&mut self) -> Result<(), MoEError> {
+        if self.gate_up.is_some() {
+            return Ok(());
+        }
+        let Some((layers, experts)) = self.staging_dims else {
+            // The host-plan adapter allocates on the next miss; nothing to
+            // rebuild ahead of time.
+            return Ok(());
+        };
+        let pinned = self.pinned.take().ok_or_else(|| {
+            MoEError::Bad("rehydrate_banks before any pinned banks were installed".into())
+        })?;
+        self.enable_device_staging(pinned, layers, experts)?;
+        if self.prefill_enabled {
+            self.enable_prefill_overlap()?;
+        }
+        Ok(())
+    }
+
+    pub fn banks_resident(&self) -> bool {
+        self.gate_up.is_some()
+    }
+
     /// Allocate the device slot tables and the per-layer source-pointer arrays,
     /// then the pinned host banks are the source the copy kernel reads.
     ///
@@ -585,6 +634,7 @@ impl CudaMoE {
             src_ptrs,
         });
         self.pinned = Some(pinned);
+        self.staging_dims = Some((layers, experts));
         Ok(())
     }
 
@@ -685,6 +735,7 @@ impl CudaMoE {
             window_start: 0,
             dma,
         });
+        self.prefill_enabled = true;
         Ok(())
     }
 
@@ -2126,6 +2177,23 @@ impl ExpertSlotStore for Mutex<CudaMoE> {
 
     fn slots(&self) -> usize {
         self.lock().map(|m| m.slots).unwrap_or(0)
+    }
+
+    fn release_banks(&self) -> Result<(), MoEError> {
+        self.lock()
+            .map_err(|_| MoEError::Bad("cuda slot cache poisoned".into()))?
+            .release_banks();
+        Ok(())
+    }
+
+    fn rehydrate_banks(&self) -> Result<(), MoEError> {
+        self.lock()
+            .map_err(|_| MoEError::Bad("cuda slot cache poisoned".into()))?
+            .rehydrate_banks()
+    }
+
+    fn banks_resident(&self) -> bool {
+        self.lock().map(|m| m.banks_resident()).unwrap_or(false)
     }
 }
 

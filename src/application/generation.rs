@@ -282,7 +282,7 @@ fn run_batch(
             // One page table per request, and every step advances it by the
             // tokens it has not seen: the prompt in budget-sized chunks, then one
             // token each.
-            let kv = engine.cache().expect("checked above").clone();
+            let kv = engine.cache().expect("checked above");
             if phase == Phase::Decode && engine.captured().is_some() {
                 // The engine owns a captured decode service, so a whole decode
                 // step replays on one graph instead of one cached forward per

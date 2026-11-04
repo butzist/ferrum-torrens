@@ -33,6 +33,8 @@ pub struct CachedExperts {
     /// just decode. Off falls back to the host plan.
     staged: bool,
     cache_size: usize,
+    num_layers: usize,
+    num_experts: usize,
 }
 
 impl CachedExperts {
@@ -74,6 +76,8 @@ impl CachedExperts {
             steps: AtomicU64::new(0),
             staged,
             cache_size,
+            num_layers,
+            num_experts,
         }
     }
 
@@ -99,6 +103,24 @@ impl CachedExperts {
 impl MoEExecutor for CachedExperts {
     fn steps(&self) -> u64 {
         self.steps()
+    }
+
+    /// Free the device banks and forget the slot plan. The store keeps the
+    /// pinned host source, so the next step restages exactly the experts it
+    /// routes to; the slot machine starts empty because every bank slot is
+    /// uninitialized memory again.
+    fn release_cache(&self) -> Result<(), MoEError> {
+        self.store.release_banks()?;
+        *self.locked() = ExpertCache::new(self.num_layers, self.num_experts, self.cache_size);
+        Ok(())
+    }
+
+    fn rehydrate_cache(&self) -> Result<(), MoEError> {
+        self.store.rehydrate_banks()
+    }
+
+    fn cache_resident(&self) -> bool {
+        self.store.banks_resident()
     }
 
     fn execute_device<'a>(
@@ -691,6 +713,31 @@ mod tests {
             &mut out,
         )
         .unwrap();
+    }
+
+    /// Freeing the banks must also forget the slot plan: every expert the next
+    /// step routes to has to be staged again, because the bank memory is fresh.
+    #[test]
+    fn releasing_the_expert_cache_restages_every_expert_next_step() {
+        let mut store = strict_store(4);
+        store.expect_banks_resident().return_const(true);
+        store.expect_load().times(4).returning(|_, _, _| Ok(()));
+        store.expect_release_banks().times(1).returning(|| Ok(()));
+        store.expect_rehydrate_banks().times(1).returning(|| Ok(()));
+        let mut gemm = MockExpertGemm::new();
+        gemm.expect_grouped_moe_dev()
+            .times(2)
+            .returning(|_, _| Ok(()));
+        let executor = CachedExperts::new(Arc::new(store), Arc::new(gemm), 2, 4, 4);
+        let (x, _defaults, weights, mut out) = step_buffers();
+        let experts = Buf::new(vec![1.0, 3.0, 1.0, 3.0]);
+        let req = device_request(0, &x, &experts, &weights);
+        executor.execute_device(&req, &mut out).unwrap();
+        assert!(executor.cache_resident());
+
+        executor.release_cache().unwrap();
+        executor.rehydrate_cache().unwrap();
+        executor.execute_device(&req, &mut out).unwrap();
     }
 
     #[test]

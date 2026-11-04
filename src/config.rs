@@ -125,6 +125,10 @@ pub struct Serve {
     pub port: u16,
     #[serde(default)]
     pub served_model_name: Option<String>,
+    /// Seconds without a request after which the server may release its device
+    /// residency. `0` disables idle release.
+    #[serde(default = "default_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
 }
 
 impl Default for Serve {
@@ -133,8 +137,13 @@ impl Default for Serve {
             host: "127.0.0.1".to_string(),
             port: DEFAULT_PORT,
             served_model_name: None,
+            idle_timeout_secs: default_idle_timeout_secs(),
         }
     }
+}
+
+fn default_idle_timeout_secs() -> u64 {
+    600
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
