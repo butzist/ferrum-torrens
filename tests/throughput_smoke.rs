@@ -195,17 +195,25 @@ impl Sampler {
     }
 }
 
-/// `FERRUM_FTW_DIR` picks the checkpoint (M8.1); unset is the reference one.
-fn config() -> Config {
-    // The serving shape: bf16 KV (the default), the committed NVFP4 cubins via
-    // `kernel.triton`, whole-layer prefill overlap. `FERRUM_SMOKE_GRAPH=1` turns
-    // decode capture on so the eager and captured arms share every other knob.
+/// Whether `FERRUM_SMOKE_GRAPH=1` asked for the captured arm. `FERRUM_SMOKE_ARMS`
+/// (`eager`, `captured`, or `all`) overrides it.
+fn graph_from_env() -> bool {
+    std::env::var("FERRUM_SMOKE_GRAPH").as_deref() == Ok("1")
+}
+
+/// The serving shape: bf16 KV (the default), the committed NVFP4 cubins via
+/// `kernel.triton`, whole-layer prefill overlap, decode capture on or off.
+///
+/// Footprint: one engine pins 16.9 GiB of host expert banks (every expert of
+/// every layer, page-locked so it cannot be reclaimed) on a 32 GiB box, and a
+/// dropped engine does not return its device slot banks (TODO.md M8.1e). So a
+/// model load needs the box to itself, and a matrix should spend
+/// `FERRUM_SMOKE_REPS` reps on one load rather than start a process per rep.
+/// The device pools are separate: a smaller `FERRUM_SMOKE_KVTOK` /
+/// `FERRUM_SMOKE_SEQ` / `FERRUM_SMOKE_PREFILL_CHUNK` trims VRAM and the prefill
+/// scratch, not the host banks.
+fn config(graph: bool) -> Config {
     let dir = common::ftw_dir();
-    let graph = if std::env::var("FERRUM_SMOKE_GRAPH").as_deref() == Ok("1") {
-        "true"
-    } else {
-        "false"
-    };
     let kv = std::env::var("FERRUM_SMOKE_KV").unwrap_or_else(|_| "bf16".into());
     let kv_tokens = std::env::var("FERRUM_SMOKE_KVTOK").unwrap_or_else(|_| "4096".into());
     // The config default is `auto` (item 12); `FERRUM_SMOKE_CACHE` pins a slot
@@ -323,7 +331,18 @@ fn single_request_throughput_smoke() {
     if !cfg!(feature = "cudarc") {
         panic!("this smoke needs --features cudarc; without it there is no GPU forward");
     }
-    let engine = load_engine(&config()).unwrap();
+    vram("process start");
+    run_arm(graph_from_env());
+}
+
+/// Load one engine, warm it, then time one request and print the numbers.
+///
+/// One arm per process on purpose: dropping an `Engine` returns its 16.9 GiB of
+/// pinned host banks but leaves its device slot banks allocated (~1.8 MiB per
+/// cache slot), so a second load in the same process starts with that memory
+/// gone and eventually fails (TODO.md M8.1e).
+fn run_arm(graph: bool) {
+    let engine = load_engine(&config(graph)).unwrap();
     eprintln!("captured decode graph: {}", engine.captured().is_some());
     vram("after load");
 
@@ -336,10 +355,27 @@ fn single_request_throughput_smoke() {
         "the kernel path must have run"
     );
 
+    // Further reps reuse the loaded engine: a reload costs 16.9 GiB of pinned
+    // banks and a graph capture for no measurement value, and the warm cache it
+    // starts from is the steady state a serving step sees anyway.
+    let reps = env_usize("FERRUM_SMOKE_REPS").unwrap_or(1).max(1);
+    for rep in 1..=reps {
+        if reps > 1 {
+            eprintln!("--- rep {rep}/{reps}");
+        }
+        measure(&engine);
+    }
+    eprintln!("peak rss: {:.1} GiB", peak_rss_gib());
+    drop(engine);
+    vram("after drop");
+}
+
+/// One timed request over a warm engine, printing the pp/tg pair.
+fn measure(engine: &Engine) {
     let sampler = Sampler::start();
     let t = time_request(
-        &engine,
-        prompt_of(&engine, prefill_target_tokens()),
+        engine,
+        prompt_of(engine, prefill_target_tokens()),
         decode_tokens(),
     );
     let samples = sampler.map(Sampler::stop).unwrap_or_default();
@@ -391,4 +427,19 @@ fn single_request_throughput_smoke() {
     // mixer dominates; see TODO.md section 8).
     assert!(pp > 1.0, "prompt processing too slow: {pp:.1} tok/s");
     assert!(tg > 0.2, "text generation collapsed: {tg:.1} tok/s");
+}
+
+/// The process's high-water resident set. The host, not the device, is the tight
+/// budget here: an engine pins 16.9 GiB of expert banks that the kernel cannot
+/// reclaim, so a run's real cost has to be printed rather than guessed.
+fn peak_rss_gib() -> f64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("VmHWM:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|v| v.parse::<u64>().ok())
+        })
+        .map_or(0.0, |kb| kb as f64 / (1024.0 * 1024.0))
 }

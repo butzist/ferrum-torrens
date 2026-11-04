@@ -260,7 +260,7 @@
               # interpreter but not the kernel deps).
               export FERRUM_PYTHON="${pythonEnv}/bin/python3"
               # via bash, not the shebang: the jail has no /usr/bin/env.
-              alias ft-gate="bash $FLAKE_ROOT/scripts/run-gate.sh"
+              alias ft-gate="bash $FLAKE_ROOT/scripts/run-gated.sh"
               # The kernel self-check on CPU tensors through Triton's interpreter.
               alias kernel-selftest="''${FERRUM_PYTHON} -m ferrum_kernel.selftest --interp"
               alias kernel-compile-check="''${FERRUM_PYTHON} -m ferrum_kernel.compile_check"

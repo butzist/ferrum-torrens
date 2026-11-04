@@ -86,6 +86,18 @@ fi
 
 echo "running $test_name ($target, cap ${cap_gib}G${features:+, features: $features})" >&2
 
+# A real-checkpoint run needs ~19 GiB of unreclaimable host memory: 16.9 GiB of
+# page-locked expert banks plus the process. Refuse before the load instead of
+# letting the OOM killer pick a victim, which loses a load's worth of work and
+# can take the session with it. FT_NEED_GIB overrides for a smaller config.
+need_gib="${FT_NEED_GIB:-19}"
+avail_gib="$(awk '/^MemAvailable:/ {printf "%d", $2 / 1048576}' /proc/meminfo)"
+if [[ -n "$avail_gib" ]] && (( avail_gib < need_gib )); then
+  echo "refusing: MemAvailable ${avail_gib} GiB < ${need_gib} GiB for one load" >&2
+  echo "free the host (a build, a second model load, a browser) or set FT_NEED_GIB" >&2
+  exit 3
+fi
+
 if command -v prlimit >/dev/null 2>&1; then
   # prlimit --as takes bytes; a bare KiB number here would be read as bytes and
   # cap the process at ~30 MB, which the dynamic loader fails on before the
