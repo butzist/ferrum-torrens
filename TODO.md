@@ -1,7 +1,13 @@
 # FerrumTorrens -- FreeToken MVP port to Rust: TODO
 
 Status (2026-11-04): **M7 complete and the second checkpoint is merged: M8.1 is
-done except the Nix store path (M8.1b).** `Ornith-1.5-35B-A3B-NVFP4` converts
+done except the Nix store path (M8.1b), which is in progress on branch
+`feat/m8.1b-model-variant`.** The Nix side there is implemented and verified
+(`nix/checkpoints.nix` table, `model.variant` in the NixOS module, one flake
+package per checkpoint, lazy evaluation proven by `nix build --dry-run`); the one
+blocker is the Ornith HF fixed-output hash, which a download in flight fills, and
+the HF artifact turns out to differ from the export gated so far, so it also
+needs a re-gate. `Ornith-1.5-35B-A3B-NVFP4` (the local export) converts
 with no code change, passes every device gate, and lands at pp parity and 1-3%
 behind on tg; the difference is routing entropy, measured as +5.4% expert-cache
 misses per decode step and scoped as R13 in `OPTIMIZATION.md`. M8.1c is closed
@@ -582,11 +588,48 @@ Ordered slices, each its own gated change:
   whole-layer prefill, decode-cache retention). The gates take the checkpoint
   from `FERRUM_FTW_DIR` (`tests/common`); the exact token-id pins stay on the
   reference checkpoint and a second checkpoint asserts semantics instead.
-- [ ] **M8.1b Class A -- the second checkpoint as a store path.** `nix/model.nix`
-  instantiated for `ornith-ai/Ornith-1.5-35B-A3B-NVFP4` (its own `repo` and
-  fixed-output `hash`; one `nix build` pass fills the hash), plus the flake
-  package attribute. Needs ~45 GB of store space for the snapshot and the FTW.
-  Acceptance: `nix build .#ferrum-torrens-model-ornith` yields a servable FTW.
+- [ ] **M8.1b Class A -- a second checkpoint as a store path (IN PROGRESS,
+  branch `feat/m8.1b-model-variant`).** Implemented and verified on that branch:
+  `nix/checkpoints.nix` is the single table of served checkpoints (`repo`, the
+  fixed-output NAR `hash` of its HF snapshot, the advertised `name`); both
+  `flake.nix` and `nix/module.nix` import it, so the values cannot drift.
+  `flake.nix` exposes one package per entry (`ferrum-torrens-model`,
+  `ferrum-torrens-model-ornith`), and the module grew `model.variant` (enum, the
+  reference by default) which `lib.mkDefault`s `model.repo`, `model.hash` and
+  `servedModelName`; an explicit value still wins, and `model.path` skips the
+  model build entirely. Lazy evaluation verified with `nix build --dry-run`:
+  `.#ferrum-torrens` plans **no** model derivation at all, and
+  `.#ferrum-torrens-model` plans only the `nvidia` HF fixed-output derivation
+  (no Ornith). Module behaviour verified with a NixOS eval: variant ornith gives
+  the ornith repo and name, an explicit `model.hash` overrides it, and the
+  reference variant is unchanged. README and `ARCHITECTURE.md` 2 are updated.
+  **Blocker: `nix/checkpoints.nix` still carries `hash =
+  "__ORNITH_HF_HASH__"`**, so `nix build .#ferrum-torrens-model-ornith` cannot
+  evaluate yet. Getting the real hash needs a `snapshot_download`-equivalent
+  tree of `ornith-ai/Ornith-1.5-35B-A3B-NVFP4`; `/tmp/opencode/m81b/fetch_ornith.sh`
+  does that (per-file size and LFS sha256 checked against the HF API, then
+  `nix hash path`), writing to `.model-cache/hf-hf/Ornith-1.5-35B-A3B-NVFP4`; it
+  was at ~12.4 of ~24 GB when this was recorded (~4 MB/s, so ~50 min left). The
+  method is proven: hashing the reference snapshot minus `.cache` reproduces the
+  pinned reference hash exactly (`sha256-JTcnVr...`).
+  **The HF artifact is not the snapshot we gated.** The current HF `main` has 22
+  files; our `.model-cache/hf/Ornith-1.5-35B-A3B-NVFP4` export lacks four of them
+  (`README.md`, `.gitattributes`, two `assets/*.png`) and its
+  `model-00002-of-00003.safetensors` is 10,706,653,328 bytes against the repo's
+  10,006,454,416 (a 700,198,912-byte difference), so every number and gate
+  recorded for Ornith so far belongs to the local export, not to the artifact the
+  flake will serve. So the next steps are: (1) fill the hash from the fetch and
+  re-check `nix build .#ferrum-torrens-model-ornith --dry-run`; (2) convert the
+  fetched tree with the Rust converter and run `ftw_real_checkpoint`,
+  `engine_real_load`, one `engine_real_generate` and `cudarc_engine_generate` on
+  it (`FERRUM_FTW_DIR`), because the converted bytes differ; (3) record the
+  outcome in `DONE.md` and add the `model.variant` decision to section 7 as 149
+  (take the next free number at merge time; `feat/spec-decode` holds 149 for M9
+  until then); (4) merge and push. Remove `.model-cache/hf-hf/` afterwards
+  (~24 GB) and the `.model-cache/.hashcheck/` hardlink tree.
+  Acceptance: `nix build .#ferrum-torrens-model-ornith` yields a servable FTW,
+  and `servedModelName` follows the variant when the unit is configured with
+  `model.variant = "ornith-1.5-35b-a3b-nvfp4"`.
 - [x] **M8.1c Captured decode on a second checkpoint -- DONE (decision 148).**
   The divergence was never capture-specific: eager decode ran the dense gather
   plus `causal_sdpa` and `conv_prefill`, while a captured step runs paged

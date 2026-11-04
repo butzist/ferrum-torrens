@@ -96,15 +96,23 @@
             inherit kernels;
           };
 
-          # The FTW checkpoint as a store path: the HF snapshot is a
-          # fixed-output derivation and the converter runs over it at build
-          # time. Override `hash` to follow a new revision, or pass `source` to
-          # convert a local snapshot without a download.
-          ferrum-torrens-model = pkgs.callPackage ./nix/model.nix {
-            converter = ferrum-torrens-convert;
-            hash = "sha256-JTcnVrnwsMBjPzBouRPPQKya4CGjHMkZJYFmdvnzg4U=";
-            source = null;
-          };
+          # The served checkpoints (nix/checkpoints.nix), one package per entry.
+          # The HF snapshot is a fixed-output derivation and the converter runs
+          # over it at build time. Nix evaluates lazily: building one attribute
+          # never downloads or converts the other, and the serving binary's
+          # closure contains no checkpoint at all (the module supplies the
+          # selected FTW at run time). The hashes are inert strings until a
+          # derivation references them.
+          checkpoints = import ./nix/checkpoints.nix;
+          modelFor =
+            name:
+            pkgs.callPackage ./nix/model.nix {
+              converter = ferrum-torrens-convert;
+              inherit (checkpoints.${name}) repo hash;
+              source = null;
+            };
+          ferrum-torrens-model = modelFor "qwen3.6-35b-a3b-nvfp4";
+          ferrum-torrens-model-ornith = modelFor "ornith-1.5-35b-a3b-nvfp4";
 
           # The serving runtime (cudarc) links a CUDA 13 cuBLAS: the devshell's
           # CUDA 12.9 libcublas is 16-44% slower on prefill, while 13.8.0.4
@@ -179,6 +187,7 @@
               ferrum-torrens
               ferrum-torrens-convert
               ferrum-torrens-model
+              ferrum-torrens-model-ornith
               ;
             default = ferrum-torrens;
           };

@@ -240,9 +240,18 @@ elementwise.py"]
   root cudarc links), `CUDARC_CUDA_VERSION` and the loader path, and wires
   Triton's `ptxas` (still 12.9) and `libcuda` probes. `scripts/run-gated.sh` (`ft-gate`) runs the
   heavy real-checkpoint tests serially under an `RLIMIT_AS` cap.
-- **The Nix side is two files.** `flake.nix` owns the project (the toolchain
-  packages and the devshell), and `nix/kernels.nix` builds the cubins. The
-  jailed opencode is the system-installed launcher from the NixOS/home-manager
+- **The Nix side is a flake plus one file per concern.** `flake.nix` owns the
+  project (the toolchain packages, the devshell and the packages),
+  `nix/kernels.nix` builds the cubins, `nix/package.nix` and `nix/convert.nix`
+  the two binaries, `nix/model.nix` one FTW store path,
+  `nix/checkpoints.nix` the served-checkpoint table (repo, fixed-output NAR
+  hash, advertised name) and `nix/module.nix` the NixOS unit. The unit's
+  `model.variant` selects a table entry and defaults `model.repo`,
+  `model.hash` and `servedModelName` from it; only the selected checkpoint is
+  realised, because the unselected `model.nix` instantiation is referenced by
+  nothing, and `model.path` skips even the selected one. The serving binary's
+  closure carries no checkpoint: the FTW is a runtime path the unit reads.
+  The jailed opencode is the system-installed launcher from the NixOS/home-manager
   config, not a project package; run it from the devshell so it forwards the
   devshell environment (GPU, `/nix`, Nix daemon socket, credentials).
 - **A second checkpoint's kernel set `[TODO]`** (TODO.md M8.2). The cubins bake
@@ -251,7 +260,9 @@ elementwise.py"]
   AOT set, built by the same `nix/kernels.nix` from a shape profile and embedded
   by `build.rs` through `FERRUM_KERNEL_DIR`. The boundary is one set per binary:
   there is no runtime manifest multiplexing (decision 146). A checkpoint whose
-  shapes and quant recipe match the served one needs no new set at all.
+  shapes and quant recipe match the served one needs no new set at all -- which
+  is why the two served checkpoints differ only in a `nix/checkpoints.nix` entry
+  (`ferrum-torrens-model` and `ferrum-torrens-model-ornith`, M8.1b).
 
 ---
 

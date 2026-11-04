@@ -164,6 +164,9 @@ at build time (and optionally to run the upstream FreeToken reference/probes).
             gpu = 0;
             cudaGraph = true;
             kvTokens = 16384;
+            # Selects the checkpoint; it also defaults servedModelName:
+            #   "qwen3.6-35b-a3b-nvfp4" (default) | "ornith-1.5-35b-a3b-nvfp4"
+            # model.variant = "ornith-1.5-35b-a3b-nvfp4";
             # model.path = "/srv/models/Qwen3.6-35B-A3B-NVFP4.ftw";
             # model.source = /srv/hf/Qwen3.6-35B-A3B-NVFP4;
           };
@@ -183,14 +186,25 @@ by `model.hash`; update `model.repo`/`model.revision`/`model.hash` together to
 follow a new checkpoint. Use `model.source` for a local HF snapshot, or
 `model.path` (+ `model.autoConvert = false`) for an existing FTW.
 
+`model.variant` chooses the checkpoint and defaults `model.repo`, `model.hash`
+and `servedModelName`; both entries live in `nix/checkpoints.nix`. Only the
+selected one is realised: Nix is lazy, so the system build never downloads or
+converts the other checkpoint, and with `model.path` set no model derivation is
+forced at all. The server binary's closure never contains a checkpoint either --
+the FTW is a runtime path the unit reads.
+
 The flake also exposes:
 
 ```
-ferrum-torrens            # server, cubins embedded
-ferrum-torrens-convert    # CPU-only HF -> FTW converter
-ferrum-torrens-model      # converted FTW checkpoint
-kernels                   # compiled sm_120 cubins
+ferrum-torrens                    # server, cubins embedded
+ferrum-torrens-convert            # CPU-only HF -> FTW converter
+ferrum-torrens-model              # converted FTW checkpoint (Qwen3.6)
+ferrum-torrens-model-ornith       # converted FTW checkpoint (Ornith-1.5)
+kernels                           # compiled sm_120 cubins
 ```
+
+Building one model does not build the other: `nix build
+.#ferrum-torrens-model-ornith` downloads and converts only that snapshot.
 
 ### Standalone
 

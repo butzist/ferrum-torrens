@@ -10,6 +10,13 @@ let
   system = pkgs.stdenv.hostPlatform.system;
   defaultPackage = self.packages.${system}.ferrum-torrens;
 
+  # The served checkpoints, by `model.variant`. A variant only names data: the
+  # repo, the fixed-output NAR hash of its HF snapshot and the advertised model
+  # name. Which one becomes real is decided by `modelPackage` below, and Nix
+  # builds exactly that one.
+  checkpoints = import ./checkpoints.nix;
+  checkpoint = checkpoints.${cfg.model.variant};
+
   modelPackage = pkgs.callPackage ./model.nix {
     converter = self.packages.${system}.ferrum-torrens-convert;
     inherit (cfg.model)
@@ -189,10 +196,25 @@ in
     };
 
     model = {
+      variant = lib.mkOption {
+        type = lib.types.enum [
+          "qwen3.6-35b-a3b-nvfp4"
+          "ornith-1.5-35b-a3b-nvfp4"
+        ];
+        default = "qwen3.6-35b-a3b-nvfp4";
+        description = ''
+          The served checkpoint. It drives `model.repo`, `model.hash` and
+          `servedModelName` (each still overridable). Only the selected
+          checkpoint is ever realised: with `model.path = null` the module
+          references one `model.nix` instantiation, and Nix never builds or
+          downloads the other one.
+        '';
+      };
+
       repo = lib.mkOption {
         type = lib.types.str;
         default = "nvidia/Qwen3.6-35B-A3B-NVFP4";
-        description = "Hugging Face repo to convert.";
+        description = "Hugging Face repo to convert (defaulted from model.variant).";
       };
 
       revision = lib.mkOption {
@@ -204,7 +226,7 @@ in
       hash = lib.mkOption {
         type = lib.types.str;
         default = "sha256-JTcnVrnwsMBjPzBouRPPQKya4CGjHMkZJYFmdvnzg4U=";
-        description = "NAR hash of the downloaded HF snapshot; update it with the repo/revision (ignored when model.source is set).";
+        description = "NAR hash of the downloaded HF snapshot (defaulted from model.variant); update it with the repo/revision, and ignored when model.source is set.";
       };
 
       path = lib.mkOption {
@@ -244,6 +266,13 @@ in
         message = "services.ferrum-torrens needs model.path, or model.autoConvert = true to build the FTW checkpoint";
       }
     ];
+
+    # `model.variant` picks the checkpoint; an explicit `model.repo` / `hash` /
+    # `servedModelName` still wins, and `model.path` skips the model build
+    # entirely (the `modelPackage` above is then never forced).
+    services.ferrum-torrens.model.repo = lib.mkDefault checkpoint.repo;
+    services.ferrum-torrens.model.hash = lib.mkDefault checkpoint.hash;
+    services.ferrum-torrens.servedModelName = lib.mkDefault checkpoint.name;
 
     users.groups = lib.mkIf (cfg.group == "ferrum-torrens") {
       ferrum-torrens = { };
