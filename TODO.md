@@ -16,7 +16,11 @@ decoding). `Ornith-1.5-35B-A3B-NVFP4` lands at pp parity and 1-3% behind on tg
 closed by decision 148 -- one-token text decode runs the device kernels on both
 arms (`maxabs_delta = 0.000000` per step). Two footprint findings remain: a load
 pins 16.93 GiB of host expert banks (peak RSS 18.6 GiB, so one load at a time),
-and a dropped engine keeps its device slot banks (M8.1e). The
+and a dropped engine keeps its device slot banks (M8.1e). **M9 (speculative
+decoding with the checkpoint's own MTP head, section 6d) is scoped but not
+started** (decision 150): the head is in both checkpoints, the target verify
+keeps the output exact, and the draft may be quantized because only the accept
+rate depends on it. The
 vision tower runs on the device (decision 139); busy devices and a full GPU both
 answer `503` + `Retry-After` instead of crashing (140, 144); the idle release
 stages the GPU back to the host behind an exclusive batch lease (141); mrope
@@ -641,6 +645,81 @@ Ordered slices, each its own gated change:
   the checkpoints that exist, so it is the most expensive path and waits for a
   client that needs it.
 
+## 6d. M9 -- speculative decoding with the MTP head (planned 2026-11-04)
+
+Port of FreeToken PR #844 (the MTP draft of their speculative-decoding stack:
+#833 seams, #834 radix lookahead, #836 target verify, #841 shared GDN). Their
+result on a single H100: accept length 3.36-3.74 of `k + 1 = 4`, and Qwen3.6-35B-A3B
+decode **159 -> 261 tok/s (1.64x)**; the target verify makes every draft exact,
+so the draft only moves the accept rate, never the output.
+
+**Why this is cheap for us to try and what it is not.** Upstream refuses an FTW
+checkpoint as a draft source because "the FTW conversion drops `mtp.*`". We have
+no such escape: both our checkpoints *are* FTW, so keeping the head is step one.
+But the head is small and already present: **19 `mtp.*` tensors** in
+Qwen3.6-35B-A3B-NVFP4 (stacked bf16 experts `[256, 1024, 2048]` and
+`[256, 2048, 512]`) and **785** in Ornith-1.5-35B-A3B-NVFP4 (the same weights
+per-expert), all bf16, **~1.7 GB**. It is one *full-attention* decoder layer
+(gated q `[8192, 2048]`, k/v `[512, 2048]`, q/k RMSNorm) plus MoE and a shared
+expert, with `mtp.fc` `[2048, 4096]`, two pre-fc norms and `mtp.norm`; the
+embedding and the LM head are the target's.
+
+**What the engine is missing** (verified in the code, not from the PR):
+
+| need | today |
+| --- | --- |
+| the head in FTW | the converter drops `mtp.*` (`converter/model.rs:253`, pinned by a test) |
+| verify logits for every drafted row | the cached forward answers the last row only (`answers: vec![n-1]`; `forward_cudarc` rejects more) |
+| commit `n` of `k+1` verified rows | the GDN state advances for the whole forward; there is no per-row commit |
+| draft KV | no second pool keyed by the target's slot ids |
+| the loop | no draft/verify/accept path in `generation.rs` |
+
+Ordered slices, each its own gated change:
+
+- [ ] **M9.1 draft weights in the FTW.** Keep `mtp.*` (handle both the stacked and
+  the per-expert layout), group it as a `draft` section in the index with meta
+  (`has_mtp`, the maximum draft depth), and **quantize the draft's experts to
+  NVFP4 in the converter** (round-to-nearest with the same group-16 layout the
+  kernels already read), which takes 1.7 GB to ~0.5 GB -- resident next to the
+  target's cache on 8 GB is the whole point, and only the accept rate depends on
+  draft precision. Gate: a converter test that the head round-trips for both
+  layouts and that the index sizes match; `ftw_real_checkpoint` grows a
+  `mtp` assertion.
+- [ ] **M9.2 draft forward** (`models/qwen3_6/mtp.rs`): `embed(token_{p+1})` and
+  the target hidden at `p` -> pre-fc norms -> `fc` -> one decoder layer ->
+  `mtp.norm` -> the shared LM head, with the draft's own KV pool (one layer, 2 KV
+  heads at 256: ~1 KiB/token, so 4096 tokens is 4 MiB per slot). It reuses the
+  tower's attention/MoE ops; there is no new kernel. Gate: a host oracle of the
+  draft layer against the device path, and the draft's next-token hit rate over
+  a real prompt (the accept-rate proxy).
+- [ ] **M9.3 verify.** Multi-row `answers` in the cudarc forward (project the
+  drafted rows through the final norm + lm_head), then one forward over
+  `[pending, d1..dk]` at the session's position. Gate: verifying `k+1` rows gives
+  the same logits per row as `k+1` single-token forwards, token for token.
+- [ ] **M9.4 commit `n` of `k+1`.** First implementation with no kernel change:
+  snapshot the GDN state slot before the verify (the snapshot primitive already
+  exists for hybrid_radix), truncate the KV page table to the accepted rows, and
+  replay the accepted prefix to leave the live state where `n` decode steps
+  would. Measure that replay's cost; only if it eats the win, give the GDN
+  recurrence a per-row scratch (upstream #836's approach). Gate: after accepting
+  `n < k+1`, the next step's logits equal a plain decode of the same `n` tokens.
+- [ ] **M9.5 loop and config.** `[spec] algorithm = "mtp"`, `num_steps = 3`
+  (off by default), draft -> verify -> accept -> stream accepted tokens, with
+  stop tokens, `max_tokens`, abort and usage counted correctly. Batching stays
+  out while speculating (`max_running_requests = 1`) for the first slice.
+- [ ] **M9.6 gates and numbers.** Output **token-for-token identical** to greedy
+  decoding with speculation on and off (the exactness contract), accept length,
+  and a tg A/B (128 decoded tokens) with the reference checkpoint; prefill
+  unchanged. Captured verify graphs are a later slice.
+
+Non-goals: DFlash (the other method in #828), MTP for an architecture that ships
+no head (Qwen3-Coder), TP > 1, and GGUF draft packs.
+
+Risks to settle during M9.1/M9.2: the draft's 0.5 GB resident cost on an 8 GB
+card (it comes out of the target's expert cache and KV budget); and whether a
+36-token MTP layer drafted at `k = 3` is enough to beat the extra verify rows
+when decode is already at FreeToken parity.
+
 ## 7. Decisions
 
 The full log of confirmed decisions (numbers 1..134, stable -- code, tests and
@@ -719,6 +798,17 @@ history.
   a local export (Ornith's shard 2 did), and the converter can pack tensors in
   a different order (the reference Rust FTW did), so `FERRUM_FTW_DIR` takes the
   `nix build` output. The local `.model-cache` is disposable.
+
+- **150** -- **speculative decoding drafts with the checkpoint's own `mtp`
+  layer, and the draft may be approximate.** The target verify makes every
+  emitted token exact (the output must equal plain greedy decoding token for
+  token), so only the accept rate depends on draft precision; that is what makes
+  a 1.7 GB bf16 MTP head viable on an 8 GB card once the converter quantizes its
+  experts to NVFP4. The head is kept in the FTW (the upstream FreeToken port
+  cannot do this from an FTW because its conversion drops `mtp.*`; both of this
+  repo's checkpoints are FTW). No separate draft model and no DFlash in M9;
+  batching stays at one request while speculating until the per-row GDN commit
+  is understood.
 
 - **113** -- the kernel artifacts are **built by Nix, never committed**
   (`nix/kernels.nix`). `build.rs` requires `$FERRUM_KERNEL_DIR` and copies its
