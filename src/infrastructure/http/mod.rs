@@ -1446,367 +1446,13 @@ impl Stream for SseBody {
 }
 
 #[cfg(test)]
+pub(crate) mod test_support;
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::application::engine::fake::*;
-    use axum::body::Body;
-    use axum::http::Request;
+    use crate::infrastructure::http::test_support::*;
+    use axum::http::Request as HttpRequest;
     use tower::ServiceExt;
-
-    fn test_router() -> Router {
-        test_router_with_rec().0
-    }
-
-    /// The fake tokenizer renders `"{role}\n{content}\n"` per turn plus the
-    /// `assistant\n` generation prompt, and encodes bytes one to one.
-    fn rendered(system: &str, user: &str) -> String {
-        format!("system\n{system}\nuser\n{user}\nassistant\n")
-    }
-
-    /// The fake model answers with the counter one past the prompt's last id, so
-    /// the expected tokens follow from the rendered prompt.
-    fn fake_tokens(prompt: &str, n: usize) -> Vec<u32> {
-        let last = u32::from(*prompt.as_bytes().last().expect("a prompt"));
-        (1..=n as u32).map(|i| last + i).collect()
-    }
-
-    fn fake_text(tokens: &[u32]) -> String {
-        tokens.iter().map(|&b| char::from(b as u8)).collect()
-    }
-
-    fn test_router_with_rec() -> (Router, Recorder) {
-        let (engine, rec) = test_engine(limits());
-        let state = AppState::new(Arc::new(engine), "test-model".to_string());
-        (router(state), rec)
-    }
-
-    async fn post_chat(router: Router, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
-        let response = router
-            .oneshot(
-                Request::post("/v1/chat/completions")
-                    .header("content-type", "application/json")
-                    .body(Body::from(body.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let status = response.status();
-        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
-            .await
-            .unwrap();
-        (status, serde_json::from_slice(&bytes).unwrap())
-    }
-
-    async fn post_chat_sse(body: serde_json::Value) -> Vec<String> {
-        post_chat_sse_with(test_router(), body).await
-    }
-
-    async fn post_chat_sse_with(router: Router, body: serde_json::Value) -> Vec<String> {
-        let response = router
-            .oneshot(
-                Request::post("/v1/chat/completions")
-                    .header("content-type", "application/json")
-                    .body(Body::from(body.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
-            .await
-            .unwrap();
-        String::from_utf8(bytes.to_vec())
-            .unwrap()
-            .split("\n\n")
-            .filter(|f| !f.is_empty())
-            .map(str::to_string)
-            .collect()
-    }
-
-    fn chunk_of(frame: &str) -> serde_json::Value {
-        serde_json::from_str(&frame[6..]).expect("a data frame holds one json")
-    }
-
-    async fn post_responses_with(
-        router: Router,
-        body: serde_json::Value,
-    ) -> (StatusCode, serde_json::Value) {
-        let response = router
-            .oneshot(
-                Request::post("/v1/responses")
-                    .header("content-type", "application/json")
-                    .body(Body::from(body.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let status = response.status();
-        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
-            .await
-            .unwrap();
-        (status, serde_json::from_slice(&bytes).unwrap())
-    }
-
-    async fn post_responses(body: serde_json::Value) -> (StatusCode, serde_json::Value) {
-        post_responses_with(test_router(), body).await
-    }
-
-    /// Responses SSE frames pair an `event:` line with a `data:` line, so they
-    /// are split whole; `[DONE]` is a bare data frame.
-    async fn post_responses_sse_with(router: Router, body: serde_json::Value) -> Vec<String> {
-        let response = router
-            .oneshot(
-                Request::post("/v1/responses")
-                    .header("content-type", "application/json")
-                    .body(Body::from(body.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
-            .await
-            .unwrap();
-        String::from_utf8(bytes.to_vec())
-            .unwrap()
-            .split("\n\n")
-            .filter(|f| !f.is_empty())
-            .map(str::to_string)
-            .collect()
-    }
-
-    fn responses_event(frame: &str) -> (String, serde_json::Value) {
-        let mut kind = String::new();
-        let mut data = String::new();
-        for line in frame.split('\n') {
-            if let Some(rest) = line.strip_prefix("event: ") {
-                kind = rest.to_string();
-            } else if let Some(rest) = line.strip_prefix("data: ") {
-                data = rest.to_string();
-            }
-        }
-        let value = serde_json::from_str(&data).expect("a data line holds one json");
-        (kind, value)
-    }
-
-    #[tokio::test]
-    async fn responses_text_input_answers_a_message_item() {
-        let (router, rec) = test_router_with_rec();
-        let (status, body) = post_responses_with(
-            router,
-            serde_json::json!({
-                "model": "test-model",
-                "instructions": "be brief",
-                "input": "ab",
-                "max_output_tokens": 3,
-            }),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["object"], "response");
-        assert!(body["id"].as_str().unwrap().starts_with("resp_"));
-        assert_eq!(body["status"], "completed");
-        assert_eq!(body["output"][0]["type"], "message");
-        assert_eq!(body["output"][0]["role"], "assistant");
-        assert_eq!(body["output"][0]["content"][0]["type"], "output_text");
-        assert_eq!(
-            body["output"][0]["content"][0]["text"],
-            fake_text(&fake_tokens(&rendered("be brief", "ab"), 3))
-        );
-        assert_eq!(
-            body["usage"]["input_tokens"],
-            rendered("be brief", "ab").len()
-        );
-        assert_eq!(body["usage"]["output_tokens"], 3);
-        assert_eq!(
-            body["usage"]["total_tokens"],
-            rendered("be brief", "ab").len() + 3
-        );
-
-        let prompt: Vec<u32> = rendered("be brief", "ab").bytes().map(u32::from).collect();
-        assert_eq!(rec.calls()[0].input_ids, prompt);
-    }
-
-    #[tokio::test]
-    async fn responses_function_call_output_renders_the_tool_turn() {
-        let (router, rec) = test_router_with_rec();
-        let (status, _) = post_responses_with(
-            router,
-            serde_json::json!({
-                "input": [
-                    { "role": "user", "content": "weather?" },
-                    {
-                        "type": "function_call",
-                        "call_id": "call_1",
-                        "name": "get_weather",
-                        "arguments": "{\"city\":\"Paris\"}"
-                    },
-                    { "type": "function_call_output", "call_id": "call_1", "output": "sunny" }
-                ],
-                "max_output_tokens": 1,
-            }),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        let prompt = "user\nweather?\nassistant\n\ntool\nsunny\nassistant\n";
-        assert_eq!(
-            rec.calls()[0].input_ids,
-            prompt.bytes().map(u32::from).collect::<Vec<u32>>(),
-            "the function call and its output become assistant/tool turns"
-        );
-    }
-
-    #[tokio::test]
-    async fn responses_tool_call_returns_a_function_call_item() {
-        let (status, body) = post_responses_with(
-            tool_router(),
-            serde_json::json!({
-                "model": "test-model",
-                "input": "weather in Paris?",
-                "tools": [{
-                    "type": "function",
-                    "name": "get_weather",
-                    "description": "look up weather",
-                    "parameters": { "type": "object" }
-                }],
-                "max_output_tokens": TOOL_SCRIPT.len(),
-            }),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["status"], "completed");
-        let output = body["output"].as_array().expect("output array");
-        assert_eq!(output.len(), 1, "no text, one call: {output:?}");
-        assert_eq!(output[0]["type"], "function_call");
-        assert_eq!(output[0]["name"], "get_weather");
-        assert_eq!(output[0]["status"], "completed");
-        assert!(output[0]["call_id"].as_str().unwrap().starts_with("call_"));
-        let args: serde_json::Value =
-            serde_json::from_str(output[0]["arguments"].as_str().unwrap()).unwrap();
-        assert_eq!(args["city"], "Paris");
-    }
-
-    #[tokio::test]
-    async fn responses_streams_text_deltas_and_completes() {
-        let frames = post_responses_sse_with(
-            test_router(),
-            serde_json::json!({
-                "input": "ab",
-                "instructions": "be brief",
-                "max_output_tokens": 3,
-                "stream": true,
-            }),
-        )
-        .await;
-        let events: Vec<(String, serde_json::Value)> = frames
-            .iter()
-            .filter(|f| *f != "data: [DONE]")
-            .map(|f| responses_event(f))
-            .collect();
-        assert_eq!(events[0].0, "response.created");
-        assert_eq!(events[0].1["response"]["status"], "in_progress");
-        assert_eq!(
-            events
-                .iter()
-                .filter(|(kind, _)| kind == "response.output_text.delta")
-                .count(),
-            3
-        );
-        let text: String = events
-            .iter()
-            .filter(|(kind, _)| kind == "response.output_text.delta")
-            .map(|(_, data)| data["delta"].as_str().unwrap())
-            .collect();
-        assert_eq!(
-            text,
-            fake_text(&fake_tokens(&rendered("be brief", "ab"), 3))
-        );
-        let done = events
-            .iter()
-            .find(|(kind, _)| kind == "response.output_text.done")
-            .expect("a text done event");
-        assert_eq!(done.1["text"], text);
-        let completed = events
-            .iter()
-            .find(|(kind, _)| kind == "response.completed")
-            .expect("a completed event");
-        assert_eq!(completed.1["response"]["status"], "completed");
-        assert_eq!(
-            completed.1["response"]["output"][0]["content"][0]["text"],
-            text
-        );
-        assert_eq!(completed.1["response"]["usage"]["output_tokens"], 3);
-        assert_eq!(frames.last().unwrap(), "data: [DONE]");
-    }
-
-    #[tokio::test]
-    async fn responses_streams_function_call_arguments() {
-        let frames = post_responses_sse_with(
-            tool_router(),
-            serde_json::json!({
-                "input": "weather in Paris?",
-                "tools": [{
-                    "type": "function",
-                    "name": "get_weather",
-                    "parameters": { "type": "object" }
-                }],
-                "max_output_tokens": TOOL_SCRIPT.len(),
-                "stream": true,
-            }),
-        )
-        .await;
-        let events: Vec<(String, serde_json::Value)> = frames
-            .iter()
-            .filter(|f| *f != "data: [DONE]")
-            .map(|f| responses_event(f))
-            .collect();
-        let added = events
-            .iter()
-            .find(|(kind, _)| kind == "response.output_item.added")
-            .expect("a call item added");
-        assert_eq!(added.1["item"]["type"], "function_call");
-        assert_eq!(added.1["item"]["name"], "get_weather");
-        let args_done = events
-            .iter()
-            .find(|(kind, _)| kind == "response.function_call_arguments.done")
-            .expect("arguments done");
-        let args: serde_json::Value =
-            serde_json::from_str(args_done.1["arguments"].as_str().unwrap()).unwrap();
-        assert_eq!(args["city"], "Paris");
-        let completed = events
-            .iter()
-            .find(|(kind, _)| kind == "response.completed")
-            .expect("a completed event");
-        assert_eq!(
-            completed.1["response"]["output"][0]["type"],
-            "function_call"
-        );
-        assert_eq!(frames.last().unwrap(), "data: [DONE]");
-    }
-
-    #[tokio::test]
-    async fn responses_ignores_stateful_fields_and_rejects_an_empty_input() {
-        let (status, _) = post_responses(serde_json::json!({
-            "input": "hi",
-            "store": true,
-            "previous_response_id": "resp_other",
-            "metadata": { "k": "v" },
-            "text": { "format": { "type": "text" } },
-            "reasoning": { "effort": "low" },
-            "max_output_tokens": 1,
-        }))
-        .await;
-        assert_eq!(status, StatusCode::OK);
-
-        let (status, body) = post_responses(serde_json::json!({ "input": [] })).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(body["error"]["message"].as_str().unwrap().contains("input"));
-
-        let (status, _) =
-            post_responses(serde_json::json!({ "input": "hi", "max_output_tokens": 0 })).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-    }
-
     #[tokio::test]
     async fn chat_completions_answer_with_the_rendered_template() {
         let (router, rec) = test_router_with_rec();
@@ -1921,7 +1567,7 @@ mod tests {
     async fn post_json(body: serde_json::Value) -> (StatusCode, serde_json::Value) {
         let response = test_router()
             .oneshot(
-                Request::post("/v1/completions")
+                HttpRequest::post("/v1/completions")
                     .header("content-type", "application/json")
                     .body(Body::from(body.to_string()))
                     .unwrap(),
@@ -1937,7 +1583,7 @@ mod tests {
 
     async fn get(path: &str) -> (StatusCode, serde_json::Value) {
         let response = test_router()
-            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .oneshot(HttpRequest::get(path).body(Body::empty()).unwrap())
             .await
             .unwrap();
         let status = response.status();
@@ -2060,7 +1706,7 @@ mod tests {
     async fn streaming_sends_one_frame_per_token_then_the_final_frame_and_done() {
         let response = test_router()
             .oneshot(
-                Request::post("/v1/completions")
+                HttpRequest::post("/v1/completions")
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({ "prompt": "ab", "max_tokens": 3, "stream": true })
@@ -2129,7 +1775,7 @@ mod tests {
     async fn a_stream_stops_at_eos_and_says_so() {
         let response = test_router()
             .oneshot(
-                Request::post("/v1/completions")
+                HttpRequest::post("/v1/completions")
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({ "prompt": "<before-eos>", "max_tokens": 4, "stream": true })
@@ -2210,68 +1856,11 @@ mod tests {
     /// The tool-call text the scripted model below emits verbatim (its byte ids
     /// start at `SCRIPT_BASE`). Kept under `FAKE_VOCAB - SCRIPT_BASE` bytes so a
     /// run of consecutive ids never wraps.
-    const TOOL_SCRIPT: &str = "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>";
-    const REASONED_TOOL_SCRIPT: &str = "Checking it.\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>";
-    const SCRIPT_BASE: u32 = 400;
-
+    ///
     /// Encodes every prompt to one id, so the counter model then walks the ids
     /// that decode to `script` byte by byte. A deterministic model output for
     /// the tool-call path, which the plain fake (consecutive printable bytes)
     /// cannot produce.
-    struct ScriptTokenizer(&'static str);
-
-    impl crate::domain::Tokenizer for ScriptTokenizer {
-        fn encode(&self, _text: &str) -> Result<Vec<u32>, crate::domain::TokenizerError> {
-            Ok(vec![SCRIPT_BASE - 1])
-        }
-
-        fn decode(&self, ids: &[u32]) -> Result<String, crate::domain::TokenizerError> {
-            Ok(ids
-                .iter()
-                .map(|&id| {
-                    let i = id.wrapping_sub(SCRIPT_BASE) as usize;
-                    if id >= SCRIPT_BASE && i < self.0.len() {
-                        char::from(self.0.as_bytes()[i])
-                    } else {
-                        char::from(id as u8)
-                    }
-                })
-                .collect())
-        }
-
-        fn render_chat(
-            &self,
-            _messages: &[ChatMessage],
-            _tools: &[ChatTool],
-        ) -> Result<String, crate::domain::TokenizerError> {
-            Ok(String::new())
-        }
-    }
-
-    fn script_router(script: &'static str) -> Router {
-        use crate::application::engine::EngineLimits;
-        use crate::infrastructure::torch::Device;
-        let (model, _rec) = FakeModel::new();
-        let limits = EngineLimits {
-            max_seq_len: 4096,
-            max_output_tokens: 256,
-            max_running_requests: 4,
-            max_prefill_length: 16,
-        };
-        let engine = Engine::new(
-            Arc::new(model),
-            Arc::new(ScriptTokenizer(script)),
-            vec![FAKE_EOS],
-            limits,
-            Device::Cpu,
-        );
-        router(AppState::new(Arc::new(engine), "test-model".to_string()))
-    }
-
-    fn tool_router() -> Router {
-        script_router(TOOL_SCRIPT)
-    }
-
     fn tool_request(script: &'static str, stream: bool) -> serde_json::Value {
         serde_json::json!({
             "model": "test-model",
