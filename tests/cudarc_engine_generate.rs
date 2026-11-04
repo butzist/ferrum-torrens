@@ -18,15 +18,18 @@ use ferrum_torrens::config::Config;
 use ferrum_torrens::domain::sampling::SamplingParams;
 use ferrum_torrens::domain::scheduler::FinishReason;
 
-const FTW_DIR: &str = ".model-cache/Qwen3.6-35B-A3B-NVFP4.ftw";
+mod common;
+
 const PROMPT: &str = "The capital of France is";
 /// Token id of " Paris" in this checkpoint's tokenizer, the FreeToken GPU
 /// reference for this prompt (see `tests/engine_real_generate.rs`).
 const ORACLE_FIRST_TOKEN: u32 = 11751;
 
+/// `FERRUM_FTW_DIR` picks the checkpoint (M8.1); unset is the reference one.
 fn config(max_output_tokens: u32, cuda_graph: bool) -> Config {
+    let dir = common::ftw_dir();
     format!(
-        "[model]\npath = \"{FTW_DIR}\"\nmax_seq_len = 4096\nmax_output_tokens = {max_output_tokens}\n\
+        "[model]\npath = \"{dir}\"\nmax_seq_len = 4096\nmax_output_tokens = {max_output_tokens}\n\
          max_prefill_length = 1024\nmax_running_requests = 1\ncuda_graph = {cuda_graph}\n\n\
          [kv]\nnum_tokens = 4096\ndtype = \"f32\"\n\n\
          [moe]\ncache_size_slots = 512\n\n[kernel]\ntriton = true\n"
@@ -88,11 +91,19 @@ fn the_cudarc_engine_generates_the_oracle_token_through_the_kernel() {
     eprintln!("{steps} expert steps over {layers} layers");
     assert_eq!(g.finish_reason, FinishReason::Length, "the budget is 1");
     assert_eq!(g.tokens.len(), 1);
-    assert_eq!(
-        g.tokens[0], ORACLE_FIRST_TOKEN,
-        "greedy next token must match the FreeToken GPU oracle ({ORACLE_FIRST_TOKEN} = \" Paris\"), got {:?} ({:?})",
-        g.tokens[0], g.text
-    );
+    if common::is_reference_checkpoint() {
+        assert_eq!(
+            g.tokens[0], ORACLE_FIRST_TOKEN,
+            "greedy next token must match the FreeToken GPU oracle ({ORACLE_FIRST_TOKEN} = \" Paris\"), got {:?} ({:?})",
+            g.tokens[0], g.text
+        );
+    } else {
+        assert!(
+            g.text.to_lowercase().contains("paris"),
+            "the next token must name the capital, got {:?}",
+            g.text
+        );
+    }
     assert_eq!(
         steps % layers,
         0,
@@ -124,7 +135,13 @@ fn the_captured_cudarc_engine_generates_the_same_tokens_as_the_eager_one() {
             start.elapsed().as_secs_f64(),
             g.tokens
         );
-        assert_eq!(g.tokens[0], ORACLE_FIRST_TOKEN);
+        if common::is_reference_checkpoint() {
+            assert_eq!(g.tokens[0], ORACLE_FIRST_TOKEN);
+        } else {
+            // No id oracle for a second checkpoint; the captured arm only has to
+            // agree with the eager one, which is what the graph test below checks.
+            assert!(g.text.to_lowercase().contains("paris"), "got {:?}", g.text);
+        }
         g.tokens
     };
 

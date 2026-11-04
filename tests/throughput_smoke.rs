@@ -18,7 +18,7 @@ use ferrum_torrens::config::{Config, DEFAULT_MAX_PREFILL_LENGTH};
 use ferrum_torrens::domain::sampling::SamplingParams;
 use ferrum_torrens::domain::scheduler::FinishReason;
 
-const FTW_DIR: &str = ".model-cache/Qwen3.6-35B-A3B-NVFP4.ftw";
+mod common;
 
 /// Decode tokens to generate in the measured run. `FERRUM_SMOKE_TOKENS`
 /// overrides it, so a profiling run can be kept short.
@@ -195,10 +195,12 @@ impl Sampler {
     }
 }
 
+/// `FERRUM_FTW_DIR` picks the checkpoint (M8.1); unset is the reference one.
 fn config() -> Config {
     // The serving shape: bf16 KV (the default), the committed NVFP4 cubins via
     // `kernel.triton`, whole-layer prefill overlap. `FERRUM_SMOKE_GRAPH=1` turns
     // decode capture on so the eager and captured arms share every other knob.
+    let dir = common::ftw_dir();
     let graph = if std::env::var("FERRUM_SMOKE_GRAPH").as_deref() == Ok("1") {
         "true"
     } else {
@@ -230,7 +232,7 @@ fn config() -> Config {
          raise FERRUM_SMOKE_SEQ"
     );
     format!(
-        "[model]\npath = \"{FTW_DIR}\"\ndevice = \"cuda\"\nmax_seq_len = {max_seq_len}\n\
+        "[model]\npath = \"{dir}\"\ndevice = \"cuda\"\nmax_seq_len = {max_seq_len}\n\
          max_output_tokens = {}\nmax_prefill_length = {prefill_chunk}\n\
          max_running_requests = 4\ncuda_graph = {graph}\n\n\
          [kv]\nnum_tokens = {kv_tokens}\ndtype = \"{kv}\"\n\n\

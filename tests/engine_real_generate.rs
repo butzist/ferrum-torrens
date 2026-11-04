@@ -25,7 +25,8 @@ use ferrum_torrens::domain::ChatMessage;
 use ferrum_torrens::domain::sampling::{Rng, SamplingParams};
 use ferrum_torrens::domain::scheduler::FinishReason;
 
-const FTW_DIR: &str = ".model-cache/Qwen3.6-35B-A3B-NVFP4.ftw";
+mod common;
+
 const PROMPT: &str = "The capital of France is";
 /// Token id of " Paris" in this checkpoint's tokenizer.
 const ORACLE_FIRST_TOKEN: u32 = 11751;
@@ -42,14 +43,16 @@ const CHAT_TEMPLATE_ORACLE_IDS: &[u32] = &[
 /// with a GPU run of the FreeToken reference server.
 const CHAT_PIN_FIRST_TOKEN: u32 = 8160;
 
+/// `FERRUM_FTW_DIR` picks the checkpoint (M8.1); unset is the reference one.
 fn config(max_output_tokens: u32) -> Config {
+    let dir = common::ftw_dir();
     // `[kv] num_tokens` sizes the pool: the default 131072 tokens is 5 GiB of
     // f32 KV (decision 33), which no longer fits beside the resident tower
     // weights (decision 40) on the 8 GB target. 4096 is this workload's
     // `max_seq_len`, so nothing here is ever paged out. `dtype = "f32"` keeps the
     // oracle gates on the lossless pool; the serving default is bf16.
     format!(
-        "[model]\npath = \"{FTW_DIR}\"\nmax_seq_len = 4096\nmax_output_tokens = {max_output_tokens}\n\
+        "[model]\npath = \"{dir}\"\nmax_seq_len = 4096\nmax_output_tokens = {max_output_tokens}\n\
          max_prefill_length = 1024\nmax_running_requests = 1\n\n\
          [kv]\nnum_tokens = 4096\ndtype = \"f32\"\n\n[moe]\ncache_size_slots = 512\n"
     )
@@ -84,11 +87,21 @@ fn one_token_prediction_matches_the_oracle() {
 
     assert_eq!(g.finish_reason, FinishReason::Length, "the budget is 1");
     assert_eq!(g.tokens.len(), 1);
-    assert_eq!(
-        g.tokens[0], ORACLE_FIRST_TOKEN,
-        "greedy next token must match the FreeToken GPU oracle ({ORACLE_FIRST_TOKEN} = \" Paris\"), got {:?} ({:?})",
-        g.tokens[0], g.text
-    );
+    if common::is_reference_checkpoint() {
+        assert_eq!(
+            g.tokens[0], ORACLE_FIRST_TOKEN,
+            "greedy next token must match the FreeToken GPU oracle ({ORACLE_FIRST_TOKEN} = \" Paris\"), got {:?} ({:?})",
+            g.tokens[0], g.text
+        );
+    } else {
+        // A second checkpoint has no id oracle in this repo, so the gate is the
+        // answer itself: greedy next token after "The capital of France is".
+        assert!(
+            g.text.to_lowercase().contains("paris"),
+            "the next token must name the capital, got {:?}",
+            g.text
+        );
+    }
 }
 
 /// The chat path end to end: the checkpoint's own chat template renders the
@@ -111,18 +124,26 @@ fn a_chat_request_answers_from_the_rendered_template() {
     ];
     let prompt = engine.render_chat(&conversation, &[]).unwrap();
     let ids = engine.encode(&prompt).unwrap();
-    assert_eq!(
-        ids, CHAT_TEMPLATE_ORACLE_IDS,
-        "the template must render the transformers prompt, got {prompt:?}"
-    );
+    // The template ids and the answer pin belong to the reference checkpoint's
+    // chat template. A second checkpoint renders its own template, so the gate
+    // there is that the conversation renders and the model answers at all.
+    if common::is_reference_checkpoint() {
+        assert_eq!(
+            ids, CHAT_TEMPLATE_ORACLE_IDS,
+            "the template must render the transformers prompt, got {prompt:?}"
+        );
+    }
 
     let request = make_request(&engine, 1, ids, greedy(1), 0).unwrap();
     let g = generation::generate(&engine, request).unwrap();
-    assert_eq!(
-        g.tokens[0], CHAT_PIN_FIRST_TOKEN,
-        "the templated conversation must answer the pinned token, got {:?}",
-        g.text
-    );
+    assert!(!g.tokens.is_empty(), "the chat request must answer");
+    if common::is_reference_checkpoint() {
+        assert_eq!(
+            g.tokens[0], CHAT_PIN_FIRST_TOKEN,
+            "the templated conversation must answer the pinned token, got {:?}",
+            g.text
+        );
+    }
 }
 
 /// The same one-token gate with `kernel.triton = true`: the tower's routed
@@ -173,11 +194,19 @@ fn one_token_through_the_kernel_matches_the_oracle() {
     );
     assert!(steps >= layers, "at least the prefill ran, got {steps}");
     assert_eq!(g.tokens.len(), 1);
-    assert_eq!(
-        g.tokens[0], ORACLE_FIRST_TOKEN,
-        "the kernel path must reach the same oracle token, got {:?} ({:?})",
-        g.tokens[0], g.text
-    );
+    if common::is_reference_checkpoint() {
+        assert_eq!(
+            g.tokens[0], ORACLE_FIRST_TOKEN,
+            "the kernel path must reach the same oracle token, got {:?} ({:?})",
+            g.tokens[0], g.text
+        );
+    } else {
+        assert!(
+            g.text.to_lowercase().contains("paris"),
+            "the kernel path must still name the capital, got {:?}",
+            g.text
+        );
+    }
 }
 
 /// Bisect the forward with a logit lens: print what the final norm + lm_head

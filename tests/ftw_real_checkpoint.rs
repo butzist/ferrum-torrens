@@ -1,21 +1,30 @@
 // Gated validation against the real converted checkpoint. Run with:
 //   cargo test --test ftw_real_checkpoint -- --ignored
 // Not run by default: needs .model-cache/Qwen3.6-35B-A3B-NVFP4.ftw present.
+// `FERRUM_FTW_DIR` points it at another converted checkpoint (M8.1).
 
 use ferrum_torrens::domain::weights::{DType, QuantFormat, TensorKind};
 use ferrum_torrens::infrastructure::ftw::{ALIGN, FtwIndex};
 
-const FTW_DIR: &str = ".model-cache/Qwen3.6-35B-A3B-NVFP4.ftw";
+mod common;
 
 #[test]
 #[ignore = "requires converted checkpoint in .model-cache"]
 fn real_checkpoint_parses_and_is_coherent() {
-    let doc = std::fs::read_to_string(format!("{FTW_DIR}/freetoken_weight.json")).unwrap();
+    // `FERRUM_FTW_DIR` picks the checkpoint (M8.1); unset is the reference one.
+    // The exact byte and tensor counts are the reference's; a second checkpoint
+    // is checked on the layout invariants, which is what the converter
+    // guarantees for any checkpoint of this family.
+    let dir = common::ftw_dir();
+    let reference = common::is_reference_checkpoint();
+    let doc = std::fs::read_to_string(format!("{dir}/freetoken_weight.json")).unwrap();
     let ix = FtwIndex::parse(&doc).unwrap();
 
-    assert_eq!(ix.total_bytes, 21_785_153_536);
-    assert_eq!(ix.shards.len(), 3);
-    assert_eq!(ix.tensors.len(), 1388);
+    if reference {
+        assert_eq!(ix.total_bytes, 21_785_153_536);
+        assert_eq!(ix.shards.len(), 3);
+        assert_eq!(ix.tensors.len(), 1388);
+    }
     assert_eq!(ix.quant_format, Some(QuantFormat::Nvfp4));
     assert_eq!(ix.expert_bank_num_layers, Some(40));
 

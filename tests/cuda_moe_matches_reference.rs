@@ -34,7 +34,12 @@ use ferrum_torrens::infrastructure::cudarc::TensorDType;
 use ferrum_torrens::infrastructure::ftw::{FtwIndex, FtwReader};
 use ferrum_torrens::infrastructure::torch::Device;
 
-const FTW_DIR: &str = ".model-cache/Qwen3.6-35B-A3B-NVFP4.ftw";
+mod common;
+
+/// `FERRUM_FTW_DIR` picks the checkpoint (M8.1); unset is the reference one.
+fn ftw_dir() -> String {
+    common::ftw_dir()
+}
 const LAYER: usize = 17;
 const TOP_K: usize = 8;
 const TOKENS: usize = 4;
@@ -258,17 +263,16 @@ fn plan(index: &FtwIndex, source: &dyn ExpertSlabSource) -> Case {
 }
 
 fn open_checkpoint() -> Option<(Arc<FtwIndex>, Arc<dyn WeightsReader>)> {
-    if !Path::new(FTW_DIR).is_dir() {
-        println!("skipping: no checkpoint in {FTW_DIR}");
+    let dir = ftw_dir();
+    if !Path::new(&dir).is_dir() {
+        println!("skipping: no checkpoint in {dir}");
         return None;
     }
     let index = Arc::new(
-        FtwIndex::parse(
-            &std::fs::read_to_string(format!("{FTW_DIR}/freetoken_weight.json")).unwrap(),
-        )
-        .unwrap(),
+        FtwIndex::parse(&std::fs::read_to_string(format!("{dir}/freetoken_weight.json")).unwrap())
+            .unwrap(),
     );
-    let reader: Arc<dyn WeightsReader> = Arc::new(FtwReader::open(Path::new(FTW_DIR)).unwrap());
+    let reader: Arc<dyn WeightsReader> = Arc::new(FtwReader::open(Path::new(&dir)).unwrap());
     Some((index, reader))
 }
 
@@ -313,10 +317,10 @@ fn the_committed_cubins_match_the_scalar_oracle_on_real_expert_slabs() {
     println!(
         "GATE env: cwd={} ftw={}",
         std::env::current_dir().unwrap().display(),
-        FTW_DIR,
+        ftw_dir(),
     );
     let Some((index, reader)) = open_checkpoint() else {
-        panic!("gate needs the checkpoint in {FTW_DIR}");
+        panic!("gate needs the checkpoint in {}", ftw_dir());
     };
     let source: Arc<dyn ExpertSlabSource> = Arc::new(FtwBanks::new(reader, index.clone()));
     let case = plan(&index, &*source);
@@ -420,7 +424,7 @@ fn a_chunked_prefill_step_matches_the_host_plan() {
     const TOKENS2: usize = 64;
 
     let Some((index, reader)) = open_checkpoint() else {
-        panic!("gate needs the checkpoint in {FTW_DIR}");
+        panic!("gate needs the checkpoint in {}", ftw_dir());
     };
     let shapes = shapes(&index);
     let (hidden, inter) = (shapes.hidden, shapes.inter);
@@ -540,7 +544,7 @@ fn a_cache_above_the_old_ceiling_stages_on_device() {
     const TOKENS2: usize = 8;
 
     let Some((index, reader)) = open_checkpoint() else {
-        panic!("gate needs the checkpoint in {FTW_DIR}");
+        panic!("gate needs the checkpoint in {}", ftw_dir());
     };
     let shapes = shapes(&index);
     let (hidden, inter) = (shapes.hidden, shapes.inter);
@@ -655,7 +659,7 @@ fn a_whole_layer_prefill_overlap_matches_the_host_plan() {
     const TOKENS: usize = 256;
 
     let Some((index, reader)) = open_checkpoint() else {
-        panic!("gate needs the checkpoint in {FTW_DIR}");
+        panic!("gate needs the checkpoint in {}", ftw_dir());
     };
     let shapes = shapes(&index);
     let (hidden, inter) = (shapes.hidden, shapes.inter);
@@ -847,7 +851,7 @@ fn a_prefill_retains_the_decode_expert_cache() {
     const WARM_TOKENS: usize = 16; // x top_k 8 = 128 routes == the cap -> flat LRU
 
     let Some((index, reader)) = open_checkpoint() else {
-        panic!("gate needs the checkpoint in {FTW_DIR}");
+        panic!("gate needs the checkpoint in {}", ftw_dir());
     };
     let shapes = shapes(&index);
     let (hidden, inter) = (shapes.hidden, shapes.inter);
@@ -937,7 +941,7 @@ fn a_prefill_retains_the_decode_expert_cache() {
 #[serial]
 fn the_bank_addresses_survive_a_layer_switch() {
     let Some((index, reader)) = open_checkpoint() else {
-        panic!("gate needs the checkpoint in {FTW_DIR}");
+        panic!("gate needs the checkpoint in {}", ftw_dir());
     };
     let source: Arc<dyn ExpertSlabSource> = Arc::new(FtwBanks::new(reader, index.clone()));
     let shapes = shapes(&index);
@@ -975,7 +979,7 @@ fn the_bank_addresses_survive_a_layer_switch() {
 #[serial]
 fn the_device_handoff_agrees_with_the_host_handoff() {
     let Some((index, reader)) = open_checkpoint() else {
-        panic!("gate needs the checkpoint in {FTW_DIR}");
+        panic!("gate needs the checkpoint in {}", ftw_dir());
     };
     let source: Arc<dyn ExpertSlabSource> = Arc::new(FtwBanks::new(reader, index.clone()));
     let case = plan(&index, &*source);
