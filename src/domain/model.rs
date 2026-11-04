@@ -33,6 +33,9 @@ pub struct ModelParams {
     pub head_dim: usize,
     pub rotary_dim: usize,
     pub rope_theta: f32,
+    /// Multimodal RoPE: how the rotary pairs split across the (t, h, w) axes.
+    /// `None` keeps every pair on the flat sequence position (text-only).
+    pub mrope: Option<MropeParams>,
 
     // GatedDeltaNet
     pub linear_key_head_dim: usize,
@@ -89,6 +92,25 @@ impl ModelParams {
     }
 }
 
+/// The mrope axis split, from `rope_parameters` in the checkpoint config:
+/// `section` counts the rotary pairs given to (temporal, height, width) and
+/// `interleaved` selects how those counts map onto pair indices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MropeParams {
+    pub interleaved: bool,
+    pub section: [usize; 3],
+}
+
+/// One image's vision-tower output: the per-visual-token embedding rows and
+/// the merged LLM grid they lay out row-major, which mrope needs for the
+/// height/width axes.
+#[derive(Debug, Clone)]
+pub struct EncodedImage {
+    pub rows: Vec<Vec<f32>>,
+    pub grid_h: usize,
+    pub grid_w: usize,
+}
+
 /// A single batched forward pass. `input_ids`/`positions` are the flattened
 /// tokens and their absolute sequence positions; `answers` lists the row index
 /// (in `input_ids`) whose final logits the caller samples from (the last token
@@ -98,6 +120,9 @@ impl ModelParams {
 pub struct ForwardInput {
     pub input_ids: Vec<u32>,
     pub positions: Vec<u32>,
+    /// Multimodal RoPE triples (t, h, w) per token, window-local. `None` (or
+    /// the model having no mrope) keeps the flat `positions` rope.
+    pub mrope_positions: Option<Vec<[u32; 3]>>,
     pub answers: Vec<usize>,
     /// Visual embeddings spliced in at `image_positions`: rows of the LLM's
     /// `hidden_size`, produced by the arch's vision tower. `image_positions`
@@ -119,7 +144,7 @@ pub struct ForwardInput {
 /// arch's chat template emits for an image, so the order of the encoded
 /// `<|image_pad|>` runs in a prompt pins the order of an image list.
 pub trait VisionTower: Send + Sync {
-    fn encode(&self, image_bytes: &[u8]) -> Result<Vec<Vec<f32>>, String>;
+    fn encode(&self, image_bytes: &[u8]) -> Result<EncodedImage, String>;
     fn image_token_id(&self) -> u32;
     /// Stage probes for parity gates: patch-embed/pos-embed state, the
     /// post-first-block state, the first token-norm, the first Q/K/V
@@ -225,6 +250,7 @@ mod tests {
             max_position_embeddings: 262144,
             eos_token_id: 248044,
             bos_token_id: 248044,
+            mrope: None,
             expert_slot_bytes: 1_775_616,
         }
     }

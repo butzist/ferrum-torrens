@@ -9,7 +9,8 @@ use std::sync::Arc;
 
 use crate::domain::decode::{CapturedDecode, DecodeError, DecodeRow};
 use crate::domain::kvcache::{CachedModel, KvCache, SequenceCache};
-use crate::domain::model::{ForwardInput, LayerProbe, ModelParams};
+use crate::domain::model::{EncodedImage, ForwardInput, LayerProbe, ModelParams, MropeParams};
+use crate::models::qwen3_6::mrope::ImageRun;
 use crate::domain::sampling::{Rng, SamplingParams, sample};
 use crate::domain::tokenizer::{ChatMessage, Tokenizer, TokenizerError};
 use crate::infrastructure::torch::{CudaProbe, Device, DeviceRequest};
@@ -73,15 +74,22 @@ pub enum EngineError {
     Moe(#[from] crate::domain::expert_kernel::MoEError),
 }
 
-/// A request's image data, computed once at request build time: `rows[i]` is
-/// the embedding row the LLM stream splices in at the global token index
-/// `positions[i]` of the request's expanded id sequence.
+/// The splice a forward needs: embedding rows and their window-local
+/// positions.
 pub type ImageSplice = (Vec<Vec<f32>>, Vec<usize>);
 
+/// A request's image data, computed once at request build time: `rows[i]` is
+/// the embedding row the LLM stream splices in at the global token index
+/// `positions[i]` of the request's expanded id sequence. For a model with
+/// mrope, `triples` holds the (t, h, w) position triple of every expanded
+/// prompt token and `delta` is the mrope position delta a decode continuation
+/// applies past the prompt.
 #[derive(Debug, Clone)]
 pub struct RequestImages {
     pub rows: Vec<Vec<f32>>,
     pub positions: Vec<usize>,
+    pub triples: Vec<[u32; 3]>,
+    pub delta: i64,
 }
 
 impl RequestImages {
@@ -117,6 +125,32 @@ impl RequestImages {
         } else {
             Ok(Some((rows, local)))
         }
+    }
+
+    /// The mrope triples for the window `[start, start + len)` of the
+    /// session's sequence: the prompt's tokens read the table, tokens past it
+    /// sit at `start + delta` on every axis (HF applies the stored
+    /// `mrope_position_deltas` to the decode arange). `None` when the request
+    /// built no triples (no images, or a model without mrope).
+    pub fn triples_for_window(&self, start: usize, len: usize) -> Option<Vec<[u32; 3]>> {
+        if self.triples.is_empty() {
+            return None;
+        }
+        Some(
+            (start..start + len)
+                .map(|g| match self.triples.get(g) {
+                    Some(tr) => *tr,
+                    None => {
+                        // The prompt's last position is max_pos, so a token at
+                        // `start >= prompt_len` is never below `max_pos + 1 +
+                        // delta = 0`.
+                        let p = g as i64 + self.delta;
+                        debug_assert!(p >= 0, "mrope decode position {p} underflowed");
+                        [p as u32; 3]
+                    }
+                })
+                .collect(),
+        )
     }
 }
 
@@ -233,15 +267,18 @@ impl Drop for ExclusiveLease<'_> {
 /// repeated per visual token rather than merged into one id, so the KV page
 /// table, the radix tree and the chunked prefill all see the real token count.
 /// The n-th pad run in the ids takes the n-th image; there must be exactly one
-/// run per image and one image per run.
+/// run per image and one image per run. When the model enables mrope, the
+/// expanded prompt also gets its per-token (t, h, w) position triples and the
+/// decode rope delta, built from each image's merged grid.
 fn expand_image_pads<E>(
     prompt_ids: &[u32],
     images: &[Vec<u8>],
     pad: u32,
+    mrope: Option<MropeParams>,
     mut encode: E,
 ) -> Result<(Vec<u32>, RequestImages), EngineError>
 where
-    E: FnMut(&[u8]) -> Result<Vec<Vec<f32>>, String>,
+    E: FnMut(&[u8]) -> Result<EncodedImage, String>,
 {
     let pads = prompt_ids.iter().filter(|&&i| i == pad).count();
     if pads != images.len() {
@@ -254,21 +291,54 @@ where
     let mut ids = Vec::with_capacity(prompt_ids.len());
     let mut rows: Vec<Vec<f32>> = Vec::new();
     let mut positions: Vec<usize> = Vec::new();
+    let mut runs: Vec<ImageRun> = Vec::new();
     let mut image_i = 0usize;
     for &id in prompt_ids {
         if id != pad {
             ids.push(id);
             continue;
         }
-        let visual = encode(images[image_i].as_slice()).map_err(EngineError::Vision)?;
+        let encoded = encode(images[image_i].as_slice()).map_err(EngineError::Vision)?;
         image_i += 1;
-        for row in visual {
+        let start = ids.len();
+        let count = encoded.grid_h * encoded.grid_w;
+        if encoded.rows.len() != count {
+            return Err(EngineError::Vision(format!(
+                "image {} returned {} rows for a {}x{} merged grid",
+                image_i - 1,
+                encoded.rows.len(),
+                encoded.grid_h,
+                encoded.grid_w
+            )));
+        }
+        runs.push(ImageRun {
+            start,
+            gh: encoded.grid_h,
+            gw: encoded.grid_w,
+        });
+        for row in encoded.rows {
             positions.push(ids.len());
             rows.push(row);
             ids.push(pad);
         }
     }
-    Ok((ids, RequestImages { rows, positions }))
+    let (triples, delta) = match mrope {
+        Some(_) if !runs.is_empty() => {
+            let built = crate::models::qwen3_6::mrope::prompt_triples(ids.len(), &runs);
+            debug_assert_eq!(built.0.len(), ids.len());
+            built
+        }
+        _ => (Vec::new(), 0i64),
+    };
+    Ok((
+        ids,
+        RequestImages {
+            rows,
+            positions,
+            triples,
+            delta,
+        },
+    ))
 }
 
 /// An id or the list of ids, the shape `generation_config.json` uses for
@@ -803,7 +873,15 @@ impl Engine {
             .ok_or_else(|| EngineError::Vision("this checkpoint has no vision tower".into()))?;
         let pad = vision.image_token_id();
         let (ids, splice) =
-            expand_image_pads(&prompt_ids, &images, pad, |bytes| vision.encode(bytes))?;
+            expand_image_pads(&prompt_ids, &images, pad, self.params.mrope, |bytes| {
+                vision.encode(bytes)
+            })?;
+        if !splice.triples.is_empty() && self.captured().is_some() {
+            eprintln!(
+                "warning: an image request decodes on the eager path; the captured decode \
+                 graphs stage flat text positions only"
+            );
+        }
         let images = std::sync::Arc::new(splice);
         crate::application::generation::make_request_with_images(
             self, uid, ids, images, params, seed,
@@ -864,9 +942,11 @@ impl Engine {
             None => (Vec::new(), Vec::new()),
         };
         let has_images = !image_positions.is_empty();
+        let mrope_positions = images.and_then(|imgs| imgs.triples_for_window(start, n));
         let input = crate::domain::model::ForwardInput {
             input_ids: ids.to_vec(),
             positions: (start..start + n).map(|p| p as u32).collect(),
+            mrope_positions,
             answers: vec![n - 1],
             image_embeddings: if has_images {
                 Some(image_embeddings)
@@ -936,10 +1016,20 @@ impl Engine {
             image_positions = imgs.positions.clone();
         }
         let has_images = !image_positions.is_empty();
+        // A single-row image request refires its whole sequence: the triples
+        // table covers the expanded prompt, tokens past it the decode delta.
+        let mrope_positions = match images {
+            Some(imgs) => {
+                let n: usize = rows.iter().map(|r| r.ids.len()).sum();
+                imgs.triples_for_window(0, n)
+            }
+            None => None,
+        };
         let res = self.residency()?;
         let logits = res.model.forward(&crate::domain::model::ForwardInput {
             input_ids,
             positions,
+            mrope_positions,
             answers,
             image_embeddings: if has_images {
                 Some(image_embeddings)
@@ -1014,6 +1104,10 @@ pub(crate) mod fake {
             max_position_embeddings: 4096,
             eos_token_id: FAKE_EOS,
             bos_token_id: FAKE_EOS,
+            mrope: Some(crate::domain::model::MropeParams {
+                interleaved: true,
+                section: [1, 1, 0],
+            }),
             expert_slot_bytes: 16,
         }
     }
@@ -1264,6 +1358,41 @@ pub(crate) mod fake {
         }
     }
 
+    /// The placeholder id `FakeVision` hands out, and the only non-text id the
+    /// image tests put in a prompt.
+    pub const FAKE_IMAGE_PAD: u32 = 250;
+
+    /// A vision tower with no tower behind it: every image encodes to
+    /// `tokens` zero rows on a fixed merged grid, so the engine's image path
+    /// can be driven without a checkpoint.
+    pub struct FakeVision {
+        pub tokens: usize,
+        pub grid: (usize, usize),
+    }
+
+    impl Default for FakeVision {
+        fn default() -> Self {
+            Self {
+                tokens: 4,
+                grid: (2, 2),
+            }
+        }
+    }
+
+    impl crate::domain::model::VisionTower for FakeVision {
+        fn encode(&self, _image: &[u8]) -> Result<EncodedImage, String> {
+            Ok(EncodedImage {
+                rows: vec![vec![0.0; 8]; self.tokens],
+                grid_h: self.grid.0,
+                grid_w: self.grid.1,
+            })
+        }
+
+        fn image_token_id(&self) -> u32 {
+            FAKE_IMAGE_PAD
+        }
+    }
+
     pub fn test_engine(limits: EngineLimits) -> (Engine, Recorder) {
         let (model, rec) = FakeModel::new();
         (
@@ -1491,6 +1620,63 @@ mod tests {
         assert_eq!(l.max_output_tokens, 32);
         assert_eq!(l.max_running_requests, 2);
         assert_eq!(l.max_prefill_length, 512);
+    }
+
+    const PAD: u32 = fake::FAKE_IMAGE_PAD;
+
+    fn fake_vision() -> Arc<dyn crate::domain::model::VisionTower> {
+        Arc::new(fake::FakeVision::default())
+    }
+
+    /// "a" + one 2x2 image + "b": the expanded prompt is [a, pad, pad, pad,
+    /// pad, b] and its triples follow the reference counter -- the text token,
+    /// the grid row-major at temporal 1, then the trailing text at the
+    /// advanced counter 3.
+    #[test]
+    fn an_image_request_builds_mrope_triples_and_a_delta() {
+        let (_, splice) = expand_image_pads(
+            &[97, PAD, 98],
+            &[vec![]],
+            PAD,
+            Some(MropeParams {
+                interleaved: true,
+                section: [1, 1, 0],
+            }),
+            |bytes| fake_vision().encode(bytes),
+        )
+        .unwrap();
+        assert_eq!(splice.rows.len(), 4);
+        assert_eq!(splice.positions, vec![1, 2, 3, 4]);
+        assert_eq!(
+            splice.triples,
+            vec![[0, 0, 0], [1, 1, 1], [1, 1, 2], [1, 2, 1], [1, 2, 2], [3, 3, 3]]
+        );
+        assert_eq!(splice.delta, -2, "max position 3 + 1 - 6 prompt tokens");
+    }
+
+    #[test]
+    fn an_image_request_without_mrope_skips_the_triples() {
+        let (_, splice) = expand_image_pads(&[97, PAD], &[vec![]], PAD, None, |bytes| {
+            fake_vision().encode(bytes)
+        })
+        .unwrap();
+        assert!(splice.triples.is_empty());
+        assert!(splice.triples_for_window(0, 3).is_none());
+    }
+
+    #[test]
+    fn an_image_request_with_a_grid_mismatch_is_an_error() {
+        let got = expand_image_pads(&[97, PAD], &[vec![]], PAD, None, |_| {
+            Ok(EncodedImage {
+                rows: vec![vec![0.0; 8]; 3],
+                grid_h: 2,
+                grid_w: 2,
+            })
+        });
+        assert!(
+            matches!(got, Err(EngineError::Vision(msg)) if msg.contains("merged grid")),
+            "the row count must match the grid the triples are built from"
+        );
     }
 
     #[test]

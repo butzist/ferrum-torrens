@@ -283,10 +283,12 @@ fn run_batch(
             // tokens it has not seen: the prompt in budget-sized chunks, then one
             // token each.
             let kv = engine.cache().expect("checked above");
-            if phase == Phase::Decode && engine.captured().is_some() {
+            if phase == Phase::Decode && engine.captured().is_some() && !images_only {
                 // The engine owns a captured decode service, so a whole decode
                 // step replays on one graph instead of one cached forward per
-                // request. Prefill stays on the per-request path (see below).
+                // request. Prefill stays on the per-request path (see below),
+                // and so does any image request: the graphs stage flat text
+                // positions, an image request's decode needs its mrope delta.
                 captured_decode_step(engine, &kv, &mut sessions, &batch.reqs)?
             } else {
                 let mut out = Vec::with_capacity(batch.reqs.len());
@@ -529,6 +531,7 @@ fn finish_text(engine: &Engine, s: &Session) -> Result<String, EngineError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::engine::fake;
     use crate::application::engine::fake::*;
 
     fn req(e: &Engine, uid: u64, prompt: &str, params: SamplingParams) -> Request {
@@ -865,6 +868,130 @@ mod tests {
             pages_before,
             "all cache pages are returned after in-flight forward drains"
         );
+    }
+
+    const PAD: u32 = fake::FAKE_IMAGE_PAD;
+
+    fn fake_vision() -> Arc<dyn crate::domain::model::VisionTower> {
+        Arc::new(FakeVision::default())
+    }
+
+    fn image_request(e: &Engine, uid: u64, prompt_ids: Vec<u32>, max_tokens: u32) -> Request {
+        let p = SamplingParams {
+            max_tokens,
+            ..SamplingParams::default()
+        };
+        e.make_request_with_images(uid, prompt_ids, vec![vec![]], p, 0)
+            .unwrap()
+    }
+
+    /// An image request's decode steps sit at (start + delta) on every axis:
+    /// the captured graphs only carry flat text positions, so the batched
+    /// step is skipped and the per-request cached path applies the mrope
+    /// delta the prompt ended on.
+    #[test]
+    fn an_image_request_decodes_at_start_plus_delta() {
+        let (e, rec, _cache) = test_cached_engine(limits());
+        let e = e.with_vision(fake_vision());
+        let req = image_request(&e, 1, vec![97, PAD, 98], 3);
+        let g = generate(&e, req).unwrap();
+        assert_eq!(g.tokens.len(), 3);
+        let calls = rec.cached_calls();
+        assert_eq!(calls.len(), 3, "prefill plus two decode steps");
+        assert_eq!(calls[0].positions, vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(
+            calls[0].mrope_positions.as_ref().unwrap(),
+            &[
+                [0, 0, 0],
+                [1, 1, 1],
+                [1, 1, 2],
+                [1, 2, 1],
+                [1, 2, 2],
+                [3, 3, 3]
+            ]
+        );
+        // Decode at start 6: (6 + delta) = 4 on every axis.
+        assert_eq!(calls[1].positions, vec![6]);
+        assert_eq!(calls[1].mrope_positions.as_ref().unwrap(), &[[4, 4, 4]]);
+        assert_eq!(calls[2].mrope_positions.as_ref().unwrap(), &[[5, 5, 5]]);
+    }
+
+    /// A prefill chunk that straddles the image run takes its own slice of
+    /// the triples table, exactly like the embedding splice does.
+    #[test]
+    fn a_chunked_image_prefill_takes_its_triple_slice() {
+        let (e, rec, _cache) = test_cached_engine(chunk_limits());
+        let e = e.with_vision(fake_vision());
+        let req = image_request(&e, 1, vec![97, PAD, 98], 2);
+        let g = generate(&e, req).unwrap();
+        assert_eq!(g.tokens.len(), 2);
+        let calls = rec.cached_calls();
+        assert_eq!(calls.len(), 4, "three 2-token chunks plus one decode");
+        let triples: Vec<Vec<[u32; 3]>> = calls
+            .iter()
+            .map(|c| c.mrope_positions.as_ref().unwrap().clone())
+            .collect();
+        assert_eq!(triples[0], vec![[0, 0, 0], [1, 1, 1]]);
+        assert_eq!(triples[1], vec![[1, 1, 2], [1, 2, 1]]);
+        assert_eq!(triples[2], vec![[1, 2, 2], [3, 3, 3]]);
+        assert_eq!(triples[3], vec![[4, 4, 4]]);
+    }
+
+    #[test]
+    fn a_text_only_request_keeps_flat_positions() {
+        let (e, rec, _cache) = test_cached_engine(limits());
+        let e = e.with_vision(fake_vision());
+        let g = generate(&e, req(&e, 1, "ab", params(2))).unwrap();
+        assert_eq!(g.tokens, vec![99, 100]);
+        for (i, call) in rec.cached_calls().iter().enumerate() {
+            assert!(
+                call.mrope_positions.is_none(),
+                "text step {i} must stay on the flat path"
+            );
+        }
+        assert_eq!(rec.cached_calls()[1].positions, vec![2]);
+    }
+
+    /// The stateless (no-cache) path re-feeds the sequence: prompt tokens
+    /// read the triples table, generated tokens the delta rule.
+    #[test]
+    fn a_stateless_image_run_applies_the_delta_past_the_prompt() {
+        let (e, rec) = test_engine(limits());
+        let e = e.with_vision(fake_vision());
+        let req = image_request(&e, 1, vec![97, PAD, 98], 3);
+        generate(&e, req).unwrap();
+        let calls = rec.calls();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0].mrope_positions.as_ref().unwrap().len(), 6);
+        let second = calls[1].mrope_positions.as_ref().unwrap();
+        assert_eq!(second.len(), 7);
+        assert_eq!(
+            second[..5],
+            [[0, 0, 0], [1, 1, 1], [1, 1, 2], [1, 2, 1], [1, 2, 2]]
+        );
+        assert_eq!(second[5], [3, 3, 3]);
+        assert_eq!(second[6], [4, 4, 4], "generated token at 6 + delta");
+    }
+
+    /// The captured graphs stage flat text positions, so an image request
+    /// must decode on the per-request path even when the engine owns graphs:
+    /// no captured step ever sees its rows.
+    #[test]
+    fn an_image_request_skips_the_captured_decode() {
+        let (e, rec, _cache, captured) = test_captured_engine(limits());
+        let e = e.with_vision(fake_vision());
+        let r = image_request(&e, 1, vec![97, PAD, 98], 3);
+        let g = generate(&e, r).unwrap();
+        assert_eq!(g.tokens.len(), 3);
+        assert!(
+            captured.lock().unwrap().is_empty(),
+            "an image request never rides the captured graphs"
+        );
+        assert_eq!(rec.cached_calls().len(), 3, "it decodes on the cached path");
+        // A text request in the same engine still takes the captured step.
+        let g = generate(&e, req(&e, 2, "ab", params(2))).unwrap();
+        assert_eq!(g.tokens, vec![99, 100]);
+        assert_eq!(captured.lock().unwrap().len(), 1);
     }
 
     #[test]

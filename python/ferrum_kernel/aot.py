@@ -62,6 +62,7 @@ from .elementwise import (
     _scale_heads_kernel,
 )
 from .gdn import _gdn_decode_kernel, _gdn_tri_solve_kernel
+from .mrope import _mrope_gather_kernel
 from .norm import _add_rmsnorm_kernel
 from .fp8_linear import (
     GEMM_STAGES,
@@ -120,6 +121,8 @@ from .signatures import (
     topk_last_constexprs,
     rope,
     rope_constexprs,
+    mrope_gather,
+    mrope_gather_constexprs,
     causal_sdpa,
     causal_sdpa_constexprs,
     causal_sdpa_f32_constexprs,
@@ -510,6 +513,12 @@ LINEAR_KERNELS: dict[str, dict] = {
         "fn": _rope_kernel,
         "signature": rope("bf16"),
         "constexprs": rope_constexprs(),
+        "num_warps": 4,
+    },
+    "mrope_gather": {
+        "fn": _mrope_gather_kernel,
+        "signature": mrope_gather(),
+        "constexprs": mrope_gather_constexprs(),
         "num_warps": 4,
     },
     "causal_sdpa_bf16": {

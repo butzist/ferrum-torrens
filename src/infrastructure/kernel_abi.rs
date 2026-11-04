@@ -646,6 +646,7 @@ pub const SUM_ALL_F32: &str = "sum_all_f32";
 pub const SOFTMAX_LAST_F32: &str = "softmax_last_f32";
 pub const TOPK_LAST_F32: &str = "topk_last_f32";
 pub const ROPE_BF16: &str = "rope_bf16";
+pub const MROPE_GATHER: &str = "mrope_gather";
 pub const REPEAT_HEADS_BF16: &str = "repeat_heads_bf16";
 pub const CAUSAL_SDPA_BF16: &str = "causal_sdpa_bf16";
 pub const CAUSAL_SDPA_F32: &str = "causal_sdpa_f32";
@@ -654,7 +655,7 @@ pub const GDN_RATIO_MASKS_F32: &str = "gdn_ratio_masks_f32";
 pub const MUL_MID_F32: &str = "mul_mid_f32";
 pub const SCALE_HEADS_F32: &str = "scale_heads_f32";
 
-const LINEAR_NAMES: [&str; 45] = [
+const LINEAR_NAMES: [&str; 46] = [
     GDN_DECODE,
     CONV_DECODE,
     CONV_PREFILL,
@@ -693,6 +694,7 @@ const LINEAR_NAMES: [&str; 45] = [
     SOFTMAX_LAST_F32,
     TOPK_LAST_F32,
     ROPE_BF16,
+    MROPE_GATHER,
     REPEAT_HEADS_BF16,
     CAUSAL_SDPA_BF16,
     CAUSAL_SDPA_F32,
@@ -889,6 +891,7 @@ pub fn linear_cubin(name: &str) -> Result<&'static [u8], MoEError> {
         }
         TOPK_LAST_F32 => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/topk_last_f32.cubin")),
         ROPE_BF16 => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/rope_bf16.cubin")),
+        MROPE_GATHER => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/mrope_gather.cubin")),
         REPEAT_HEADS_BF16 => {
             include_bytes!(concat!(env!("OUT_DIR"), "/kernel/repeat_heads_bf16.cubin"))
         }
@@ -983,6 +986,7 @@ fn linear_ptx(name: &str) -> &'static str {
         }
         TOPK_LAST_F32 => include_str!(concat!(env!("OUT_DIR"), "/kernel/topk_last_f32.ptx")),
         ROPE_BF16 => include_str!(concat!(env!("OUT_DIR"), "/kernel/rope_bf16.ptx")),
+        MROPE_GATHER => include_str!(concat!(env!("OUT_DIR"), "/kernel/mrope_gather.ptx")),
         REPEAT_HEADS_BF16 => {
             include_str!(concat!(env!("OUT_DIR"), "/kernel/repeat_heads_bf16.ptx"))
         }

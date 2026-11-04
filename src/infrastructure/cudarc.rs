@@ -32,8 +32,8 @@ use crate::infrastructure::kernel_abi::{
     CAUSAL_SDPA_BF16, CAUSAL_SDPA_F32, COL_MUL_BF16, COL_MUL_F32, COPY_STRIDED_BF16,
     COPY_STRIDED_F32, COPY_STRIDED_I32, COPY_STRIDED_I64, COPY_STRIDED_U8, CUMSUM_DIM0_F32,
     GATHER_ROWS_BF16, GATHER_ROWS_F32, GATHER_ROWS_I32, GDN_RATIO_MASKS_F32, INDEX_SELECT_BF16,
-    LinearAbi, MAX_ALL_F32, MUL_BF16, MUL_F32, MUL_MID_F32, REPEAT_HEADS_BF16, ROPE_BF16,
-    SCALAR_BF16, SCALAR_F32, SCALE_HEADS_F32, SCATTER_ROWS_BF16, SCATTER_ROWS_F32,
+    LinearAbi, MAX_ALL_F32, MROPE_GATHER, MUL_BF16, MUL_F32, MUL_MID_F32, REPEAT_HEADS_BF16,
+    ROPE_BF16, SCALAR_BF16, SCALAR_F32, SCALE_HEADS_F32, SCATTER_ROWS_BF16, SCATTER_ROWS_F32,
     SOFTMAX_LAST_F32, SUM_ALL_F32, SUM_LAST_F32, TOPK_LAST_F32, UNARY_BF16, UNARY_F32,
     add_rmsnorm_args, add_rmsnorm_grid,
 };
@@ -1470,6 +1470,54 @@ impl Tensor {
         Ok(out)
     }
 
+    /// The mrope rope rows for a `[rows, 3]` i32 triple table and an axis map
+    /// `axis[p]`: `out[r, p] = self[sin][triple[r, axis[p]], p]`. Returns
+    /// `(cos, sin)` f32 `[rows, half]` fresh tensors.
+    pub fn mrope_gather_rows(
+        &self,
+        sin: &Tensor,
+        triples: &Tensor,
+        axis: &Tensor,
+    ) -> Result<(Tensor, Tensor), MoEError> {
+        if self.dtype() != TensorDType::F32 || self.dim() != 2 {
+            return Err(bad("mrope_gather wants an f32 [max_len, half] table"));
+        }
+        let half = self.shape[1];
+        if sin.shape != self.shape || sin.dtype() != TensorDType::F32 {
+            return Err(bad("mrope_gather wants matching cos/sin tables"));
+        }
+        if triples.dtype() != TensorDType::I32 || triples.dim() != 2 || triples.shape[1] != 3 {
+            return Err(bad("mrope_gather wants i32 [rows, 3] triples"));
+        }
+        if axis.dtype() != TensorDType::I32 || axis.dim() != 1 || axis.shape[0] != half {
+            return Err(bad(format!(
+                "mrope_gather wants an i32 [{half}] axis map"
+            )));
+        }
+        let cos_out = self.rt.zeros(&[triples.shape[0], half], TensorDType::F32)?;
+        let sin_out = self.rt.zeros(&[triples.shape[0], half], TensorDType::F32)?;
+        let (rows, half_len) = (triples.shape[0], half);
+        if rows == 0 || half_len == 0 {
+            return Ok((cos_out, sin_out));
+        }
+        let cos_t = self.contiguous()?;
+        let sin_t = sin.contiguous()?;
+        let triple_t = triples.contiguous()?;
+        let axis_t = axis.contiguous()?;
+        self.rt.kernels().mrope_gather(
+            self.rt.raw_stream(),
+            cos_t.device_ptr(),
+            sin_t.device_ptr(),
+            triple_t.device_ptr(),
+            axis_t.device_ptr(),
+            cos_out.device_ptr(),
+            sin_out.device_ptr(),
+            half_len,
+            rows,
+        )?;
+        Ok((cos_out, sin_out))
+    }
+
     /// GQA expand: `[tokens, kb, dim] -> [tokens, kb * rep, dim]`.
     pub fn repeat_heads(&self, kb: usize, rep: usize) -> Result<Tensor, MoEError> {
         if self.dtype() != TensorDType::Bf16 || self.dim() != 3 || self.shape[1] != kb {
@@ -2317,6 +2365,34 @@ impl LinearKernels {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn mrope_gather(
+        &self,
+        stream: CUstream,
+        cos: u64,
+        sin: u64,
+        triple: u64,
+        axis: u64,
+        cos_out: u64,
+        sin_out: u64,
+        half: usize,
+        rows: usize,
+    ) -> Result<(), MoEError> {
+        let k = self.abi.kernel(MROPE_GATHER)?;
+        let mut pack = ArgPack::for_linear(k);
+        pack.ptr(cos)?;
+        pack.ptr(sin)?;
+        pack.ptr(triple)?;
+        pack.ptr(axis)?;
+        pack.ptr(cos_out)?;
+        pack.ptr(sin_out)?;
+        pack.u32(half as u32)?;
+        let mut params = pack.kernel_params()?;
+        let block = k.constexpr("BLOCK")? as usize;
+        let grid = (rows as u32, half.div_ceil(block) as u32, 1);
+        self.launch(MROPE_GATHER, grid, &mut params, stream)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn repeat_heads(
         &self,
         stream: CUstream,
@@ -2518,5 +2594,54 @@ mod tests {
         let dst = rt.zeros(&[3], TensorDType::U8).unwrap();
         bytes.copy_to(&dst).unwrap();
         assert_eq!(dst.to_host_u8().unwrap(), vec![4, 5, 6]);
+    }
+
+    #[test]
+    fn mrope_gather_rows_follows_the_axis_map() {
+        let Ok(rt) = Runtime::open(0) else {
+            return;
+        };
+        // Tables over 8 rows, a half of 4, and an axis map that reads all
+        // three triple columns.
+        let max_len = 8;
+        let half = 4;
+        let cos_v: Vec<f32> = (0..max_len * half).map(|i| i as f32).collect();
+        let cos = rt.from_slice_f32(&cos_v, &[max_len, half]).unwrap();
+        let sin = rt.from_slice_f32(&cos_v, &[max_len, half]).unwrap();
+        let triples = rt.from_slice_i32(&[1, 2, 3, 5, 6, 7], &[2, 3]).unwrap();
+        let axis = rt.from_slice_i32(&[0, 1, 2, 1], &[half]).unwrap();
+        let (got_cos, got_sin) = cos.mrope_gather_rows(&sin, &triples, &axis).unwrap();
+        assert_eq!(got_cos.shape(), vec![2, half]);
+        // Row 0 reads pair p from triple [1, 2, 3]: axis [0, 1, 2, 1] ->
+        // element p of table rows [1, 2, 3, 2].
+        let want = |rows: &[usize]| -> Vec<f32> {
+            rows.iter()
+                .enumerate()
+                .map(|(p, &r)| cos_v[r * half + p])
+                .collect()
+        };
+        let mut want_all = want(&[1, 2, 3, 2]);
+        want_all.extend(want(&[5, 6, 7, 6]));
+        assert_eq!(got_cos.to_host_f32().unwrap(), want_all);
+        assert_eq!(got_sin.to_host_f32().unwrap(), want_all);
+    }
+
+    #[test]
+    fn mrope_gather_rows_rejects_bad_geometry() {
+        let Ok(rt) = Runtime::open(0) else {
+            return;
+        };
+        let table = rt.from_slice_f32(&[0.0; 8 * 4], &[8, 4]).unwrap();
+        let other = rt.from_slice_f32(&[0.0; 8 * 4], &[8, 4]).unwrap();
+        let triples = rt.from_slice_i32(&[0; 6], &[2, 3]).unwrap();
+        let axis = rt.from_slice_i32(&[0; 3], &[3]).unwrap();
+        assert!(
+            table.mrope_gather_rows(&other, &triples, &axis).is_err(),
+            "axis map must match the half"
+        );
+        let axis = rt.from_slice_i32(&[0; 4], &[4]).unwrap();
+        let bad_triples = rt.from_slice_i32(&[0; 4], &[2, 2]).unwrap();
+        assert!(table.mrope_gather_rows(&other, &bad_triples, &axis).is_err());
+        let _ = triples;
     }
 }

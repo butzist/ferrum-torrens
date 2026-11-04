@@ -803,6 +803,7 @@ mod tests {
             max_position_embeddings: 4096,
             eos_token_id: 0,
             bos_token_id: 0,
+            mrope: None,
             expert_slot_bytes: 1,
         }
     }

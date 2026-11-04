@@ -67,7 +67,7 @@ impl Qwen3_6Vision {
 }
 
 impl crate::domain::model::VisionTower for Qwen3_6Vision {
-    fn encode(&self, image_bytes: &[u8]) -> Result<Vec<Vec<f32>>, String> {
+    fn encode(&self, image_bytes: &[u8]) -> Result<crate::domain::model::EncodedImage, String> {
         let (w, h, px) = crate::models::qwen3_6::image_prep::decode_rgb(image_bytes)?;
         let cfg = &self.tower.config;
         let (nw, nh) =
@@ -76,7 +76,20 @@ impl crate::domain::model::VisionTower for Qwen3_6Vision {
         let chw = crate::models::qwen3_6::image_prep::to_chw(&shrunk, nw as usize, nh as usize);
         let normed =
             crate::models::qwen3_6::image_prep::normalize_rgb(&chw, nw as usize, nh as usize);
-        encode(&self.tower, &normed, nh as usize, nw as usize)
+        let rows = encode(&self.tower, &normed, nh as usize, nw as usize)?;
+        let grid_h = nh as usize / (cfg.patch_size * cfg.spatial_merge_size);
+        let grid_w = nw as usize / (cfg.patch_size * cfg.spatial_merge_size);
+        if rows.len() != grid_h * grid_w {
+            return Err(format!(
+                "the tower returned {} rows for a {grid_h}x{grid_w} merged grid",
+                rows.len()
+            ));
+        }
+        Ok(crate::domain::model::EncodedImage {
+            rows,
+            grid_h,
+            grid_w,
+        })
     }
 
     fn image_token_id(&self) -> u32 {

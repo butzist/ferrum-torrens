@@ -23,6 +23,7 @@ from .elementwise import (
     SDPA_BLOCK_N_F32,
 )
 from .gdn import GDN_BV, GDN_SOLVE_BV, GDN_SOLVE_N
+from .mrope import MROPE_BLOCK
 from .fp8_linear import (
     GEMM_BLOCK_K as FP8_GEMM_BLOCK_K,
     GEMM_BLOCK_M as FP8_GEMM_BLOCK_M,
@@ -868,6 +869,25 @@ def rope(dtype: str = SERVING_DTYPE) -> dict:
 
 def rope_constexprs(head_dim: int = 256) -> dict:
     return {"BLOCK": head_dim}
+
+
+def mrope_gather() -> dict:
+    """Multimodal rope gather (TODO.md section 8, mrope decode wiring):
+    `out[r, p] = table[triple[r, axis[p]], p]` for the cos and sin tables."""
+    return {
+        "cos_ptr": "*fp32",
+        "sin_ptr": "*fp32",
+        "triple_ptr": "*i32",
+        "axis_ptr": "*i32",
+        "cos_out_ptr": "*fp32",
+        "sin_out_ptr": "*fp32",
+        "half": "i32",
+        "BLOCK": "constexpr",
+    }
+
+
+def mrope_gather_constexprs(block: int = MROPE_BLOCK) -> dict:
+    return {"BLOCK": block}
 
 
 def repeat_heads(dtype: str = SERVING_DTYPE) -> dict:

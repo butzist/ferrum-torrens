@@ -285,6 +285,41 @@ pub fn apply_partial_rope(
     }
 }
 
+/// The mrope variant of `apply_partial_rope`: pair `i` rotates at the same
+/// frequency `base^(-2i/rotary_dim)` but at the position its axis holds for
+/// that token, `triples[tt][axis[i]]`. Equal triples on all three axes give
+/// exactly the flat rope's angles.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_partial_rope_mrope(
+    x: &mut [f32],
+    t: usize,
+    heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    base: f32,
+    triples: &[[u32; 3]],
+    axis: &[usize],
+) {
+    if rotary_dim == 0 {
+        return;
+    }
+    let half = rotary_dim / 2;
+    for tt in 0..t {
+        for h in 0..heads {
+            let row = &mut x[(tt * heads + h) * head_dim..(tt * heads + h + 1) * head_dim];
+            for i in 0..half {
+                let pos = triples[tt][axis[i]];
+                let ang = pos as f32 * base.powf(-2.0 * i as f32 / rotary_dim as f32);
+                let (cos, sin) = (ang.cos(), ang.sin());
+                let lo = row[i];
+                let hi = row[i + half];
+                row[i] = lo * cos - hi * sin;
+                row[i + half] = hi * cos + lo * sin;
+            }
+        }
+    }
+}
+
 pub(crate) fn expand_heads(x: &[f32], t: usize, heads: usize, rep: usize, dim: usize) -> Vec<f32> {
     let mut out = Vec::with_capacity(t * heads * rep * dim);
     for i in 0..t {
@@ -443,6 +478,7 @@ fn full_attention(
     layer: usize,
     t: usize,
     positions: &[u32],
+    mrope: Option<&[[u32; 3]]>,
 ) -> Result<Vec<f32>> {
     let p = ctx.params;
     let hd = p.head_dim;
@@ -491,8 +527,39 @@ fn full_attention(
     let mut q_f = rms_norm(&q, &qn, p.rms_norm_eps, hd);
     let mut k_n = rms_norm(&k_flat, &kn, p.rms_norm_eps, hd);
 
-    apply_partial_rope(&mut q_f, t, qh, hd, p.rotary_dim, p.rope_theta, positions);
-    apply_partial_rope(&mut k_n, t, kvh, hd, p.rotary_dim, p.rope_theta, positions);
+    match mrope {
+        Some(triples) if !triples.is_empty() => {
+            let (interleaved, section) = match p.mrope {
+                Some(m) => (m.interleaved, m.section),
+                None => (false, [0; 3]),
+            };
+            let axis = super::mrope::mrope_axis_map(&section, p.rotary_dim / 2, interleaved);
+            apply_partial_rope_mrope(
+                &mut q_f,
+                t,
+                qh,
+                hd,
+                p.rotary_dim,
+                p.rope_theta,
+                triples,
+                &axis,
+            );
+            apply_partial_rope_mrope(
+                &mut k_n,
+                t,
+                kvh,
+                hd,
+                p.rotary_dim,
+                p.rope_theta,
+                triples,
+                &axis,
+            );
+        }
+        _ => {
+            apply_partial_rope(&mut q_f, t, qh, hd, p.rotary_dim, p.rope_theta, positions);
+            apply_partial_rope(&mut k_n, t, kvh, hd, p.rotary_dim, p.rope_theta, positions);
+        }
+    }
 
     let attn = causal_attention(&q_f, &k_n, &v_flat, t, qh, kvh, hd);
     let mut gated = vec![0.0f32; t * qh * hd];
@@ -787,10 +854,14 @@ pub(crate) fn trace_vec(stage: &str, layer: usize, v: &[f32]) {
     trace(stage, layer, l2, amax);
 }
 
+/// One contiguous sequence through the whole tower: embed, the layer stack,
+/// the final norm and the lm_head over the last token.
+#[allow(clippy::too_many_arguments)]
 fn run_sequence(
     ctx: &Ctx,
     tokens: &[u32],
     positions: &[u32],
+    mrope: Option<&[[u32; 3]]>,
     mut lens: Option<&mut Vec<Lens>>,
     image_embeddings: Option<&[Vec<f32>]>,
     image_positions: Option<&[usize]>,
@@ -859,7 +930,7 @@ fn run_sequence(
 
         let attn_out = match p.layer_types[layer] {
             crate::domain::model::LayerType::FullAttention => {
-                full_attention(ctx, &h1, layer, t, positions)?
+                full_attention(ctx, &h1, layer, t, positions, mrope)?
             }
             crate::domain::model::LayerType::LinearAttention => {
                 linear_attention(ctx, &h1, layer, t)?
@@ -1014,6 +1085,7 @@ pub fn forward_reference(
                 &ctx,
                 &input.input_ids[s..i],
                 &input.positions[s..i],
+                input.mrope_positions.as_deref().map(|m| &m[s..i]),
                 None,
                 input.image_embeddings.as_deref(),
                 input.image_positions.as_deref(),
@@ -1046,6 +1118,7 @@ pub fn logit_lens(
         &ctx,
         &input.input_ids,
         &input.positions,
+        input.mrope_positions.as_deref(),
         if every == 0 { None } else { Some(&mut lenses) },
         input.image_embeddings.as_deref(),
         input.image_positions.as_deref(),
@@ -1056,6 +1129,7 @@ pub fn logit_lens(
 
 #[cfg(test)]
 mod tests {
+    use super::super::mrope::mrope_axis_map;
     use super::*;
 
     #[test]
@@ -1074,6 +1148,42 @@ mod tests {
         let before = x.clone();
         apply_partial_rope(&mut x, 1, 1, 6, 4, 1e7, &[0]);
         assert!((0..6).all(|i| (x[i] - before[i]).abs() < 1e-6));
+    }
+
+    #[test]
+    fn mrope_rope_takes_each_pair_position_from_its_axis() {
+        // One head, hd=4, rotary over both pairs. Pair 0 reads the height
+        // axis, pair 1 the temporal one.
+        let mut x = [1.0f32, 0.0, 2.0, 5.0];
+        apply_partial_rope_mrope(&mut x, 1, 1, 4, 4, 2.0, &[[3, 10, 7]], &[1, 0]);
+        // Pair 0 couples dims (0, 2) at the height position 10, frequency 1.
+        let (c, s) = (10f32.cos(), 10f32.sin());
+        assert!((x[0] - (c - 2.0 * s)).abs() < 1e-5, "{}", x[0]);
+        assert!((x[2] - (2.0 * c + s)).abs() < 1e-5, "{}", x[2]);
+        // Pair 1 couples dims (1, 3) at the temporal position 3, frequency
+        // 2^(-2/4): [0, 5] is a pure rotation.
+        let ang = 3.0f32 * 2.0f32.powf(-0.5);
+        assert!((x[1] + 5.0 * ang.sin()).abs() < 1e-5, "{}", x[1]);
+        assert!((x[3] - 5.0 * ang.cos()).abs() < 1e-5, "{}", x[3]);
+    }
+
+    /// Equal triples on every axis are the flat rope, whatever the pair map
+    /// says: the angle only depends on the position a pair reads.
+    #[test]
+    fn mrope_rope_with_equal_axes_is_the_flat_rope() {
+        let section = [11usize, 11, 10];
+        let axis = mrope_axis_map(&section, 32, true);
+        let (heads, head_dim) = (3usize, 256usize);
+        let x: Vec<f32> = (0..2 * heads * head_dim)
+            .map(|i| (i as f32 * 0.37).sin() * 1.3)
+            .collect();
+        let positions: Vec<u32> = (0..2).map(|p| 3 + p as u32 * 17).collect();
+        let triples: Vec<[u32; 3]> = positions.iter().map(|&p| [p; 3]).collect();
+        let mut a = x.clone();
+        apply_partial_rope(&mut a, 2, heads, head_dim, 64, 1e7, &positions);
+        let mut b = x.clone();
+        apply_partial_rope_mrope(&mut b, 2, heads, head_dim, 64, 1e7, &triples, &axis);
+        assert_eq!(a, b, "bit-exact: same angles in the same pairs");
     }
 
     #[test]

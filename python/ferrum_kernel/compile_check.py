@@ -52,6 +52,7 @@ from .elementwise import (
     _scale_heads_kernel,
 )
 from .gdn import _gdn_decode_kernel, _gdn_tri_solve_kernel
+from .mrope import _mrope_gather_kernel
 from .norm import _add_rmsnorm_kernel
 from .fp8_linear import (
     _fp8_gemm_kernel,
@@ -90,6 +91,8 @@ from .signatures import grouped_down_constexprs, grouped_gate_up_constexprs
 from .signatures import index_copy as _index_copy_sig
 from .signatures import index_copy_constexprs, lru_constexprs
 from .signatures import lru_ensure as _lru_sig
+from .signatures import mrope_gather as _mrope_gather_sig
+from .signatures import mrope_gather_constexprs
 from .signatures import moe_csr_count as _moe_csr_count_sig
 from .signatures import moe_csr_constexprs
 from .signatures import moe_csr_prefix as _moe_csr_prefix_sig
@@ -259,6 +262,12 @@ def main() -> int:
     # The GDN prefill chunk helpers: the scan and the three broadcasts.
     for label, fn, sig, consts in (
         ("cumsum_dim0", _cumsum_dim0_kernel, _cumsum_dim0_sig(), cumsum_dim0_constexprs()),
+        (
+            "mrope_gather",
+            _mrope_gather_kernel,
+            _mrope_gather_sig(),
+            mrope_gather_constexprs(),
+        ),
         (
             "gdn_ratio_masks",
             _gdn_ratio_masks_kernel,

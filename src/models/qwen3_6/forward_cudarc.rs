@@ -374,10 +374,12 @@ enum Access<'a> {
 }
 
 /// The absolute rope positions for the tokens of one step, as host values for
-/// the cached prefill and as a device `[rows]` i32 tensor for a captured step.
+/// the cached prefill, as per-token (t, h, w) triples for a multimodal
+/// request, or as a device `[rows]` i32 tensor for a captured step.
 #[derive(Clone, Copy)]
 enum Positions<'a> {
     Host(&'a [u32]),
+    Triples(&'a [[u32; 3]]),
     Device(&'a Tensor),
 }
 
@@ -397,6 +399,10 @@ pub struct CudarcQwen3_6 {
     cache: Arc<DeviceCache>,
     rope_cos: Tensor,
     rope_sin: Tensor,
+    /// The mrope axis map over the rotary pairs, i32 `[rotary_dim / 2]`: the
+    /// axis (0=t, 1=h, 2=w) every pair follows. All temporal when the model
+    /// has no mrope, which never leaves the flat path.
+    mrope_axis: Tensor,
 }
 
 impl CudarcQwen3_6 {
@@ -418,6 +424,13 @@ impl CudarcQwen3_6 {
             .map_err(moe_bad)?;
         let max_len = params.max_position_embeddings.max(4096);
         let (rope_cos, rope_sin) = rope_tables(&rt, max_len, params.rotary_dim, params.rope_theta)?;
+        let (interleaved, section) = match &params.mrope {
+            Some(m) => (m.interleaved, m.section),
+            None => (false, [0; 3]),
+        };
+        let axis = super::mrope::mrope_axis_map(&section, params.rotary_dim / 2, interleaved);
+        let axis: Vec<i32> = axis.iter().map(|&a| a as i32).collect();
+        let mrope_axis = rt.from_slice_i32(&axis, &[axis.len()])?;
         Ok(Self {
             rt,
             params,
@@ -433,6 +446,7 @@ impl CudarcQwen3_6 {
             cache,
             rope_cos,
             rope_sin,
+            mrope_axis,
         })
     }
 
@@ -503,6 +517,20 @@ impl CudarcQwen3_6 {
         ))
     }
 
+    /// The rope rows for per-token (t, h, w) triples: pair `p` reads the axis
+    /// its map entry names, through the `mrope_gather` cubin.
+    fn rope_for_triples(&self, triples: &[[u32; 3]]) -> Result<(Tensor, Tensor)> {
+        if self.params.rotary_dim == 0 || self.rope_cos.shape()[0] == 0 {
+            let empty = self.rt.from_slice_f32(&[], &[0, 0])?;
+            return Ok((empty.clone(), empty));
+        }
+        let flat: Vec<i32> = triples.iter().flatten().map(|&p| p as i32).collect();
+        let idx = self.rt.from_slice_i32(&flat, &[triples.len(), 3])?;
+        self.rope_cos
+            .mrope_gather_rows(&self.rope_sin, &idx, &self.mrope_axis)
+            .map_err(moe_bad)
+    }
+
     fn project_attention(
         &self,
         layer: &Layer,
@@ -542,6 +570,7 @@ impl CudarcQwen3_6 {
         }
         let (cos, sin) = match positions {
             Positions::Host(positions) => self.rope_for(positions)?,
+            Positions::Triples(triples) => self.rope_for_triples(triples)?,
             Positions::Device(positions) => self.rope_for_device(positions)?,
         };
         let q = apply_rope(&q, qh, hd, p.rotary_dim, &cos, &sin)?.reshape(&[t, qh, hd])?;
@@ -985,7 +1014,12 @@ impl CudarcQwen3_6 {
         }
     }
 
-    fn run_tower(&self, ids: &[u32], positions: &[u32], access: &Access<'_>) -> Result<Vec<f32>> {
+    fn run_tower(
+        &self,
+        ids: &[u32],
+        positions: Positions<'_>,
+        access: &Access<'_>,
+    ) -> Result<Vec<f32>> {
         let out = self.run_tower_inner(ids, positions, access);
         substep_report(ids.len());
         out
@@ -1082,7 +1116,7 @@ impl CudarcQwen3_6 {
     fn run_tower_inner(
         &self,
         ids: &[u32],
-        positions: &[u32],
+        positions: Positions<'_>,
         access: &Access<'_>,
     ) -> Result<Vec<f32>> {
         let p = &self.params;
@@ -1092,7 +1126,7 @@ impl CudarcQwen3_6 {
         }
         let idx: Vec<i32> = ids.iter().map(|i| *i as i32).collect();
         let idx = self.rt.from_slice_i32(&idx, &[t])?;
-        let stream = self.tower_stream(&idx, t, &Positions::Host(positions), access)?;
+        let stream = self.tower_stream(&idx, t, &positions, access)?;
         let last = stream.narrow(0, t - 1, 1)?;
         let normed = rms_norm(&last, &self.tower.final_norm, p.rms_norm_eps)?;
         if ablated("head") {
@@ -1113,13 +1147,13 @@ impl Model for CudarcQwen3_6 {
         let mut s = 0usize;
         for i in 1..=n {
             if i == n || input.positions[i] <= input.positions[i - 1] {
+                let positions = match input.mrope_positions.as_deref() {
+                    Some(triples) => Positions::Triples(&triples[s..i]),
+                    None => Positions::Host(&input.positions[s..i]),
+                };
                 out.extend(
-                    self.run_tower(
-                        &input.input_ids[s..i],
-                        &input.positions[s..i],
-                        &Access::Stateless,
-                    )
-                    .expect("cudarc forward"),
+                    self.run_tower(&input.input_ids[s..i], positions, &Access::Stateless)
+                        .expect("cudarc forward"),
                 );
                 s = i;
             }
@@ -1149,6 +1183,11 @@ impl CachedModel for CudarcQwen3_6 {
                     .to_string(),
             });
         }
+        if input.mrope_positions.as_ref().is_some_and(|m| m.len() != n) {
+            return Err(KvcacheError::MisalignedCache {
+                why: "the cached forward wants one mrope triple per token".to_string(),
+            });
+        }
         if input.answers != vec![n - 1] {
             return Err(KvcacheError::MisalignedCache {
                 why: "the cached forward takes one sequence and answers its last token".to_string(),
@@ -1165,7 +1204,11 @@ impl CachedModel for CudarcQwen3_6 {
             cache,
             state: self.cache.state(),
         };
-        self.run_tower(&input.input_ids, &input.positions, &access)
+        let positions = match input.mrope_positions.as_deref() {
+            Some(triples) => Positions::Triples(triples),
+            None => Positions::Host(&input.positions),
+        };
+        self.run_tower(&input.input_ids, positions, &access)
             .map_err(|e| KvcacheError::MisalignedCache { why: e.to_string() })
     }
 }

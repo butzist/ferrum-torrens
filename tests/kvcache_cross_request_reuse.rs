@@ -65,6 +65,7 @@ fn input(ids: &[u32], start: usize) -> ForwardInput {
     ForwardInput {
         input_ids: ids.to_vec(),
         positions: (start..start + ids.len()).map(|p| p as u32).collect(),
+        mrope_positions: None,
         answers: vec![ids.len() - 1],
         image_embeddings: None,
         image_positions: None,

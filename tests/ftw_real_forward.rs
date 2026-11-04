@@ -36,6 +36,7 @@ fn real_checkpoint_reference_forward_is_finite_and_deterministic() {
     let input = ForwardInput {
         input_ids: vec![248044, 19593, 48128, 16, 2177],
         positions: vec![0, 1, 2, 3, 4],
+        mrope_positions: None,
         answers: vec![4],
         image_embeddings: None,
         image_positions: None,

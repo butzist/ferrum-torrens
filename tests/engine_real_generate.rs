@@ -194,6 +194,7 @@ fn logit_lens_locates_the_first_bad_layer() {
     let ids = engine.encode(PROMPT).unwrap();
     let input = ferrum_torrens::domain::model::ForwardInput {
         positions: (0..ids.len() as u32).collect(),
+        mrope_positions: None,
         input_ids: ids,
         answers: vec![],
         image_embeddings: None,

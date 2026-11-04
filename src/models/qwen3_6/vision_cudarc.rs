@@ -178,7 +178,7 @@ struct MergerW {
 }
 
 impl crate::domain::model::VisionTower for Qwen3_6VisionCudarc {
-    fn encode(&self, image_bytes: &[u8]) -> R<Vec<Vec<f32>>> {
+    fn encode(&self, image_bytes: &[u8]) -> R<crate::domain::model::EncodedImage> {
         // Identical host preprocessing to the host tower's entry point.
         let (w, h, px) = image_prep::decode_rgb(image_bytes)?;
         let cfg = &self.tower.config;
@@ -187,7 +187,20 @@ impl crate::domain::model::VisionTower for Qwen3_6VisionCudarc {
         let shrunk = image_prep::resize_rgb(&px, w, h, nw, nh);
         let chw = image_prep::to_chw(&shrunk, nw as usize, nh as usize);
         let normed = image_prep::normalize_rgb(&chw, nw as usize, nh as usize);
-        self.encode_pixels(&normed, nh as usize, nw as usize)
+        let rows = self.encode_pixels(&normed, nh as usize, nw as usize)?;
+        let step = cfg.patch_size * cfg.spatial_merge_size;
+        let (grid_h, grid_w) = (nh as usize / step, nw as usize / step);
+        if rows.len() != grid_h * grid_w {
+            return Err(format!(
+                "the tower returned {} rows for a {grid_h}x{grid_w} merged grid",
+                rows.len()
+            ));
+        }
+        Ok(crate::domain::model::EncodedImage {
+            rows,
+            grid_h,
+            grid_w,
+        })
     }
 
     fn image_token_id(&self) -> u32 {

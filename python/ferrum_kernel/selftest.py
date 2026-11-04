@@ -26,6 +26,7 @@ from . import conv as conv_mod
 from . import fp8_linear as fp8_mod
 from . import gdn as gdn_mod
 from . import linear as linear_mod
+from . import mrope as mrope_mod
 from . import norm as norm_mod
 from . import offload as off
 from .nvfp4_moe import (
@@ -713,6 +714,37 @@ def check_fp8_linear(device: torch.device, tol: float, interp: bool) -> int:
     return failures
 
 
+def check_mrope_gather(device: torch.device, tol: float) -> int:
+    """Multimodal rope gather: the kernel against the torch table gather, with
+    the serving interleaved axis map (pairs 1,4,..,31 height; 2,5,..,29 width;
+    the rest temporal)."""
+    failures = 0
+    for rows, half, max_len, seed in ((5, 32, 64, 0), (1, 32, 8, 1), (3, 8, 16, 2)):
+        g = torch.Generator().manual_seed(seed)
+        cos = torch.randn((max_len, half), generator=g)
+        sin = torch.randn((max_len, half), generator=g)
+        triple = torch.randint(0, max_len, (rows, 3), generator=g, dtype=torch.int32)
+        axis = torch.zeros((half,), dtype=torch.int32)
+        for p in range(half):
+            if p % 3 == 1 and p < 33:
+                axis[p] = 1
+            elif p % 3 == 2 and p < 30:
+                axis[p] = 2
+        want_cos, want_sin = mrope_mod.mrope_gather_reference(cos, sin, triple, axis)
+        got_cos = torch.empty((rows, half), dtype=torch.float32)
+        got_sin = torch.empty((rows, half), dtype=torch.float32)
+        mrope_mod.launch_mrope_gather(cos, sin, triple, axis, got_cos, got_sin)
+        rel = max(
+            (got_cos - want_cos).abs().max().item(),
+            (got_sin - want_sin).abs().max().item(),
+        )
+        print(f"mrope_gather rows={rows} half={half}: max |d| {rel:.3e}")
+        if rel > tol:
+            failures += 1
+            print(f"mrope_gather rows={rows} half={half}: FAIL", file=sys.stderr)
+    return failures
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--device", default="cpu")
@@ -842,6 +874,10 @@ def main(argv: list[str] | None = None) -> int:
         torch.device(args.device), args.tol, full=args.device != "cpu"
     )
     if norm_failures:
+        print("FAIL", file=sys.stderr)
+        return 1
+    mrope_failures = check_mrope_gather(torch.device(args.device), 0.0)
+    if mrope_failures:
         print("FAIL", file=sys.stderr)
         return 1
     dense_failures = check_nvfp4_dense(torch.device(args.device), args.tol)

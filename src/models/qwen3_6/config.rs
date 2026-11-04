@@ -99,6 +99,37 @@ pub fn parse_text_config(tc: &Value) -> Result<ModelParams, ConfigError> {
     };
 
     let rms_norm_eps = get_f64(tc, "rms_norm_eps").unwrap_or(1e-6) as f32;
+    let mrope = match tc
+        .get("rope_parameters")
+        .and_then(|r| r.get("mrope_section"))
+    {
+        Some(v) => {
+            let section: Vec<usize> = v
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_u64)
+                        .map(|v| v as usize)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if section.len() != 3 {
+                return Err(ConfigError::Bad(
+                    "mrope_section",
+                    format!("want 3 entries (t, h, w), got {}", section.len()),
+                ));
+            }
+            Some(crate::domain::model::MropeParams {
+                interleaved: tc
+                    .get("rope_parameters")
+                    .and_then(|r| r.get("mrope_interleaved"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                section: [section[0], section[1], section[2]],
+            })
+        }
+        None => None,
+    };
     let max_position_embeddings =
         get_u64(tc, "max_position_embeddings").unwrap_or(262_144) as usize;
     let eos = get_u64(tc, "eos_token_id")? as u32;
@@ -135,6 +166,7 @@ pub fn parse_text_config(tc: &Value) -> Result<ModelParams, ConfigError> {
         max_position_embeddings,
         eos_token_id: eos,
         bos_token_id: bos,
+        mrope,
         expert_slot_bytes: expert_slot_bytes_nvfp4(hidden_size, moe_intermediate),
     })
 }
@@ -281,6 +313,41 @@ mod tests {
         assert_eq!(p.num_gdn_layers(), 30);
         let full = p.full_attention_layers();
         assert_eq!(full, (0..40).filter(|i| i % 4 == 3).collect::<Vec<_>>());
+        let mrope = p.mrope.expect("the real checkpoint enables mrope");
+        assert!(mrope.interleaved);
+        assert_eq!(mrope.section, [11, 11, 10]);
+    }
+
+    #[test]
+    fn no_mrope_section_means_no_mrope() {
+        let tc: Value = serde_json::from_str(
+            r#"{"hidden_size": 4, "num_hidden_layers": 1, "vocab_size": 8,
+                "num_experts": 2, "num_experts_per_tok": 1, "moe_intermediate_size": 2,
+                "shared_expert_intermediate_size": 2, "num_attention_heads": 1,
+                "num_key_value_heads": 1, "head_dim": 4, "partial_rotary_factor": 0.5,
+                "eos_token_id": 7, "full_attention_interval": 1,
+                "rope_parameters": {"rope_theta": 10000000.0}}"#,
+        )
+        .unwrap();
+        let p = parse_text_config(&tc).unwrap();
+        assert_eq!(p.mrope, None);
+    }
+
+    #[test]
+    fn a_mrope_section_of_the_wrong_length_is_rejected() {
+        let tc: Value = serde_json::from_str(
+            r#"{"hidden_size": 4, "num_hidden_layers": 1, "vocab_size": 8,
+                "num_experts": 2, "num_experts_per_tok": 1, "moe_intermediate_size": 2,
+                "shared_expert_intermediate_size": 2, "num_attention_heads": 1,
+                "num_key_value_heads": 1, "head_dim": 4, "partial_rotary_factor": 0.5,
+                "eos_token_id": 7,
+                "rope_parameters": {"rope_theta": 10000000.0, "mrope_section": [11, 11]}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            parse_text_config(&tc),
+            Err(ConfigError::Bad("mrope_section", _))
+        ));
     }
 
     #[test]

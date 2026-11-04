@@ -668,12 +668,12 @@ fn the_device_tower_matches_the_host_tower() -> Result<(), Box<dyn std::error::E
     );
 
     let start = Instant::now();
-    let host_rows = host.encode(&img).expect("host encode");
+    let host_rows = host.encode(&img).expect("host encode").rows;
     let host_ms = start.elapsed().as_secs_f64() * 1000.0;
 
     // The second call exercises the steady-state cost (no allocator warm-up).
     let start = Instant::now();
-    let dev_rows = device.encode(&img).expect("device encode");
+    let dev_rows = device.encode(&img).expect("device encode").rows;
     let dev_ms = start.elapsed().as_secs_f64() * 1000.0;
 
     assert_eq!(
