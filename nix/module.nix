@@ -28,6 +28,7 @@ let
     host = "${cfg.host}"
     port = ${toString cfg.port}
     served_model_name = "${cfg.servedModelName}"
+    idle_timeout_secs = ${toString cfg.idleTimeoutSecs}
 
     [model]
     path = "${modelPath}"
@@ -140,6 +141,12 @@ in
       type = lib.types.ints.positive;
       default = 32768;
       description = "[model] max_output_tokens.";
+    };
+
+    idleTimeoutSecs = lib.mkOption {
+      type = lib.types.ints.unsigned;
+      default = 600;
+      description = "[serve] idle_timeout_secs; seconds without a request before the device residency is released. 0 disables idle release.";
     };
 
     cudaGraph = lib.mkOption {
