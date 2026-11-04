@@ -39,11 +39,19 @@ use crate::infrastructure::kernel_abi::{
 };
 
 fn bad(e: impl std::fmt::Display) -> MoEError {
-    MoEError::Bad(format!("cudarc: {e}"))
+    let text = e.to_string();
+    if crate::domain::expert_kernel::is_out_of_device_memory(&text) {
+        return MoEError::OutOfMemory(text);
+    }
+    MoEError::Bad(format!("cudarc: {text}"))
 }
 
 fn driver(e: CudaError) -> MoEError {
-    MoEError::Bad(format!("driver: {e}"))
+    let text = e.to_string();
+    if crate::domain::expert_kernel::is_out_of_device_memory(&text) {
+        return MoEError::OutOfMemory(text);
+    }
+    MoEError::Bad(format!("driver: {text}"))
 }
 
 /// A cuBLAS algorithm and compute type. The M7.1a sweep used this to check
@@ -1490,9 +1498,7 @@ impl Tensor {
             return Err(bad("mrope_gather wants i32 [rows, 3] triples"));
         }
         if axis.dtype() != TensorDType::I32 || axis.dim() != 1 || axis.shape[0] != half {
-            return Err(bad(format!(
-                "mrope_gather wants an i32 [{half}] axis map"
-            )));
+            return Err(bad(format!("mrope_gather wants an i32 [{half}] axis map")));
         }
         let cos_out = self.rt.zeros(&[triples.shape[0], half], TensorDType::F32)?;
         let sin_out = self.rt.zeros(&[triples.shape[0], half], TensorDType::F32)?;
@@ -2641,7 +2647,11 @@ mod tests {
         );
         let axis = rt.from_slice_i32(&[0; 4], &[4]).unwrap();
         let bad_triples = rt.from_slice_i32(&[0; 4], &[2, 2]).unwrap();
-        assert!(table.mrope_gather_rows(&other, &bad_triples, &axis).is_err());
+        assert!(
+            table
+                .mrope_gather_rows(&other, &bad_triples, &axis)
+                .is_err()
+        );
         let _ = triples;
     }
 }

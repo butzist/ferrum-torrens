@@ -35,6 +35,10 @@ pub enum CudaError {
 
 pub type CUresult = c_int;
 pub type CUdevice = c_int;
+
+/// `CUDA_ERROR_OUT_OF_MEMORY`.
+pub const CUDA_ERROR_OUT_OF_MEMORY: CUresult = 2;
+
 /// An opaque driver handle. The driver API's own opaque types are pointers on
 /// every platform this engine targets.
 pub type CUdeviceptr = u64;

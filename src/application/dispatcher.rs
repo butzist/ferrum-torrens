@@ -38,12 +38,60 @@ const DECODE_MS_PER_TOKEN: u64 = 33;
 /// batch can mix streaming and non-streaming jobs.
 pub type Sink = Box<dyn FnMut(u64, &str, u32, usize) -> bool + Send + 'static>;
 
-/// One queued request. `reply` carries the finished `Generation`, or the error
-/// text (the worker is off the async runtime, so it hands back a message).
+/// One queued request. `reply` carries the finished `Generation`, or why the
+/// batch did not run (the worker is off the async runtime, so the kind has to
+/// ride back instead of the handler re-deriving it from a message).
 pub struct Job {
     pub request: Request,
     pub sink: Option<Sink>,
-    pub reply: oneshot::Sender<Result<Generation, String>>,
+    pub reply: oneshot::Sender<Result<Generation, JobError>>,
+}
+
+/// Why a job failed to produce a generation.
+///
+/// The device-memory case is kept apart from the message: a released engine
+/// that cannot rebuild answers 503 with `Retry-After`, and flattening it to a
+/// string here would turn that into the handler's generic 422.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobError {
+    /// The GPU had no free memory when the batch tried to wake the model up.
+    OutOfDeviceMemory {
+        retry_after_ms: u64,
+        detail: String,
+    },
+    Failed(String),
+}
+
+impl JobError {
+    /// The text a stream frame carries. A stream's headers are already on the
+    /// wire, so this is where its retry hint has to go.
+    pub fn message(&self) -> String {
+        match self {
+            Self::OutOfDeviceMemory {
+                retry_after_ms,
+                detail,
+            } => format!(
+                "the GPU has no free memory for the model ({detail}); retry in {} s",
+                retry_after_ms.div_ceil(1000).max(1)
+            ),
+            Self::Failed(m) => m.clone(),
+        }
+    }
+}
+
+impl From<EngineError> for JobError {
+    fn from(e: EngineError) -> Self {
+        match e {
+            EngineError::OutOfDeviceMemory {
+                retry_after_ms,
+                detail,
+            } => Self::OutOfDeviceMemory {
+                retry_after_ms,
+                detail,
+            },
+            other => Self::Failed(other.to_string()),
+        }
+    }
 }
 
 /// The handle `AppState` keeps. `submit` is callable from any handler thread.
@@ -163,24 +211,25 @@ fn worker(engine: Arc<Engine>, rx: Receiver<Job>, busy: Arc<AtomicBool>, idle: I
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => return,
         };
-        // A request wakes the device back up.
-        if stage >= 1 {
-            let _ = engine.rehydrate_moe();
-            let _ = engine.rehydrate();
+        // A request wakes the device back up. A rebuild that cannot find device
+        // memory fails the whole batch with a retryable error: running a forward
+        // over a residency that failed to build would be a fault, and the client
+        // should back off instead.
+        if stage >= 1 || !engine.is_resident() {
             stage = 0;
-        }
-        let mut jobs = vec![first];
-        let deadline = Instant::now() + BATCH_WINDOW;
-        while jobs.len() < max_running {
-            let now = Instant::now();
-            if now >= deadline {
-                break;
+            let warmed = engine
+                .rehydrate_moe()
+                .and_then(|()| engine.rehydrate().map(|_| ()));
+            if let Err(e) = warmed {
+                let err = JobError::from(e);
+                for job in drain(&rx, first, max_running) {
+                    let _ = job.reply.send(Err(err.clone()));
+                }
+                last = Instant::now();
+                continue;
             }
-            match rx.recv_timeout(deadline - now) {
-                Ok(j) => jobs.push(j),
-                Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => break,
-            }
         }
+        let jobs = drain(&rx, first, max_running);
         busy.store(true, Ordering::Relaxed);
         let _lease = engine.batch_lease();
         run_jobs(&engine, jobs);
@@ -189,12 +238,30 @@ fn worker(engine: Arc<Engine>, rx: Receiver<Job>, busy: Arc<AtomicBool>, idle: I
     }
 }
 
+/// The batch window: the first job plus whatever coalesces behind it within
+/// `BATCH_WINDOW`, up to the batch size.
+fn drain(rx: &Receiver<Job>, first: Job, max_running: usize) -> Vec<Job> {
+    let mut jobs = vec![first];
+    let deadline = Instant::now() + BATCH_WINDOW;
+    while jobs.len() < max_running {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        match rx.recv_timeout(deadline - now) {
+            Ok(j) => jobs.push(j),
+            Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    jobs
+}
+
 /// Run a drained batch: one `generate_batch` over every job, with each job's
 /// sink routed by uid, then a result (or the batch error) to each reply.
 fn run_jobs(engine: &Engine, jobs: Vec<Job>) {
     let mut sinks: HashMap<u64, Sink> = HashMap::new();
     let mut requests = Vec::with_capacity(jobs.len());
-    let mut replies: Vec<(u64, oneshot::Sender<Result<Generation, String>>)> =
+    let mut replies: Vec<(u64, oneshot::Sender<Result<Generation, JobError>>)> =
         Vec::with_capacity(jobs.len());
     for job in jobs {
         let uid = job.request.uid;
@@ -215,16 +282,16 @@ fn run_jobs(engine: &Engine, jobs: Vec<Job>) {
             let mut by_uid: HashMap<u64, Generation> =
                 generations.into_iter().map(|g| (g.uid, g)).collect();
             for (uid, reply) in replies {
-                let result = by_uid
-                    .remove(&uid)
-                    .ok_or_else(|| format!("the batch produced no result for {uid}"));
+                let result = by_uid.remove(&uid).ok_or_else(|| {
+                    JobError::Failed(format!("the batch produced no result for {uid}"))
+                });
                 let _ = reply.send(result);
             }
         }
         Err(e) => {
-            let message = e.to_string();
+            let err = JobError::from(e);
             for (_, reply) in replies {
-                let _ = reply.send(Err(message.clone()));
+                let _ = reply.send(Err(err.clone()));
             }
         }
     }
@@ -277,6 +344,69 @@ mod tests {
             sink: None,
             reply,
         }
+    }
+
+    /// A request that wakes an idle-released engine into a full GPU answers with
+    /// the retryable kind and never runs a forward over a half-built residency.
+    /// The worker keeps looping: once memory is back, the same dispatcher serves
+    /// the next job normally.
+    #[test]
+    fn a_batch_that_cannot_wake_the_model_answers_with_retry() {
+        use crate::application::engine::{OUT_OF_MEMORY_RETRY_AFTER_MS, RebuildError, Residency};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (model, _rec) = FakeModel::new();
+        let room = Arc::new(AtomicBool::new(false));
+        let rebuild = {
+            let room = Arc::clone(&room);
+            Arc::new(move || {
+                if !room.load(Ordering::Relaxed) {
+                    return Err(RebuildError::OutOfDeviceMemory(
+                        "cudarc: DriverError(CUDA_ERROR_OUT_OF_MEMORY, \"out of memory\")".into(),
+                    ));
+                }
+                let (model, _) = FakeModel::new();
+                Ok(Residency::new(Arc::new(model), None, None, None, None))
+            })
+        };
+        let engine = Arc::new(Engine::with_residency(
+            Residency::new(Arc::new(model), None, None, None, None),
+            Some(rebuild),
+            Arc::new(FakeTokenizer),
+            vec![FAKE_EOS],
+            limits(),
+            crate::infrastructure::torch::Device::Cpu,
+        ));
+        engine.release_residency();
+        assert!(!engine.is_resident());
+        let dispatcher = Dispatcher::new(Arc::clone(&engine));
+
+        let (reply, rx) = oneshot::channel();
+        let mut refused = job(&engine, 1, "ab", 1);
+        refused.reply = reply;
+        assert!(dispatcher.submit(refused).is_ok());
+        match rx.blocking_recv().unwrap() {
+            Err(JobError::OutOfDeviceMemory { retry_after_ms, .. }) => {
+                assert_eq!(retry_after_ms, OUT_OF_MEMORY_RETRY_AFTER_MS)
+            }
+            other => panic!("expected the retryable branch, got {other:?}"),
+        }
+        assert!(
+            !engine.is_resident(),
+            "the failed batch must leave the engine cold for the retry"
+        );
+
+        room.store(true, Ordering::Relaxed);
+        let (reply, rx) = oneshot::channel();
+        let mut served = job(&engine, 2, "ab", 2);
+        served.reply = reply;
+        assert!(dispatcher.submit(served).is_ok());
+        let g = rx
+            .blocking_recv()
+            .unwrap()
+            .expect("the retry after memory came back is served");
+        assert_eq!(g.uid, 2);
+        drop(dispatcher);
     }
 
     /// Submit N jobs at once; the worker must run them through one batched

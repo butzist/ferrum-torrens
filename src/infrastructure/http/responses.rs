@@ -55,7 +55,7 @@ pub(crate) fn responses_stream_body(
                     vec![stream.failed("the generation was aborted")]
                 }
                 Ok(Ok(g)) => stream.finish(&g),
-                Ok(Err(msg)) => vec![stream.failed(&msg)],
+                Ok(Err(e)) => vec![stream.failed(&e.message())],
                 Err(_) => vec![stream.failed("the engine worker dropped the request")],
             }
         };
@@ -113,6 +113,7 @@ pub(crate) async fn responses(
     };
 
     if streaming {
+        state.ensure_resident().await?;
         return Ok(responses_stream_body(&state, request, &req));
     }
 
@@ -152,6 +153,10 @@ impl From<EngineError> for ApiError {
                 "the server is finishing another request; retry when it is idle",
                 retry_after_ms.div_ceil(1000),
             ),
+            OutOfDeviceMemory {
+                retry_after_ms,
+                detail,
+            } => ApiError::out_of_device_memory(&detail, retry_after_ms),
             Tokenize(m) => ApiError::bad_request(format!("prompt could not be tokenized: {m}")),
             Chat(m) => ApiError::bad_request(m),
             Vision(m) => ApiError::unprocessable(m),
@@ -161,6 +166,15 @@ impl From<EngineError> for ApiError {
             NoParams(uid) => ApiError::unprocessable(format!("no sampling parameters for {uid}")),
             // Engine-side faults, not anything the caller can fix: the cache is
             // a server resource and its bookkeeping failing is a server bug.
+            // A device allocation that ran out of memory mid-request is the same
+            // retryable condition as a failed rebuild, whichever port reported
+            // it (KV pool growth, expert-bank staging).
+            KvCache(m) if is_out_of_memory(&m) => {
+                ApiError::out_of_device_memory(&m, OUT_OF_MEMORY_RETRY_AFTER_MS)
+            }
+            Moe(crate::domain::expert_kernel::MoEError::OutOfMemory(m)) => {
+                ApiError::out_of_device_memory(&m, OUT_OF_MEMORY_RETRY_AFTER_MS)
+            }
             e @ (NoKvCache
             | EmptyStep { .. }
             | CacheOutOfStep { .. }
@@ -171,6 +185,22 @@ impl From<EngineError> for ApiError {
             | NotResident
             | Rebuild(_)
             | Moe(_)) => ApiError::unprocessable(format!("engine kv cache: {e}")),
+        }
+    }
+}
+
+/// A job that did not produce a generation. The worker classifies a failed
+/// residency rebuild (an idle release that cannot find GPU memory) as
+/// retryable, so the client gets the same 503 + `Retry-After` as the busy
+/// paths instead of a generic error.
+impl From<JobError> for ApiError {
+    fn from(e: JobError) -> Self {
+        match e {
+            JobError::OutOfDeviceMemory {
+                retry_after_ms,
+                detail,
+            } => ApiError::out_of_device_memory(&detail, retry_after_ms),
+            JobError::Failed(m) => ApiError::unprocessable(format!("generation failed: {m}")),
         }
     }
 }

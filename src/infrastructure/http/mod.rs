@@ -21,9 +21,10 @@ use futures_core::Stream;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use crate::application::dispatcher::{Dispatcher, IdlePolicy, Job};
-use crate::application::engine::{Engine, EngineError};
+use crate::application::dispatcher::{Dispatcher, IdlePolicy, Job, JobError};
+use crate::application::engine::{Engine, EngineError, OUT_OF_MEMORY_RETRY_AFTER_MS};
 use crate::application::generation::{self, Request, make_request};
+use crate::domain::expert_kernel::is_out_of_device_memory as is_out_of_memory;
 use crate::domain::sampling::SamplingParams;
 use crate::domain::scheduler::FinishReason;
 use crate::domain::{ChatMessage, ChatTool, ChatToolCall};
@@ -53,6 +54,25 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Put the device model back before a response stream starts.
+    ///
+    /// A stream's headers go out before the worker touches the device, so an
+    /// idle-released engine that cannot find GPU memory has to fail here: the
+    /// worker's own classification would arrive after the 200, as an in-stream
+    /// error frame a client cannot retry on. A resident engine answers from a
+    /// lock read, so the hot path costs nothing.
+    pub(crate) async fn ensure_resident(&self) -> Result<(), ApiError> {
+        if self.engine.is_resident() {
+            return Ok(());
+        }
+        let engine = Arc::clone(&self.engine);
+        match tokio::task::spawn_blocking(move || engine.rehydrate()).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => Err(ApiError::from(e)),
+            Err(_) => Err(ApiError::unprocessable("the engine worker is not running")),
+        }
+    }
+
     pub fn new(engine: Arc<Engine>, served_model_name: String) -> Self {
         Self::with_idle_timeout(engine, served_model_name, 600)
     }
@@ -2063,6 +2083,77 @@ mod tests {
         );
     }
 
+    /// A streaming request must be refused on the response line, not inside a
+    /// `200` SSE body: the handler puts the residency back before the headers,
+    /// so a full GPU is a status the client's retry loop can act on.
+    #[tokio::test]
+    async fn a_stream_needing_the_device_is_refused_before_the_stream() {
+        use crate::application::engine::fake::{FAKE_EOS, FakeModel, FakeTokenizer};
+        use crate::application::engine::{RebuildError, Residency};
+        use crate::infrastructure::torch::Device;
+
+        let (model, _rec) = FakeModel::new();
+        let engine = Engine::with_residency(
+            Residency::new(Arc::new(model), None, None, None, None),
+            Some(Arc::new(|| {
+                Err(RebuildError::OutOfDeviceMemory(
+                    "cuda: out of memory".into(),
+                ))
+            })),
+            Arc::new(FakeTokenizer),
+            vec![FAKE_EOS],
+            limits(),
+            Device::Cpu,
+        );
+        engine.release_residency();
+        let state = AppState::new(Arc::new(engine), "test-model".into());
+
+        let err = state
+            .ensure_resident()
+            .await
+            .expect_err("the GPU is full, so the stream must not open");
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.retry_after, Some(5));
+    }
+
+    /// An idle-released engine that cannot rebuild because the GPU is full is a
+    /// retry, not a fault: 503 with a whole-second `Retry-After`, and a body
+    /// code a client can branch on.
+    #[tokio::test]
+    async fn an_out_of_memory_rebuild_answers_503_with_retry_after() {
+        let err = ApiError::from(EngineError::OutOfDeviceMemory {
+            retry_after_ms: 5_000,
+            detail: "cudarc: DriverError(CUDA_ERROR_OUT_OF_MEMORY, \"out of memory\")".into(),
+        });
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.code, "out_of_device_memory");
+        assert_eq!(err.retry_after, Some(5));
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("5")
+        );
+    }
+
+    /// The same condition after the worker hop keeps its status: the reply is
+    /// a classified `JobError`, not a flattened message the handler would turn
+    /// into a 422.
+    #[test]
+    fn a_job_that_lost_the_device_keeps_its_retry_hint() {
+        let err = ApiError::from(
+            crate::application::dispatcher::JobError::OutOfDeviceMemory {
+                retry_after_ms: 5_000,
+                detail: "cuda: out of memory".into(),
+            },
+        );
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.retry_after, Some(5));
+    }
+
     /// Idle is the normal case: no image request is ever refused while nothing
     /// is on the device.
     #[tokio::test]
@@ -2163,6 +2254,20 @@ impl ApiError {
             code: "busy",
             message: message.into(),
             retry_after: Some(retry_after.max(1)),
+        }
+    }
+
+    /// An idle-released engine could not rebuild: the GPU has no free memory
+    /// for it right now. This is not the caller's fault and not a server bug --
+    /// another process is holding VRAM -- so it is a 503 the client retries,
+    /// with a `Retry-After` so it backs off instead of hammering the rebuild.
+    fn out_of_device_memory(detail: &str, retry_after_ms: u64) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            kind: "server_error",
+            code: "out_of_device_memory",
+            message: format!("the GPU has no free memory: {detail}"),
+            retry_after: Some(retry_after_ms.div_ceil(1000).max(1)),
         }
     }
 }

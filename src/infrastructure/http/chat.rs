@@ -108,7 +108,8 @@ pub(crate) fn stream_body(
                     let _ = final_tx.try_send(sse_data("[DONE]"));
                 }
             }
-            Ok(Err(msg)) => {
+            Ok(Err(e)) => {
+                let msg = e.message();
                 let _ = final_tx.try_send(final_frames.error(&msg));
                 let _ = final_tx.try_send(sse_data("[DONE]"));
             }
@@ -202,6 +203,7 @@ pub(crate) async fn chat_completions(
     };
 
     if streaming {
+        state.ensure_resident().await?;
         return Ok(stream_body(&state, request, Wire::Chat));
     }
 

@@ -7,6 +7,17 @@
 use crate::domain::numerics::{e4m3fn_to_f32, f16_to_f32, fp4_nibble};
 use thiserror::Error;
 
+/// Whether an error text describes an allocation that ran out of device memory.
+///
+/// Two spellings reach this engine: cudarc renders the driver result as
+/// `DriverError(CUDA_ERROR_OUT_OF_MEMORY, "out of memory")`, while our own
+/// driver path carries the `cuGetErrorString` text, which is `out of memory`.
+/// Both are stable across CUDA 12/13 and mean the same retryable condition, so
+/// the classification lives next to `MoEError` instead of in each adapter.
+pub fn is_out_of_device_memory(text: &str) -> bool {
+    text.contains("CUDA_ERROR_OUT_OF_MEMORY") || text.contains("out of memory")
+}
+
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum MoEError {
     #[error("moe: {0}")]
@@ -16,6 +27,11 @@ pub enum MoEError {
     /// The checkpoint has no such expert-bank entry.
     #[error("moe: no expert bank entry {entry}")]
     Missing { entry: String },
+    /// A device allocation for the expert cache failed because the GPU has no
+    /// free memory. Distinct from `Bad` because the server answers it with a
+    /// retryable 503 instead of treating it as a fault.
+    #[error("moe: out of device memory: {0}")]
+    OutOfMemory(String),
     /// The bytes behind an entry could not be read; `why` is the reader port's
     /// own message, kept verbatim so the shard/file detail survives.
     #[error("moe: read {entry}: {why}")]
@@ -560,6 +576,23 @@ fn gemv_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two spellings the engine actually sees, plus the near misses that
+    /// must stay ordinary faults. The first string is the idle-release OOM this
+    /// classifier exists for.
+    #[test]
+    fn out_of_memory_texts_are_recognized() {
+        assert!(is_out_of_device_memory(
+            "cudarc: DriverError(CUDA_ERROR_OUT_OF_MEMORY, \"out of memory\")"
+        ));
+        assert!(is_out_of_device_memory("cuda: out of memory"));
+        assert!(!is_out_of_device_memory(
+            "cudarc: DriverError(CUDA_ERROR_INVALID_VALUE, \"invalid argument\")"
+        ));
+        assert!(!is_out_of_device_memory(
+            "moe: no expert bank entry down#L00003"
+        ));
+    }
 
     #[test]
     fn routes_flatten_token_major() {

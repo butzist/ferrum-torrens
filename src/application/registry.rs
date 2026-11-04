@@ -24,6 +24,25 @@ pub enum RegistryError {
     Unsupported(String),
     #[error("model construction failed: {0}")]
     Build(String),
+    /// The device had no free memory for the model. Kept apart from `Build`
+    /// because the server answers it with a retryable 503 rather than a fault:
+    /// an idle-released engine simply rebuilds once memory is available again.
+    #[error("the GPU has no free memory for the model: {0}")]
+    OutOfDeviceMemory(String),
+}
+
+impl RegistryError {
+    /// Classify a construction failure: a device out-of-memory report is
+    /// retryable, anything else is a real fault. Every device-touching site
+    /// funnels through here so the distinction survives to the HTTP layer.
+    pub fn build(e: impl std::fmt::Display) -> Self {
+        let text = e.to_string();
+        if crate::domain::expert_kernel::is_out_of_device_memory(&text) {
+            Self::OutOfDeviceMemory(text)
+        } else {
+            Self::Build(text)
+        }
+    }
 }
 
 /// A model plus the capture service the composition root built over its own KV
@@ -93,7 +112,7 @@ pub fn build(
                 // it takes the parsed params plus the reader rather than the
                 // scalar path's pre-loaded dense store.
                 let params = crate::models::qwen3_6::config::parse_text_config(tc)
-                    .map_err(|e| RegistryError::Build(e.to_string()))?;
+                    .map_err(RegistryError::build)?;
                 let capture = config.model.cuda_graph && config.kernel.triton && device.is_cuda();
                 if config.model.cuda_graph && !capture {
                     eprintln!(
@@ -119,7 +138,7 @@ pub fn build(
                     reader.clone(),
                     rt.clone(),
                 )
-                .map_err(RegistryError::Build)?;
+                .map_err(RegistryError::build)?;
                 // Load the tower with the MoE port detached: the auto cache
                 // budget (item 12) reads the free VRAM after the tower, the KV
                 // pool and the ports are all resident, then sizes the expert
@@ -134,7 +153,7 @@ pub fn build(
                     fp8_linear,
                     cache.clone(),
                 )
-                .map_err(|e| RegistryError::Build(e.to_string()))?;
+                .map_err(RegistryError::build)?;
                 let slots = resolve_cache_slots(config, &params, device, Some(driver.as_ref()))?;
                 let moe = moe_port(
                     config,
@@ -219,7 +238,7 @@ fn scalar_built(
         recapture: None,
         model: Arc::new(
             Qwen3_6::from_text_config(tc, index.clone(), reader.clone())
-                .map_err(|e| RegistryError::Build(e.to_string()))?,
+                .map_err(RegistryError::build)?,
         ),
         moe: None,
         cache_size_slots: config
@@ -248,12 +267,12 @@ pub fn load_vision(
         .and_then(Value::as_u64)
         .and_then(|v| u32::try_from(v).ok())
         .ok_or_else(|| {
-            RegistryError::Build("vision_config present but image_token_id is not a u32".into())
+            RegistryError::build("vision_config present but image_token_id is not a u32")
         })?;
-    let vcfg = crate::models::qwen3_6::config::parse_vision_config(vc)
-        .map_err(|e| RegistryError::Build(e.to_string()))?;
+    let vcfg =
+        crate::models::qwen3_6::config::parse_vision_config(vc).map_err(RegistryError::build)?;
     let weights = crate::models::qwen3_6::weights::VisionWeights::load(&index, reader.as_ref())
-        .map_err(|e| RegistryError::Build(e.to_string()))?;
+        .map_err(RegistryError::build)?;
     let tower = crate::models::qwen3_6::vision::VisionTower::new(vcfg, weights);
     Ok(Some(std::sync::Arc::new(
         crate::models::qwen3_6::vision::Qwen3_6Vision::new(tower, id),
@@ -274,7 +293,7 @@ fn capture_decode(
     use crate::domain::kvcache::KvCache;
     use crate::infrastructure::decode_buffers::DecodeBuffers;
 
-    let build_err = |e: String| RegistryError::Build(e);
+    let build_err = |e: String| RegistryError::build(e);
     let mut padding_cache = cache.begin();
     cache
         .reserve(&mut padding_cache, 1)
@@ -300,7 +319,7 @@ fn capture_decode(
             |bufs: &DecodeBuffers| model.forward_decode_into(bufs).map_err(|e| e.to_string()),
         )
     }
-    .map_err(|e| RegistryError::Build(e.to_string()))
+    .map_err(RegistryError::build)
 }
 
 /// The batch sizes to capture: `1`, `2`, `4` and `max_running`, deduplicated and
@@ -374,7 +393,7 @@ fn moe_port(
     if !config.kernel.triton {
         return Ok(None);
     }
-    let build_err = |e: String| RegistryError::Build(e);
+    let build_err = |e: String| RegistryError::build(e);
     let shapes = ExpertShapes::new(params.hidden_size, params.moe_intermediate_size)
         .map_err(|e| build_err(e.to_string()))?;
     // One `Mutex<CudaMoE>` is both ports: the store stages into it and the gemm
@@ -447,7 +466,7 @@ fn resolve_cache_slots(
         // No device to budget from: keep the conservative explicit default.
         return Ok(crate::config::DEFAULT_CACHE_SIZE_SLOTS);
     };
-    let build_err = |e: String| RegistryError::Build(e);
+    let build_err = |e: String| RegistryError::build(e);
     // Free VRAM as the driver sees it: the tower, the KV pool and the moe ports
     // are already resident, so this is exactly the expert-cache budget.
     let owned = match lib {
@@ -516,7 +535,7 @@ fn head_port(
     use crate::infrastructure::cuda_linear::DenseGemv;
     match device {
         Device::Cuda(_) => Ok(Some(Arc::new(
-            DenseGemv::new(device, stream).map_err(|e| RegistryError::Build(e.to_string()))?,
+            DenseGemv::new(device, stream).map_err(RegistryError::build)?,
         ))),
         _ => Ok(None),
     }
@@ -533,7 +552,7 @@ fn fp8_port(
     use crate::infrastructure::cuda_linear::Fp8Linear;
     match device {
         Device::Cuda(_) => Ok(Some(Arc::new(
-            Fp8Linear::new(device, stream).map_err(|e| RegistryError::Build(e.to_string()))?,
+            Fp8Linear::new(device, stream).map_err(RegistryError::build)?,
         ))),
         _ => Ok(None),
     }
@@ -555,8 +574,7 @@ pub fn build_scalar(
                 .get("text_config")
                 .ok_or(RegistryError::NoArch)?;
             Ok(Box::new(
-                Qwen3_6::from_text_config(tc, index, reader)
-                    .map_err(|e| RegistryError::Build(e.to_string()))?,
+                Qwen3_6::from_text_config(tc, index, reader).map_err(RegistryError::build)?,
             ))
         }
         other => Err(RegistryError::Unsupported(other.to_string())),

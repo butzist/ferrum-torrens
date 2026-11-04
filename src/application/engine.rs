@@ -10,10 +10,10 @@ use std::sync::Arc;
 use crate::domain::decode::{CapturedDecode, DecodeError, DecodeRow};
 use crate::domain::kvcache::{CachedModel, KvCache, SequenceCache};
 use crate::domain::model::{EncodedImage, ForwardInput, LayerProbe, ModelParams, MropeParams};
-use crate::models::qwen3_6::mrope::ImageRun;
 use crate::domain::sampling::{Rng, SamplingParams, sample};
 use crate::domain::tokenizer::{ChatMessage, Tokenizer, TokenizerError};
 use crate::infrastructure::torch::{CudaProbe, Device, DeviceRequest};
+use crate::models::qwen3_6::mrope::ImageRun;
 
 #[derive(Debug, Clone, Copy)]
 pub struct EngineLimits {
@@ -70,6 +70,11 @@ pub enum EngineError {
     NotResident,
     #[error("rebuilding the device model failed: {0}")]
     Rebuild(String),
+    /// The device model is not resident (an idle release dropped it) and the
+    /// GPU has no free memory to rebuild it. Retryable: another process is
+    /// holding VRAM, so the answer is a 503 with `Retry-After`, not a fault.
+    #[error("the GPU has no free memory for the device model: {detail}")]
+    OutOfDeviceMemory { retry_after_ms: u64, detail: String },
     #[error("moe: {0}")]
     Moe(#[from] crate::domain::expert_kernel::MoEError),
 }
@@ -221,13 +226,40 @@ impl Residency {
     }
 }
 
+/// How long a client is told to wait after a rebuild found the GPU full. Short
+/// enough that a transient holder (a short-lived trainer, a desktop compositor
+/// spike) clears, long enough that a retry storm does not re-run the rebuild
+/// upload on every request. The condition is a foreign process's, so there is
+/// no per-request estimate like the busy path's.
+pub const OUT_OF_MEMORY_RETRY_AFTER_MS: u64 = 5_000;
+
+/// Why a residency rebuild failed. The engine maps the memory case onto a
+/// retryable `EngineError` instead of flattening it into a string, so an idle
+/// release that cannot find VRAM answers 503 rather than 4xx/5xx-fault.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RebuildError {
+    /// The GPU had no free memory for the tower, KV pool or expert cache.
+    OutOfDeviceMemory(String),
+    /// Anything else: a corrupt checkpoint, a kernel/manifest mismatch, IO.
+    Failed(String),
+}
+
+impl std::fmt::Display for RebuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OutOfDeviceMemory(m) => write!(f, "{m}"),
+            Self::Failed(m) => write!(f, "{m}"),
+        }
+    }
+}
+
 pub struct Engine {
     /// The device model, or `None` after an idle release. `residency()` rebuilds
     /// it on demand through `rebuild`.
     residency: std::sync::RwLock<Option<Arc<Residency>>>,
     /// Rebuilds the device model from the checkpoint after `release_residency`.
     /// `None` for an engine that owns its model forever (every unit test).
-    rebuild: Option<Arc<dyn Fn() -> Result<Residency, String> + Send + Sync>>,
+    rebuild: Option<Arc<dyn Fn() -> Result<Residency, RebuildError> + Send + Sync>>,
     /// Host-only model shape, kept across a residency release so `params()` and
     /// the engine limits still answer while the device is cold.
     params: ModelParams,
@@ -528,7 +560,7 @@ pub fn load_engine(config: &crate::config::Config) -> Result<Engine, LoadError> 
     // A released residency is rebuilt from the index and reader already open,
     // so giving the GPU back costs a tower upload and a capture, not a re-read
     // of the checkpoint index.
-    let rebuild: Arc<dyn Fn() -> Result<Residency, String> + Send + Sync> = {
+    let rebuild: Arc<dyn Fn() -> Result<Residency, RebuildError> + Send + Sync> = {
         let config = config.clone();
         let index = std::sync::Arc::clone(&index);
         let reader = reader.clone();
@@ -541,7 +573,12 @@ pub fn load_engine(config: &crate::config::Config) -> Result<Engine, LoadError> 
                 device,
                 &config,
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| match e {
+                crate::application::registry::RegistryError::OutOfDeviceMemory(detail) => {
+                    RebuildError::OutOfDeviceMemory(detail)
+                }
+                other => RebuildError::Failed(other.to_string()),
+            })?;
             Ok(Residency::new(
                 built.model,
                 built.vision,
@@ -603,7 +640,7 @@ impl Engine {
     /// service over the model's own KV pool.
     pub fn with_residency(
         residency: Residency,
-        rebuild: Option<Arc<dyn Fn() -> Result<Residency, String> + Send + Sync>>,
+        rebuild: Option<Arc<dyn Fn() -> Result<Residency, RebuildError> + Send + Sync>>,
         tokenizer: Arc<dyn Tokenizer>,
         eos_ids: Vec<u32>,
         limits: EngineLimits,
@@ -655,14 +692,22 @@ impl Engine {
     }
 
     /// Rebuild the released device model through the composition root's
-    /// closure. A no-op when it is already resident.
+    /// closure. A no-op when it is already resident. A GPU that is full is a
+    /// retryable condition, not a fault: the slot stays empty so the next
+    /// request tries again.
     pub fn rehydrate(&self) -> Result<Arc<Residency>, EngineError> {
         let mut slot = self.residency.write().expect("residency lock");
         if let Some(res) = slot.as_ref() {
             return Ok(Arc::clone(res));
         }
         let rebuild = self.rebuild.as_ref().ok_or(EngineError::NotResident)?;
-        let res = Arc::new(rebuild().map_err(EngineError::Rebuild)?);
+        let res = Arc::new(rebuild().map_err(|e| match e {
+            RebuildError::OutOfDeviceMemory(detail) => EngineError::OutOfDeviceMemory {
+                retry_after_ms: OUT_OF_MEMORY_RETRY_AFTER_MS,
+                detail,
+            },
+            RebuildError::Failed(m) => EngineError::Rebuild(m),
+        })?);
         *slot = Some(Arc::clone(&res));
         Ok(res)
     }
@@ -725,7 +770,15 @@ impl Engine {
             return Ok(());
         };
         if let Some(moe) = &res.moe {
-            moe.rehydrate_cache().map_err(EngineError::Moe)?;
+            moe.rehydrate_cache().map_err(|e| match e {
+                crate::domain::expert_kernel::MoEError::OutOfMemory(detail) => {
+                    EngineError::OutOfDeviceMemory {
+                        retry_after_ms: OUT_OF_MEMORY_RETRY_AFTER_MS,
+                        detail,
+                    }
+                }
+                other => EngineError::Moe(other),
+            })?;
         }
         let mut slot = res.captured.lock().expect("captured lock");
         if slot.is_none()
@@ -1622,6 +1675,19 @@ mod tests {
         assert_eq!(l.max_prefill_length, 512);
     }
 
+    #[test]
+    fn a_page_size_other_than_one_is_rejected() {
+        // Config parsing already refuses page_size != 1, so the loader guard is
+        // reached by mutating a parsed config past validation.
+        let mut cfg = config_with_page_size(1);
+        cfg.model.page_size = 16;
+        assert!(matches!(
+            engine_limits_from_config(&cfg),
+            Err(LoadError::PageSize(16))
+        ));
+        assert!(engine_limits_from_config(&config_with_page_size(1)).is_ok());
+    }
+
     const PAD: u32 = fake::FAKE_IMAGE_PAD;
 
     fn fake_vision() -> Arc<dyn crate::domain::model::VisionTower> {
@@ -1649,7 +1715,14 @@ mod tests {
         assert_eq!(splice.positions, vec![1, 2, 3, 4]);
         assert_eq!(
             splice.triples,
-            vec![[0, 0, 0], [1, 1, 1], [1, 1, 2], [1, 2, 1], [1, 2, 2], [3, 3, 3]]
+            vec![
+                [0, 0, 0],
+                [1, 1, 1],
+                [1, 1, 2],
+                [1, 2, 1],
+                [1, 2, 2],
+                [3, 3, 3]
+            ]
         );
         assert_eq!(splice.delta, -2, "max position 3 + 1 - 6 prompt tokens");
     }
@@ -1677,19 +1750,6 @@ mod tests {
             matches!(got, Err(EngineError::Vision(msg)) if msg.contains("merged grid")),
             "the row count must match the grid the triples are built from"
         );
-    }
-
-    #[test]
-    fn a_page_size_other_than_one_is_rejected() {
-        // Config parsing already refuses page_size != 1, so the loader guard is
-        // reached by mutating a parsed config past validation.
-        let mut cfg = config_with_page_size(1);
-        cfg.model.page_size = 16;
-        assert!(matches!(
-            engine_limits_from_config(&cfg),
-            Err(LoadError::PageSize(16))
-        ));
-        assert!(engine_limits_from_config(&config_with_page_size(1)).is_ok());
     }
 
     #[test]
@@ -1834,5 +1894,63 @@ mod tests {
             ),
             "device = \"cuda\" must be rejected in a build without a compute backend"
         );
+    }
+
+    /// An idle-released engine that cannot rebuild because the GPU is full is a
+    /// retryable condition: the error is the memory branch with a backoff, the
+    /// engine stays cold (nothing half-built is published), repeating the call
+    /// answers the same way, and the first call that finds room succeeds.
+    #[test]
+    fn a_rebuild_without_gpu_memory_is_retryable_and_leaves_the_engine_cold() {
+        let (model, _rec) = fake::FakeModel::new();
+        let residency = Residency::new(Arc::new(model), None, None, None, None);
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let room = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let rebuild: Arc<dyn Fn() -> Result<Residency, RebuildError> + Send + Sync> = {
+            let attempts = Arc::clone(&attempts);
+            let room = Arc::clone(&room);
+            Arc::new(move || {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if !room.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(RebuildError::OutOfDeviceMemory(
+                        "cudarc: DriverError(CUDA_ERROR_OUT_OF_MEMORY, \"out of memory\")".into(),
+                    ));
+                }
+                let (model, _) = fake::FakeModel::new();
+                Ok(Residency::new(Arc::new(model), None, None, None, None))
+            })
+        };
+        let engine = Engine::with_residency(
+            residency,
+            Some(rebuild),
+            Arc::new(fake::FakeTokenizer),
+            vec![fake::FAKE_EOS],
+            fake::limits(),
+            Device::Cpu,
+        );
+        engine.release_residency();
+        assert!(!engine.is_resident());
+
+        for _ in 0..2 {
+            let err = match engine.rehydrate() {
+                Ok(_) => panic!("the GPU has no room, so the rebuild must fail"),
+                Err(e) => e,
+            };
+            match err {
+                EngineError::OutOfDeviceMemory { retry_after_ms, .. } => {
+                    assert_eq!(retry_after_ms, OUT_OF_MEMORY_RETRY_AFTER_MS)
+                }
+                other => panic!("expected the retryable branch, got {other:?}"),
+            }
+            assert!(
+                !engine.is_resident(),
+                "a failed rebuild must not publish a half-built residency"
+            );
+        }
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 2);
+
+        room.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(engine.rehydrate().is_ok(), "the retry must succeed");
+        assert!(engine.is_resident());
     }
 }

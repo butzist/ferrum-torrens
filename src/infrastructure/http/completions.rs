@@ -39,6 +39,7 @@ pub(crate) async fn completions(
     let request = make_request(&engine, uid, ids, params, seed)?;
 
     if stream {
+        state.ensure_resident().await?;
         return Ok(chat::stream_body(&state, request, Wire::Text));
     }
 
@@ -82,7 +83,7 @@ pub(crate) async fn dispatch(
     }
     match rx.await {
         Ok(Ok(g)) => Ok(g),
-        Ok(Err(msg)) => Err(ApiError::unprocessable(format!("generation failed: {msg}"))),
+        Ok(Err(e)) => Err(ApiError::from(e)),
         Err(_) => Err(ApiError::unprocessable(
             "the engine worker dropped the request",
         )),
