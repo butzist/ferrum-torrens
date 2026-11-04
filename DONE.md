@@ -4415,3 +4415,17 @@ subsection names are kept verbatim.
        chain `part()`, with bf16 relating only the smoke answer's own tolerance.
        Budget note: the f32 tower's weight upload (~1.7 GiB) increases the 
        expert-cache auto-sizing.
+
+140. **A busy device answers 503 + `Retry-After`, not a queued image request**
+     (2026-11-04). `EngineError::Busy { retry_after_ms }` maps to an
+     `ApiError` with `SERVICE_UNAVAILABLE`, `code = "busy"` and a whole-second
+     `Retry-After` header. `Dispatcher` tracks whether a batch is on the device
+     (`AtomicBool`, set around `run_jobs`) and exposes `retry_after_ms()`, a
+     coarse upper bound derived from the measured `DECODE_MS_PER_TOKEN = 33`
+     (`OPTIMIZATION.md`) times `max_output_tokens`. `chat_completions` refuses
+     an image request while that flag is set, so the client retries when the
+     residency is idle instead of queueing behind a batch whose remaining time
+     cannot be bounded tightly. Unit gates:
+     `a_busy_engine_answers_503_with_retry_after`, `an_idle_dispatcher_is_not_busy`.
+     Device check: a long text request in flight makes an image request answer
+     `503` with `retry-after: 2`; an idle server serves the same image normally.

@@ -1464,6 +1464,8 @@ pub struct ApiError {
     pub kind: &'static str,
     pub code: &'static str,
     pub message: String,
+    /// Seconds the client should wait before retrying, emitted as `Retry-After`.
+    pub retry_after: Option<u64>,
 }
 
 impl ApiError {
@@ -1473,6 +1475,7 @@ impl ApiError {
             kind: "invalid_request_error",
             code: "invalid_request",
             message: message.into(),
+            retry_after: None,
         }
     }
 
@@ -1482,6 +1485,7 @@ impl ApiError {
             kind: "invalid_request_error",
             code: "model_not_found",
             message: message.into(),
+            retry_after: None,
         }
     }
 
@@ -1491,6 +1495,20 @@ impl ApiError {
             kind: "invalid_request_error",
             code: "unsupported_value",
             message: message.into(),
+            retry_after: None,
+        }
+    }
+
+    /// The server cannot serve this request yet without disturbing work that is
+    /// already on the device. `retry_after` is a whole-second estimate; the
+    /// client should back off and retry rather than treat it as a bad request.
+    fn busy(message: impl Into<String>, retry_after: u64) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            kind: "server_error",
+            code: "busy",
+            message: message.into(),
+            retry_after: Some(retry_after.max(1)),
         }
     }
 }
@@ -1503,6 +1521,10 @@ impl From<EngineError> for ApiError {
             PromptTooLong { len, max } => {
                 ApiError::unprocessable(format!("prompt has {len} tokens, over the {max} limit"))
             }
+            Busy { retry_after_ms } => ApiError::busy(
+                "the server is finishing another request; retry when it is idle",
+                retry_after_ms.div_ceil(1000),
+            ),
             Tokenize(m) => ApiError::bad_request(format!("prompt could not be tokenized: {m}")),
             Chat(m) => ApiError::bad_request(m),
             Vision(m) => ApiError::unprocessable(m),
@@ -1532,7 +1554,14 @@ impl IntoResponse for ApiError {
                 code: self.code,
             },
         };
-        (self.status, Json(body)).into_response()
+        let retry_after = self.retry_after;
+        let mut response = (self.status, Json(body)).into_response();
+        if let Some(secs) = retry_after
+            && let Ok(value) = secs.to_string().parse()
+        {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+        response
     }
 }
 
@@ -2067,6 +2096,15 @@ async fn chat_completions(
         for img in turn.image_parts()? {
             images.push(img.bytes);
         }
+    }
+    // An image request borrows the device residency for its tower pass, so it
+    // must not start while a batch owns it. Tell the client to retry instead of
+    // queueing behind work whose remaining time we cannot bound tightly.
+    if !images.is_empty() && state.dispatcher.busy() {
+        return Err(ApiError::busy(
+            "the device is serving another request; retry when it is idle",
+            state.dispatcher.retry_after_ms().div_ceil(1000),
+        ));
     }
 
     // Rendering the template and tokenizing it both run off the runtime, and both
@@ -3188,5 +3226,35 @@ mod tests {
         assert_eq!(emitted, 0);
         out.push_str(flush.as_deref().unwrap_or(""));
         assert_eq!(out, "<tool_call><function=x>");
+    }
+
+    /// A busy engine answers 503 with a whole-second `Retry-After`; the body
+    /// keeps the OpenAI error shape so clients that parse it still do.
+    #[tokio::test]
+    async fn a_busy_engine_answers_503_with_retry_after() {
+        let err = ApiError::from(EngineError::Busy {
+            retry_after_ms: 1_056,
+        });
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.retry_after, Some(2));
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("2")
+        );
+    }
+
+    /// Idle is the normal case: no image request is ever refused while nothing
+    /// is on the device.
+    #[tokio::test]
+    async fn an_idle_dispatcher_is_not_busy() {
+        let (engine, _rec) = test_engine(limits());
+        let dispatcher = Dispatcher::new(Arc::new(engine));
+        assert!(!dispatcher.busy());
+        assert!(dispatcher.retry_after_ms() > 0);
     }
 }

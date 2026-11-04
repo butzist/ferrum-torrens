@@ -12,6 +12,7 @@
 // concurrent serving safe as well as batched.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -26,6 +27,12 @@ use crate::application::generation::{self, Generation, Request, SinkSet};
 /// against a decode step (~50 ms) so it coalesces bursts without adding latency
 /// to a lone request.
 const BATCH_WINDOW: Duration = Duration::from_millis(2);
+
+/// Measured decode cost on the reference GPU (`OPTIMIZATION.md`: captured
+/// decode at the auto cache is ~33 ms/token). The busy estimate is a bound on
+/// how long a queued request's generation can take, so it uses the slow end of
+/// the measured band rather than the best case.
+const DECODE_MS_PER_TOKEN: u64 = 33;
 
 /// A streaming sink the worker calls per token, tagged with the request uid so a
 /// batch can mix streaming and non-streaming jobs.
@@ -43,20 +50,40 @@ pub struct Job {
 pub struct Dispatcher {
     tx: Mutex<Option<Sender<Job>>>,
     handle: Option<thread::JoinHandle<()>>,
+    busy: Arc<AtomicBool>,
+    retry_after_ms: u64,
 }
 
 impl Dispatcher {
     /// Spawn the worker over `engine`. Every forward in the process runs here.
     pub fn new(engine: Arc<Engine>) -> Self {
         let (tx, rx) = std::sync::mpsc::channel::<Job>();
+        let busy = Arc::new(AtomicBool::new(false));
+        let worker_busy = Arc::clone(&busy);
+        let retry_after_ms = engine.limits().max_output_tokens as u64 * DECODE_MS_PER_TOKEN;
         let handle = thread::Builder::new()
             .name("ferrum-dispatch".into())
-            .spawn(move || worker(engine, rx))
+            .spawn(move || worker(engine, rx, worker_busy))
             .expect("the dispatcher thread spawns");
         Self {
             tx: Mutex::new(Some(tx)),
             handle: Some(handle),
+            busy,
+            retry_after_ms,
         }
+    }
+
+    /// Whether a batch is on the device right now. A request that needs the
+    /// residency for itself (an image request borrowing the MoE cache) must not
+    /// start while this is true.
+    pub fn busy(&self) -> bool {
+        self.busy.load(Ordering::Relaxed)
+    }
+
+    /// Coarse upper bound for the current batch, in milliseconds, derived from
+    /// the measured decode cost and the configured output limit.
+    pub fn retry_after_ms(&self) -> u64 {
+        self.retry_after_ms
     }
 
     /// Queue a job. `Err(job)` means the worker is gone (a shutdown race).
@@ -80,7 +107,7 @@ impl Drop for Dispatcher {
     }
 }
 
-fn worker(engine: Arc<Engine>, rx: Receiver<Job>) {
+fn worker(engine: Arc<Engine>, rx: Receiver<Job>, busy: Arc<AtomicBool>) {
     let max_running = engine.limits().max_running_requests.max(1);
     loop {
         let first = match rx.recv() {
@@ -101,7 +128,9 @@ fn worker(engine: Arc<Engine>, rx: Receiver<Job>) {
                 Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => break,
             }
         }
+        busy.store(true, Ordering::Relaxed);
         run_jobs(&engine, jobs);
+        busy.store(false, Ordering::Relaxed);
     }
 }
 

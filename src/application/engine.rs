@@ -60,6 +60,11 @@ pub enum EngineError {
     Captured(String),
     #[error("vision tower: {0}")]
     Vision(String),
+    /// The device is busy with work that owns the residency this request needs
+    /// to borrow. `retry_after_ms` is the estimate the HTTP layer turns into
+    /// `Retry-After`.
+    #[error("server busy, retry in {retry_after_ms} ms")]
+    Busy { retry_after_ms: u64 },
 }
 
 /// A request's image data, computed once at request build time: `rows[i]` is

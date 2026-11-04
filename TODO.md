@@ -1,6 +1,6 @@
 # FerrumTorrens -- FreeToken MVP port to Rust: TODO
 
-Status (2026-11-03): **M7 complete and the vision tower runs on the device (decision 139 -> DONE.md 139, gate `tests/vision_cudarc_tower.rs`; `mrope.rs` is loaded but still TODO for decode).**
+Status (2026-11-04): **M7 complete and the vision tower runs on the device (decision 139 -> DONE.md 139, gate `tests/vision_cudarc_tower.rs`; `mrope.rs` is loaded but still TODO for decode).** A busy device now answers `503` + `Retry-After` for image requests (decision 140 -> DONE.md 140). Still open: partial MoE eviction for the vision prefill and idle-time GPU release.
 Old status (2026-10-23): **M7 is complete: the cudarc runtime is the serving path,
 libtorch/tch/candle are gone (decision 132), and decode CUDA-graph capture is
 ported (decision 134).** `CudarcQwen3_6::forward_decode_into` runs the batched
