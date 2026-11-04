@@ -4,10 +4,9 @@
 # `nix/module.nix` selects one by `model.variant`; because the hash is inert
 # until a derivation is referenced, evaluating this table builds nothing.
 #
-# Refresh a hash by building the model once with a placeholder and reading the
-# reported hash, or by running `snapshot_download(local_dir=...)` (exactly what
-# `nix/model.nix` does), removing `.cache`, and hashing the tree:
-#   nix hash path <snapshot>
+# Refresh a hash with `scripts/fetch-hf-hash.sh <repo> <dir>`: it fetches the
+# snapshot the way `nix/model.nix` does (resuming, verifying each file against
+# the Hub API) and prints the `nix hash path` value to paste here.
 {
   "qwen3.6-35b-a3b-nvfp4" = {
     repo = "nvidia/Qwen3.6-35B-A3B-NVFP4";

@@ -605,13 +605,19 @@ Ordered slices, each its own gated change:
   reference variant is unchanged. README and `ARCHITECTURE.md` 2 are updated.
   **Blocker: `nix/checkpoints.nix` still carries `hash =
   "__ORNITH_HF_HASH__"`**, so `nix build .#ferrum-torrens-model-ornith` cannot
-  evaluate yet. Getting the real hash needs a `snapshot_download`-equivalent
-  tree of `ornith-ai/Ornith-1.5-35B-A3B-NVFP4`; `/tmp/opencode/m81b/fetch_ornith.sh`
-  does that (per-file size and LFS sha256 checked against the HF API, then
-  `nix hash path`), writing to `.model-cache/hf-hf/Ornith-1.5-35B-A3B-NVFP4`; it
-  was at ~12.4 of ~24 GB when this was recorded (~4 MB/s, so ~50 min left). The
-  method is proven: hashing the reference snapshot minus `.cache` reproduces the
-  pinned reference hash exactly (`sha256-JTcnVr...`).
+  evaluate yet. The hash comes from `scripts/fetch-hf-hash.sh` (new: it fetches
+  the snapshot the way `nix/model.nix` does, resumes with `curl -C -`, verifies
+  every file against the Hub API's size and LFS sha256, then prints
+  `nix hash path`); the method is proven, because hashing the reference snapshot
+  minus `.cache` reproduces the pinned reference hash exactly
+  (`sha256-JTcnVr...`). **The fetch was interrupted at 12.4 of ~24 GB** (the
+  shell that ran it was cancelled and `/tmp` was cleaned, so its log and the
+  ad-hoc script are gone; the script now lives in the repo). The partial tree is
+  `.model-cache/hf-hf/Ornith-1.5-35B-A3B-NVFP4`: `model-00001` 4,743,331,840 of
+  10,005,851,848 bytes, `model-00002` 4,245,229,568 of 10,006,454,416,
+  `model-00003` complete at 3,408,113,436 (the repo is 23,460,228,712 bytes,
+  21.85 GiB, so ~11 GB of shard 1 and 2 are left). Re-run the same command to
+  resume; it skips complete files and continues the partial ones.
   **The HF artifact is not the snapshot we gated.** The current HF `main` has 22
   files; our `.model-cache/hf/Ornith-1.5-35B-A3B-NVFP4` export lacks four of them
   (`README.md`, `.gitattributes`, two `assets/*.png`) and its
