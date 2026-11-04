@@ -1023,6 +1023,13 @@ impl Engine {
                 want: vocab,
             });
         }
+        crate::application::generation::trace_logits(
+            "eager",
+            uid,
+            start + n - 1,
+            ids[n - 1],
+            &logits,
+        );
         Ok(logits)
     }
 

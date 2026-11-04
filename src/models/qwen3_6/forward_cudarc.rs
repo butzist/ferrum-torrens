@@ -1200,6 +1200,17 @@ impl CachedModel for CudarcQwen3_6 {
                     .to_string(),
             });
         }
+        // A one-token text step is the decode step, and it must run the kernels
+        // the captured graph records (decision 148): the dense gather plus
+        // `causal_sdpa` and `conv_prefill` below round differently enough to flip
+        // a near-tie, so an eager run and a replayed graph would disagree. An
+        // image step keeps the dense path because its mrope positions are not the
+        // flat ones the paged kernel takes.
+        if n == 1 && input.mrope_positions.is_none() {
+            return self
+                .decode_one_cached(input, cache)
+                .map_err(|e| KvcacheError::MisalignedCache { why: e.to_string() });
+        }
         let access = Access::Cached {
             cache,
             state: self.cache.state(),
@@ -1214,6 +1225,36 @@ impl CachedModel for CudarcQwen3_6 {
 }
 
 impl CudarcQwen3_6 {
+    /// One token through the same device kernels a captured decode step records:
+    /// paged attention, the fused GDN decode, and device-side KV locations and
+    /// state slots. The captured step stages those same tensors, so replaying a
+    /// graph re-runs these launches over new data and reproduces this forward
+    /// bit for bit -- which is what makes "captured == eager" a testable claim
+    /// rather than a hope. `cache` has already been grown by this token.
+    fn decode_one_cached(&self, input: &ForwardInput, cache: &SequenceCache) -> Result<Vec<f32>> {
+        let id = input.input_ids[0] as i32;
+        let position = input.positions[0] as i32;
+        let out_loc = cache.tail(1)[0] as i32;
+        let slot = cache.state_slot() as i32;
+        let window: Vec<i32> = cache.filled().iter().map(|v| *v as i32).collect();
+        let ids = self.rt.from_slice_i32(&[id], &[1])?;
+        let positions = self.rt.from_slice_i32(&[position], &[1])?;
+        let out_locs = self.rt.from_slice_i32(&[out_loc], &[1])?;
+        let slots = self.rt.from_slice_i32(&[slot], &[1])?;
+        let kv_locs = self.rt.from_slice_i32(&window, &[1, window.len()])?;
+        let access = Access::Device {
+            out_locs: &out_locs,
+            kv_locs: &kv_locs,
+            slots: &slots,
+        };
+        let stream = self.tower_stream(&ids, 1, &Positions::Device(&positions), &access)?;
+        let normed = rms_norm(&stream, &self.tower.final_norm, self.params.rms_norm_eps)?;
+        if ablated("head") {
+            return Ok(vec![0.0; self.params.vocab_size]);
+        }
+        self.lm_head_logits(&normed)
+    }
+
     /// One batched decode step with every input already staged on the device:
     /// the tokens, rope positions, GDN state slots, K/V store locations and
     /// attention windows all come from `bufs`, and the `[max_bs, vocab]` logits

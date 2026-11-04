@@ -30,6 +30,75 @@ use crate::domain::scheduler::{
 /// a stop string longer than this is caught by the length/eos rules instead.
 const STOP_TAIL_TOKENS: usize = 64;
 
+/// The two highest logits of a row as `(id, value)` pairs, ties keeping the
+/// lower id, which is the sampler's own argmax rule.
+fn top2(logits: &[f32]) -> ((u32, f32), (u32, f32)) {
+    let mut best = (0u32, f32::NEG_INFINITY);
+    let mut second = (0u32, f32::NEG_INFINITY);
+    for (i, &v) in logits.iter().enumerate() {
+        if v > best.1 {
+            second = best;
+            best = (i as u32, v);
+        } else if v > second.1 {
+            second = (i as u32, v);
+        }
+    }
+    (best, second)
+}
+
+/// The largest absolute difference between two equally long rows.
+fn max_abs_delta(a: &[f32], b: &[f32]) -> f32 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0, f32::max)
+}
+
+/// The eager arm's logits, kept by `(uid, position)` so the captured arm can
+/// diff the same row.
+type EagerRows = std::collections::HashMap<(u64, usize), Vec<f32>>;
+
+/// Dev-only logit trace: with `FT_LOGIT_TRACE=1`, print one line per sampled row
+/// (its top two logits and, for the captured arm, the delta against the eager
+/// arm's row at the same position). A capture-fidelity question is answered by
+/// that delta, not by the sampled token: an emitted-token difference is either a
+/// near-tie (`max_abs` below the top-two gap) or a real divergence. This is a
+/// measurement probe, never a serving path: off, it costs one `getenv` per
+/// sampled row.
+pub(crate) fn trace_logits(mode: &str, uid: u64, pos: usize, input: u32, logits: &[f32]) {
+    use std::sync::{Mutex, OnceLock};
+
+    if std::env::var_os("FT_LOGIT_TRACE").is_none() {
+        return;
+    }
+    static EAGER: OnceLock<Mutex<EagerRows>> = OnceLock::new();
+    let eager = EAGER.get_or_init(|| Mutex::new(HashMap::new()));
+    let ((t1, v1), (t2, v2)) = top2(logits);
+    let gap = v1 - v2;
+    let mut delta = String::from("-");
+    if mode == "eager" {
+        eager
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert((uid, pos), logits.to_vec());
+    } else {
+        let prior = eager
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&(uid, pos))
+            .cloned();
+        if let Some(prev) = prior
+            && prev.len() == logits.len()
+        {
+            delta = format!("{:.6}", max_abs_delta(&prev, logits));
+        }
+    }
+    println!(
+        "FT-LOGITS {mode} uid={uid} pos={pos} in={input} \
+         t1={t1}:{v1:.4} t2={t2}:{v2:.4} gap={gap:.6} maxabs_delta={delta}"
+    );
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Generation {
     pub uid: u64,
@@ -494,6 +563,15 @@ fn captured_decode_step(
             got: logits.len(),
             want: reqs.len(),
         });
+    }
+    for (i, row) in rows.iter().enumerate() {
+        trace_logits(
+            "captured",
+            reqs[i].uid,
+            row.position as usize,
+            row.input_id,
+            &logits[i],
+        );
     }
     Ok(reqs
         .iter()
@@ -1118,5 +1196,31 @@ mod tests {
         rb.seed = 42;
         let b = generate(&e, rb).unwrap();
         assert_eq!(a.tokens, b.tokens);
+    }
+
+    #[test]
+    fn top2_reports_the_two_highest_logits_lower_id_first_on_a_tie() {
+        assert_eq!(
+            top2(&[0.5, 9.0, 3.0, 8.0]),
+            ((1, 9.0), (3, 8.0)),
+            "first is the max, second is the runner-up"
+        );
+        assert_eq!(
+            top2(&[4.0, 4.0]),
+            ((0, 4.0), (1, 4.0)),
+            "a tie keeps the lower id first, the same rule the sampler's argmax uses"
+        );
+        assert_eq!(
+            top2(&[-1.0]),
+            ((0, -1.0), (0, f32::NEG_INFINITY)),
+            "a one-token row has no runner-up"
+        );
+    }
+
+    #[test]
+    fn max_abs_delta_is_the_largest_entrywise_difference() {
+        assert_eq!(max_abs_delta(&[1.0, 2.0], &[1.5, 1.0]), 1.0);
+        assert_eq!(max_abs_delta(&[1.0, 2.0], &[1.0, 2.0]), 0.0);
+        assert_eq!(max_abs_delta(&[], &[]), 0.0);
     }
 }
