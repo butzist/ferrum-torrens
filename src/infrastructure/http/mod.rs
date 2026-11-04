@@ -81,11 +81,11 @@ impl AppState {
 
 pub fn router(state: AppState) -> Router {
     Router::new()
-        .route("/v1/completions", post(completions))
-        .route("/v1/chat/completions", post(chat_completions))
-        .route("/v1/responses", post(responses))
-        .route("/v1/models", get(models))
-        .route("/health", get(health))
+        .route("/v1/completions", post(completions::completions))
+        .route("/v1/chat/completions", post(chat::chat_completions))
+        .route("/v1/responses", post(responses::responses))
+        .route("/v1/models", get(models::models))
+        .route("/health", get(models::health))
         .with_state(Arc::new(state))
 }
 
@@ -444,7 +444,7 @@ const VISION_MARKER: &str = "<|vision_start|><|image_pad|><|vision_end|>";
 
 /// A client sends `arguments` as a JSON string (OpenAI's shape); accept an
 /// object too. The domain wants the wire JSON string either way.
-fn arguments_text(value: Option<&serde_json::Value>) -> String {
+pub(crate) fn arguments_text(value: Option<&serde_json::Value>) -> String {
     match value {
         Some(serde_json::Value::String(s)) => s.clone(),
         Some(other) => other.to_string(),
@@ -828,7 +828,7 @@ impl ResponsesRequest {
     }
 }
 
-fn merge_assistant_content(turns: &mut Vec<ChatMessage>, content: String) {
+pub(crate) fn merge_assistant_content(turns: &mut Vec<ChatMessage>, content: String) {
     if let Some(last) = turns.last_mut()
         && last.role == "assistant"
         && last.content.is_none()
@@ -845,7 +845,7 @@ fn merge_assistant_content(turns: &mut Vec<ChatMessage>, content: String) {
     });
 }
 
-fn merge_assistant_call(turns: &mut Vec<ChatMessage>, call: ChatToolCall) {
+pub(crate) fn merge_assistant_call(turns: &mut Vec<ChatMessage>, call: ChatToolCall) {
     if let Some(last) = turns.last_mut()
         && last.role == "assistant"
     {
@@ -860,7 +860,7 @@ fn merge_assistant_call(turns: &mut Vec<ChatMessage>, call: ChatToolCall) {
     });
 }
 
-fn stringify(value: Option<&serde_json::Value>) -> String {
+pub(crate) fn stringify(value: Option<&serde_json::Value>) -> String {
     match value {
         None | Some(serde_json::Value::Null) => String::new(),
         Some(serde_json::Value::String(s)) => s.clone(),
@@ -964,7 +964,7 @@ pub struct ResponsesOutputTokens {
     pub reasoning_tokens: usize,
 }
 
-fn responses_usage(g: &generation::Generation) -> ResponsesUsage {
+pub(crate) fn responses_usage(g: &generation::Generation) -> ResponsesUsage {
     ResponsesUsage {
         input_tokens: g.prompt_tokens,
         output_tokens: g.tokens.len(),
@@ -976,7 +976,11 @@ fn responses_usage(g: &generation::Generation) -> ResponsesUsage {
     }
 }
 
-fn responses_output(text: &str, calls: Vec<ParsedToolCall>, uid: u64) -> Vec<ResponsesOutputItem> {
+pub(crate) fn responses_output(
+    text: &str,
+    calls: Vec<ParsedToolCall>,
+    uid: u64,
+) -> Vec<ResponsesOutputItem> {
     let mut output = Vec::new();
     if !text.is_empty() {
         output.push(ResponsesOutputItem::Message(ResponsesOutputMessage {
@@ -1307,287 +1311,14 @@ impl ResponsesStream {
     }
 }
 
-/// `stream: true` for `/v1/responses`: the same dispatcher job and per-token
-/// sink as the chat stream, formatted as Responses events. Frames ride a
-/// bounded channel, so a slow client drops its own stream instead of stalling
-/// the batch it rides in.
-fn responses_stream_body(
-    state: &Arc<AppState>,
-    request: generation::Request,
-    req: &ResponsesRequest,
-) -> Response {
-    let (tx, rx) = mpsc::channel::<String>(32);
-    let base = ResponsesBase::new(state, req, request.uid);
-    let stream = Arc::new(Mutex::new(ResponsesStream::new(base, request.uid)));
-    for frame in stream.lock().expect("responses stream lock").opened() {
-        let _ = tx.try_send(frame);
-    }
-
-    let sink_tx = tx.clone();
-    let sink_stream = Arc::clone(&stream);
-    let sink: crate::application::dispatcher::Sink = Box::new(move |_uid, text, _id, _index| {
-        let mut stream = sink_stream.lock().expect("responses stream lock");
-        for frame in stream.token(text) {
-            if sink_tx.try_send(frame).is_err() {
-                return false;
-            }
-        }
-        true
-    });
-
-    let (reply, rx_reply) = tokio::sync::oneshot::channel();
-    if state
-        .dispatcher
-        .submit(Job {
-            request,
-            sink: Some(sink),
-            reply,
-        })
-        .is_err()
-    {
-        let frame = stream
-            .lock()
-            .expect("responses stream lock")
-            .failed("the engine worker is not running");
-        let _ = tx.try_send(frame);
-        let _ = tx.try_send(sse_data("[DONE]"));
-        drop(tx);
-        return sse_response(rx);
-    }
-
-    let final_tx = tx.clone();
-    let final_stream = Arc::clone(&stream);
-    tokio::spawn(async move {
-        let reply = rx_reply.await;
-        let frames = {
-            let mut stream = final_stream.lock().expect("responses stream lock");
-            match reply {
-                Ok(Ok(g)) if g.finish_reason == FinishReason::Abort => {
-                    vec![stream.failed("the generation was aborted")]
-                }
-                Ok(Ok(g)) => stream.finish(&g),
-                Ok(Err(msg)) => vec![stream.failed(&msg)],
-                Err(_) => vec![stream.failed("the engine worker dropped the request")],
-            }
-        };
-        for frame in frames {
-            let _ = final_tx.try_send(frame);
-        }
-        let _ = final_tx.try_send(sse_data("[DONE]"));
-        drop(final_tx);
-    });
-    drop(tx);
-    sse_response(rx)
-}
-
-async fn responses(
-    State(state): State<Arc<AppState>>,
-    payload: Result<Json<ResponsesRequest>, JsonRejection>,
-) -> Result<Response, ApiError> {
-    let Json(req) =
-        payload.map_err(|e| ApiError::bad_request(format!("invalid json body: {e}")))?;
-
-    if !req.model.is_empty() && req.model != state.served_model_name {
-        return Err(ApiError::not_found(format!(
-            "model {} not found, this server serves {}",
-            req.model, state.served_model_name
-        )));
-    }
-    if req.max_output_tokens == Some(0) {
-        return Err(ApiError::bad_request(
-            "max_output_tokens must be a positive integer",
-        ));
-    }
-    if req.background == Some(true) {
-        return Err(ApiError::bad_request("background mode is not supported"));
-    }
-
-    let messages = req.chat_messages()?;
-    let tools = req.chat_tools();
-    let uid = state.next_uid();
-    let engine = Arc::clone(&state.engine);
-    let params = req.sampling_params();
-    let streaming = req.stream.unwrap_or(false);
-
-    let worker = Arc::clone(&engine);
-    let prepared =
-        tokio::task::spawn_blocking(move || -> Result<generation::Request, EngineError> {
-            let prompt = worker.render_chat(&messages, &tools)?;
-            let ids = worker.encode(&prompt)?;
-            make_request(&worker, uid, ids, params, uid)
-        })
-        .await
-        .expect("preparation task is not cancellable");
-    let request = match prepared {
-        Ok(r) => r,
-        Err(e) => return Err(ApiError::from(e)),
-    };
-
-    if streaming {
-        return Ok(responses_stream_body(&state, request, &req));
-    }
-
-    let generated = dispatch(&state, request, None).await?;
-    let (content, calls) = parse_tool_calls(&generated.text);
-    let output = responses_output(&content, calls, uid);
-    let base = ResponsesBase::new(&state, &req, uid);
-    Ok(
-        Json(base.response("completed", output, Some(responses_usage(&generated)), None))
-            .into_response(),
-    )
-}
-
-#[derive(Debug, Serialize)]
-pub struct ModelsResponse {
-    pub object: &'static str,
-    pub data: Vec<ModelCard>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ModelCard {
-    pub id: String,
-    pub object: &'static str,
-    pub created: u64,
-    pub owned_by: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct HealthResponse {
-    pub status: &'static str,
-    pub model: String,
-}
-
-/// OpenAI-shaped error body: `{"error": {"message", "type", "code"}}`.
-#[derive(Debug, Serialize)]
-pub struct ErrorBody {
-    pub error: ErrorDetail,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ErrorDetail {
-    pub message: String,
-    #[serde(rename = "type")]
-    pub kind: &'static str,
-    pub code: &'static str,
-}
-
-pub struct ApiError {
-    pub status: StatusCode,
-    pub kind: &'static str,
-    pub code: &'static str,
-    pub message: String,
-    /// Seconds the client should wait before retrying, emitted as `Retry-After`.
-    pub retry_after: Option<u64>,
-}
-
-impl ApiError {
-    fn bad_request(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::BAD_REQUEST,
-            kind: "invalid_request_error",
-            code: "invalid_request",
-            message: message.into(),
-            retry_after: None,
-        }
-    }
-
-    fn not_found(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::NOT_FOUND,
-            kind: "invalid_request_error",
-            code: "model_not_found",
-            message: message.into(),
-            retry_after: None,
-        }
-    }
-
-    fn unprocessable(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::UNPROCESSABLE_ENTITY,
-            kind: "invalid_request_error",
-            code: "unsupported_value",
-            message: message.into(),
-            retry_after: None,
-        }
-    }
-
-    /// The server cannot serve this request yet without disturbing work that is
-    /// already on the device. `retry_after` is a whole-second estimate; the
-    /// client should back off and retry rather than treat it as a bad request.
-    fn busy(message: impl Into<String>, retry_after: u64) -> Self {
-        Self {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            kind: "server_error",
-            code: "busy",
-            message: message.into(),
-            retry_after: Some(retry_after.max(1)),
-        }
-    }
-}
-
-impl From<EngineError> for ApiError {
-    fn from(e: EngineError) -> Self {
-        use EngineError::*;
-        match e {
-            EmptyPrompt => ApiError::bad_request("prompt must not be empty"),
-            PromptTooLong { len, max } => {
-                ApiError::unprocessable(format!("prompt has {len} tokens, over the {max} limit"))
-            }
-            Busy { retry_after_ms } => ApiError::busy(
-                "the server is finishing another request; retry when it is idle",
-                retry_after_ms.div_ceil(1000),
-            ),
-            Tokenize(m) => ApiError::bad_request(format!("prompt could not be tokenized: {m}")),
-            Chat(m) => ApiError::bad_request(m),
-            Vision(m) => ApiError::unprocessable(m),
-            BadLogits { got, want } => {
-                ApiError::unprocessable(format!("model returned {got} logits, expected {want}"))
-            }
-            NoParams(uid) => ApiError::unprocessable(format!("no sampling parameters for {uid}")),
-            // Engine-side faults, not anything the caller can fix: the cache is
-            // a server resource and its bookkeeping failing is a server bug.
-            e @ (NoKvCache
-            | EmptyStep { .. }
-            | CacheOutOfStep { .. }
-            | KvCache(_)
-            | NoCapturedDecode
-            | DecodeStepNotOne { .. }
-            | Captured(_)
-            | NotResident
-            | Rebuild(_)
-            | Moe(_)) => ApiError::unprocessable(format!("engine kv cache: {e}")),
-        }
-    }
-}
-
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        let body = ErrorBody {
-            error: ErrorDetail {
-                message: self.message,
-                kind: self.kind,
-                code: self.code,
-            },
-        };
-        let retry_after = self.retry_after;
-        let mut response = (self.status, Json(body)).into_response();
-        if let Some(secs) = retry_after
-            && let Ok(value) = secs.to_string().parse()
-        {
-            response.headers_mut().insert(header::RETRY_AFTER, value);
-        }
-        response
-    }
-}
-
-fn unix_now() -> u64 {
+pub(crate) fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
 }
 
-fn finish_reason_str(r: FinishReason) -> &'static str {
+pub(crate) fn finish_reason_str(r: FinishReason) -> &'static str {
     match r {
         FinishReason::Stop => "stop",
         FinishReason::Length => "length",
@@ -1595,255 +1326,7 @@ fn finish_reason_str(r: FinishReason) -> &'static str {
     }
 }
 
-async fn completions(
-    State(state): State<Arc<AppState>>,
-    payload: Result<Json<CompletionRequest>, JsonRejection>,
-) -> Result<Response, ApiError> {
-    let Json(req) =
-        payload.map_err(|e| ApiError::bad_request(format!("invalid json body: {e}")))?;
-
-    if !req.model.is_empty() && req.model != state.served_model_name {
-        return Err(ApiError::not_found(format!(
-            "model {} not found, this server serves {}",
-            req.model, state.served_model_name
-        )));
-    }
-    if req.n.unwrap_or(1) != 1 {
-        return Err(ApiError::unprocessable("only n=1 is supported"));
-    }
-
-    let uid = state.next_uid();
-    let engine = Arc::clone(&state.engine);
-    let params = req.sampling_params();
-    let seed = req.seed.unwrap_or(uid);
-    let stream = req.stream.unwrap_or(false);
-    let prompt = req.prompt;
-
-    // Tokenize off the runtime, then hand the request to the dispatcher, which
-    // owns the single model worker and batches whatever is queued behind it.
-    let ids = {
-        let tokenizer = Arc::clone(&engine);
-        match tokio::task::spawn_blocking(move || tokenizer.encode(&prompt))
-            .await
-            .expect("encoding task is not cancellable")
-        {
-            Ok(ids) => ids,
-            Err(e) => return Err(ApiError::from(e)),
-        }
-    };
-    let request = make_request(&engine, uid, ids, params, seed)?;
-
-    if stream {
-        return Ok(stream_body(&state, request, Wire::Text));
-    }
-
-    let generated = dispatch(&state, request, None).await?;
-    let usage = usage_of(&generated);
-    Ok(Json(CompletionResponse {
-        id: format!("cmpl-{}", generated.uid),
-        object: "text_completion",
-        created: unix_now(),
-        model: state.served_model_name.clone(),
-        choices: vec![CompletionChoice {
-            text: generated.text,
-            index: 0,
-            logprobs: None,
-            finish_reason: Some(finish_reason_str(generated.finish_reason)),
-        }],
-        usage: Some(usage),
-    })
-    .into_response())
-}
-
-/// Submit one request to the engine worker and await its `Generation`. The
-/// worker batches whatever it queued behind it (TODO.md item 11); a per-token
-/// `sink` rides along when the caller wants a stream.
-async fn dispatch(
-    state: &Arc<AppState>,
-    request: Request,
-    sink: Option<crate::application::dispatcher::Sink>,
-) -> Result<generation::Generation, ApiError> {
-    let (reply, rx) = tokio::sync::oneshot::channel();
-    if state
-        .dispatcher
-        .submit(Job {
-            request,
-            sink,
-            reply,
-        })
-        .is_err()
-    {
-        return Err(ApiError::unprocessable("the engine worker is not running"));
-    }
-    match rx.await {
-        Ok(Ok(g)) => Ok(g),
-        Ok(Err(msg)) => Err(ApiError::unprocessable(format!("generation failed: {msg}"))),
-        Err(_) => Err(ApiError::unprocessable(
-            "the engine worker dropped the request",
-        )),
-    }
-}
-
-fn usage_of(g: &generation::Generation) -> Usage {
-    Usage {
-        prompt_tokens: g.prompt_tokens,
-        completion_tokens: g.tokens.len(),
-        total_tokens: g.prompt_tokens + g.tokens.len(),
-    }
-}
-
-/// `stream: true`: one `data: {...}` frame per token as it is sampled, a frame
-/// carrying the finish reason plus the usage, then `data: [DONE]`.
-///
-/// The prompt is tokenized and clamped before the stream starts, so a bad
-/// request is still an ordinary JSON error with its status code. Everything
-/// after that has already sent headers, so a failure mid-run rides on the stream
-/// as an `error` frame. The generation runs on a blocking task and pushes frames
-/// through a bounded channel: a slow client holds the run back instead of
-/// buffering it, and a client that hangs up closes the channel, which stops the
-/// run.
-/// Which wire shape a stream speaks: `/v1/completions` frames carry `text`,
-/// `/v1/chat/completions` frames carry a `delta`.
-#[derive(Clone, Copy)]
-enum Wire {
-    Text,
-    Chat,
-}
-
-impl Wire {
-    fn id(self, uid: u64) -> String {
-        match self {
-            Wire::Text => format!("cmpl-{uid}"),
-            Wire::Chat => format!("chatcmpl-{uid}"),
-        }
-    }
-}
-
-/// `stream: true`: one `data: {...}` frame per token as it is sampled, a frame
-/// carrying the finish reason plus the usage, then `data: [DONE]`.
-///
-/// The prompt is tokenized and clamped before the stream starts, so a bad
-/// request is still an ordinary JSON error with its status code. Everything
-/// after that has already sent headers, so a failure mid-run rides on the stream
-/// as an `error` frame. The generation runs on a blocking task and pushes frames
-/// through a bounded channel: a slow client holds the run back instead of
-/// buffering it, and a client that hangs up closes the channel, which stops the
-/// run.
-/// Builds the SSE frames a stream sends. Owns its ids so the per-token sink can
-/// be a `'static + Send` closure the engine worker calls.
-#[derive(Clone)]
-struct Frames {
-    wire: Wire,
-    id: String,
-    created: u64,
-    model: String,
-}
-
-impl Frames {
-    fn chunk(&self, text: &str, finish: Option<&'static str>, usage: Option<Usage>) -> String {
-        let payload = match self.wire {
-            Wire::Text => serde_json::to_string(&CompletionResponse {
-                id: self.id.clone(),
-                object: "text_completion",
-                created: self.created,
-                model: self.model.clone(),
-                choices: vec![CompletionChoice {
-                    text: text.to_string(),
-                    index: 0,
-                    logprobs: None,
-                    finish_reason: finish,
-                }],
-                usage,
-            }),
-            Wire::Chat => serde_json::to_string(&ChatChunk {
-                id: self.id.clone(),
-                object: "chat.completion.chunk",
-                created: self.created,
-                model: self.model.clone(),
-                choices: vec![ChatChunkChoice {
-                    index: 0,
-                    delta: ChatDelta {
-                        role: (finish.is_none() && text.is_empty()).then_some("assistant"),
-                        content: text.to_string(),
-                        tool_calls: None,
-                    },
-                    finish_reason: finish,
-                }],
-                usage,
-            }),
-        };
-        sse_data(&payload.expect("chunk serializes"))
-    }
-
-    /// The opening chat frame: names the role before any content arrives.
-    fn role(&self) -> String {
-        self.chat_frame(ChatDelta {
-            role: Some("assistant"),
-            content: String::new(),
-            tool_calls: None,
-        })
-    }
-
-    /// The first frame of a tool call: names `index`, `id`, `type` and the
-    /// function, with empty arguments.
-    fn tool_open(&self, index: usize, id: &str, name: &str) -> String {
-        self.chat_frame(ChatDelta {
-            role: None,
-            content: String::new(),
-            tool_calls: Some(vec![DeltaToolCall {
-                index,
-                id: Some(id.to_string()),
-                kind: Some("function"),
-                function: Some(DeltaFunction {
-                    name: Some(name.to_string()),
-                    arguments: None,
-                }),
-            }]),
-        })
-    }
-
-    /// A follow-up frame carrying the call's `arguments` JSON.
-    fn tool_args(&self, index: usize, arguments: &str) -> String {
-        self.chat_frame(ChatDelta {
-            role: None,
-            content: String::new(),
-            tool_calls: Some(vec![DeltaToolCall {
-                index,
-                id: None,
-                kind: None,
-                function: Some(DeltaFunction {
-                    name: None,
-                    arguments: Some(arguments.to_string()),
-                }),
-            }]),
-        })
-    }
-
-    fn chat_frame(&self, delta: ChatDelta) -> String {
-        let payload = serde_json::to_string(&ChatChunk {
-            id: self.id.clone(),
-            object: "chat.completion.chunk",
-            created: self.created,
-            model: self.model.clone(),
-            choices: vec![ChatChunkChoice {
-                index: 0,
-                delta,
-                finish_reason: None,
-            }],
-            usage: None,
-        });
-        sse_data(&payload.expect("chunk serializes"))
-    }
-
-    fn error(&self, message: &str) -> String {
-        let payload = serde_json::json!({
-            "error": { "message": message, "type": "engine_error" }
-        });
-        sse_data(&payload.to_string())
-    }
-}
-
-fn sse_response(rx: mpsc::Receiver<String>) -> Response {
+pub(crate) fn sse_response(rx: mpsc::Receiver<String>) -> Response {
     let body = Body::from_stream(SseBody { rx });
     Response::builder()
         .status(StatusCode::OK)
@@ -1948,273 +1431,7 @@ impl ChatStream {
 
 /// Longest suffix of `buffer` that is a proper prefix of `open`, so it might
 /// still complete into the opener on a later token.
-fn partial_opener(buffer: &str, open: &str) -> usize {
-    let max = open.len().saturating_sub(1).min(buffer.len());
-    for keep in (1..=max).rev() {
-        let start = buffer.len() - keep;
-        if buffer.is_char_boundary(start) && open.starts_with(&buffer[start..]) {
-            return keep;
-        }
-    }
-    0
-}
-
-/// `stream: true`: one `data: {...}` frame per token as it is sampled, a frame
-/// carrying the finish reason plus the usage, then `data: [DONE]`.
-///
-/// The prompt is tokenized and clamped before the stream starts, so a bad
-/// request is still an ordinary JSON error with its status code. Everything
-/// after that has already sent headers, so a failure mid-run rides on the stream
-/// as an `error` frame. The tokens come back through the dispatcher's per-request
-/// sink: frames go over a bounded channel, so a slow client drops its own stream
-/// (a full buffer aborts the sink) instead of stalling the batch it rides in.
-fn stream_body(state: &Arc<AppState>, request: generation::Request, wire: Wire) -> Response {
-    let (tx, rx) = mpsc::channel::<String>(32);
-    let frames = Frames {
-        wire,
-        id: wire.id(request.uid),
-        created: unix_now(),
-        model: state.served_model_name.clone(),
-    };
-    let tool_stream = Arc::new(Mutex::new(ChatStream::new()));
-    if let Wire::Chat = wire {
-        let _ = tx.try_send(frames.role());
-    }
-
-    let sink: crate::application::dispatcher::Sink = match wire {
-        Wire::Text => {
-            let sink_tx = tx.clone();
-            let sink_frames = frames.clone();
-            Box::new(move |_uid, text, _id, _index| {
-                sink_tx
-                    .try_send(sink_frames.chunk(text, None, None))
-                    .is_ok()
-            })
-        }
-        Wire::Chat => {
-            let sink_tx = tx.clone();
-            let sink_frames = frames.clone();
-            let stream = Arc::clone(&tool_stream);
-            Box::new(move |_uid, text, _id, _index| {
-                let actions = stream.lock().expect("tool stream lock").feed(text);
-                for action in actions {
-                    let frame = match action {
-                        ChatAction::Content(content) => sink_frames.chunk(&content, None, None),
-                        ChatAction::ToolCall {
-                            index,
-                            id,
-                            name,
-                            arguments,
-                        } => {
-                            if sink_tx
-                                .try_send(sink_frames.tool_open(index, &id, &name))
-                                .is_err()
-                            {
-                                return false;
-                            }
-                            sink_frames.tool_args(index, &arguments)
-                        }
-                    };
-                    if sink_tx.try_send(frame).is_err() {
-                        return false;
-                    }
-                }
-                true
-            })
-        }
-    };
-
-    let (reply, rx_reply) = tokio::sync::oneshot::channel();
-    if state
-        .dispatcher
-        .submit(Job {
-            request,
-            sink: Some(sink),
-            reply,
-        })
-        .is_err()
-    {
-        let _ = tx.try_send(frames.error("the engine worker is not running"));
-        let _ = tx.try_send(sse_data("[DONE]"));
-        drop(tx);
-        return sse_response(rx);
-    }
-
-    let final_tx = tx.clone();
-    let final_frames = frames.clone();
-    let final_tools = Arc::clone(&tool_stream);
-    tokio::spawn(async move {
-        match rx_reply.await {
-            Ok(Ok(g)) => {
-                if g.finish_reason != FinishReason::Abort {
-                    let usage = usage_of(&g);
-                    let mut reason = finish_reason_str(g.finish_reason);
-                    if let Wire::Chat = final_frames.wire {
-                        let (emitted, leftover) =
-                            final_tools.lock().expect("tool stream lock").finish();
-                        if let Some(text) = leftover {
-                            let _ = final_tx.try_send(final_frames.chunk(&text, None, None));
-                        }
-                        if emitted > 0 {
-                            reason = "tool_calls";
-                        }
-                    }
-                    let _ = final_tx.try_send(final_frames.chunk("", Some(reason), Some(usage)));
-                    let _ = final_tx.try_send(sse_data("[DONE]"));
-                }
-            }
-            Ok(Err(msg)) => {
-                let _ = final_tx.try_send(final_frames.error(&msg));
-                let _ = final_tx.try_send(sse_data("[DONE]"));
-            }
-            Err(_) => {
-                let _ =
-                    final_tx.try_send(final_frames.error("the engine worker dropped the request"));
-                let _ = final_tx.try_send(sse_data("[DONE]"));
-            }
-        }
-        drop(final_tx);
-    });
-    drop(tx);
-    sse_response(rx)
-}
-
-async fn chat_completions(
-    State(state): State<Arc<AppState>>,
-    payload: Result<Json<ChatCompletionRequest>, JsonRejection>,
-) -> Result<Response, ApiError> {
-    let Json(req) =
-        payload.map_err(|e| ApiError::bad_request(format!("invalid json body: {e}")))?;
-
-    if !req.model.is_empty() && req.model != state.served_model_name {
-        return Err(ApiError::not_found(format!(
-            "model {} not found, this server serves {}",
-            req.model, state.served_model_name
-        )));
-    }
-    if req.n.unwrap_or(1) != 1 {
-        return Err(ApiError::unprocessable("only n=1 is supported"));
-    }
-    if req.messages.is_empty() {
-        return Err(ApiError::bad_request("messages must not be empty"));
-    }
-
-    let uid = state.next_uid();
-    let engine = Arc::clone(&state.engine);
-    let params = req.sampling_params();
-    let seed = req.seed.unwrap_or(uid);
-    let streaming = req.stream.unwrap_or(false);
-    let messages: Vec<ChatMessage> = req.messages.iter().map(ChatTurn::to_domain).collect();
-    let tools: Vec<ChatTool> = req.tools.iter().map(ChatToolSpec::to_domain).collect();
-    let mut images: Vec<Vec<u8>> = Vec::new();
-    for turn in &req.messages {
-        for img in turn.image_parts()? {
-            images.push(img.bytes);
-        }
-    }
-    // An image request borrows the device exclusively for its tower pass, so it
-    // must not start while a batch (or another vision pass) owns it.
-    if state.engine.exclusive() {
-        return Err(ApiError::busy(
-            "the device is serving another request; retry when it is idle",
-            state.dispatcher.retry_after_ms().div_ceil(1000),
-        ));
-    }
-    if !images.is_empty() && state.dispatcher.busy() {
-        return Err(ApiError::busy(
-            "the device is serving another request; retry when it is idle",
-            state.dispatcher.retry_after_ms().div_ceil(1000),
-        ));
-    }
-
-    // Rendering the template and tokenizing it both run off the runtime, and both
-    // still have to answer with a status code rather than a frame. An image
-    // request's tower pass is the heaviest piece of preparation, which is exactly
-    // what spawn_blocking is here for. It takes the exclusive lease so the
-    // expert banks can be freed for the encode and no batch races it.
-    let worker = Arc::clone(&engine);
-    let prepared =
-        tokio::task::spawn_blocking(move || -> Result<generation::Request, EngineError> {
-            let prompt = worker.render_chat(&messages, &tools)?;
-            let ids = worker.encode(&prompt)?;
-            if images.is_empty() {
-                return make_request(&worker, uid, ids, params, seed);
-            }
-            let lease = worker.try_exclusive().ok_or(EngineError::Busy {
-                retry_after_ms: 1_000,
-            })?;
-            worker.release_moe()?;
-            let result = worker.make_request_with_images(uid, ids, images, params, seed);
-            worker.rehydrate_moe()?;
-            drop(lease);
-            result
-        })
-        .await
-        .expect("preparation task is not cancellable");
-    let request = match prepared {
-        Ok(r) => r,
-        Err(e) => return Err(ApiError::from(e)),
-    };
-
-    if streaming {
-        return Ok(stream_body(&state, request, Wire::Chat));
-    }
-
-    let generated = dispatch(&state, request, None).await?;
-    let usage = usage_of(&generated);
-    let (content, calls) = parse_tool_calls(&generated.text);
-    let (message, finish_reason) = if calls.is_empty() {
-        (
-            ChatMessageOut {
-                role: "assistant",
-                content: generated.text,
-                tool_calls: None,
-            },
-            finish_reason_str(generated.finish_reason),
-        )
-    } else {
-        (
-            ChatMessageOut {
-                role: "assistant",
-                content,
-                tool_calls: Some(
-                    calls
-                        .into_iter()
-                        .map(|c| OutToolCall {
-                            id: c.id,
-                            kind: "function",
-                            function: OutFunction {
-                                name: c.name,
-                                arguments: c.arguments,
-                            },
-                        })
-                        .collect(),
-                ),
-            },
-            "tool_calls",
-        )
-    };
-    Ok(Json(ChatCompletionResponse {
-        id: format!("chatcmpl-{}", generated.uid),
-        object: "chat.completion",
-        created: unix_now(),
-        model: state.served_model_name.clone(),
-        choices: vec![ChatChoice {
-            index: 0,
-            message,
-            finish_reason: Some(finish_reason),
-        }],
-        usage: Some(usage),
-    })
-    .into_response())
-}
-
-fn sse_data(payload: &str) -> String {
-    format!("data: {payload}\n\n")
-}
-
-/// The SSE body: whole frames off the channel, in order, as they arrive.
-struct SseBody {
+pub(crate) struct SseBody {
     rx: mpsc::Receiver<String>,
 }
 
@@ -2226,25 +1443,6 @@ impl Stream for SseBody {
             .poll_recv(cx)
             .map(|frame| frame.map(|f| Ok(Bytes::from(f))))
     }
-}
-
-async fn models(State(state): State<Arc<AppState>>) -> Json<ModelsResponse> {
-    Json(ModelsResponse {
-        object: "list",
-        data: vec![ModelCard {
-            id: state.served_model_name.clone(),
-            object: "model",
-            created: unix_now(),
-            owned_by: "ferrum-torrens".to_string(),
-        }],
-    })
-}
-
-async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
-    Json(HealthResponse {
-        status: "ok",
-        model: state.served_model_name.clone(),
-    })
 }
 
 #[cfg(test)]
@@ -3284,5 +2482,229 @@ mod tests {
         let dispatcher = Dispatcher::new(Arc::new(engine));
         assert!(!dispatcher.busy());
         assert!(dispatcher.retry_after_ms() > 0);
+    }
+}
+
+mod chat;
+
+pub(crate) fn sse_data(payload: &str) -> String {
+    format!("data: {payload}\n\n")
+}
+
+pub(crate) fn partial_opener(buffer: &str, open: &str) -> usize {
+    let max = open.len().saturating_sub(1).min(buffer.len());
+    for keep in (1..=max).rev() {
+        let start = buffer.len() - keep;
+        if buffer.is_char_boundary(start) && open.starts_with(&buffer[start..]) {
+            return keep;
+        }
+    }
+    0
+}
+
+mod responses;
+
+#[derive(Debug, Serialize)]
+pub struct ModelsResponse {
+    pub object: &'static str,
+    pub data: Vec<ModelCard>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ModelCard {
+    pub id: String,
+    pub object: &'static str,
+    pub created: u64,
+    pub owned_by: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HealthResponse {
+    pub status: &'static str,
+    pub model: String,
+}
+
+pub struct ApiError {
+    pub status: StatusCode,
+    pub kind: &'static str,
+    pub code: &'static str,
+    pub message: String,
+    /// Seconds the client should wait before retrying, emitted as `Retry-After`.
+    pub retry_after: Option<u64>,
+}
+
+impl ApiError {
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            kind: "invalid_request_error",
+            code: "invalid_request",
+            message: message.into(),
+            retry_after: None,
+        }
+    }
+
+    fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            kind: "invalid_request_error",
+            code: "model_not_found",
+            message: message.into(),
+            retry_after: None,
+        }
+    }
+
+    fn unprocessable(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            kind: "invalid_request_error",
+            code: "unsupported_value",
+            message: message.into(),
+            retry_after: None,
+        }
+    }
+
+    /// The server cannot serve this request yet without disturbing work that is
+    /// already on the device. `retry_after` is a whole-second estimate; the
+    /// client should back off and retry rather than treat it as a bad request.
+    fn busy(message: impl Into<String>, retry_after: u64) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            kind: "server_error",
+            code: "busy",
+            message: message.into(),
+            retry_after: Some(retry_after.max(1)),
+        }
+    }
+}
+
+mod completions;
+
+mod models;
+
+#[derive(Clone, Copy)]
+pub(crate) enum Wire {
+    Text,
+    Chat,
+}
+
+impl Wire {
+    fn id(self, uid: u64) -> String {
+        match self {
+            Wire::Text => format!("cmpl-{uid}"),
+            Wire::Chat => format!("chatcmpl-{uid}"),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct Frames {
+    wire: Wire,
+    id: String,
+    created: u64,
+    model: String,
+}
+
+impl Frames {
+    fn chunk(&self, text: &str, finish: Option<&'static str>, usage: Option<Usage>) -> String {
+        let payload = match self.wire {
+            Wire::Text => serde_json::to_string(&CompletionResponse {
+                id: self.id.clone(),
+                object: "text_completion",
+                created: self.created,
+                model: self.model.clone(),
+                choices: vec![CompletionChoice {
+                    text: text.to_string(),
+                    index: 0,
+                    logprobs: None,
+                    finish_reason: finish,
+                }],
+                usage,
+            }),
+            Wire::Chat => serde_json::to_string(&ChatChunk {
+                id: self.id.clone(),
+                object: "chat.completion.chunk",
+                created: self.created,
+                model: self.model.clone(),
+                choices: vec![ChatChunkChoice {
+                    index: 0,
+                    delta: ChatDelta {
+                        role: (finish.is_none() && text.is_empty()).then_some("assistant"),
+                        content: text.to_string(),
+                        tool_calls: None,
+                    },
+                    finish_reason: finish,
+                }],
+                usage,
+            }),
+        };
+        sse_data(&payload.expect("chunk serializes"))
+    }
+
+    /// The opening chat frame: names the role before any content arrives.
+    fn role(&self) -> String {
+        self.chat_frame(ChatDelta {
+            role: Some("assistant"),
+            content: String::new(),
+            tool_calls: None,
+        })
+    }
+
+    /// The first frame of a tool call: names `index`, `id`, `type` and the
+    /// function, with empty arguments.
+    fn tool_open(&self, index: usize, id: &str, name: &str) -> String {
+        self.chat_frame(ChatDelta {
+            role: None,
+            content: String::new(),
+            tool_calls: Some(vec![DeltaToolCall {
+                index,
+                id: Some(id.to_string()),
+                kind: Some("function"),
+                function: Some(DeltaFunction {
+                    name: Some(name.to_string()),
+                    arguments: None,
+                }),
+            }]),
+        })
+    }
+
+    /// A follow-up frame carrying the call's `arguments` JSON.
+    fn tool_args(&self, index: usize, arguments: &str) -> String {
+        self.chat_frame(ChatDelta {
+            role: None,
+            content: String::new(),
+            tool_calls: Some(vec![DeltaToolCall {
+                index,
+                id: None,
+                kind: None,
+                function: Some(DeltaFunction {
+                    name: None,
+                    arguments: Some(arguments.to_string()),
+                }),
+            }]),
+        })
+    }
+
+    fn chat_frame(&self, delta: ChatDelta) -> String {
+        let payload = serde_json::to_string(&ChatChunk {
+            id: self.id.clone(),
+            object: "chat.completion.chunk",
+            created: self.created,
+            model: self.model.clone(),
+            choices: vec![ChatChunkChoice {
+                index: 0,
+                delta,
+                finish_reason: None,
+            }],
+            usage: None,
+        });
+        sse_data(&payload.expect("chunk serializes"))
+    }
+
+    fn error(&self, message: &str) -> String {
+        let payload = serde_json::json!({
+            "error": { "message": message, "type": "engine_error" }
+        });
+        sse_data(&payload.to_string())
     }
 }
