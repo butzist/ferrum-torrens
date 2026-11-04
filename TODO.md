@@ -1,6 +1,6 @@
 # FerrumTorrens -- FreeToken MVP port to Rust: TODO
 
-Status (2026-11-04): **M7 complete and the vision tower runs on the device (decision 139 -> DONE.md 139, gate `tests/vision_cudarc_tower.rs`; `mrope.rs` is loaded but still TODO for decode).** A busy device now answers `503` + `Retry-After` for image requests (decision 140 -> DONE.md 140). Still open: partial MoE eviction for the vision prefill and idle-time GPU release.
+Status (2026-11-04): **M7 complete, the vision tower runs on the device (decision 139), busy devices answer `503` + `Retry-After` (decision 140), the idle release stages the GPU back to the host behind an exclusive batch lease (decision 141), and a rebuild that finds the GPU full answers `503` instead of crashing (decision 144).** Open work, in order: (1) **partial MoE eviction for the vision prefill** (R12 below: the whole-layer prefill still borrows a fixed `2*E = 512` slots for ~49-token vision prompts; measure, then size the buffer from routed ids, decision 138's parked follow-up). The old perf levers are closed: decode, prefill and K=4 aggregate are all at or ahead of FreeToken (R9 baselines; R8.2 and R10.5 closed 2026-11-04 as moot/measured-no-win). mrope decode wiring landed and its device smoke passed (decision 142).
 Old status (2026-10-23): **M7 is complete: the cudarc runtime is the serving path,
 libtorch/tch/candle are gone (decision 132), and decode CUDA-graph capture is
 ported (decision 134).** `CudarcQwen3_6::forward_decode_into` runs the batched
@@ -524,6 +524,33 @@ The full log of confirmed decisions (numbers 1..134, stable -- code, tests and
 `ARCHITECTURE.md` reference them by number) lives in `DONE.md`. This section
 lists only the decisions that still bind open work; everything else there is
 history.
+
+- **143** -- **video input is deferred, and it is a milestone, not wiring.** The
+  checkpoint is a VL model (`video_token_id` 248057, `temporal_patch_size` 2,
+  per-frame timestamp tokens), but serving video needs: real t=2 temporal patch
+  assembly (today both vision paths duplicate a still frame into both temporal
+  slots), a `(gt, gh, gw)` grid per frame, timestamp rendering in the chat
+  template, per-frame mrope runs (each advancing the counter by `max(gh, gw)`),
+  an extended host oracle (FreeToken is text-only and the runtime has no
+  transformers/torch), and the serving cost of hundreds-to-thousands of extra
+  tokens per clip. No client here needs it and no OpenAI video input surface
+  exists to target. If a real client does, the first slice is **client-supplied
+  frames** (a `frames: [data-url]` field, per-frame grid) with no demuxer
+  dependency; ffmpeg bindings only once upload is actually required. Video stays
+  out of scope (section 2) until then.
+
+- **144** -- **a rebuild that finds the GPU full is a retryable `503`, never a
+  crash or a `4xx`.** An idle-released engine needs VRAM again on the next
+  request, and another process may hold it. The condition is classified at the
+  allocation that failed (`MoEError::OutOfMemory` -> `RegistryError` ->
+  `RebuildError` -> `EngineError` -> `JobError`) and answered `503` with code
+  `out_of_device_memory` and `Retry-After: 5`, keeping the engine cold so the
+  next request retries. Two rules bind open work: never flatten this error to a
+  string between the worker and the handler (it would become a `422`), and keep
+  the text seam in `domain::expert_kernel::is_out_of_device_memory` as the only
+  textual match, because the driver reports OOM as a string only. Streaming
+  handlers must call `AppState::ensure_resident` before their SSE headers, or
+  the refusal arrives behind a `200`.
 
 - **113** -- the kernel artifacts are **built by Nix, never committed**
   (`nix/kernels.nix`). `build.rs` requires `$FERRUM_KERNEL_DIR` and copies its
@@ -1067,10 +1094,14 @@ prompt override before comparing miss rates.
   kernel (keeping the exact arithmetic, oracle green) was 1.26 -> 0.70 ms but
   measured **captured-neutral-to--6%**: the captured step is memory-bound, not
   router-bound. Archived, not shipped.
-- [ ] **R8.2 Fused GDN decode** (adopt the vendored FLA
-  `fused_sigmoid_gating_delta_rule_update`). One Triton kernel for gating +
-  l2norm + recurrence + state I/O, replacing `gdn_conv/gdn_ba/gdn_recur/gdn_tail`.
-  gdn 9.8 -> ~7. Gate: GDN oracle.
+- [x] **R8.2 Fused GDN decode** -- CLOSED as moot (2026-11-04). The FLA adoption
+  this item asked for is decision 77's `gdn_decode` (one kernel: gating +
+  l2norm + recurrence + indexed state I/O), already wired with `conv_decode`
+  (decision 86). The "gdn 9.8 -> ~7" estimate predates the R6 sub-stage profile
+  (`OPTIMIZATION.md`): `gdn_qkvz` (the bulk) is at the ~220 GB/s read roofline
+  and what remains (`gdn_tail` + `gdn_ba` ~1.8 ms) is the sub-ms-stage class
+  that measured captured-neutral (R8.1) or a regression (R9.2). Do not reopen
+  without a captured-tg reason.
 - [x] **R8.3 Attention kernel** -- CLOSED (2026-10-19): the "4.4 vs 2.1-2.8" was a
   measurement artifact (the eager profile's `attn` is the libtorch fallback; the
   paged kernel runs only in the captured path and costs ~0.1-0.25 ms). See
@@ -1154,13 +1185,13 @@ re-profiled at HEAD: the GDN *bundle* is 42% (`gdn_qkvz` 0.85 + `gdn_ba`
   decision 118).** The fused kernel is already taken on all 39 residual layers;
   the 0.87 ms/token is the MoE copy overlap (`FT_ABLATE=moe`: 4.231 -> 0.832
   ms/token) and forcing the op chain moves pp <1%. Nothing shipped.
-- [ ] **R10.5 pp parity ladder (2026-10-22).** FreeToken's compute-side prefill
-  is ~0.92 ms/token (their table pp minus the ~0.87 s HTTP fixed cost); ours is
-  3.69 ms/token at 517 and 2.61 at 2057, so the gap is ~4.0x / ~2.8x. The
-  ordered retries (re-profile, R10.4 norm_in, host-attention slimming then a
-  batched prefill attention kernel, chunk-size sweep under the grouped GEMM,
-  MoE streaming floor, small-op fusion, and a speculative captured prefill
-  step) are recorded in `OPTIMIZATION.md` R10.5.
+- [x] **R10.5 pp parity ladder -- CLOSED as moot (2026-11-04).** It was written
+  when pp was 2.4-4.6x behind; after R10.6a/b, R10.7, R10.8, R10.9 and R10.10
+  prefill is ahead of FreeToken (400.9 vs 366.2 at 517, 958.5 vs 725.0 at 2057,
+  `OPTIMIZATION.md` R9 baselines). The untried leftovers (host-attention
+  slimming, a batched prefill attention kernel, a captured prefill step) are
+  only justified by a newly measured pp gap; the R10.3 regression warning
+  (`decision 117`) still applies to the kernel item.
 - [x] **R10.6 MoE prefill copy (re-scoped 2026-10-22, decision 118).** The
   prefill gap was the expert stream, not the dense ops. Both slices landed:
   (a) the production prefill chunk (decision 119) and (b) the copy on the DMA
@@ -1225,6 +1256,32 @@ re-profiled at HEAD: the GDN *bundle* is 42% (`gdn_qkvz` 0.85 + `gdn_ba`
   (+2.2%)**, 517 flat; `BLOCK_M=64` alone was +1.4% and compaction alone +0.6%,
   so both were needed to clear the 2% bar. Greedy ids `[561, 3841]`, both
   prefill arms green. Logs `/tmp/opencode/r10_10/`.
+
+- [ ] **R12 vision-prefill partial eviction (2026-11-04, in progress).** The
+  whole-layer prefill borrows a fixed `2 * num_experts = 512` buffer slots
+  (`select_buffer_slots`) and streams all 256 experts of every layer, even for
+  a ~49-token vision prompt (~392 routes -> ~200 distinct experts/layer on
+  broad routing) -- and the vision tower's ~1.7 GiB upload (decision 139)
+  shrinks the auto expert cache, so the waste bites harder. Audit
+  (2026-11-04): the decision-138 blockers are smaller than recorded --
+  `prefill_layer` already receives the layer's routed ids *before* its
+  prefetch (router-before-staging is satisfied), and `pick_window` already
+  generalizes over a contiguous window size, so the slice is a distinct-expert
+  count + a variable victim table/seg_ids/row rebuild per half. Step 0 first:
+  measure the vision prefill's distinct-expert footprint and the decode
+  miss-rate churn (`FT_SLOTS_REPORT` / `FT_MISS_TRACE`, mixed vision+text vs a
+  text-only control); note the whole-layer stream is ~18.18 GB per chunk
+  (~1.3 s at the 14 GB/s DMA line rate) no matter how few tokens the prompt
+  has, so that copy latency is the dominant vision-prefill cost to attack.
+  Facts in `OPTIMIZATION.md` R12.
+- [x] **mrope decode wiring (correctness, 2026-11-04) -- DONE (decision 142).**
+  Image prompts get the reference's per-pair mrope positions: the triples
+  (t, h, w) per expanded-prompt token and the decode delta live on
+  `RequestImages`, the interleaved pair map replaced the contiguous helper,
+  the scalar oracle takes the mrope rope, and the cudarc path gathers the rope
+  rows per axis through the new `mrope_gather` cubin. Text-only requests keep
+  the flat path bit-exact and the captured decode graphs untouched (image
+  requests decode on the eager cached path). See `DONE.md` 142.
 
 ### State of play
 

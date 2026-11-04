@@ -272,17 +272,23 @@
               # resident; a live FreeToken engine keeps ~22 GiB of weights of its
               # own, which is enough together to invite the OOM killer. Warn, do
               # not fail. `ft-daemon` runs the serve as a child that outlives it
-              # (KillMode=process), so also look for a bare `ft serve`.
+              # (KillMode=process), so also look for a bare FreeToken serve.
               if command -v systemctl >/dev/null 2>&1; then
                 for unit in ft-daemon freetoken; do
                   if systemctl --user is-active --quiet "$unit" 2>/dev/null; then
-                    echo "warning: $unit.service is running; it or its 'ft serve' child holds FreeToken's ~22 GiB resident." >&2
+                    echo "warning: $unit.service is running; it or its FreeToken serve child holds ~22 GiB resident." >&2
                     echo "         stop it (systemctl --user stop $unit) before a gated run." >&2
                   fi
                 done
               fi
-              if command -v pgrep >/dev/null 2>&1 && pgrep -f 'ft serve' >/dev/null 2>&1; then
-                echo "warning: an 'ft serve' process holds FreeToken's ~22 GiB resident; stop it before a gated run." >&2
+              # The pattern is assembled from two pieces on purpose: this hook's
+              # text is the argument of the `bash -c` that `nix develop --command`
+              # spawns, so `ps` lists it as a cmdline. A literal phrase here (or
+              # in the message below) would then match itself and warn on every
+              # shell entry.
+              ft_serve_pattern="ft"" serve"
+              if command -v pgrep >/dev/null 2>&1 && pgrep -f "$ft_serve_pattern" >/dev/null 2>&1; then
+                echo "warning: a running FreeToken serve holds ~22 GiB resident; stop it before a gated run." >&2
               fi
             '';
           };

@@ -1669,7 +1669,38 @@ bs=1 decode is now **1.08x**. Prefill is flat at 517 (401.0) and 958.5 at 2057
 on the auto cache. `FERRUM_SMOKE_CACHE=1984`/`2048` remain useful diagnostics
 for a larger prefill chunk budget. Logs `/tmp/opencode/r10_10/`.
 
-## Candidate: dynamic prefill buffer (vision + short prompts)
+## R12 -- vision-prefill partial eviction (opened 2026-11-04, in progress)
+
+The whole-layer prefill borrows a fixed `2 * num_experts = 512` buffer slots
+(`select_buffer_slots`) and streams one whole layer (all six banks, ~18 GB
+across 40 layers at ~14 GB/s DMA) regardless of how many distinct experts the
+prompt's routes touch. For a ~49-token vision prompt (decision 139) that is at
+most 49 * 8 = 392 routes over up to 256 experts -- the borrow is sized for the
+worst case, and the stream moves banks the prompt never reads. Decision 139
+also notes the vision tower's ~1.7 GiB upload shrinks the auto expert cache, so
+the coldest-slot churn the borrow causes now evicts a proportionally larger
+working set.
+
+Step 0 -- measure before sizing anything (the R8.5 lesson: the workload, not a
+policy bug, explained the "gap"):
+- `FT_SLOTS_REPORT=1` + `FT_MISS_TRACE=1` on a mixed workload: one image
+  request, then a decode, then a second decode, and compare the second decode's
+  miss count against a text-only control (the R7.2 acceptance shape, now with
+  image prompts).
+- Count the distinct routed experts per vision prefill (`FT_ROUTE_TRACE` at
+  prefill) against the 512-slot borrow.
+
+The fix (decision 138's parked follow-up, unchanged in goal, smaller in
+mechanism than recorded -- audit 2026-11-04): size the buffer from the routed
+expert ids. `prefill_layer` already receives the layer's routed ids before its
+prefetch (the "router-before-staging" blocker was already satisfied), and
+`pick_window` already generalizes over a contiguous window size, so the work
+is a distinct-expert count (host-side sync is fine; prefill is uncaptured) plus
+a variable per-half victim table / `seg_ids` / copy-row rebuild. Ship only if
+step 0 shows the churn or copy latency is measurable; "LRU pressure already
+reclaims it" remains the null result.
+
+## Closed: dynamic prefill buffer candidate (parked 2026-10-23, superseded by R12)
 
 The whole-layer prefill buffer is fixed at `2 * num_experts` slots
 (`select_buffer_slots`), freed on every prefill even when the prompt only

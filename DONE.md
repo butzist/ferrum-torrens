@@ -4429,3 +4429,133 @@ subsection names are kept verbatim.
      `a_busy_engine_answers_503_with_retry_after`, `an_idle_dispatcher_is_not_busy`.
      Device check: a long text request in flight makes an image request answer
      `503` with `retry-after: 2`; an idle server serves the same image normally.
+
+141. **Idle release gives the GPU back in stages; a batch holds an exclusive lease** (2026-11-04).
+     The dispatcher worker owns the idle timer (`IdlePolicy::from_timeout([serve]
+     idle_timeout_secs)`, default 600 s): after the timeout it advances to stage 1
+     (`Engine::release_moe`, frees the expert banks, the cheap part) and after a
+     second timeout to stage 2 (`Engine::release_residency`, drops the device
+     model; `residency()` rebuilds it from the checkpoint on the next request).
+     Stages advance only on the worker thread while `!engine.exclusive()`, so no
+     forward is ever disturbed, and the poll loop moved from a blocking `recv()`
+     to a 50 ms `recv_timeout`. A submitted job rehydrates (`rehydrate_moe` +
+     `rehydrate`) before running, so a request wakes the device back up. Around
+     every `run_jobs` the worker holds `Engine::batch_lease()`, the exclusive
+     lease that vision `encode` waits on and what decision 140's busy flag
+     reports. The NixOS module exposes `idle_timeout_secs` (`nix/module.nix`).
+     - **Gates.** `cargo test` (dispatcher batching + the decision-140
+       busy/idle pair), clippy default + `cudarc`, `cargo fmt --check`. The
+       release/rehydrate transitions have no dedicated device gate yet; they are
+       exercised indirectly by every post-release request rehydrating.
+
+142. **mrope positions wired for image prompts** (2026-11-04). An image
+     request's rope is no longer the flat `start..start+n`: `RequestImages`
+     now carries the per-token (t, h, w) triples of the whole expanded prompt
+     plus the mrope position delta, built by `expand_image_pads` from each
+     image's merged grid (the `VisionTower` port returns `EncodedImage { rows,
+     grid_h, grid_w }` now). Semantics are HF `modeling_qwen3_vl.py` exactly
+     (`get_rope_index` + `recomposition_frequencies`): a text run counts all
+     three axes up together; an image run holds temporal at the counter,
+     spreads height/width over the merged grid row-major, and advances the
+     counter by `max(gh, gw)` -- not by the `gh*gw` tokens it splices; the
+     decode delta is `max position + 1 - prompt_len` (negative whenever an
+     image is present, since the counter trails the token count), and a decode
+     token at `start` sits at `start + delta` on every axis.
+     - **Interleaved-scheme correction.** The old `mrope_component` implemented
+       the CONTIGUOUS scheme (first 11 pairs temporal, next 11 height, last 10
+       width); the checkpoint's `mrope_interleaved: true` recomposes the axes
+       pairwise: height takes pairs {1, 4, ..., 31} (offset 1, stride 3, below
+       `section[1]*3`), width takes {2, 5, ..., 29}, everything else --
+       including pairs past the section total -- stays temporal. The helper and
+       its tests now implement the interleaved map; `mrope_axis_map(section,
+       pairs, interleaved)` selects the scheme from the config flag, which
+       `config.rs` parses from `rope_parameters` into `ModelParams.mrope`.
+     - **Paths.** The scalar oracle takes
+       `apply_partial_rope_mrope` (per-pair position, per-pair frequency; the
+       angle form is unchanged). The cudarc forward grows `Positions` with a
+       `Triples` variant and gathers the rope rows per axis through a new
+       `mrope_gather` Triton cubin (`out[r, p] = table[triple[r, axis[p]], p]`,
+       one launch for cos and sin, registered in the manifest's `linear`
+       section), driven by an axis-map tensor built at load. Text-only requests
+       keep the flat `[t]` path bit-exact and the captured decode graphs
+       untouched; image requests decode on the eager cached path instead (the
+       graphs stage flat text positions only), with a one-time warning at
+       request build, and the engine never adopts a prefix for them (unchanged).
+     - **Gates.** `cargo test` 396 passed (mrope triples/delta hand examples,
+       the interleaved map, prefill-chunk triple slices, decode
+       `start + delta` steps, the stateless refeed delta, grid-mismatch
+       rejection, and an image request never riding the captured graphs),
+       `cargo test --features cudarc --lib` 481 passed (the gather
+       cubin against a host gather on the device), clippy default + cudarc
+       clean, `cargo fmt --check` clean, `kernel-selftest --interp` PASS
+       (mrope gather exact at 0.0), `scripts/check-kernels.sh` PASS
+       (sm_120), and the gated device smoke `tests/vision_smoke.rs`
+       (`prlimit --as=68719476736`, debug build, 1 passed) served an image
+       end to end with the mrope path live: 49 visual tokens (the 7x7 merged
+       grid) encoded in 0.3 s, finish `Length`, coherent description
+       (`tests/vision_smoke.rs`, log `/tmp/opencode/logs/vision_smoke.log`).
+
+143. **Video input deferred; client-supplied frames would come first** (2026-11-05).
+     The checkpoint is a VL model, not an Omni: it has a `vision_config` and a
+     `video_token_id` but no audio tower. Video is not a wiring job. The
+     verified requirements: `temporal_patch_size` is 2 and the ViT conv is
+     `[out, C, 2, 16, 16]`, while both vision paths currently feed the same
+     still frame into both temporal slots (`vision.rs`); `num_patches` ignores
+     the temporal dim; the ViT's temporal rope axis is unused; the chat
+     template renders images only, where video needs the Qwen3.5 per-frame
+     `<t> <vision_start> ... <vision_end>` timestamp tokens; the mrope triple
+     builder handles one image run and video needs N per-frame runs (counter
+     advancing by `max(gh, gw)` each); and there is no oracle -- FreeToken is
+     text-only and the runtime deliberately carries no transformers/torch, so
+     correctness would rest on an extended host oracle plus hand-derived
+     reference semantics. Serving cost also changes shape (hundreds to
+     thousands of extra tokens per clip against the 8192 prefill budget and
+     the 8 GiB VRAM target). No client in use needs video, and there is no
+     OpenAI-standard chat video input to be compatible with. If a client does,
+     the first slice is client-supplied frames (a `frames: [data-url]` field,
+     per-frame grid, no codec dependency); a demuxer (ffmpeg bindings) only
+     after upload is genuinely required. Recorded in `TODO.md` section 7 as
+     decision 143.
+
+144. **A rebuild that finds the GPU full answers 503 instead of failing** (2026-11-04).
+     The idle release (decision 141) gives the GPU back, so the next request
+     rebuilds the residency -- and another process may hold the VRAM by then.
+     That used to surface as `RegistryError::Build(..)` flattened to a string,
+     which the handlers turned into a `422` ("the caller sent something wrong")
+     and, worse, the worker could go on to run a batch over a residency that was
+     never built. It is a retry, so it is now classified all the way:
+     - **Detection.** `MoEError::OutOfMemory` is raised where the allocation
+       fails (`cudarc::bad` and `cudarc::driver`); the predicate
+       `domain::expert_kernel::is_out_of_device_memory` matches
+       `CUDA_ERROR_OUT_OF_MEMORY` (cudarc's rendering) and `out of memory`
+       (`cuGetErrorString`'s). The predicate lives in the domain, not in
+       `cuda_driver`, because the non-`cudarc` build still compiles the registry
+       and the HTTP mapping.
+     - **Propagation.** `RegistryError::OutOfDeviceMemory` ->
+       `RebuildError::OutOfDeviceMemory` -> `EngineError::OutOfDeviceMemory
+       { retry_after_ms: 5_000, detail }`. `Engine::rehydrate` publishes nothing
+       on failure, so the engine stays cold and the next request tries again;
+       `rehydrate_moe` classifies the bank reallocation the same way.
+     - **The worker hop.** `Job.reply` now carries `Result<Generation,
+       JobError>`; `JobError::OutOfDeviceMemory` is the only reason a message
+       would have lost the distinction, so the kind travels instead of the text.
+       A wake that fails replies to every job in the coalesced window and keeps
+       looping (`run_jobs` is not entered at all).
+     - **HTTP.** `ApiError::out_of_device_memory` answers `503`,
+       `code: "out_of_device_memory"`, `Retry-After: 5`. Streaming handlers
+       (`chat`, `completions`, `responses`) call `AppState::ensure_resident`
+       before their SSE headers, so a cold engine's refusal is an HTTP status a
+       client retries on instead of an error frame behind a `200`. An OOM
+       reported mid-request (KV pool growth, expert staging) maps to the same
+       503 through the catch-all in `From<EngineError> for ApiError`.
+     - **Gates.** `cargo fmt --check` clean, clippy `--all-targets` clean
+       (default and `cudarc`), `cargo test` 401 passed / 7 ignored,
+       `cargo test --features cudarc --lib` 487 passed. New tests: the text
+       classifier against the two real spellings from the observed
+       `DriverError(CUDA_ERROR_OUT_OF_MEMORY, "out of memory")`; the engine
+       staying cold and repeatable across two failed rebuilds, then succeeding;
+       the dispatcher answering `JobError::OutOfDeviceMemory` without running a
+       forward and serving the next job once memory is back; the `503` +
+       `Retry-After` mapping for both the engine and the worker-hop error.
+       The real device case (exhausting the 8 GiB card on purpose) is not a gate:
+       the fixture strings come from the OOM an actual idle rebuild produced.

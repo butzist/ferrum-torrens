@@ -243,6 +243,13 @@ Instructions for AI coding agents working in this repository.
   committed artifacts to be stale any more; `nix build .#kernels` is the gate
   that turns the sources into the `kernel/` tree the Rust build consumes. Run
   both in the devShell; neither needs a GPU.
+- Flake builds see **only git-tracked files**: a flake copies the repo as git
+  sees it, so a new kernel module that is not `git add`-ed is absent from the
+  `kernels` derivation while the devShell's `PYTHONPATH` (the working tree)
+  still imports it. That mismatch fails `nix build .#kernels` with
+  `ModuleNotFoundError: No module named 'ferrum_kernel.<new>'`. `git add` the
+  file before building; after kernel sources change, rebuild and re-enter the
+  shell so `FERRUM_KERNEL_DIR` stops pointing at the previous artifact set.
 - Kernel work has a CPU inner loop, no GPU needed (DONE.md decision 31), and it
   is **hermetic in the devShell**. The flake's `pythonEnv` is torch + triton +
   numpy, and its `shellHook` wires triton to the cudatoolkit's `ptxas`

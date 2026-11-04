@@ -186,7 +186,7 @@ flowchart LR
 
   subgraph KernelAOT["kernel toolchain (devshell, hermetic python)"]
     direction TB
-    K1["python/ferrum_kernel/\nnvfp4_moe.py, offload.py, moe_prefill.py,\nattention.py, gdn.py, linear.py,\nfp8_linear.py, signatures.py,
+    K1["python/ferrum_kernel/\nnvfp4_moe.py, offload.py, moe_prefill.py,\nattention.py, gdn.py, linear.py,\nfp8_linear.py, mrope.py, signatures.py,
 elementwise.py"]
     K2["aot.py: triton.compile\nGPUTarget cuda sm_120"]
     K3[("kernel/*.cubin + *.ptx\n+ manifest.json (Nix output)")]
@@ -450,6 +450,21 @@ window`, staged per row by `stage_window`): the lagging slots are dropped by the
 step-position mask and carry only a valid pool index, so the gather keeps the
 same shape and addresses every step -- the precondition for the cubin launchers.
 
+**Vision tower `[core]`** (decisions 139, 142). The checkpoint is
+`Qwen3_5MoeForConditionalGeneration`: image (and a video placeholder token)
+input through a ViT; there is **no audio tower**. `models/qwen3_6/vision.rs`
+(host preprocess + the host oracle) and `vision_cudarc.rs` (the device tower)
+implement the `VisionTower` port: image decode/resize/normalize/patchify stay
+on the host, the ViT blocks and the patch merger run f32 on the device (f32
+cuBLAS GEMMs, the committed elementwise/reduce kernels, `bmm` attention, axial
+2D rope) with no new Triton cubins. `encode` returns `EncodedImage { rows,
+grid_h, grid_w }`; `Engine::make_request_with_images` expands each
+`<|image_pad|>` to `grid_h * grid_w` placeholders, the forward splices the
+embedding rows at those global positions (`RequestImages::slice_for_window`
+rebases them into the step's window), and `RequestImages` carries the per-token
+mrope position triples and delta (decision 142). Video is not served; a
+text-only request never builds vision state.
+
 ### 3.5 MoE offload `[core]` (whole-layer prefill overlap `[core]`)
 
 The heart of the port. The engine's MoE obligation is split: the model computes
@@ -548,7 +563,10 @@ LRU's hot set survives the prefill (decision 94) and each bank's whole layer is
 one DMA run. `PrefillHarness` (the copy stream, its events and the row
 indices) is retained across transitions; the driver exposes it through owned
 `OwnedStream`/`OwnedEvent` handles that destroy themselves on drop. The blocks
-are the cache's own slots, so this adds no expert VRAM.
+are the cache's own slots, so this adds no expert VRAM. While idle the
+dispatcher releases the device in stages (decision 141): the expert banks first
+(`release_moe`), then the whole residency (`release_residency`);
+`rehydrate_moe`/`rehydrate` put them back before the next request runs.
 
 ### 3.6 KV cache, radix, and GDN state `[core]`
 
@@ -713,6 +731,44 @@ GPU/CPU work, never on the tokio runtime). A stream's frames ride a bounded
 channel and a per-request sink returns `false` when it is full, which aborts
 only that request instead of stalling the batch. `Request` carries its own seed,
 so co-batching never changes a lone request's tokens.
+
+**Idle release and the busy answer** (decisions 140, 141). The worker owns the
+idle timer (`IdlePolicy`, from `serve.idle_timeout_secs`): after the timeout it
+advances to stage 1 (`Engine::release_moe`, frees the expert banks) and after a
+second timeout to stage 2 (`Engine::release_residency`, drops the device model;
+`residency()` rebuilds it from the checkpoint on the next request). Stages
+advance only on the worker thread while no batch is on the device, the poll
+loop is a 50 ms `recv_timeout`, and a submitted job rehydrates before running.
+Every `run_jobs` holds `Engine::batch_lease()`, the exclusive lease that vision
+`encode` waits on; while it is held, `chat_completions` refuses image requests
+with `503` and a whole-second `Retry-After` (a coarse upper bound from
+`DECODE_MS_PER_TOKEN * max_output_tokens`) instead of queueing behind an
+unbounded batch.
+
+**Waking up into a full GPU** (decision 144). A rebuild is the one place the
+engine can need more VRAM than it has while it is idle: another process may have
+taken the device since the release. That is a retry, not a fault, so it never
+crashes and never runs a forward over a half-built residency:
+
+- **Classified, not stringly.** `MoEError::OutOfMemory` is raised where the
+  allocation fails (`cudarc::bad`/`driver`), `RegistryError::OutOfDeviceMemory`
+  where construction fails, `RebuildError` in the rebuild closure and
+  `EngineError::OutOfDeviceMemory` at the engine. The text predicate
+  (`domain::expert_kernel::is_out_of_device_memory`, matching
+  `CUDA_ERROR_OUT_OF_MEMORY` and the `cuGetErrorString` wording) is the one
+  seam that stays textual, because the driver only reports a string; it sits in
+  the domain next to `MoEError` so the non-`cudarc` build still compiles.
+- **Worker.** A wake that fails leaves the residency slot empty (a failed build
+  publishes nothing), answers every job in the coalesced window with the
+  retryable `JobError`, and keeps looping: the next request after memory frees
+  rebuilds normally. The error kind rides the reply channel, because a flattened
+  message would come out as the handler's generic `422`.
+- **HTTP.** `EngineError`/`JobError` map to `503` + `Retry-After: 5` with code
+  `out_of_device_memory`. Streaming handlers call `AppState::ensure_resident`
+  *before* the SSE headers, so the refusal is an HTTP status a client can retry
+  on rather than an in-stream frame behind a `200`. A residency miss during a
+  running batch (KV pool growth, expert-bank staging) is classified the same way.
+
 
 ### 3.9 CUDA-graph decode capture -- implemented
 
