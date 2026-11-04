@@ -4559,3 +4559,53 @@ subsection names are kept verbatim.
        `Retry-After` mapping for both the engine and the worker-hop error.
        The real device case (exhausting the 8 GiB card on purpose) is not a gate:
        the fixture strings come from the OOM an actual idle rebuild produced.
+
+145. **Short prefills keep the staged LRU; the whole-layer stream needs 1536
+     routes** (2026-11-04). R12 was opened to size the prefill's fixed
+     `2 * num_experts` borrow from the routed ids. Step 0 showed the borrow is
+     not the problem: the *whole-layer copy* is, and the routed-only copy
+     already exists as the chunked staged LRU. So the slice became a gate on
+     when to stream, and the variable victim table was not built.
+     - **Probe.** `FT_ROUTE_TRACE=1` (new dev probe in `prefill_layer`, the
+       same shape as `FT_MISS_TRACE`: a D2H read on the uncaptured prefill
+       path, never in serving) prints per-layer route and distinct-expert
+       counts, with the count in a unit-tested `distinct_experts`.
+       `tests/vision_prefill_churn.rs` is the gated harness (two arms, one
+       load each, one image request plus text prompts of 72/128/192/256/517
+       ids, unique first ids so the hybrid radix cannot reuse a prefix --
+       without that the 517-token arm only prefilled 51 tokens and the curve
+       was wrong).
+     - **Footprint.** The 72-token image request routes 576 ids per layer and
+       names 58-113 distinct experts of 256 (mean 86, 34%). A same-length text
+       prompt is the same (mean 92); 128 tokens mean 92 and 256 mean 102. The
+       whole-layer copy therefore moves ~3x the bytes a short prompt reads.
+       Routing is much more skewed than the uniform estimate (229 of 256).
+     - **Cost** (release, auto cache 1024 slots with the tower resident,
+       time to first token): streamed 1.43/1.31/1.31/1.31/1.30/1.29 s against
+       staged-LRU 0.77/0.74/1.02/1.28/1.53/2.58 s for image-72, text-72, 128,
+       192, 256, 517. The stream is a fixed ~1.29 s (18.2 GB at the ~14 GB/s
+       DMA line rate, nothing to hide it behind at these lengths); the staged
+       LRU is launch-bound at ~4 ms/token. The arms cross at 192 tokens.
+     - **Change.** `WHOLE_LAYER_MIN_ROUTES = 1536` and `whole_layer_step`
+       (`cuda_moe`): the stream needs the harness (cache >= `2 * num_experts`
+       and `moe.prefill_overlap`), more than one `lru_ensure` launch, and at
+       least 1536 routes. Unit test pins the boundary. The two device gates
+       that cover the stream (`a_whole_layer_prefill_overlap_matches_the_host_plan`,
+       `a_prefill_retains_the_decode_expert_cache`) moved from 64 to 256
+       tokens so they still take the path they claim to cover; both pass.
+     - **Re-measured through the same probe with `prefill_overlap = true`:**
+       the image request now takes the staged LRU at 0.78 s (-45%) and
+       192/256/517 still stream (the route lines show it).
+     - **Decode churn: none.** `FT_MISS_TRACE=1` after a whole-layer image
+       prefill gives 320/196/147/142/146 misses over five decode steps against
+       299/233/257/170/138 after text; the borrow takes the coldest 512 slots
+       and leaves the decode LRU alone (decision 94).
+     - **Gate defect found.** `tests/vision_smoke.rs` never set
+       `[kernel] triton = true`, so the one multimodal device gate ran the host
+       expert widening: its recorded 2495 s run was that, not debug slowness.
+       It now runs the serving path and passes in **26.03 s** (49 visual
+       tokens, coherent answer, finish Length).
+     - **Gates.** `cargo test` 402 passed / 7 ignored, `cargo test --features
+       cudarc --lib` 490 passed, clippy `--all-targets` clean (default and
+       `cudarc`), `cargo fmt --check` clean. Device: both retargeted MoE gates
+       and the vision smoke pass under `prlimit --as=68719476736`.

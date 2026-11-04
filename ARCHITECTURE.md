@@ -533,11 +533,16 @@ the pinned banks carrying across, so prefill uses the same device path as decode
 
 **Whole-layer prefill overlap `[core]`** (decision 67). When the config enables
 it and the cache holds `2 * num_experts` slots (`enable_prefill_overlap`), a
-prefill-shaped step (routes > `BLOCK_K`) switches the `Residency` state machine
-to `Prefill`: a contiguous window of `2 * num_experts` cache slots becomes two
-full-layer buffers, a device gather maps the router's ids through that half's
-victim table, and there is one streamed copy of the layer plus one grouped GEMM
-pass instead of a per-chunk `lru_ensure`. The grouped CSR (`seg`/`route_idx`)
+long enough prefill-shaped step (`routes >= WHOLE_LAYER_MIN_ROUTES` = 1536,
+above one `BLOCK_K` launch; R12/decision 145 measured the crossover) switches
+the `Residency` state machine to `Prefill`: a contiguous window of
+`2 * num_experts` cache slots becomes two full-layer buffers, a device gather
+maps the router's ids through that half's victim table, and there is one
+streamed copy of the layer plus one grouped GEMM pass instead of a per-chunk
+`lru_ensure`. A short prefill keeps the chunked staged LRU: it routes to only
+~a third of a layer's experts, and the stream's fixed 18.2 GB copy has no
+compute to hide under at that length, so the routed subset is ~45% faster to
+first token. The grouped CSR (`seg`/`route_idx`)
 is built on the device by `moe_csr_count`/`moe_csr_prefix`/`moe_csr_scatter`
 (stable ascending route order per slot), and the per-chunk scratch group and
 the token-major route table are reused across layers for a given
@@ -555,8 +560,9 @@ launches the batched grouped GEMM (`launch_grouped`, one program per
 covers only the active half's `2E` slots, R10.10/decision 128) instead of the
 per-route GEMV, so
 each expert's weight is read once per chunk; decode keeps the GEMV and
-`FERRUM_PF_GEMV=1` forces it for the A/B. A step that drops back below the cap
-returns to `Decode`; the buffer's slots are the **coldest contiguous window**
+`FERRUM_PF_GEMV=1` forces it for the A/B. A step that drops below
+`WHOLE_LAYER_MIN_ROUTES` (or below `BLOCK_K`) runs the staged LRU again; the
+buffer's slots are the **coldest contiguous window**
 (chosen by minimum total usage on entry, freed there, with the per-half copy
 rows and the `(half, expert) -> slot` map rebuilt from them), so the decode
 LRU's hot set survives the prefill (decision 94) and each bank's whole layer is

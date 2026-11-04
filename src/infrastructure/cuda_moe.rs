@@ -755,11 +755,15 @@ impl CudaMoE {
         Ok(ids.iter().filter(|&&id| id >= 0).count())
     }
 
-    /// Whether a step is prefill-shaped: more routes than one `lru_ensure`
-    /// launch handles. Below that it stays on the flat LRU, where a whole-layer
-    /// stream would over-copy for a token count that hides nothing.
+    /// Whether a step is prefill-shaped and long enough to stream whole layers.
+    /// Below this the chunked staged LRU is cheaper: it copies only the experts
+    /// the step routes to.
     fn is_prefill_step(&self, routes: usize) -> Result<bool, MoEError> {
-        Ok(self.prefill.is_some() && routes > self.lru_block_k()?)
+        Ok(whole_layer_step(
+            self.prefill.is_some(),
+            routes,
+            self.lru_block_k()?,
+        ))
     }
 
     /// The `lru_ensure` route cap, or zero when device staging is off. The
@@ -1798,7 +1802,7 @@ impl CudaMoE {
         let hidden = self.shapes.hidden;
         let tokens = x.numel() / hidden;
         let routes = tokens * top_k;
-        let (_experts_per_layer, layers) = {
+        let (experts_per_layer, layers) = {
             let st = self.device_staging.as_ref().expect("staging");
             (st.experts, st.layers)
         };
@@ -1844,6 +1848,17 @@ impl CudaMoE {
         // runs on the device: `experts` is already an i32 tensor, so the host
         // never sees the 16.5k router ids.
         let experts_flat = as_i32_ids(experts, routes, &self.rt)?;
+        // Dev-only R12 probe: with `FT_ROUTE_TRACE` set, print this layer's route
+        // count and how many distinct experts it names, so the waste in the
+        // whole-layer copy can be read off a real prompt. Prefill is uncaptured,
+        // so a D2H is legal here; never in serving.
+        if std::env::var_os("FT_ROUTE_TRACE").is_some() {
+            let ids = experts.to_host_i32()?;
+            eprintln!(
+                "[route] layer={layer} tokens={tokens} top_k={top_k} routes={routes} distinct={} experts={experts_per_layer}",
+                distinct_experts(&ids, experts_per_layer)
+            );
+        }
         let slots = victim_table
             .gather_rows(&experts_flat)?
             .reshape(&[routes])?;
@@ -2065,6 +2080,45 @@ fn whole_layer_runs(
     })
 }
 
+/// Routes at which streaming whole layers starts to pay for itself.
+///
+/// The stream copies every expert of every layer (all six banks, ~18.2 GB over
+/// this checkpoint's 40 layers) whatever the prompt length, and hides the copy
+/// under the previous layer's compute. A short prompt reads only a fraction of
+/// each layer -- a 72-token prompt names 58-113 of 256 experts per layer -- and
+/// has no compute to hide the copy behind, so the chunked staged LRU's
+/// routed-only copy is cheaper. R12 step 0 measured time to first token at
+/// 72/128/192/256/517 tokens (release, auto cache, 1024 slots with the tower
+/// resident): 0.76/1.02/1.28/1.53/2.58 s on the staged LRU against a flat
+/// 1.29 s streamed, so the two cross at 192 tokens = 1536 routes (top_k 8).
+/// The stream takes over at the crossing.
+const WHOLE_LAYER_MIN_ROUTES: usize = 1536;
+
+/// Whether a step of `routes` routes takes the whole-layer stream: the harness
+/// has to exist, the step has to exceed one `lru_ensure` launch (`block_k`, the
+/// staged LRU's route cap), and it has to be long enough for the copy to be
+/// worth more than the routed subset. Split out from `is_prefill_step` so the
+/// decision is testable without a device.
+fn whole_layer_step(prefill: bool, routes: usize, block_k: usize) -> bool {
+    prefill && routes > block_k && routes >= WHOLE_LAYER_MIN_ROUTES
+}
+
+/// How many distinct experts a route list names, among `experts` ids. R12's
+/// measurement input: the whole-layer prefill copies every expert of every
+/// layer, while a prompt reads only the ids it routes to. A negative id is
+/// router padding and an id past the bank names no expert, so neither counts.
+fn distinct_experts(ids: &[i32], experts: usize) -> usize {
+    let mut seen = vec![false; experts];
+    let mut n = 0;
+    for &id in ids {
+        if id >= 0 && (id as usize) < experts && !seen[id as usize] {
+            seen[id as usize] = true;
+            n += 1;
+        }
+    }
+    n
+}
+
 /// Start of the contiguous `buffer`-slot window with the lowest total usage.
 /// Free slots (usage 0) naturally win, so the buffer only takes slots the decode
 /// LRU has not touched recently. Contiguity is what makes one DMA run per bank
@@ -2246,6 +2300,41 @@ mod tests {
         fn slab(&self, _: usize, _: u32, _: Part) -> Result<Slab, MoEError> {
             unreachable!("the CPU paths must refuse before staging")
         }
+    }
+
+    /// R12's sizing input: the whole-layer stream copies all `experts` of every
+    /// layer, while the prompt reads only the distinct ids it routes to. A
+    /// negative id is a router padding slot and an id past the bank is not an
+    /// expert either, so neither counts.
+    #[test]
+    fn distinct_experts_counts_what_a_prompt_actually_reads() {
+        assert_eq!(distinct_experts(&[0, 1, 1, 3, 3, 3], 4), 3);
+        assert_eq!(distinct_experts(&[7, 7], 8), 1);
+        assert_eq!(distinct_experts(&[0, 1, 2, 3], 4), 4);
+        assert_eq!(distinct_experts(&[], 4), 0);
+        assert_eq!(distinct_experts(&[-1, -1], 4), 0);
+        assert_eq!(distinct_experts(&[4, 99], 4), 0);
+        assert_eq!(distinct_experts(&[2, 2], 0), 0);
+    }
+
+    /// R12: the whole-layer stream needs both the harness and a long enough
+    /// step. A short prefill keeps the chunked LRU (its routed-only copy is
+    /// cheaper than a whole-layer stream), and a step under one `lru_ensure`
+    /// launch (`block_k`) never needs the harness at all.
+    #[test]
+    fn the_whole_layer_stream_needs_a_harness_and_a_long_step() {
+        assert!(whole_layer_step(true, WHOLE_LAYER_MIN_ROUTES, 128));
+        assert!(whole_layer_step(true, 8192, 128));
+        assert!(!whole_layer_step(true, WHOLE_LAYER_MIN_ROUTES - 1, 128));
+        // The 72-token vision prompt's 576 routes: the stream would move 256
+        // experts per layer for a prompt that reads a third of them.
+        assert!(!whole_layer_step(true, 576, 128));
+        assert!(!whole_layer_step(false, 8192, 128));
+        assert!(!whole_layer_step(
+            true,
+            WHOLE_LAYER_MIN_ROUTES,
+            WHOLE_LAYER_MIN_ROUTES
+        ));
     }
 
     /// The prefill chunk ceiling: `FERRUM_PF_CHUNK` overrides the default, and

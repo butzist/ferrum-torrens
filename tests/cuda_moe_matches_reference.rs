@@ -649,9 +649,10 @@ fn a_whole_layer_prefill_overlap_matches_the_host_plan() {
     const LAYERS: usize = 2;
     const EXPERTS: usize = 256;
     const SLOTS: usize = 512;
-    // 64 x top_k 8 = 512 routes, four times the committed `BLOCK_K` (128), so
-    // every layer takes the whole-layer path.
-    const TOKENS: usize = 64;
+    // 256 x top_k 8 = 2048 routes, past `WHOLE_LAYER_MIN_ROUTES` (1536), so
+    // every layer takes the whole-layer path. A shorter prefill would stay on
+    // the staged LRU (R12) and never exercise the harness this gate covers.
+    const TOKENS: usize = 256;
 
     let Some((index, reader)) = open_checkpoint() else {
         panic!("gate needs the checkpoint in {FTW_DIR}");
@@ -917,8 +918,9 @@ fn a_prefill_retains_the_decode_expert_cache() {
         "warm steps should leave resident experts, got {before}"
     );
 
-    // A whole-layer prefill: 64 x top_k 8 = 512 routes > the 128 cap.
-    run(&exec, 0, 64, 3);
+    // A whole-layer prefill: 256 x top_k 8 = 2048 routes, past
+    // `WHOLE_LAYER_MIN_ROUTES`, so the stream (not the staged LRU) runs.
+    run(&exec, 0, 256, 3);
     let after = gate("resident after", moe.lock().unwrap().resident_count());
     assert_eq!(
         after, before,

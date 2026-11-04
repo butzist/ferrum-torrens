@@ -1,6 +1,17 @@
 # FerrumTorrens -- FreeToken MVP port to Rust: TODO
 
-Status (2026-11-04): **M7 complete, the vision tower runs on the device (decision 139), busy devices answer `503` + `Retry-After` (decision 140), the idle release stages the GPU back to the host behind an exclusive batch lease (decision 141), and a rebuild that finds the GPU full answers `503` instead of crashing (decision 144).** Open work, in order: (1) **partial MoE eviction for the vision prefill** (R12 below: the whole-layer prefill still borrows a fixed `2*E = 512` slots for ~49-token vision prompts; measure, then size the buffer from routed ids, decision 138's parked follow-up). The old perf levers are closed: decode, prefill and K=4 aggregate are all at or ahead of FreeToken (R9 baselines; R8.2 and R10.5 closed 2026-11-04 as moot/measured-no-win). mrope decode wiring landed and its device smoke passed (decision 142).
+Status (2026-11-04): **M7 complete, and the plan has no open checkboxes.** The
+vision tower runs on the device (decision 139); busy devices and a full GPU both
+answer `503` + `Retry-After` instead of crashing (140, 144); the idle release
+stages the GPU back to the host behind an exclusive batch lease (141); mrope
+positions for image prompts are wired and device-gated (142); and short prefills
+no longer stream whole layers (145: image-request time to first token 1.43 s ->
+0.78 s, -45%, measured crossover at 192 tokens). Decode, prefill and K=4
+aggregate are at or ahead of FreeToken on the measured points. R8.2, R10.5 and
+R12 are closed with measurements (the first two as moot/no-win); video input
+stays out of scope (143). The only milestone-sized work left is unscoped:
+serving a second checkpoint needs per-checkpoint cubin sets (the kernel shapes
+are global constants), so it starts with a design slice, not a model port.
 Old status (2026-10-23): **M7 is complete: the cudarc runtime is the serving path,
 libtorch/tch/candle are gone (decision 132), and decode CUDA-graph capture is
 ported (decision 134).** `CudarcQwen3_6::forward_decode_into` runs the batched
@@ -1257,23 +1268,16 @@ re-profiled at HEAD: the GDN *bundle* is 42% (`gdn_qkvz` 0.85 + `gdn_ba`
   so both were needed to clear the 2% bar. Greedy ids `[561, 3841]`, both
   prefill arms green. Logs `/tmp/opencode/r10_10/`.
 
-- [ ] **R12 vision-prefill partial eviction (2026-11-04, in progress).** The
-  whole-layer prefill borrows a fixed `2 * num_experts = 512` buffer slots
-  (`select_buffer_slots`) and streams all 256 experts of every layer, even for
-  a ~49-token vision prompt (~392 routes -> ~200 distinct experts/layer on
-  broad routing) -- and the vision tower's ~1.7 GiB upload (decision 139)
-  shrinks the auto expert cache, so the waste bites harder. Audit
-  (2026-11-04): the decision-138 blockers are smaller than recorded --
-  `prefill_layer` already receives the layer's routed ids *before* its
-  prefetch (router-before-staging is satisfied), and `pick_window` already
-  generalizes over a contiguous window size, so the slice is a distinct-expert
-  count + a variable victim table/seg_ids/row rebuild per half. Step 0 first:
-  measure the vision prefill's distinct-expert footprint and the decode
-  miss-rate churn (`FT_SLOTS_REPORT` / `FT_MISS_TRACE`, mixed vision+text vs a
-  text-only control); note the whole-layer stream is ~18.18 GB per chunk
-  (~1.3 s at the 14 GB/s DMA line rate) no matter how few tokens the prompt
-  has, so that copy latency is the dominant vision-prefill cost to attack.
-  Facts in `OPTIMIZATION.md` R12.
+- [x] **R12 short-prefill expert streaming -- DONE (decision 145).** Measured
+  first (a `FT_ROUTE_TRACE` probe plus `tests/vision_prefill_churn.rs`): a
+  72-token image prompt reads 58-113 of 256 experts per layer, while the stream
+  copies all of them at a fixed ~1.29 s; the staged LRU is ~4 ms/token, so the
+  two cross at 192 tokens. `WHOLE_LAYER_MIN_ROUTES = 1536` now gates the stream
+  (`whole_layer_step`), image-request TTFT 1.43 s -> 0.78 s (-45%) with
+  192+ tokens still streamed. The planned variable victim table was not built:
+  it would copy the same subset the staged LRU already copies, without the
+  lookahead. Details, curve and the vision-gate defect it exposed in `DONE.md`
+  145 and `OPTIMIZATION.md` R12.
 - [x] **mrope decode wiring (correctness, 2026-11-04) -- DONE (decision 142).**
   Image prompts get the reference's per-pair mrope positions: the triples
   (t, h, w) per expanded-prompt token and the decode delta live on
@@ -1316,6 +1320,6 @@ moe_cache_size_slots = "auto"  # auto sizes from free VRAM (decisions 90, 127); 
                                # ceiling 2048 (decision 85); 512 MiB reserve -> ~1920 slots
 max_running_requests = 4
 max_prefill_length = 8192
-prefill_overlap = true         # takes effect only when cache_size_slots >= 512
+prefill_overlap = true         # needs cache_size_slots >= 512; streams only at >= 1536 routes (decision 145)
 cuda_graph = false             # parked: warns and stays eager on cudarc
 ```

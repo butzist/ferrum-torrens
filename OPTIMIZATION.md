@@ -1669,48 +1669,66 @@ bs=1 decode is now **1.08x**. Prefill is flat at 517 (401.0) and 958.5 at 2057
 on the auto cache. `FERRUM_SMOKE_CACHE=1984`/`2048` remain useful diagnostics
 for a larger prefill chunk budget. Logs `/tmp/opencode/r10_10/`.
 
-## R12 -- vision-prefill partial eviction (opened 2026-11-04, in progress)
+## R12 -- short-prefill expert streaming (opened and closed 2026-11-04)
 
-The whole-layer prefill borrows a fixed `2 * num_experts = 512` buffer slots
-(`select_buffer_slots`) and streams one whole layer (all six banks, ~18 GB
-across 40 layers at ~14 GB/s DMA) regardless of how many distinct experts the
-prompt's routes touch. For a ~49-token vision prompt (decision 139) that is at
-most 49 * 8 = 392 routes over up to 256 experts -- the borrow is sized for the
-worst case, and the stream moves banks the prompt never reads. Decision 139
-also notes the vision tower's ~1.7 GiB upload shrinks the auto expert cache, so
-the coldest-slot churn the borrow causes now evicts a proportionally larger
-working set.
+The whole-layer prefill borrowed a fixed `2 * num_experts = 512` buffer slots
+(`select_buffer_slots`) and streamed all 256 experts of every layer (all six
+banks, ~18.2 GB over 40 layers at the ~14 GB/s DMA line rate) regardless of how
+many distinct experts the prompt's routes touched. The plan was to size that
+borrow from the routed ids (decision 138's parked follow-up). Step 0 changed
+the slice: the bytes are the cost, and the routed-subset copy already exists as
+the chunked staged LRU (`prefill_overlap = false`).
 
-Step 0 -- measure before sizing anything (the R8.5 lesson: the workload, not a
-policy bug, explained the "gap"):
-- `FT_SLOTS_REPORT=1` + `FT_MISS_TRACE=1` on a mixed workload: one image
-  request, then a decode, then a second decode, and compare the second decode's
-  miss count against a text-only control (the R7.2 acceptance shape, now with
-  image prompts).
-- Count the distinct routed experts per vision prefill (`FT_ROUTE_TRACE` at
-  prefill) against the 512-slot borrow.
+**Footprint** (`FT_ROUTE_TRACE=1`, a dev probe in `prefill_layer`;
+`tests/vision_prefill_churn.rs`). A 72-token image request routes 576 ids per
+layer and names **58-113 distinct experts of 256** (mean 86, 34%). Routing is
+much more skewed than the uniform estimate (229 of 256), and a same-length text
+prompt behaves the same (mean 92), so this is the model, not the image splice.
+Growth with length is slow: mean distinct 92 at 128 tokens and 102 at 256. A
+whole-layer copy therefore moves ~3x the bytes such a prompt reads.
 
-The fix (decision 138's parked follow-up, unchanged in goal, smaller in
-mechanism than recorded -- audit 2026-11-04): size the buffer from the routed
-expert ids. `prefill_layer` already receives the layer's routed ids before its
-prefetch (the "router-before-staging" blocker was already satisfied), and
-`pick_window` already generalizes over a contiguous window size, so the work
-is a distinct-expert count (host-side sync is fine; prefill is uncaptured) plus
-a variable per-half victim table / `seg_ids` / copy-row rebuild. Ship only if
-step 0 shows the churn or copy latency is measurable; "LRU pressure already
-reclaims it" remains the null result.
+**Cost** (release, auto cache = 1024 slots with the vision tower resident,
+`max_output_tokens = 6`, one load per arm, arms run back to back in the same
+order; time to first token):
 
-## Closed: dynamic prefill buffer candidate (parked 2026-10-23, superseded by R12)
+| tokens | routes | streamed | staged LRU |
+| --- | --- | --- | --- |
+| 72 (image) | 576 | 1.43 s | 0.77 s |
+| 72 (text) | 576 | 1.31 s | 0.74 s |
+| 128 | 1024 | 1.31 s | 1.02 s |
+| 192 | 1536 | 1.31 s | 1.28 s |
+| 256 | 2048 | 1.30 s | 1.53 s |
+| 517 | 4136 | 1.29 s | 2.58 s |
 
-The whole-layer prefill buffer is fixed at `2 * num_experts` slots
-(`select_buffer_slots`), freed on every prefill even when the prompt only
-touches a handful of experts (e.g. a vision prompt's 49 visual tokens). Size
-the buffer from the routed expert ids of the prefilled tokens instead, floor at
-`num_experts`, and only fall back to `2 * num_experts` when the distinct-expert
-count exceeds it. Blocked on: running the router over the full prompt before
-staging, and a variable-size copy-row rebuild. Parked until measured; the
-current cost is only the coldest-slot churn, which LRU pressure already
-reclaims.
+The stream is a fixed ~1.29 s (copy at the line rate; at these lengths there is
+no compute to hide it behind), while the staged LRU is launch-bound at ~4 ms
+per token: it copies only the routed subset, so it wins below 192 tokens and
+loses above. The arms cross at 192 tokens = 1536 routes.
+
+**Shipped.** `WHOLE_LAYER_MIN_ROUTES = 1536` gates the stream on routes
+(`whole_layer_step`), not on cache size alone; the announced `prefill_overlap`
+still selects whether the harness exists. Verified through the same probe with
+`prefill_overlap = true`: the image request now takes the staged LRU (0.78 s,
+-45%) while 192/256/517 still stream (the probe's route lines confirm the
+routing).
+
+**Not taken: the variable victim table.** Sizing the borrow from the routed ids
+would copy the same subset the staged LRU already copies, but it cannot keep the
+lookahead -- layer `L`'s routes are known only after `L`'s attention, so a
+routed-only whole-layer copy is serialized exactly where the flat path already
+is. It would add a per-layer D2H and run compression for no bytes saved, so the
+stream keeps its all-experts copy and is simply not used below the crossover.
+
+**Decode churn: none from the borrow.** `FT_MISS_TRACE=1` after a whole-layer
+image prefill gives 320/196/147/142/146 misses over the first five decode steps,
+against 299/233/257/170/138 after the text control. The borrow takes the coldest
+512 slots and leaves the decode LRU alone (decision 94), so R12's churn concern
+does not materialize; the cost was always the copy.
+
+**Gate defect found while measuring.** `tests/vision_smoke.rs` never set
+`[kernel] triton = true`, so the one multimodal device gate ran the host expert
+widening (its 2495 s debug run was that, not debug slowness). It now runs the
+serving path and passes in seconds.
 
 ## Closed: vision tower on cudarc (decision 139 -> DONE.md 139)
 

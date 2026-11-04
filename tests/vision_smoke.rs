@@ -4,6 +4,12 @@
 //   cargo test --release --features cudarc --test vision_smoke -- --ignored --nocapture
 // (needs .model-cache/Qwen3.6-35B-A3B-NVFP4.ftw and a CUDA device)
 //
+// `kernel.triton = true` is part of the gate: without it the routed experts run
+// on the host widening, which is not the serving path (and ~100x slower). The
+// cache is 512 slots, so the whole-layer prefill harness exists; the 72-token
+// prompt stays on the staged LRU (R12), which is the path a short image request
+// actually takes.
+//
 // The image is generated in-test: a red circle on white, resized by the tower's
 // own preprocessing to the smallest legal patch grid. The decoded answer is not
 // pinned to a reference oracle (the tower's forward is ours); the gate is that
@@ -28,6 +34,7 @@ fn config(max_output_tokens: u32) -> Config {
     format!(
         "[model]\npath = \"{FTW_DIR}\"\nmax_seq_len = 4096\nmax_output_tokens = {max_output_tokens}\n\
          max_prefill_length = 1024\nmax_running_requests = 1\n\n\
+         [kernel]\ntriton = true\n\n\
          [kv]\nnum_tokens = 4096\ndtype = \"bf16\"\n\n[moe]\ncache_size_slots = 512\n"
     )
     .parse()
