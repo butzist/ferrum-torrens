@@ -79,6 +79,9 @@ Instructions for AI coding agents working in this repository.
 - Every module is covered by unit tests. Mock external boundaries with
   `mockall`: the FTW reader, CUDA device, clock, scheduler interaction, and
   any other trait boundary.
+- **Keep tests in the same file as their associated source.** Do not split a
+  module's `#[cfg(test)] mod tests` into a separate file; a module and its
+  unit tests live together so the two stay in sync.
 - Port relevant upstream FreeToken tests from an external checkout (the
   upstream `tests/` tree mirrors the subsystems; it is not vendored here). The numeric oracles live in this repo as Rust counterparts:
   `gdn_reference`, radix prefix tree invariants, offload LRU/eviction rules,
