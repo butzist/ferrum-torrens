@@ -1,6 +1,9 @@
 # FerrumTorrens -- FreeToken MVP port to Rust: TODO
 
-Status (2026-11-04): **M7 complete, and the plan has no open checkboxes.** The
+Status (2026-11-04): **M7 complete. The only open work is the new M8
+second-checkpoint milestone (section 6c): M8.1 is a shape-identical NVFP4
+sibling that needs converter + gate work only (decision 146), and the
+per-checkpoint cubin set waits for a checkpoint whose shapes differ.** The
 vision tower runs on the device (decision 139); busy devices and a full GPU both
 answer `503` + `Retry-After` instead of crashing (140, 144); the idle release
 stages the GPU back to the host behind an exclusive batch lease (141); mrope
@@ -9,9 +12,8 @@ no longer stream whole layers (145: image-request time to first token 1.43 s ->
 0.78 s, -45%, measured crossover at 192 tokens). Decode, prefill and K=4
 aggregate are at or ahead of FreeToken on the measured points. R8.2, R10.5 and
 R12 are closed with measurements (the first two as moot/no-win); video input
-stays out of scope (143). The only milestone-sized work left is unscoped:
-serving a second checkpoint needs per-checkpoint cubin sets (the kernel shapes
-are global constants), so it starts with a design slice, not a model port.
+stays out of scope (143).
+
 Old status (2026-10-23): **M7 is complete: the cudarc runtime is the serving path,
 libtorch/tch/candle are gone (decision 132), and decode CUDA-graph capture is
 ported (decision 134).** `CudarcQwen3_6::forward_decode_into` runs the batched
@@ -529,6 +531,69 @@ any port.
   forward and the libtorch devshell closure are gone. The same gate set runs
   on `cudarc`; `cargo tree` contains no torch/tch/candle package.
 
+## 6c. M8 -- a second checkpoint (scoped 2026-11-04, NOT STARTED)
+
+The engine is model-agnostic by construction (a `models/` module, one registry
+entry, and a kernel shape set), but only one checkpoint has ever been served.
+This milestone is the path to a second one. It is **not started**: M8.1 names
+the cheapest candidate (a shape-identical NVFP4 sibling that needs no kernel
+work) and is the first open item; M8.2 only matters once a checkpoint's *shapes*
+differ, and M8.3 waits for a real client need.
+
+What actually varies, and what each seam costs:
+
+| seam | where it lives today | cost when it changes |
+| --- | --- | --- |
+| tensor names / fused roles | `src/converter/model.rs` (one family, no arch dispatch) | a converter family |
+| quant recipe | NVFP4 experts + FP8 dense, assumed | **a new grouped-MoE kernel** for FP8 or compressed-tensors experts |
+| text tower | `src/models/<arch>/` + `registry::build` | a new arch module |
+| kernel shapes | `SERVING_*` constexprs in `python/ferrum_kernel/signatures.py`, baked into the cubins; `kernel_abi`/launchers validate MoE hidden/inter/top_k and the attention/GDN geometry | a per-checkpoint cubin set (M8.2) |
+| layer count, vocab, token ids | FTW meta + runtime args | nothing |
+
+Candidates that fit this box (8 GiB VRAM, ~20 GiB of host expert banks; HF
+sizes and configs checked 2026-11-04):
+
+| checkpoint | size | arch | quant | cost |
+| --- | --- | --- | --- | --- |
+| `ornith-ai/Ornith-1.5-35B-A3B-NVFP4` | 23.42 GB safetensors, same as the served checkpoint | `Qwen3_5MoeForConditionalGeneration`, **every dimension identical** to Qwen3.6-35B-A3B (text and vision: 40 layers, hidden 2048, 256 experts top-8, inter 512, 16/2 heads at 256, GDN 16/32 at 128, mrope `[11,11,10]`, vision depth 27 / hidden 1152, token ids) | modelopt `MIXED_PRECISION`, same groups (FP8 dense, `W4A16_NVFP4` group-16 experts + shared expert + lm_head) and the same `model.language_model.*` keys | **A: converter + gate only** |
+| other Qwen3.5/3.6-35B-A3B NVFP4 fine-tunes | ~19-23 GB | same family | NVFP4 ok; compressed-tensors needs a reader | A or A + a reader |
+| JEV-35B | ~19 GB | same family | all-FP8 experts | D: new FP8 grouped-MoE kernel |
+| `Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8` | ~17 GB | `Qwen3MoeForCausalLM`: 48 layers, plain GQA (32 Q / 4 KV at 128), hidden 2048 but inter **768**, 128 experts top-8, no GDN, no shared expert, no vision, vocab 151936 | FP8 only (no NVFP4 release) | C+D: new arch module, new cubin set **and** FP8 experts |
+| Gemma-4-26B-A4B | ~17 GB | different attention/norm/act | to check | C |
+| Nemotron-3.5-Lightning-30B-A3B | ~19.6 GB | `NemotronH`: Mamba-2 hybrid | to check | C + new SSM kernels |
+| Laguna-S-2.1, Inkling-Small, GLM-5.3-Flash, Qwen3.8-Flash-Next, A.X-K2, Kimi | 118-169 GB | - | - | out: they do not fit host RAM |
+
+Ordered slices, each its own gated change:
+
+- [ ] **M8.1 Class A -- serve `Ornith-1.5-35B-A3B-NVFP4`.** No kernel work: the
+  shapes are identical, so the committed cubins apply. Steps: run the Rust
+  converter over it end to end (expect no code change; the things to verify are
+  the `mtp*` tensors the quant config ignores and the vision tower's `visual.*`
+  keys, both of which the converter already meets on the served checkpoint),
+  then make the gated device tests parameterized by the checkpoint
+  (`FERRUM_FTW_DIR`, defaulting to the current `.model-cache` path) and run them
+  on both: a 32-token greedy generation and the vision smoke, with
+  decode/prefill within noise (identical shapes and recipe). Acceptance:
+  `nix/model.nix` instantiated for both checkpoints builds and serves, and the
+  gates pass on both. This is what turns "model-agnostic" from a claim into a
+  gate.
+- [ ] **M8.2 Class B -- per-checkpoint cubin set.** Only for a checkpoint whose
+  shapes differ. Move the serving shapes out of module constants into an
+  explicit profile (`ServingShapes` in `signatures.py`), thread it through
+  `aot.py`, let `nix/kernels.nix` build one set per checkpoint profile, and keep
+  `build.rs` embedding whichever `FERRUM_KERNEL_DIR` it is given. **One binary
+  serves one checkpoint** (decision 146): no runtime manifest multiplexing. Add
+  the load-time guard: refuse to start when the FTW config's attention, GDN or
+  MoE geometry disagrees with the embedded manifest (MoE has `check_shapes`
+  today; attention and GDN only fail at the first launch). Acceptance: build a
+  second set with one changed hidden size and one changed head count; the guard
+  fires on a mismatch and the matching checkpoint serves.
+- [ ] **M8.3 Class C/D -- a second architecture, only on real demand.** A
+  plain-GQA MoE is the cheapest second arch because it *deletes* features (no
+  GDN, no shared expert, no vision); it still needs FP8 grouped-MoE experts for
+  the checkpoints that exist, so it is the most expensive path and waits for a
+  client that needs it.
+
 ## 7. Decisions
 
 The full log of confirmed decisions (numbers 1..134, stable -- code, tests and
@@ -562,6 +627,19 @@ history.
   textual match, because the driver reports OOM as a string only. Streaming
   handlers must call `AppState::ensure_resident` before their SSE headers, or
   the refusal arrives behind a `200`.
+
+- **146** -- **one binary serves one checkpoint, with the cubin set built for
+  that checkpoint's shapes.** A second checkpoint is never a runtime manifest
+  choice: `nix/kernels.nix` builds one set for a shape profile, `build.rs`
+  embeds it, and the process refuses a checkpoint whose attention, GDN or MoE
+  geometry disagrees with the embedded manifest (M8.2 extends the MoE-only
+  `check_shapes` to the rest). The reason is ambiguity, not size: the whole
+  set is ~7 MB, but two resident checkpoints already contend for the ~20 GiB of
+  host expert banks, and the deployment is one service with one `model.path`.
+  The first second checkpoint (`Ornith-1.5-35B-A3B-NVFP4`) needs no new set --
+  every dimension and the quant recipe match the served checkpoint -- so M8.1
+  is converter + gate work, and the AOT slice (M8.2) waits for a checkpoint
+  whose shapes actually differ.
 
 - **113** -- the kernel artifacts are **built by Nix, never committed**
   (`nix/kernels.nix`). `build.rs` requires `$FERRUM_KERNEL_DIR` and copies its

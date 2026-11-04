@@ -245,6 +245,13 @@ elementwise.py"]
   jailed opencode is the system-installed launcher from the NixOS/home-manager
   config, not a project package; run it from the devshell so it forwards the
   devshell environment (GPU, `/nix`, Nix daemon socket, credentials).
+- **A second checkpoint's kernel set `[TODO]`** (TODO.md M8.2). The cubins bake
+  the serving shapes as constexprs (`SERVING_*` in `signatures.py`), so a
+  checkpoint with different hidden/inter/top_k/head/GDN geometry needs its own
+  AOT set, built by the same `nix/kernels.nix` from a shape profile and embedded
+  by `build.rs` through `FERRUM_KERNEL_DIR`. The boundary is one set per binary:
+  there is no runtime manifest multiplexing (decision 146). A checkpoint whose
+  shapes and quant recipe match the served one needs no new set at all.
 
 ---
 
