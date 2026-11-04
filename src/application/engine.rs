@@ -737,9 +737,7 @@ impl Engine {
     /// Steps this engine's forward has run through the MoE kernel port. Zero
     /// means the routed experts were widened on the host.
     pub fn expert_steps(&self) -> u64 {
-        self.peek()
-            .map(|res| res.model.expert_steps())
-            .unwrap_or(0)
+        self.peek().map(|res| res.model.expert_steps()).unwrap_or(0)
     }
 
     pub fn device(&self) -> Device {

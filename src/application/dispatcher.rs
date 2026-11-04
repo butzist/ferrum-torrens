@@ -47,6 +47,34 @@ pub struct Job {
 }
 
 /// The handle `AppState` keeps. `submit` is callable from any handler thread.
+/// How the worker releases the device while no request is running. The first
+/// stage frees the expert banks (cheap); the second frees the whole residency.
+#[derive(Clone, Copy, Debug)]
+pub struct IdlePolicy {
+    pub moe_after: Duration,
+    pub all_after: Duration,
+}
+
+impl IdlePolicy {
+    pub fn from_timeout(total: Duration) -> Self {
+        Self {
+            moe_after: total,
+            all_after: total.saturating_mul(2),
+        }
+    }
+
+    /// The stage due for `idle` elapsed time: 0 hot, 1 MoE released, 2 cold.
+    pub fn stage_at(&self, idle: Duration) -> u8 {
+        if idle >= self.all_after {
+            2
+        } else if idle >= self.moe_after {
+            1
+        } else {
+            0
+        }
+    }
+}
+
 pub struct Dispatcher {
     tx: Mutex<Option<Sender<Job>>>,
     handle: Option<thread::JoinHandle<()>>,
@@ -57,13 +85,18 @@ pub struct Dispatcher {
 impl Dispatcher {
     /// Spawn the worker over `engine`. Every forward in the process runs here.
     pub fn new(engine: Arc<Engine>) -> Self {
+        Self::with_idle_policy(engine, IdlePolicy::from_timeout(Duration::from_secs(600)))
+    }
+
+    pub fn with_idle_policy(engine: Arc<Engine>, idle: IdlePolicy) -> Self {
         let (tx, rx) = std::sync::mpsc::channel::<Job>();
         let busy = Arc::new(AtomicBool::new(false));
         let worker_busy = Arc::clone(&busy);
         let retry_after_ms = engine.limits().max_output_tokens as u64 * DECODE_MS_PER_TOKEN;
+        let worker_idle = idle;
         let handle = thread::Builder::new()
             .name("ferrum-dispatch".into())
-            .spawn(move || worker(engine, rx, worker_busy))
+            .spawn(move || worker(engine, rx, worker_busy, worker_idle))
             .expect("the dispatcher thread spawns");
         Self {
             tx: Mutex::new(Some(tx)),
@@ -107,16 +140,36 @@ impl Drop for Dispatcher {
     }
 }
 
-fn worker(engine: Arc<Engine>, rx: Receiver<Job>, busy: Arc<AtomicBool>) {
+fn worker(engine: Arc<Engine>, rx: Receiver<Job>, busy: Arc<AtomicBool>, idle: IdlePolicy) {
     let max_running = engine.limits().max_running_requests.max(1);
+    let mut stage: u8 = 0;
+    let mut last = Instant::now();
     loop {
-        let first = match rx.recv() {
+        // Idle release: advance one stage at a time, on the worker thread only,
+        // so no forward is ever disturbed.
+        if !engine.exclusive() {
+            let due = idle.stage_at(last.elapsed());
+            while due > stage {
+                stage += 1;
+                if stage == 1 {
+                    let _ = engine.release_moe();
+                } else if stage == 2 {
+                    engine.release_residency();
+                }
+            }
+        }
+        let first = match rx.recv_timeout(Duration::from_millis(50)) {
             Ok(j) => j,
-            Err(_) => return,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => return,
         };
+        // A request wakes the device back up.
+        if stage >= 1 {
+            let _ = engine.rehydrate_moe();
+            let _ = engine.rehydrate();
+            stage = 0;
+        }
         let mut jobs = vec![first];
-        // Coalesce a burst: wait up to `BATCH_WINDOW` in total for the rest, so a
-        // steady request stream fills the batch without a per-request stall.
         let deadline = Instant::now() + BATCH_WINDOW;
         while jobs.len() < max_running {
             let now = Instant::now();
@@ -129,8 +182,10 @@ fn worker(engine: Arc<Engine>, rx: Receiver<Job>, busy: Arc<AtomicBool>) {
             }
         }
         busy.store(true, Ordering::Relaxed);
+        let _lease = engine.batch_lease();
         run_jobs(&engine, jobs);
         busy.store(false, Ordering::Relaxed);
+        last = Instant::now();
     }
 }
 

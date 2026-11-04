@@ -39,7 +39,11 @@ async fn run() -> Result<(), String> {
     let (host, port) = (config.serve.host.clone(), config.serve.port);
     eprintln!("serving on http://{host}:{port}");
     serve_forever(
-        AppState::new(engine, config.served_model_name().to_string()),
+        AppState::with_idle_timeout(
+            engine,
+            config.served_model_name().to_string(),
+            config.serve.idle_timeout_secs,
+        ),
         &host,
         port,
     )

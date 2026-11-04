@@ -21,12 +21,13 @@ use futures_core::Stream;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use crate::application::dispatcher::{Dispatcher, Job};
+use crate::application::dispatcher::{Dispatcher, IdlePolicy, Job};
 use crate::application::engine::{Engine, EngineError};
 use crate::application::generation::{self, Request, make_request};
 use crate::domain::sampling::SamplingParams;
 use crate::domain::scheduler::FinishReason;
 use crate::domain::{ChatMessage, ChatTool, ChatToolCall};
+use std::time::Duration;
 
 use super::tool_call::{ParsedToolCall, parse_tool_calls};
 
@@ -53,7 +54,18 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(engine: Arc<Engine>, served_model_name: String) -> Self {
-        let dispatcher = Dispatcher::new(Arc::clone(&engine));
+        Self::with_idle_timeout(engine, served_model_name, 600)
+    }
+
+    pub fn with_idle_timeout(
+        engine: Arc<Engine>,
+        served_model_name: String,
+        idle_timeout_secs: u64,
+    ) -> Self {
+        let dispatcher = Dispatcher::with_idle_policy(
+            Arc::clone(&engine),
+            IdlePolicy::from_timeout(Duration::from_secs(idle_timeout_secs.max(1))),
+        );
         Self {
             engine,
             served_model_name,
@@ -2100,9 +2112,14 @@ async fn chat_completions(
             images.push(img.bytes);
         }
     }
-    // An image request borrows the device residency for its tower pass, so it
-    // must not start while a batch owns it. Tell the client to retry instead of
-    // queueing behind work whose remaining time we cannot bound tightly.
+    // An image request borrows the device exclusively for its tower pass, so it
+    // must not start while a batch (or another vision pass) owns it.
+    if state.engine.exclusive() {
+        return Err(ApiError::busy(
+            "the device is serving another request; retry when it is idle",
+            state.dispatcher.retry_after_ms().div_ceil(1000),
+        ));
+    }
     if !images.is_empty() && state.dispatcher.busy() {
         return Err(ApiError::busy(
             "the device is serving another request; retry when it is idle",
@@ -2113,7 +2130,8 @@ async fn chat_completions(
     // Rendering the template and tokenizing it both run off the runtime, and both
     // still have to answer with a status code rather than a frame. An image
     // request's tower pass is the heaviest piece of preparation, which is exactly
-    // what spawn_blocking is here for.
+    // what spawn_blocking is here for. It takes the exclusive lease so the
+    // expert banks can be freed for the encode and no batch races it.
     let worker = Arc::clone(&engine);
     let prepared =
         tokio::task::spawn_blocking(move || -> Result<generation::Request, EngineError> {
@@ -2122,7 +2140,14 @@ async fn chat_completions(
             if images.is_empty() {
                 return make_request(&worker, uid, ids, params, seed);
             }
-            worker.make_request_with_images(uid, ids, images, params, seed)
+            let lease = worker.try_exclusive().ok_or(EngineError::Busy {
+                retry_after_ms: 1_000,
+            })?;
+            worker.release_moe()?;
+            let result = worker.make_request_with_images(uid, ids, images, params, seed);
+            worker.rehydrate_moe()?;
+            drop(lease);
+            result
         })
         .await
         .expect("preparation task is not cancellable");
