@@ -1,9 +1,16 @@
 # FerrumTorrens -- FreeToken MVP port to Rust: TODO
 
-Status (2026-11-04): **M7 complete. The only open work is the new M8
-second-checkpoint milestone (section 6c): M8.1 is a shape-identical NVFP4
-sibling that needs converter + gate work only (decision 146), and the
-per-checkpoint cubin set waits for a checkpoint whose shapes differ.** The
+Status (2026-11-04): **M7 complete and the second checkpoint is merged: M8.1 is
+done except the Nix store path (M8.1b).** `Ornith-1.5-35B-A3B-NVFP4` converts
+with no code change, passes every device gate, and lands at pp parity and 1-3%
+behind on tg; the difference is routing entropy, measured as +5.4% expert-cache
+misses per decode step and scoped as R13 in `OPTIMIZATION.md`. M8.1c is closed
+by decision 148 -- eager and captured decode had been two implementations of the
+same math, and one-token text decode now runs the device kernels on both arms
+(`maxabs_delta = 0.000000` per step). Two new footprint findings: a load pins
+16.93 GiB of host expert banks (peak RSS 18.6 GiB measured, so one load at a
+time is the rule, not a preference), and a dropped engine keeps its device slot
+banks (M8.1e). The
 vision tower runs on the device (decision 139); busy devices and a full GPU both
 answer `503` + `Retry-After` instead of crashing (140, 144); the idle release
 stages the GPU back to the host behind an exclusive batch lease (141); mrope
@@ -580,15 +587,15 @@ Ordered slices, each its own gated change:
   fixed-output `hash`; one `nix build` pass fills the hash), plus the flake
   package attribute. Needs ~45 GB of store space for the snapshot and the FTW.
   Acceptance: `nix build .#ferrum-torrens-model-ornith` yields a servable FTW.
-- [ ] **M8.1c Captured decode on a second checkpoint.** `cuda_graph = true`
-  fails `cudarc_engine_generate` on Ornith: eager and captured replay agree on
-  the first three tokens and diverge on the fourth (`[11751, 13, 198, 760, ...]`
-  vs `[11751, 13, 198, 32, ...]`), which reads like a near-tie flip rather than
-  a replay bug -- but it is unproven, and capture is opt-in and parked
-  (`cuda_graph = false` by default). Until it is explained, captured decode is
-  validated on the reference checkpoint only. Next step: log the top-2 logits at
-  the divergence for both arms, then either pin the near-tie or find the
-  checkpoint-dependent capture assumption.
+- [x] **M8.1c Captured decode on a second checkpoint -- DONE (decision 148).**
+  The divergence was never capture-specific: eager decode ran the dense gather
+  plus `causal_sdpa` and `conv_prefill`, while a captured step runs paged
+  attention and the fused GDN decode, and the two implementations disagree by
+  up to 0.733 in a logit at the first shared-prefix step (12 bf16 ulps at that
+  magnitude), so a near-tie flips (`pos=7`: eager gap 0.0049, `32` at 14.4408 vs
+  `760` at 14.4358). One-token text decode now takes the device kernels on both
+  arms and the gate reports `maxabs_delta = 0.000000` per step on both
+  checkpoints.
 - [x] **M8.1d Speed benchmark of the second checkpoint -- DONE.** `throughput_smoke`
   (517 prompt tokens, 128 decoded, eager and captured, two reps per checkpoint,
   alternating order): pp identical within noise (397.4 vs 392.3 tok/s eager),
@@ -597,6 +604,21 @@ Ordered slices, each its own gated change:
   not a path change. Absolute numbers sit below the 32.8 tok/s baseline because
   the card was power/thermally capped during the session. Details in `DONE.md`
   147.
+- [ ] **M8.1e A dropped engine keeps its device slot banks.** `throughput_smoke`
+  grows a `vram("process start" | "after load" | "after drop")` probe, and the
+  numbers are unambiguous: with `[moe] cache_size_slots = 256` a 6794 MiB load
+  drops to 1160 MiB against a 526 MiB process baseline, and with 1024 slots an
+  8106 MiB load drops to 2440 MiB. The retained amount is
+  `slots x 1.775 MiB` -- exactly one expert bank row per slot, plus ~140 MiB of
+  context -- so the banks outlive the `Engine`, and a second load in the same
+  process is 1.5 GiB poorer (at 1024 slots it fails with
+  `CUDA_ERROR_OUT_OF_MEMORY` in the MoE bank allocation). Host memory is *not*
+  retained: peak RSS stays 18.6 GiB and the 16.9 GiB of pinned banks come back.
+  `release_banks()` on the idle-release path frees them explicitly, so serving
+  is not affected today; dropping a whole `Engine` is what leaks. Next step: the
+  `Arc<Mutex<adapter>>` that `moe_port` clones into `CachedExperts` (twice) and
+  the model is still alive after the drop -- find the clone (a `Drop` log on the
+  adapter, then `Arc::strong_count`) before adding any in-process arm loop.
 - [ ] **M8.2 Class B -- per-checkpoint cubin set.** Only for a checkpoint whose
   shapes differ. Move the serving shapes out of module constants into an
   explicit profile (`ServingShapes` in `signatures.py`), thread it through
@@ -660,6 +682,25 @@ history.
   every dimension and the quant recipe match the served checkpoint -- so M8.1
   is converter + gate work, and the AOT slice (M8.2) waits for a checkpoint
   whose shapes actually differ.
+
+- **148** -- **one decode implementation: a one-token text step takes the device
+  kernels whether or not a graph replays it.** Eager decode used the dense
+  gather plus `causal_sdpa` and `conv_prefill`; a captured step uses the paged
+  attention kernel and the fused GDN decode. Those are two implementations of
+  the same math that do not agree numerically -- 0.733 in a logit at the first
+  shared-prefix step on the second checkpoint, roughly 12 bf16 ulps, which is
+  structural and not one-ulp noise -- so an emitted token flips on any near-tie
+  and "the replayed graph changes nothing" stops being a testable claim.
+  `forward_cached` now routes `n == 1` with flat positions through
+  `decode_one_cached`, which stages exactly the tensors a captured row stages
+  (one i32 each for the id, position, location and state slot, plus the row's
+  filled location window), so both arms run the identical launch sequence. Two
+  deliberate exceptions: a prefill chunk (`n > 1`) keeps the dense causal path,
+  whose whole point is that shape, and an image request's decode keeps it too,
+  because its mrope positions are not the flat ones the paged kernel takes; a
+  captured graph skips image requests for the same reason. The rule binds open
+  work: never add a second decode implementation, because a bit-identical gate
+  is the only honest test of capture fidelity.
 
 - **113** -- the kernel artifacts are **built by Nix, never committed**
   (`nix/kernels.nix`). `build.rs` requires `$FERRUM_KERNEL_DIR` and copies its

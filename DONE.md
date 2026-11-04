@@ -4654,3 +4654,80 @@ subsection names are kept verbatim.
        divergence is explained (near-tie versus a checkpoint-dependent capture
        assumption), captured decode stays validated on the reference checkpoint
        only. Tracked as TODO.md M8.1c.
+
+148. **The captured-decode divergence was two implementations of the same math,
+     and the fix is to have one** (2026-11-04). M8.1c reported an Ornith run
+     where an eager decode and a replayed decode agreed on three tokens and
+     flipped the fourth. The suspicion was a near-tie. The answer is worse and
+     simpler: the two arms never ran the same kernels. Eager decode took
+     `Access::Cached` -- store at the tail, gather the whole filled prefix into
+     `[filled, kv_heads, head_dim]`, `causal_sdpa`, and `conv_prefill` for the
+     GDN convolution. A captured step takes `Access::Device` -- store at a
+     staged location, the paged attention kernel, and the fused `conv_decode` +
+     `gdn_decode`. Same mathematics, different reduction orders and different
+     intermediates.
+     - **Measurement.** A dev-only `FT_LOGIT_TRACE` probe (`generation.rs`)
+       prints each row's top two logits plus `maxabs_delta` against the other
+       arm's row at the same position; the sampler's own argmax rule breaks ties
+       by lower id. On Ornith, before the fix:
+
+       | position | eager top-1 / top-2 | eager gap | maxabs delta |
+       | --- | --- | --- | --- |
+       | 5 (shared prefix) | 18.4475 / 18.2580 | 0.1896 | **0.733** |
+       | 6 (shared prefix) | 15.2748 / 14.9497 | 0.3251 | **0.1996** |
+       | 7 (shared prefix) | 14.4408 `32` / 14.4358 `760` | 0.0049 | **0.1716** |
+
+       The eager arm picks `32` at position 7 by 0.0049; the captured arm's own
+       logits put `760` at 14.4364 and `32` at 14.4224, so it picks `760`. That
+       is a near-tie, but the 0.733 at position 5 is not a near-tie artefact:
+       the logits are bf16-scaled in the head, so 0.733 is roughly twelve bf16
+       ulps at that magnitude. The two paths are numerically different models,
+       and any near-tie flips -- this was never Ornith-specific, Ornith just has
+       a flatter distribution at step 3. Positions 8+ show deltas of 14-22, but
+       those rows are fed *different* tokens by then, so they measure the
+       divergence, not the path difference.
+     - **Fix (decision 148).** `forward_cached` routes `n == 1` with flat
+       positions through a new `decode_one_cached`, which stages one i32 each for
+       the id, absolute position, pool location and state slot plus the row's
+       filled location window, then runs `tower_stream` with `Access::Device`.
+       That is the same sequence `forward_decode_into(bufs)` runs, and the tail
+       (narrow, final norm, `lm_head_logits` gemv) was already shared, so the two
+       arms are now bit-identical. The window length differs (filled vs the
+       captured `window`), which is safe: the kernel's loop bound is
+       `min(positions + 1, window)` and the tail is masked out, so the padding is
+       never read. Prefill (`n > 1`) keeps the dense causal path, and an image
+       request's decode keeps it too, because its mrope positions are not the
+       flat ones the paged kernel takes (capture skips image requests for the
+       same reason).
+     - **Gates.** `cudarc_engine_generate` now reports `maxabs_delta = 0.000000`
+       at every step on both checkpoints and the arms emit the same ids
+       (`[11751, 13, 198, 760, 6511, 314, 9338, 369]` on Ornith). On the
+       reference checkpoint all five `engine_real_generate` gates still pass with
+       their pinned ids (the paged path reproduces the FreeToken oracle), as do
+       the captured gate and `vision_smoke` (which exercises the dense path an
+       image request still takes).
+     - **Speed after the fix** (`throughput_smoke`, 517 prompt tokens, 128
+       decoded, bs=1, two reps measured on one warm engine per load, so each row
+       shares its process and clock state):
+
+       | checkpoint | arm | pp tok/s | tg tok/s | peak RSS |
+       | --- | --- | --- | --- | --- |
+       | reference | eager | 397.5 / 400.7 | 20.4 / 20.4 | 18.6 GiB |
+       | Ornith | eager | 389.9 / 395.2 | 19.8 / 19.8 | 18.7 GiB |
+       | reference | captured | 391.7 / 394.5 | 20.3 / 20.3 | 18.9 GiB |
+       | Ornith | captured | 401.1 / 404.2 | 20.1 / 20.5 | 18.9 GiB |
+
+       The unification is performance-neutral within this box's ~2-5% drift (the
+       pre-change eager reference was 397.4 / 20.75 under the same protocol), and
+       Ornith sits at pp parity and 1-3% behind on tg. The absolute numbers are
+       still ~60% of the 32.8 tok/s R11 baseline because the card is power- and
+       thermally capped; only the within-run ratios mean anything.
+     - **Why Ornith's decode is slightly behind, measured.** `FT_MISS_TRACE`
+       counts the expert-cache misses per step (a D2H probe, eager only): the
+       reference misses **519.4 experts per decode step** and Ornith **547.2
+       (+5.4%)**, with prefill at 3444 vs 3616. The expert-step count is
+       identical (5440), so this is routing entropy -- different weights route to
+       more distinct experts against a 1920-slot cache over 10 240 experts -- not
+       a path difference. The remaining lever is the decode-cache policy in
+       `lru_ensure`, which is shared with the reference; scoped as R13 in
+       `OPTIMIZATION.md`.

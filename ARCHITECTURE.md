@@ -431,31 +431,34 @@ sequenceDiagram
   Eng->>KV: reserve(n) pages for the new tokens
   Eng->>M: forward_cached(input, cache)
   M->>M: embed -> per layer
-  loop full-attention layers
+  alt one token, flat positions (decode)
+    M->>KV: store K/V at the staged location
+    M->>M: paged attention over the row's location window
+    M->>ST: fused GDN decode (conv_decode + gdn_decode), state rows in place
+  else a prefill chunk or an image token
     M->>KV: store K/V at tail, gather filled
     M->>M: partial rope + attention_cached (causal mask at q_offset)
-  end
-  loop GDN layers
-    M->>ST: read conv + recurrent state at slot
-    M->>M: conv1d + delta-rule recurrence
-    M->>ST: write back conv + recurrent state
+    M->>ST: conv_prefill, then the per-token delta rule
   end
   M->>P: execute_device(activations, ids, weights)
   P->>K: lru_ensure + index_copy + grouped GEMM
   K-->>M: routed sum (device)
   M->>M: shared expert + add; final norm
-  M->>M: lm_head block pass -> out buffer (device, no host round-trip)
-  M-->>Eng: forward_cached reads out back; forward_cached_into leaves it device-local
+  M->>M: lm_head gemv -> logits
+  M-->>Eng: forward_cached copies the logits back
 ```
 
-Both addressing modes run the same tower. `forward_cached` reads ids, positions
-and the KV window from the host `SequenceCache` (`CacheAccess::Host`) and copies
-the logits back; `forward_decode_into(bufs)` reads them from the device
-`DecodeBuffers` (`CacheAccess::Device`) and leaves the logits device-local. The
-device path gathers attention over a **fixed-length window** (`DecodeBuffers::
-window`, staged per row by `stage_window`): the lagging slots are dropped by the
-step-position mask and carry only a valid pool index, so the gather keeps the
-same shape and addresses every step -- the precondition for the cubin launchers.
+One decode implementation (decision 148). A one-token text step and a captured
+decode step run the *same* launches, which is what makes "a replayed graph
+changes nothing" testable: `decode_one_cached` stages one id, position, pool
+location and state slot plus the row's filled location window, and
+`forward_decode_into(bufs)` stages the same tensors for a whole batch. The
+captured window is a fixed `DecodeBuffers::window` and the eager one is the
+exact filled length; the kernel's bound is `min(position + 1, window)`, so the
+padded tail is masked and the results are identical. Prefill (`n > 1`) and an
+image request's decode keep the dense causal path -- the prefill because the
+shape is the point, the image because its mrope positions are not the flat ones
+the paged kernel takes.
 
 **Vision tower `[core]`** (decisions 139, 142). The checkpoint is
 `Qwen3_5MoeForConditionalGeneration`: image (and a video placeholder token)

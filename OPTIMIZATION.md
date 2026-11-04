@@ -1737,3 +1737,40 @@ gates; 0.066 s steady state vs 52.6 s in the A/B parity run, ~800x). No
 special kernels needed: f32 cuBLAS GEMMs, the committed elementwise/reduce
 kernels and `bmm`. The parity gate (`tests/vision_cudarc_tower.rs`) holds the
 host `encode` oracle: mean rel err 1e-5, max 2.8e-4 vs the f64 host chain.
+
+## R13 candidate -- decode expert-cache policy (measured 2026-11-04, not started)
+
+The second checkpoint (`Ornith-1.5-35B-A3B-NVFP4`, byte-identical layout and
+recipe) decodes 1-3% behind the reference with an identical expert-step count
+(5440 per 136 forwards). The attribution is the expert cache, not the path:
+
+| | prefill misses | decode misses/step |
+| --- | --- | --- |
+| reference | 3444 | 519.4 |
+| Ornith | 3616 | 547.2 (+5.4%) |
+
+`FT_MISS_TRACE=1` (a dev probe in `staged_group`, eager only: it reads the
+plan's `num` back) gives those. Routing is a property of the weights, so a
+checkpoint with a flatter routing distribution misses more against the same
+`lru_ensure` capacity over 40 x 256 experts.
+
+Two levers, and only one is open:
+
+- **Capacity is capped.** R11 landed 1920 auto slots; 1984 and 2048 OOM the
+  2057-token prefill scratch, so the `PREFILL_CHUNK_TOKENS=2048` scratch, not
+  the decode graph, is binding. Trading prefill chunk for slots would move the
+  cost to long prompts, which is where the measured pp gap used to be.
+- **Policy is open.** `lru_ensure` is a strict LRU over the whole cache. A
+  frequency-aware policy (per-slot hit count with a decay, or a pinned "hot set"
+  refreshed every N steps) fits the same ABI and should convert some of the +5.4%
+  back into hits. It is shared work: the reference's 519 misses/step fall too.
+
+Do not chase this with a blind constant change. The measurement protocol is the
+one in R12: two reps on one warm engine per load, checkpoint order alternating
+between sessions, `FT_MISS_TRACE` for the mechanism and `throughput_smoke` for
+the tok/s. Anything under ~2% is inside this box's drift.
+
+A separate finding from the same session, not a performance item: dropping an
+`Engine` leaves its device slot banks allocated (~1.8 MiB per cache slot,
+measured), so a second load in one process loses that much VRAM (TODO.md M8.1e).
+It does not affect serving, where the idle release calls `release_banks`.
