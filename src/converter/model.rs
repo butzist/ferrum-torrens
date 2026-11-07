@@ -289,6 +289,38 @@ fn module_role(name: &str) -> Option<(&str, Role)> {
 }
 
 fn quant_target(module: &str) -> Option<(QuantClass, String, usize)> {
+    // The checkpoint's quant config excludes the MTP head (`exclude_modules:
+    // mtp*`), so its linears are already bf16: only the fusions apply, and they
+    // pass bf16 through instead of expecting pre-packed NVFP4 or FP8 parts.
+    // `module` is the renamed output name, so the draft prefix is `draft.`.
+    if module.starts_with("draft.") {
+        for (suffix, part) in [
+            (".self_attn.q_proj", 0),
+            (".self_attn.k_proj", 1),
+            (".self_attn.v_proj", 2),
+        ] {
+            if let Some(prefix) = module.strip_suffix(suffix) {
+                return Some((
+                    QuantClass::Concat,
+                    format!("{prefix}.self_attn.qkv_proj"),
+                    part,
+                ));
+            }
+        }
+        for (suffix, part) in [
+            (".mlp.shared_expert.gate_proj", 0),
+            (".mlp.shared_expert.up_proj", 1),
+        ] {
+            if let Some(prefix) = module.strip_suffix(suffix) {
+                return Some((
+                    QuantClass::Concat,
+                    format!("{prefix}.mlp.shared_expert.gate_up_proj"),
+                    part,
+                ));
+            }
+        }
+        return None;
+    }
     if let Some(prefix) = module.strip_suffix(".self_attn.q_proj") {
         return Some((QuantClass::Fp8, format!("{prefix}.self_attn.qkv_proj"), 0));
     }
@@ -357,6 +389,11 @@ fn quant_target(module: &str) -> Option<(QuantClass, String, usize)> {
 
 fn is_gemma_norm(name: &str) -> bool {
     name == "model.norm.weight"
+        // The MTP draft's own norms are the same GemmaPlusOne form (upstream
+        // builds them as GemmaPlusOneRMSNorm), so the bake is not target-only.
+        || name == "draft.norm.weight"
+        || name == "draft.pre_fc_norm_embedding.weight"
+        || name == "draft.pre_fc_norm_hidden.weight"
         || name.ends_with(".input_layernorm.weight")
         || name.ends_with(".post_attention_layernorm.weight")
         || name.ends_with(".self_attn.q_norm.weight")
@@ -663,12 +700,24 @@ impl Emitter<'_> {
     }
 
     fn emit_draft_banks(&mut self) -> Result<Option<usize>, ConvertError> {
-        // Detect layout.
-        let stacked_gate = "mtp.layers.0.mlp.experts.gate_up_proj.weight";
+        // Detect layout. The stacked Qwen export names the MTP expert tensors
+        // without a `.weight` suffix; the per-expert export carries it.
+        let stacked_pair = [
+            (
+                "mtp.layers.0.mlp.experts.gate_up_proj.weight",
+                "mtp.layers.0.mlp.experts.down_proj.weight",
+            ),
+            (
+                "mtp.layers.0.mlp.experts.gate_up_proj",
+                "mtp.layers.0.mlp.experts.down_proj",
+            ),
+        ]
+        .into_iter()
+        .find(|(gate, _)| self.store.info(gate).is_some());
         let per_expert_gate = "mtp.layers.0.mlp.experts.0.gate_proj.weight";
-        let (stacked, num_experts) = if self.store.info(stacked_gate).is_some() {
-            let info = self.store.info(stacked_gate).unwrap();
-            (true, info.shape.first().copied().unwrap_or(0))
+        let num_experts = if let Some((gate, _)) = stacked_pair {
+            let info = self.store.info(gate).unwrap();
+            info.shape.first().copied().unwrap_or(0)
         } else if self.store.info(per_expert_gate).is_some() {
             // count experts
             let mut n = 0usize;
@@ -679,7 +728,7 @@ impl Emitter<'_> {
             {
                 n += 1;
             }
-            (false, n)
+            n
         } else {
             return Ok(None);
         };
@@ -687,16 +736,14 @@ impl Emitter<'_> {
             return Ok(None);
         }
         // Determine dims from gate_up (rows = 2*inter, cols = hidden).
-        let (gate_rows, gate_cols, down_rows, down_cols) = if stacked {
-            let info = self.store.info(stacked_gate).unwrap();
+        let (gate_rows, gate_cols, down_rows, down_cols) = if let Some((gate, down)) = stacked_pair
+        {
+            let info = self.store.info(gate).unwrap();
             // shape [E, 2I, H]
             let r = info.shape[1];
             let c = info.shape[2];
             // down
-            let dinfo = self
-                .store
-                .info("mtp.layers.0.mlp.experts.down_proj.weight")
-                .unwrap();
+            let dinfo = self.store.info(down).unwrap();
             (r, c, dinfo.shape[1], dinfo.shape[2])
         } else {
             let ginfo = self
@@ -722,14 +769,11 @@ impl Emitter<'_> {
         let mut gate_up = vec![0.0f32; num_experts * gate_rows * gate_cols];
         let mut down = vec![0.0f32; num_experts * down_rows * down_cols];
 
-        if stacked {
+        if let Some((gate, down_name)) = stacked_pair {
             // read bf16 bytes
-            let bytes = self.store.read(stacked_gate).unwrap();
+            let bytes = self.store.read(gate).unwrap();
             bf16_bytes_to_f32(&bytes, &mut gate_up);
-            let dbytes = self
-                .store
-                .read("mtp.layers.0.mlp.experts.down_proj.weight")
-                .unwrap();
+            let dbytes = self.store.read(down_name).unwrap();
             bf16_bytes_to_f32(&dbytes, &mut down);
         } else {
             for e in 0..num_experts {
@@ -1739,6 +1783,11 @@ mod tests {
         assert_eq!(rename("lm_head.weight"), "lm_head.weight");
         assert!(is_gemma_norm("model.norm.weight"));
         assert!(is_gemma_norm("model.layers.3.self_attn.q_norm.weight"));
+        assert!(is_gemma_norm("draft.norm.weight"));
+        assert!(is_gemma_norm("draft.pre_fc_norm_embedding.weight"));
+        assert!(is_gemma_norm("draft.pre_fc_norm_hidden.weight"));
+        assert!(is_gemma_norm("draft.layers.0.input_layernorm.weight"));
+        assert!(!is_gemma_norm("draft.layers.0.mlp.gate.weight"));
         assert!(!is_gemma_norm("model.layers.0.linear_attn.norm.weight"));
         assert_eq!(
             quant_target("model.layers.3.self_attn.k_proj").unwrap().2,

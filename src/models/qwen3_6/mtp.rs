@@ -16,10 +16,6 @@ fn decode_bf16(src: &[u8], n: usize) -> Vec<f32> {
         .collect()
 }
 
-fn gemma_norm(w: &[f32]) -> Vec<f32> {
-    w.iter().map(|&v| 1.0 + v).collect()
-}
-
 fn matmul(w: &[f32], x: &[f32], out_rows: usize, in_cols: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; out_rows];
     for i in 0..out_rows {
@@ -70,8 +66,8 @@ pub fn draft_forward(
     let n2_raw = ctx
         .dense("draft.pre_fc_norm_hidden.weight")
         .map_err(|e| e.to_string())?;
-    let w1 = gemma_norm(&decode_bf16(n1_raw, h));
-    let w2 = gemma_norm(&decode_bf16(n2_raw, h));
+    let w1 = decode_bf16(n1_raw, h);
+    let w2 = decode_bf16(n2_raw, h);
     let ne = rms_norm(&embeds, &w1, params.rms_norm_eps, h);
     let nh = rms_norm(prev_hidden, &w2, params.rms_norm_eps, h);
 
@@ -95,14 +91,8 @@ pub fn draft_forward(
     // Use target layer 0 norms/weights naming with draft prefix where present.
     let in_w = {
         let raw = ctx.dense(&in_w_name).map_err(|e| e.to_string())?;
-        // baked? draft norms are GemmaPlusOne -> apply 1+w
-        let base = decode_bf16(raw, h);
-        // Heuristic: if name contains input_layernorm, it's baked in target; for draft apply 1+w only if not baked.
-        if in_w_name.starts_with("draft.") {
-            gemma_norm(&base)
-        } else {
-            base
-        }
+        // The converter bakes the GemmaPlusOne shift into every norm it emits.
+        decode_bf16(raw, h)
     };
     let h1 = rms_norm(&xsum, &in_w, params.rms_norm_eps, h);
     let attn_out = full_attention(&ctx, &h1, 0, 1, &positions, None).map_err(|e| e.to_string())?;
@@ -120,12 +110,7 @@ pub fn draft_forward(
         "model.layers.0.post_attention_layernorm.weight"
     };
     let post_raw = ctx.dense(post_name).map_err(|e| e.to_string())?;
-    let post_base = decode_bf16(post_raw, h);
-    let post_w = if post_name.starts_with("draft.") {
-        gemma_norm(&post_base)
-    } else {
-        post_base
-    };
+    let post_w = decode_bf16(post_raw, h);
     let h2 = rms_norm(&sum2, &post_w, params.rms_norm_eps, h);
 
     // moe_block (uses layer 0 routed experts from the target index -> but draft has its own banks "draft_*#L00000")
@@ -135,8 +120,7 @@ pub fn draft_forward(
 
     // mtp.norm
     let norm_raw = ctx.dense("draft.norm.weight").map_err(|e| e.to_string())?;
-    let norm_base = decode_bf16(norm_raw, h);
-    let norm_w = gemma_norm(&norm_base);
+    let norm_w = decode_bf16(norm_raw, h);
     let mut residual = sum2.clone();
     for i in 0..h {
         residual[i] += xout[i];
