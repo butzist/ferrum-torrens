@@ -68,15 +68,15 @@ fn decode_bf16(src: &[u8], n: usize) -> Vec<f32> {
 
 /// Everything the forward needs: params plus the loaded dense store and the
 /// reader for the mmap'd expert banks.
-struct Ctx<'a> {
-    params: &'a ModelParams,
-    dense: &'a DenseWeights,
-    index: &'a FtwIndex,
-    reader: &'a dyn WeightsReader,
+pub(crate) struct Ctx<'a> {
+    pub(crate) params: &'a ModelParams,
+    pub(crate) dense: &'a DenseWeights,
+    pub(crate) index: &'a FtwIndex,
+    pub(crate) reader: &'a dyn WeightsReader,
 }
 
 impl Ctx<'_> {
-    fn dense(&self, name: &str) -> Result<&[u8]> {
+    pub(crate) fn dense(&self, name: &str) -> Result<&[u8]> {
         self.dense
             .bytes(name)
             .ok_or_else(|| ForwardError::Missing(name.into()))
@@ -472,7 +472,7 @@ pub(crate) fn causal_attention(
     out
 }
 
-fn full_attention(
+pub(crate) fn full_attention(
     ctx: &Ctx,
     x: &[f32],
     layer: usize,
@@ -713,7 +713,7 @@ fn shared_expert(ctx: &Ctx, x: &[f32], layer: usize, t: usize) -> Result<Vec<f32
     ))
 }
 
-fn moe_block(ctx: &Ctx, x_post: &[f32], layer: usize, t: usize) -> Result<Vec<f32>> {
+pub(crate) fn moe_block(ctx: &Ctx, x_post: &[f32], layer: usize, t: usize) -> Result<Vec<f32>> {
     let p = ctx.params;
     let h = p.hidden_size;
     let i = p.moe_intermediate_size;

@@ -10,6 +10,7 @@ pub mod image_prep;
 #[cfg(feature = "cudarc")]
 pub mod load_cudarc;
 pub mod mrope;
+pub mod mtp;
 pub mod vision;
 #[cfg(feature = "cudarc")]
 pub mod vision_cudarc;
