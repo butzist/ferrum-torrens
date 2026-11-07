@@ -9,6 +9,7 @@ pub mod model;
 pub mod numerics;
 pub mod sampling;
 pub mod scheduler;
+pub mod spec;
 pub mod tokenizer;
 pub mod weights;
 
