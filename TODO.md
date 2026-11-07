@@ -1,8 +1,11 @@
 # FerrumTorrens -- FreeToken MVP port to Rust: TODO
 
 Status (2026-11-07): **M9 (speculative decoding, section 6d) is complete through
-M9.6: speculation runs end to end on both checkpoints, token-identical to greedy
-at the gated length, but it is a measured 0.7-0.9x on tg today.** The draft head stays in the FTW
+M9.7: speculation runs end to end on both checkpoints, token-identical to greedy
+at the gated length, and is a measured 0.70-0.92x on tg.** M9.7's conclusion is a
+number, not a patch: a verify row is only ~1.24x cheaper than a plain token
+against a host-offloaded expert bank, while speculation needs 3-4 rows per 2.5-3.6
+tokens, so the exchange rate cannot win here (OPTIMIZATION.md R14). The draft head stays in the FTW
 (converter, NVFP4 experts), the verify answers every drafted row and returns its
 final-norm hidden, and the GDN state is committed for exactly the accepted rows
 with no kernel change and no state snapshot. `tests/cudarc_spec_verify.rs` proves
@@ -746,11 +749,20 @@ Ordered slices, each its own gated change:
   there: a 64-token reference run flips a near-tie at token 45 (residual batched
   GEMM drift), and the verified router must stay per-row (a batched router
   diverged Ornith at token 4).)
-- [ ] **M9.7 speculation that pays.** Ordered levers (OPTIMIZATION.md R14):
-  margin-gated acceptance (require the row's top-2 gap to exceed the drift bound
-  so a near-tie forces a plain step), device-side draft argmax instead of a
-  per-row host logit transfer, one draft pass per step instead of the chain plus
-  refresh, and a captured verify family.
+- [x] **M9.7 speculation that pays.** (CLOSED as a measured negative, with the
+  arithmetic in OPTIMIZATION.md R14.) Landed: per-row verify routing (Ornith's
+  accept 1.30 -> 2.57 and a systematic divergence gone), a `[spec] trust_margin`
+  confidence gate for token-exactness, and per-phase instrumentation (`draft` /
+  `verify` / `commit`) behind `FERRUM_SPEC_PROFILE=1`. The verdict: a verify row
+  costs 39.4 ms at 4 rows against 48.7 ms for a plain token, so the *best
+  possible* cost/token is 1.24/rows-per-token and rows-per-token is 1.66 at
+  `k=3`; the measured result is 0.70x on the reference and 0.92x on Ornith (0.91x
+  at `k=2`). Expert staging, not the implementation, sets the ceiling.
+- [ ] **R13 shared work: a resident expert working set.** The one lever that
+  would make speculation pay: `c_row < c_plain / 1.24` needs the hot expert set
+  to stop crossing the host bus on every row. Capacity is capped at ~1920 slots
+  by the prefill scratch; the open half is the policy (frequency-aware LRU / a
+  pinned hot set), which is R13.
 
 Non-goals: DFlash (the other method in #828), MTP for an architecture that ships
 no head (Qwen3-Coder), TP > 1, and GGUF draft packs.

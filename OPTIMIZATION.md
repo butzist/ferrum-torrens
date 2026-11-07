@@ -1775,48 +1775,91 @@ A separate finding from the same session, not a performance item: dropping an
 measured), so a second load in one process loses that much VRAM (TODO.md M8.1e).
 It does not affect serving, where the idle release calls `release_banks`.
 
-## R14 -- speculative decoding with the MTP draft (measured 2026-11-07, M9.6)
+## R14 -- speculative decoding with the MTP draft (measured 2026-11-07, M9.6/M9.7)
 
-`[spec] algorithm = "mtp"`, `num_steps = 3`, one request (the scheduler clamps the
-batch to one while speculating). 24 greedy tokens after "The capital of France
-is", one warm engine per load, `tests/engine_spec_generate.rs`.
+`[spec] algorithm = "mtp"`, one request (the scheduler clamps the batch to one
+while speculating). 24 greedy tokens after "The capital of France is", one warm
+engine per load, `tests/engine_spec_generate.rs`; the per-phase split comes from
+`FERRUM_SPEC_PROFILE=1`. `FERRUM_TEST_SLOTS` sets the target's expert cache (384,
+the value that leaves room for the draft's 433 MiB bank on this card).
 
-| checkpoint | path | accept | tg tok/s | vs plain |
-| --- | --- | --- | --- | --- |
-| reference | plain | -- | 18.1 | -- |
-| reference | mtp | 1.50 drafts/step | 12.2 | 0.67x |
-| Ornith | plain | -- | 16.7 | -- |
-| Ornith | mtp | 2.57 drafts/step | 15.4 | 0.92x |
+| checkpoint | path | k | accept/step | rows/step | tg tok/s | vs plain | identical |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| reference | plain | -- | -- | 1 | 17.5 | -- | -- |
+| reference | mtp | 3 | 1.50 | 4 | 12.2 | 0.70x | yes (24 tok) |
+| reference | mtp | 2 | 1.56 | 3 | 15.8 | 0.91x | yes (24 tok) |
+| Ornith | plain | -- | -- | 1 | 16.5 | -- | -- |
+| Ornith | mtp | 3 | 2.57 | 4 | 15.1 | 0.92x | yes (24 tok) |
 
-**Verdict: a measured loss, shipped off by default.** The output is identical to
-greedy at this length on both checkpoints (a 64-token reference run flips a
-near-tie at token 45 from residual batched-GEMM drift; see the levers below).
-The exchange rate is wrong: each step pays a draft chain plus a refresh pass
-(each row ends in a per-row NVFP4 LM-head GEMV whose 248320 logits are copied to
-the host for the argmax) and a `k + 1`-row verify, and returns ~2.5 tokens.
+The 64-token reference runs measured plain 20.5 tok/s against 17.0 (k=2) and
+15.1 (k=3); their token streams diverge from plain greedy somewhere past ~45
+tokens (see the drift note).
 
-Ordered levers, cheapest first:
+**Verdict: a measured loss on both checkpoints, shipped off by default. The
+exchange rate, not the implementation, is the blocker.**
 
-1. **Margin-gated acceptance.** Compute each verify row's top-2 logit gap; accept
-   drafts only while the gap exceeds a measured drift bound, and produce the
-   first below-bound token with a plain one-token step. This makes the output
-   exact by construction instead of by luck, and costs nothing on the common
-   path.
-2. **Device-side draft argmax.** The draft needs one token per row, not the
-   logits: a device argmax over the head's output buffer removes ~1 MB of host
-   transfer per draft row and the host round trip that follows it.
-3. **One draft pass per step.** Today a step runs `k - 1` chain rows plus a
-   refresh pass of up to `k + 2` rows. Folding them (draft the chain from the
-   verify's rows directly, as upstream's `post_verify` does) halves the draft
-   rows.
-4. **Captured verify family.** A captured `rows = k + 1` graph removes the
-   per-step launch overhead of the paged attention, the row-by-row GDN replay
-   and the per-row router. It must reproduce the eager verify bit for bit, which
-   is the same gate `decode_graph_capture` already uses for decode.
-5. **Draft bank sizing.** All 256 draft experts are resident (433 MiB). Halving
-   the cache changed nothing measurable (12.8 vs 12.7 tok/s), so the draft's
-   cost is in its dense work, not its expert reads; do not trade the target's
-   cache away for it.
+The arithmetic is closed. With `a` the accept fraction and `c_row` the cost of
+one verify row:
 
-Do not re-open this without a measured win on the protocol above; the accept
-rate alone (2.57/step on Ornith) does not pay for the rows it costs.
+    rows/token = (k + 1) / (1 + a * k)        cost/token = rows/token * c_row
+
+Measured `c_row` on the reference (target MoE offloaded, 384 slots): 55.8 ms at
+2 rows, 45.0 at 3, 39.4 at 4, against 48.7 ms for a plain decode token. So one
+verify row is only 1.24x cheaper than a plain token at `k = 3`, i.e. the *best
+possible* cost/token is `1.24 / rows/token`. Break-even (`rows/token = 1`) is
+unreachable: even a perfect draft (`a = 1`, `rows/token = 1`) only reaches 1.24x.
+At the measured `a = 0.47` (k=3) the ratio is 0.75x, and at `a = 0.78` (k=2, the
+same fraction upstream reports) it is 1.06x *before* the draft's own 2-4 ms per
+token, which is exactly the 0.91x measured.
+
+Why `c_row` is not far below a token: decode here is bound by staging the
+target's routed experts from the host banks (~10 GB/s), not by FLOPs. A verify's
+rows are consecutive tokens of one request, and their top-8 sets overlap only
+partly, so 4 rows stage ~3-4x the distinct experts of one row. Batching buys
+1.24x, not 4x. Upstream reports 1.64x on an H100 where the draft and the
+target's experts are resident and a row is compute-bound.
+
+**What M9.7 did change, and what it measured:**
+
+1. **The verify's router runs per row** (landed): a batched router GEMM flips an
+   expert on high-entropy routing and Ornith diverged at token 4. Per-row
+   routing made Ornith token-identical and lifted its accept 1.30 -> 2.57.
+2. **A confidence gate on the emitted rows** (`[spec] trust_margin`, default 0):
+   a row whose top-2 gap is under the margin is recomputed alone, which makes
+   the output exact by construction instead of by luck. It fires far too often
+   to be free: at margin 0.25, 9 of 27 steps took the one-row path and the run
+   fell to 14.2 tok/s; at 4.0, 47 of 48 steps did (6.9 tok/s) and a near-tie
+   still slipped through, because the batched-vs-single drift on this checkpoint
+   is order 1 (the routed expert sum dominates and its grouping changes with the
+   row count), not the ~0.1 the MoE-free measurement suggested. Default 0 keeps
+   the batch; the knob is there for a caller who needs exactness more than speed.
+3. **Drafting the prompt into the draft KV** (tried, removed): filling the draft
+   prefix over the prefill is what upstream does, but it was a *regression* here
+   (Ornith accept 2.57 -> 1.40, reference 1.50 -> 1.40) and cost a prefill-time
+   draft pass. Removed; the seed step at the first decode fills what the chain
+   needs.
+4. **The post-verify refresh pass** stays: dropping it saved 25 ms/step on the
+   reference (no accept change) but cost Ornith 1.2 drafts/step (2.57 -> 1.40),
+   so it is a quality lever, not a cost.
+5. `k`: measured optimum is 2 on the reference (0.91x vs 0.70x at 3), 3 on
+   Ornith. The config default stays 3.
+
+**Open levers, in order of expected value:**
+
+1. **A resident target working set** is the only one that changes the verdict: if
+   the hot expert set fits the card, `c_row` falls below `c_plain / 1.24` and the
+   same code wins. This is R13's problem (expert-cache capacity/policy), not
+   speculation's.
+2. **Batch the verify's LM head** across rows: today `run_tower_rows` runs one
+   NVFP4 head GEMV per answered row (each streams the 250 MB head), so a 4-row
+   verify streams it four times. `lm_head_into_device` already supports `t` rows.
+   Worth ~1-2 ms of the 156 ms step.
+3. **A captured verify family** removes the per-step launch overhead of the
+   per-row GDN replay, the per-row router and the paged attention. Small against
+   the staging cost.
+4. **A device-side draft chain** (upstream's `chain_graphs`): each draft row
+   needs its argmax before the next, so today every draft row costs a host round
+   trip. The draft is only 5-11 ms/step of the 135-156, so this is a few percent.
+
+Do not re-open this without a measured `c_row` improvement: at the current accept
+fractions the code cannot pay for the rows it adds.

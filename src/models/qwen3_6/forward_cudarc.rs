@@ -1690,7 +1690,12 @@ impl CachedModel for CudarcQwen3_6 {
                 ),
             });
         }
-        if rows == 0 || rows > stash.rows {
+        // Zero rows is a no-op: a verify whose first row is untrusted commits
+        // nothing and recomputes that row alone.
+        if rows == 0 {
+            return Ok(());
+        }
+        if rows > stash.rows {
             return Err(KvcacheError::MisalignedCache {
                 why: format!(
                     "commit_verify row count {rows} is outside 1..={}",

@@ -856,6 +856,10 @@ flowchart LR
   position-indexed bf16 `MhaPool` (2 KiB/token) on the model's runtime, and its
   expert bank is a second `CachedExperts` over `FtwBanks::draft`
   (`draft_*#L00000`), sized to hold every draft expert.
+- **Confidence gate**: `[spec] trust_margin` (default 0) makes a verified row
+  whose top-2 gap is under the margin be recomputed as a one-row step, so a
+  near-tie cannot ride the batched verify's rounding. `domain::spec::trusted_rows`
+  is the pure rule; the cost measured in R14 is why it is off by default.
 - **Wiring**: `registry::build` loads the draft before `resolve_cache_slots` so
   its ~0.5 GB comes out of the target's auto expert budget; `engine_limits_from_config`
   turns `[spec]` into `speculative_steps` and clamps `max_running_requests` to 1;

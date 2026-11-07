@@ -23,6 +23,8 @@ pub struct EngineLimits {
     pub max_prefill_length: usize,
     /// Draft tokens per speculative step; `0` keeps plain decode.
     pub speculative_steps: usize,
+    /// A verify row's top-2 gap must exceed this to be trusted (`0` trusts it).
+    pub speculative_margin: f32,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -537,6 +539,11 @@ pub fn engine_limits_from_config(
             config.model.max_running_requests
         },
         max_prefill_length: config.model.max_prefill_length,
+        speculative_margin: if speculative_steps > 0 {
+            config.speculative_trust_margin()
+        } else {
+            0.0
+        },
         speculative_steps,
     })
 }
@@ -1692,6 +1699,7 @@ pub(crate) mod fake {
             max_running_requests: 4,
             max_prefill_length: 16,
             speculative_steps: 0,
+            speculative_margin: 0.0,
         }
     }
 }

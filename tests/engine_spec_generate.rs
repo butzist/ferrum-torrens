@@ -37,17 +37,24 @@ fn tokens_budget() -> u32 {
 
 fn config(spec: Option<usize>) -> Config {
     let dir = common::ftw_dir();
+    let margin: f32 = std::env::var("SPEC_MARGIN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.0);
     let spec = match spec {
         None => String::new(),
-        Some(k) => format!("\n[spec]\nalgorithm = \"mtp\"\nnum_steps = {k}\n"),
+        Some(k) => {
+            format!("\n[spec]\nalgorithm = \"mtp\"\nnum_steps = {k}\ntrust_margin = {margin}\n")
+        }
     };
     let budget = tokens_budget();
+    let slots = std::env::var("FERRUM_TEST_SLOTS").unwrap_or_else(|_| "384".to_string());
     format!(
         "[model]\npath = \"{dir}\"\nmax_seq_len = 4096\nmax_output_tokens = {budget}\n\
          max_prefill_length = 1024\nmax_running_requests = 1\n\n\
          [kernel]\ntriton = true\n\n\
          [kv]\nnum_tokens = 4096\ndtype = \"f32\"\n\n\
-         [moe]\ncache_size_slots = 384\n{spec}"
+         [moe]\ncache_size_slots = {slots}\n{spec}"
     )
     .parse()
     .unwrap()
@@ -104,6 +111,14 @@ fn spec_decode_is_token_identical_to_greedy() {
         run(&spec, 2)
     };
     let (steps, accepted) = ferrum_torrens::application::spec_decode::stats();
+    let b = ferrum_torrens::application::spec_decode::breakdown();
+    if std::env::var_os("FERRUM_SPEC_PROFILE").is_some() {
+        eprintln!(
+            "phase ms: draft {:.0} verify {:.0} commit {:.0} over {steps} steps",
+            b.draft_ms, b.verify_ms, b.commit_ms
+        );
+    }
+    let hits = ferrum_torrens::application::spec_decode::margin_hits();
     let per_step = if steps == 0 {
         0.0
     } else {
@@ -111,7 +126,7 @@ fn spec_decode_is_token_identical_to_greedy() {
     };
     eprintln!(
         "plain {} tokens in {:.2}s ({:.1} tok/s); spec {} tokens in {:.2}s ({:.1} tok/s); \
-         {steps} steps, {accepted} drafts accepted ({per_step:.2}/step)",
+         {steps} steps, {accepted} drafts accepted ({per_step:.2}/step), {hits} margin hits",
         plain_tokens.len(),
         plain_secs,
         plain_tokens.len() as f64 / plain_secs,

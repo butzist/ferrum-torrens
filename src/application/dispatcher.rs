@@ -326,6 +326,7 @@ mod tests {
             max_running_requests: 4,
             max_output_tokens: 8,
             speculative_steps: 0,
+            speculative_margin: 0.0,
         }
     }
 

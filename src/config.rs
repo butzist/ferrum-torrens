@@ -260,6 +260,11 @@ pub struct Spec {
     pub num_steps: usize,
     #[serde(default)]
     pub draft_model_path: Option<String>,
+    /// A verify row's top-2 logit gap must exceed this before its argmax is
+    /// trusted. `0` trusts the batch (fast); a positive value recomputes a
+    /// near-tie row alone for token-exactness, at a measured speed cost.
+    #[serde(default)]
+    pub trust_margin: f32,
 }
 
 impl Default for Spec {
@@ -268,6 +273,7 @@ impl Default for Spec {
             algorithm: None,
             num_steps: default_spec_num_steps(),
             draft_model_path: None,
+            trust_margin: 0.0,
         }
     }
 }
@@ -428,6 +434,10 @@ impl Config {
     pub fn speculative_num_steps(&self) -> usize {
         self.spec.num_steps
     }
+
+    pub fn speculative_trust_margin(&self) -> f32 {
+        self.spec.trust_margin
+    }
 }
 
 fn default_port() -> u16 {
@@ -542,6 +552,7 @@ triton = true
         assert_eq!(c.spec.num_steps, 3);
         assert_eq!(c.speculative_algorithm(), None);
         assert_eq!(c.speculative_num_steps(), 3);
+        assert_eq!(c.speculative_trust_margin(), 0.0);
     }
 
     #[test]

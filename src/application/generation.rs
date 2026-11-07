@@ -357,6 +357,9 @@ fn run_batch(
             // token each.
             let kv = engine.cache().expect("checked above");
             let spec_steps = engine.limits().speculative_steps;
+            // One handle for both the decode step and the prefill that seeds the
+            // draft's K/V. `None` keeps every step on the plain path.
+
             if phase == Phase::Decode
                 && spec_steps > 0
                 && batch.reqs.len() == 1
@@ -391,6 +394,7 @@ fn run_batch(
                             start,
                             spec_steps,
                             max_seq_len,
+                            engine.limits().speculative_margin,
                             &mut s.spec,
                         );
                         s.cache = Some(cache);

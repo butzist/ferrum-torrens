@@ -56,6 +56,36 @@ pub fn reject_greedy(
     (out, emitted)
 }
 
+/// Where a row's argmax stops being trustworthy.
+///
+/// A verify runs `k + 1` rows through batched GEMMs where a decode step runs
+/// one, so its logits differ from a one-token step by a small amount (bf16
+/// accumulation order; measured ~0.1 after 40 layers). That cannot flip a token
+/// whose top-2 gap is wider than the drift, but it can flip a near-tie, which is
+/// why a row below `margin` is not trusted and the caller recomputes it one row
+/// at a time.
+pub fn trusted_rows(logits: &[f32], vocab: usize, rows: usize, margin: f32) -> usize {
+    let mut trusted = 0usize;
+    for j in 0..rows {
+        let row = &logits[j * vocab..(j + 1) * vocab];
+        let mut best = f32::NEG_INFINITY;
+        let mut second = f32::NEG_INFINITY;
+        for &v in row {
+            if v > best {
+                second = best;
+                best = v;
+            } else if v > second {
+                second = v;
+            }
+        }
+        if best - second < margin {
+            break;
+        }
+        trusted += 1;
+    }
+    trusted
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,6 +120,20 @@ mod tests {
         assert_eq!(emitted, vec![1]); // first accepted, second rejected
         assert_eq!(out[0], 1);
         assert_eq!(out[1], 2); // target's sampled token at row1
+    }
+
+    #[test]
+    fn a_near_tie_is_not_trusted() {
+        let vocab = 4usize;
+        let mut logits = vec![0.0f32; 3 * vocab];
+        // row 0: clear winner; row 1: 0.05 gap; row 2: clear.
+        logits[0] = 10.0;
+        logits[vocab] = 10.0;
+        logits[vocab + 1] = 9.95;
+        logits[2 * vocab] = 10.0;
+        assert_eq!(trusted_rows(&logits, vocab, 3, 0.5), 1);
+        assert_eq!(trusted_rows(&logits, vocab, 1, 0.5), 1);
+        assert_eq!(trusted_rows(&logits, vocab, 3, 0.01), 3);
     }
 
     #[test]

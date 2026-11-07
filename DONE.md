@@ -3106,6 +3106,19 @@ settled.
        per-row would restore bit-exactness at the cost of the amortization that
        makes speculation worth it, so the plan is margin-gated acceptance
        instead.
+     - **M9.7 measured the exchange rate and closed the slice.** A verify row
+       costs 55.8 / 45.0 / 39.4 ms at 2 / 3 / 4 rows against 48.7 ms for a plain
+       token, so one row buys only 1.24x at `k = 3`; with
+       `rows/token = (k + 1) / (1 + a * k)` the best possible ratio is
+       1.24 / rows/token, and `a = 0.47` (k=3) gives 0.75x. The measured results
+       are 0.70x on the reference and 0.92x on Ornith (0.91x at `k = 2`, where
+       `a = 0.78`). Landed from the slice: per-row verify routing, a
+       `[spec] trust_margin` gate (`0` by default; a row under the margin is
+       recomputed alone, which fires on ~30% of steps even at 0.25 because the
+       batched drift on this checkpoint is order 1), and per-phase timers. Tried
+       and removed: drafting the prompt into the draft KV (upstream does it; here
+       it cost Ornith 1.2 drafts/step) and dropping the post-verify refresh (it
+       cost the same 1.2 on Ornith for 25 ms/step on the reference).
      - **Gated M9 runs need an overlay.** Both store FTWs predate M9.1
        (`counts` 1148 dense + 240 banks, no `has_mtp`) and the two writable
        16 GiB tmpfs cannot hold a 21 GiB re-conversion. The recipe used here:
