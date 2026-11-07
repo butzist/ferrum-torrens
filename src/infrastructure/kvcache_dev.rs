@@ -91,7 +91,12 @@ impl MhaPool {
         Self::with_runtime(params, num_pages, dtype, runtime(device))
     }
 
-    fn with_runtime(params: &ModelParams, num_pages: usize, dtype: KvDType, rt: Runtime) -> Self {
+    pub(crate) fn with_runtime(
+        params: &ModelParams,
+        num_pages: usize,
+        dtype: KvDType,
+        rt: Runtime,
+    ) -> Self {
         let dense_of = dense_map(params, LayerType::FullAttention);
         let layers = dense_of.iter().filter(|d| d.is_some()).count();
         let (kv_heads, head_dim) = (params.num_kv_heads, params.head_dim);

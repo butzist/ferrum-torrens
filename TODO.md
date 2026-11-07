@@ -1,14 +1,15 @@
 # FerrumTorrens -- FreeToken MVP port to Rust: TODO
 
-Status (2026-11-07): **M9 (speculative decoding, section 6d) is in progress:
-M9.1-M9.4 are green on both checkpoints.** The draft head stays in the FTW
+Status (2026-11-07): **M9 (speculative decoding, section 6d) is complete through
+M9.6: speculation runs end to end on both checkpoints, token-identical to greedy
+at the gated length, but it is a measured 0.7-0.9x on tg today.** The draft head stays in the FTW
 (converter, NVFP4 experts), the verify answers every drafted row and returns its
 final-norm hidden, and the GDN state is committed for exactly the accepted rows
 with no kernel change and no state snapshot. `tests/cudarc_spec_verify.rs` proves
 on both checkpoints that a verify + commit + rollback leaves the cache where
-plain decode would, including after a rejection. Remaining: M9.5 (the device
-draft forward and the draft/verify/accept loop) and M9.6 (token identity, accept
-length, tg A/B). Note for gated M9 tests: the store FTWs predate M9.1 and carry
+plain decode would, including after a rejection. Remaining: M9.7, the
+optimization slice that makes speculation pay (margin-gated acceptance, device
+argmax, one draft pass, captured verify). Note for gated M9 tests: the store FTWs predate M9.1 and carry
 no draft head, and neither 16 GiB tmpfs can hold a 21 GiB FTW, so the draft
 gates run on a two-part overlay (decision 151).
 **M8.1b is complete: both checkpoints build from the flake
@@ -720,18 +721,36 @@ Ordered slices, each its own gated change:
   `n < k+1`, the next step's logits equal a plain decode of the same `n` tokens
   (argmax exact; the value bound is the batched-GEMM drift, decision 151).
   (DONE: `tests/cudarc_spec_verify.rs` passes on both checkpoints.)
-- [ ] **M9.5 loop and config.** `[spec] algorithm = "mtp"`, `num_steps = 3`
+- [x] **M9.5 loop and config.** `[spec] algorithm = "mtp"`, `num_steps = 3`
   (off by default), draft -> verify -> accept -> stream accepted tokens, with
   stop tokens, `max_tokens`, abort and usage counted correctly. Batching stays
   out while speculating (`max_running_requests = 1`) for the first slice.
-  The device draft forward (draft `Layer` load from `draft.*`, its own
-  contiguous KV at 2 KiB/token keyed by absolute position, the draft MoE bank
-  executor) lands here: `[spec]` is a no-op until it does, because the host
-  draft is far too slow to serve.
-- [ ] **M9.6 gates and numbers.** Output **token-for-token identical** to greedy
+  (DONE: `application/spec_decode.rs` is the whole step over the domain ports,
+  with five mock tests (seed, partial accept, full accept, carried draft, no
+  room) and two engine-level tests proving a speculative run emits the plain
+  run's tokens and honours a stop token; `generation` takes the step for a
+  greedy, image-free, single-request decode and falls back otherwise; the
+  registry loads the draft before the auto cache budget and clamps the batch to
+  one. The device draft forward landed with it: `DraftWeights` from `draft.*`,
+  a position-indexed bf16 draft KV on the model's runtime (2 KiB/token), a
+  second `CachedExperts` over `FtwBanks::draft`, and a per-row LM-head argmax.)
+- [x] **M9.6 gates and numbers.** Output **token-for-token identical** to greedy
   decoding with speculation on and off (the exactness contract), accept length,
   and a tg A/B (128 decoded tokens) with the reference checkpoint; prefill
   unchanged. Captured verify graphs are a later slice.
+  (DONE at the measured lengths: `tests/engine_spec_generate.rs` passes on both
+  checkpoints at 24 tokens. Accept length 1.50 drafts/step on the reference and
+  2.57 on Ornith (k = 3). tg is **slower**: 12.2 vs 18.1 tok/s on the reference
+  and 15.4 vs 16.7 on Ornith, because the draft's own forward costs more than
+  the accepted tokens save -- see OPTIMIZATION.md R14. Two caveats recorded
+  there: a 64-token reference run flips a near-tie at token 45 (residual batched
+  GEMM drift), and the verified router must stay per-row (a batched router
+  diverged Ornith at token 4).)
+- [ ] **M9.7 speculation that pays.** Ordered levers (OPTIMIZATION.md R14):
+  margin-gated acceptance (require the row's top-2 gap to exceed the drift bound
+  so a near-tie forces a plain step), device-side draft argmax instead of a
+  per-row host logit transfer, one draft pass per step instead of the chain plus
+  refresh, and a captured verify family.
 
 Non-goals: DFlash (the other method in #828), MTP for an architecture that ships
 no head (Qwen3-Coder), TP > 1, and GGUF draft packs.

@@ -200,67 +200,7 @@ impl Tower {
         let mut layers = Vec::with_capacity(params.num_layers);
         for layer in 0..params.num_layers {
             let p = format!("model.layers.{layer}");
-            let input_norm = ld.norm(&format!("{p}.input_layernorm.weight"), h)?;
-            let post_norm = ld.norm(&format!("{p}.post_attention_layernorm.weight"), h)?;
-            let mixer = if params.layer_types[layer] == LayerType::FullAttention {
-                Mixer::Full {
-                    qkv: Box::new(ld.dense(&format!("{p}.self_attn.qkv_proj.weight"))?),
-                    o: Box::new(ld.dense(&format!("{p}.self_attn.o_proj.weight"))?),
-                    q_norm: ld.norm(&format!("{p}.self_attn.q_norm.weight"), params.head_dim)?,
-                    k_norm: ld.norm(&format!("{p}.self_attn.k_norm.weight"), params.head_dim)?,
-                }
-            } else {
-                let conv_dim = 2 * params.linear_num_key_heads * params.linear_key_head_dim
-                    + params.linear_num_value_heads * params.linear_value_head_dim;
-                Mixer::Linear {
-                    qkvz: Box::new(ld.dense(&format!("{p}.linear_attn.in_proj_qkvz.weight"))?),
-                    o: Box::new(ld.dense(&format!("{p}.linear_attn.out_proj.weight"))?),
-                    ba: ld.bf16_shape(
-                        &format!("{p}.linear_attn.in_proj_ba.weight"),
-                        2 * params.linear_num_value_heads * h,
-                        &[2 * params.linear_num_value_heads, h],
-                    )?,
-                    conv: ld.bf16_shape(
-                        &format!("{p}.linear_attn.conv1d.weight"),
-                        conv_dim * params.linear_conv_kernel_dim,
-                        &[conv_dim, 1, params.linear_conv_kernel_dim],
-                    )?,
-                    a_log: ld.bf16_shape(
-                        &format!("{p}.linear_attn.A_log"),
-                        params.linear_num_value_heads,
-                        &[params.linear_num_value_heads],
-                    )?,
-                    dt_bias: ld.bf16_shape(
-                        &format!("{p}.linear_attn.dt_bias"),
-                        params.linear_num_value_heads,
-                        &[params.linear_num_value_heads],
-                    )?,
-                    norm: ld.bf16_shape(
-                        &format!("{p}.linear_attn.norm.weight"),
-                        params.linear_value_head_dim,
-                        &[params.linear_value_head_dim],
-                    )?,
-                }
-            };
-            let gate = ld.f32_shape(
-                &format!("{p}.mlp.gate.weight"),
-                params.num_experts * h,
-                &[params.num_experts, h],
-            )?;
-            let shared_gate =
-                ld.bf16_shape(&format!("{p}.mlp.shared_expert_gate.weight"), h, &[1, h])?;
-            let shared = Shared {
-                gate_up: ld.dense(&format!("{p}.mlp.shared_expert.gate_up_proj.weight"))?,
-                down: ld.dense(&format!("{p}.mlp.shared_expert.down_proj.weight"))?,
-            };
-            layers.push(Layer {
-                input_norm,
-                post_norm,
-                mixer,
-                gate,
-                shared_gate,
-                shared,
-            });
+            layers.push(load_layer(&ld, &p, &params, params.layer_types[layer])?);
         }
 
         let (weight, cols) = ld.head("lm_head.weight")?;
@@ -276,6 +216,153 @@ impl Tower {
             layers,
             lm_head,
         })
+    }
+}
+
+/// One decoder layer at `prefix`, which is either `model.layers.N` or the MTP
+/// draft's `draft.layers.0`. The draft layer is full attention with the same
+/// geometry, so only the prefix and the layer kind differ.
+fn load_layer(
+    ld: &Loader<'_>,
+    prefix: &str,
+    params: &ModelParams,
+    kind: LayerType,
+) -> Result<Layer> {
+    let h = params.hidden_size;
+    let p = prefix;
+    let input_norm = ld.norm(&format!("{p}.input_layernorm.weight"), h)?;
+    let post_norm = ld.norm(&format!("{p}.post_attention_layernorm.weight"), h)?;
+    let mixer = if kind == LayerType::FullAttention {
+        Mixer::Full {
+            qkv: Box::new(ld.dense(&format!("{p}.self_attn.qkv_proj.weight"))?),
+            o: Box::new(ld.dense(&format!("{p}.self_attn.o_proj.weight"))?),
+            q_norm: ld.norm(&format!("{p}.self_attn.q_norm.weight"), params.head_dim)?,
+            k_norm: ld.norm(&format!("{p}.self_attn.k_norm.weight"), params.head_dim)?,
+        }
+    } else {
+        let conv_dim = 2 * params.linear_num_key_heads * params.linear_key_head_dim
+            + params.linear_num_value_heads * params.linear_value_head_dim;
+        Mixer::Linear {
+            qkvz: Box::new(ld.dense(&format!("{p}.linear_attn.in_proj_qkvz.weight"))?),
+            o: Box::new(ld.dense(&format!("{p}.linear_attn.out_proj.weight"))?),
+            ba: ld.bf16_shape(
+                &format!("{p}.linear_attn.in_proj_ba.weight"),
+                2 * params.linear_num_value_heads * h,
+                &[2 * params.linear_num_value_heads, h],
+            )?,
+            conv: ld.bf16_shape(
+                &format!("{p}.linear_attn.conv1d.weight"),
+                conv_dim * params.linear_conv_kernel_dim,
+                &[conv_dim, 1, params.linear_conv_kernel_dim],
+            )?,
+            a_log: ld.bf16_shape(
+                &format!("{p}.linear_attn.A_log"),
+                params.linear_num_value_heads,
+                &[params.linear_num_value_heads],
+            )?,
+            dt_bias: ld.bf16_shape(
+                &format!("{p}.linear_attn.dt_bias"),
+                params.linear_num_value_heads,
+                &[params.linear_num_value_heads],
+            )?,
+            norm: ld.bf16_shape(
+                &format!("{p}.linear_attn.norm.weight"),
+                params.linear_value_head_dim,
+                &[params.linear_value_head_dim],
+            )?,
+        }
+    };
+    let gate = ld.f32_shape(
+        &format!("{p}.mlp.gate.weight"),
+        params.num_experts * h,
+        &[params.num_experts, h],
+    )?;
+    let shared_gate = ld.bf16_shape(&format!("{p}.mlp.shared_expert_gate.weight"), h, &[1, h])?;
+    let shared = Shared {
+        gate_up: ld.dense(&format!("{p}.mlp.shared_expert.gate_up_proj.weight"))?,
+        down: ld.dense(&format!("{p}.mlp.shared_expert.down_proj.weight"))?,
+    };
+    Ok(Layer {
+        input_norm,
+        post_norm,
+        mixer,
+        gate,
+        shared_gate,
+        shared,
+    })
+}
+
+/// The MTP draft's dense weights: the two pre-fc norms, `fc`, one full-attention
+/// decoder layer, and `draft.norm`. The embedding and the LM head are the
+/// target's, so they are not loaded here.
+pub struct DraftWeights {
+    pub pre_fc_norm_embedding: Tensor,
+    pub pre_fc_norm_hidden: Tensor,
+    /// The two half-width halves of `draft.fc` (`[h, 2h]`).
+    pub fc_embed: Dense,
+    pub fc_hidden: Dense,
+    pub layer: Layer,
+    pub norm: Tensor,
+}
+
+impl DraftWeights {
+    pub fn load(
+        params: &ModelParams,
+        rt: Runtime,
+        index: Arc<FtwIndex>,
+        reader: Arc<dyn WeightsReader>,
+    ) -> Result<Self> {
+        let ld = Loader {
+            rt: &rt,
+            index: &index,
+            reader: reader.as_ref(),
+        };
+        let h = params.hidden_size;
+        let fc = ld.dense("draft.fc.weight")?;
+        let DenseWeight::Bf16(w) = &fc.w else {
+            return Err(LoadError::Bad(
+                "draft.fc",
+                "the draft fc is not bf16".to_string(),
+            ));
+        };
+        if fc.rows != h || fc.cols != 2 * h {
+            return Err(LoadError::Bad(
+                "draft.fc",
+                format!("draft.fc is {}x{}, want {h}x{}", fc.rows, fc.cols, 2 * h),
+            ));
+        }
+        // `fc(cat(norm_e(embed), norm_h(hidden)))` is two half-width GEMMs; the
+        // halves are sliced once here so the forward never builds a strided
+        // concatenation.
+        let half = |off: usize| -> Result<Dense> {
+            let part = w
+                .narrow(1, off, h)
+                .and_then(|t| t.contiguous())
+                .map_err(|e| LoadError::Device(e.to_string()))?;
+            Ok(Dense {
+                w: DenseWeight::Bf16(Box::new(part)),
+                row_scale: None,
+                nvfp4: None,
+                rows: h,
+                cols: h,
+            })
+        };
+        Ok(Self {
+            pre_fc_norm_embedding: ld.norm("draft.pre_fc_norm_embedding.weight", h)?,
+            pre_fc_norm_hidden: ld.norm("draft.pre_fc_norm_hidden.weight", h)?,
+            fc_embed: half(0)?,
+            fc_hidden: half(h)?,
+            layer: load_layer(&ld, "draft.layers.0", params, LayerType::FullAttention)?,
+            norm: ld.norm("draft.norm.weight", h)?,
+        })
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.pre_fc_norm_embedding.nbytes()
+            + self.pre_fc_norm_hidden.nbytes()
+            + self.fc_embed.bytes()
+            + self.fc_hidden.bytes()
+            + self.norm.nbytes()
     }
 }
 

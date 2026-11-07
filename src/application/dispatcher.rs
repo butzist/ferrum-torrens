@@ -325,6 +325,7 @@ mod tests {
             max_prefill_length: 8,
             max_running_requests: 4,
             max_output_tokens: 8,
+            speculative_steps: 0,
         }
     }
 

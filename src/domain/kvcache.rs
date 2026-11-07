@@ -1063,6 +1063,15 @@ pub struct VerifyOut {
     pub hidden: Vec<f32>,
 }
 
+/// A draft pass's answer: the final-norm hidden of every row it ran and the
+/// argmax token each row predicts.
+pub struct Drafted {
+    /// `rows * params.hidden_size` f32.
+    pub hidden: Vec<f32>,
+    /// One token per row: the draft's prediction of the token after it.
+    pub tokens: Vec<u32>,
+}
+
 /// A forward that reads and writes a `SequenceCache` instead of re-running the
 /// prefix. Implemented by the compute adapter; the domain owns the contract.
 ///
@@ -1125,6 +1134,31 @@ pub trait CachedModel: Model {
         let _ = (cache, rows);
         Err(KvcacheError::MisalignedCache {
             why: "this model has no speculative verify path".to_string(),
+        })
+    }
+
+    /// Whether the checkpoint carries an MTP draft head and the engine has
+    /// enabled it. `false` means speculation cannot start, not that it failed.
+    fn draft_ready(&self) -> bool {
+        false
+    }
+
+    /// Run the MTP draft over consecutive labels `from .. from + tokens.len()`.
+    ///
+    /// Row `i` embeds `tokens[i]` (the token at label `from + i + 1`) together
+    /// with `hiddens[i]` (the target's final-norm hidden at label `from + i`) and
+    /// answers the token after it. The draft's own K/V is written at the row's
+    /// label, so the next call over a later label range attends to this one.
+    fn draft_rows(
+        &self,
+        cache: &SequenceCache,
+        tokens: &[u32],
+        hiddens: &[f32],
+        from: usize,
+    ) -> Result<Drafted, KvcacheError> {
+        let _ = (cache, tokens, hiddens, from);
+        Err(KvcacheError::MisalignedCache {
+            why: "this model has no draft head".to_string(),
         })
     }
 }

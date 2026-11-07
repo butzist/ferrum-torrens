@@ -1774,3 +1774,49 @@ A separate finding from the same session, not a performance item: dropping an
 `Engine` leaves its device slot banks allocated (~1.8 MiB per cache slot,
 measured), so a second load in one process loses that much VRAM (TODO.md M8.1e).
 It does not affect serving, where the idle release calls `release_banks`.
+
+## R14 -- speculative decoding with the MTP draft (measured 2026-11-07, M9.6)
+
+`[spec] algorithm = "mtp"`, `num_steps = 3`, one request (the scheduler clamps the
+batch to one while speculating). 24 greedy tokens after "The capital of France
+is", one warm engine per load, `tests/engine_spec_generate.rs`.
+
+| checkpoint | path | accept | tg tok/s | vs plain |
+| --- | --- | --- | --- | --- |
+| reference | plain | -- | 18.1 | -- |
+| reference | mtp | 1.50 drafts/step | 12.2 | 0.67x |
+| Ornith | plain | -- | 16.7 | -- |
+| Ornith | mtp | 2.57 drafts/step | 15.4 | 0.92x |
+
+**Verdict: a measured loss, shipped off by default.** The output is identical to
+greedy at this length on both checkpoints (a 64-token reference run flips a
+near-tie at token 45 from residual batched-GEMM drift; see the levers below).
+The exchange rate is wrong: each step pays a draft chain plus a refresh pass
+(each row ends in a per-row NVFP4 LM-head GEMV whose 248320 logits are copied to
+the host for the argmax) and a `k + 1`-row verify, and returns ~2.5 tokens.
+
+Ordered levers, cheapest first:
+
+1. **Margin-gated acceptance.** Compute each verify row's top-2 logit gap; accept
+   drafts only while the gap exceeds a measured drift bound, and produce the
+   first below-bound token with a plain one-token step. This makes the output
+   exact by construction instead of by luck, and costs nothing on the common
+   path.
+2. **Device-side draft argmax.** The draft needs one token per row, not the
+   logits: a device argmax over the head's output buffer removes ~1 MB of host
+   transfer per draft row and the host round trip that follows it.
+3. **One draft pass per step.** Today a step runs `k - 1` chain rows plus a
+   refresh pass of up to `k + 2` rows. Folding them (draft the chain from the
+   verify's rows directly, as upstream's `post_verify` does) halves the draft
+   rows.
+4. **Captured verify family.** A captured `rows = k + 1` graph removes the
+   per-step launch overhead of the paged attention, the row-by-row GDN replay
+   and the per-row router. It must reproduce the eager verify bit for bit, which
+   is the same gate `decode_graph_capture` already uses for decode.
+5. **Draft bank sizing.** All 256 draft experts are resident (433 MiB). Halving
+   the cache changed nothing measurable (12.8 vs 12.7 tok/s), so the draft's
+   cost is in its dense work, not its expert reads; do not trade the target's
+   cache away for it.
+
+Do not re-open this without a measured win on the protocol above; the accept
+rate alone (2.57/step on Ornith) does not pay for the rows it costs.

@@ -133,6 +133,9 @@ struct Session {
     rng: Rng,
     /// An image request's splice, shared from the `Request`.
     images: Option<Arc<crate::application::engine::RequestImages>>,
+    /// The speculative loop's carry between steps. `None` on a request that
+    /// never speculates.
+    spec: Option<crate::application::spec_decode::Relay>,
 }
 
 /// Build a request, clamping `max_tokens` by the engine's output limit and by
@@ -319,6 +322,7 @@ fn run_batch(
                 cache: None,
                 rng: Rng::new(seed),
                 images,
+                spec: None,
             },
         );
         pending.push(req);
@@ -352,7 +356,89 @@ fn run_batch(
             // tokens it has not seen: the prompt in budget-sized chunks, then one
             // token each.
             let kv = engine.cache().expect("checked above");
-            if phase == Phase::Decode && engine.captured().is_some() && !images_only {
+            let spec_steps = engine.limits().speculative_steps;
+            if phase == Phase::Decode
+                && spec_steps > 0
+                && batch.reqs.len() == 1
+                && !images_only
+                && engine.draft_ready()
+            {
+                // Speculation drafts, verifies and commits one request at a
+                // time; the scheduler is already clamped to one. A non-greedy
+                // request keeps plain decode: the accept rule here is the
+                // greedy prefix match.
+                let uid = batch.reqs[0].uid;
+                let greedy = {
+                    let s = &sessions[&uid];
+                    s.req.sampling.is_greedy() && s.images.is_none()
+                };
+                if greedy {
+                    let model = engine.resident_model()?;
+                    let max_seq_len = engine.limits().max_seq_len;
+                    let tokens = {
+                        let s = sessions.get_mut(&uid).expect("scheduled row has a session");
+                        if s.cache.is_none() {
+                            s.cache = Some(open_cache(&kv, &s.ids));
+                        }
+                        let pending = *s.ids.last().ok_or(EngineError::EmptyStep { uid })?;
+                        let mut cache = s.cache.take().ok_or(EngineError::NoKvCache)?;
+                        let start = cache.cached();
+                        let step = crate::application::spec_decode::speculative_step(
+                            model.as_ref(),
+                            kv.as_ref(),
+                            &mut cache,
+                            pending,
+                            start,
+                            spec_steps,
+                            max_seq_len,
+                            &mut s.spec,
+                        );
+                        s.cache = Some(cache);
+                        match step {
+                            Ok(tokens) => tokens,
+                            Err(e) => {
+                                eprintln!("warning: speculation fell back to plain decode ({e})");
+                                None
+                            }
+                        }
+                    };
+                    match tokens {
+                        Some(tokens) => {
+                            let mut last = Some(sessions[&uid].req.clone());
+                            for token in tokens {
+                                last = emit_token(engine, &mut sessions, &mut sinks, uid, token)?;
+                                if last.is_none() {
+                                    break;
+                                }
+                            }
+                            match last {
+                                Some(req) => decoding.push(req),
+                                None => finished.push(uid),
+                            }
+                            Vec::new()
+                        }
+                        // No room to speculate (or it failed): one plain step
+                        // through the per-request loop below.
+                        None => plain_decode_rows(
+                            engine,
+                            &kv,
+                            &mut sessions,
+                            &batch.reqs,
+                            &mut continuations,
+                            phase,
+                        )?,
+                    }
+                } else {
+                    plain_decode_rows(
+                        engine,
+                        &kv,
+                        &mut sessions,
+                        &batch.reqs,
+                        &mut continuations,
+                        phase,
+                    )?
+                }
+            } else if phase == Phase::Decode && engine.captured().is_some() && !images_only {
                 // The engine owns a captured decode service, so a whole decode
                 // step replays on one graph instead of one cached forward per
                 // request. Prefill stays on the per-request path (see below),
@@ -360,80 +446,14 @@ fn run_batch(
                 // positions, an image request's decode needs its mrope delta.
                 captured_decode_step(engine, &kv, &mut sessions, &batch.reqs)?
             } else {
-                let mut out = Vec::with_capacity(batch.reqs.len());
-                for scheduled in &batch.reqs {
-                    let extend_len = scheduled.extend_len;
-                    let s = sessions
-                        .get_mut(&scheduled.uid)
-                        .expect("scheduled row has a session");
-                    let Session {
-                        ids,
-                        generated: _,
-                        cache: slot,
-                        req,
-                        rng,
-                        images,
-                    } = s;
-                    if slot.is_none() {
-                        // Prefix adoption matches token ids only, so an image
-                        // request must not adopt: the same placeholder pattern
-                        // can stand for a different image. It fills its own
-                        // pages instead.
-                        let opened = if images.is_some() {
-                            kv.begin()
-                        } else {
-                            open_cache(&kv, ids)
-                        };
-                        // A matched prefix already covers tokens the scheduler
-                        // counted as pending; realign so chunking resumes past it.
-                        req.prefilled = req.prefilled.max(opened.cached());
-                        *slot = Some(opened);
-                    }
-                    let cache = slot.as_mut().expect("opened above");
-                    let start = cache.cached();
-                    let chunk = extend_len.min(ids.len() - start).max(1);
-                    let end = start + chunk;
-                    if phase == Phase::Prefill && end < ids.len() {
-                        // A non-final chunk: advance the cache and snapshot the
-                        // boundary, but keep the request queued for the rest.
-                        engine.run_prefill_cached(CachedStep {
-                            uid: req.uid,
-                            ids: &ids[start..end],
-                            start,
-                            cache,
-                            params: &req.sampling,
-                            images: images.as_deref(),
-                        })?;
-                        // An image boundary snapshot would donate KV pages the
-                        // radix could later hand to another request with the
-                        // same placeholder pattern; skip it like the donations.
-                        if images.is_none() {
-                            kv.commit(cache, &ids[..end], false);
-                        }
-                        req.advance_prefill(chunk);
-                        continuations.push(req.clone());
-                        continue;
-                    }
-                    let step = engine.run_forward_cached(
-                        CachedStep {
-                            uid: req.uid,
-                            ids: &ids[start..end],
-                            start,
-                            cache,
-                            params: &req.sampling,
-                            images: images.as_deref(),
-                        },
-                        rng,
-                    )?;
-                    if phase == Phase::Prefill {
-                        // The whole prompt is now cached: commit its prefix and a
-                        // prompt-end GDN snapshot, so a later request that extends
-                        // this prompt can resume from here.
-                        kv.commit(cache, ids.as_slice(), false);
-                    }
-                    out.push(step);
-                }
-                out
+                plain_decode_rows(
+                    engine,
+                    &kv,
+                    &mut sessions,
+                    &batch.reqs,
+                    &mut continuations,
+                    phase,
+                )?
             }
         } else {
             let rows: Vec<BatchRow<'_>> = batch
@@ -511,6 +531,129 @@ fn run_batch(
         });
     }
     Ok(out)
+}
+
+/// The per-request cached path: prefill chunks and plain one-token decode, one
+/// cached forward per scheduled row.
+#[allow(clippy::too_many_arguments)]
+fn plain_decode_rows(
+    engine: &Engine,
+    kv: &Arc<dyn KvCache>,
+    sessions: &mut HashMap<u64, Session>,
+    reqs: &[Req],
+    continuations: &mut Vec<Req>,
+    phase: Phase,
+) -> Result<Vec<(u64, u32)>, EngineError> {
+    let mut out = Vec::with_capacity(reqs.len());
+    for scheduled in reqs {
+        let extend_len = scheduled.extend_len;
+        let s = sessions
+            .get_mut(&scheduled.uid)
+            .expect("scheduled row has a session");
+        let Session {
+            ids,
+            generated: _,
+            cache: slot,
+            req,
+            rng,
+            images,
+            spec: _,
+        } = s;
+        if slot.is_none() {
+            // Prefix adoption matches token ids only, so an image request must
+            // not adopt: the same placeholder pattern can stand for a different
+            // image. It fills its own pages instead.
+            let opened = if images.is_some() {
+                kv.begin()
+            } else {
+                open_cache(kv, ids)
+            };
+            // A matched prefix already covers tokens the scheduler counted as
+            // pending; realign so chunking resumes past it.
+            req.prefilled = req.prefilled.max(opened.cached());
+            *slot = Some(opened);
+        }
+        let cache = slot.as_mut().expect("opened above");
+        let start = cache.cached();
+        let chunk = extend_len.min(ids.len() - start).max(1);
+        let end = start + chunk;
+        if phase == Phase::Prefill && end < ids.len() {
+            // A non-final chunk: advance the cache and snapshot the boundary,
+            // but keep the request queued for the rest.
+            engine.run_prefill_cached(CachedStep {
+                uid: req.uid,
+                ids: &ids[start..end],
+                start,
+                cache,
+                params: &req.sampling,
+                images: images.as_deref(),
+            })?;
+            // An image boundary snapshot would donate KV pages the radix could
+            // later hand to another request with the same placeholder pattern;
+            // skip it like the donations.
+            if images.is_none() {
+                kv.commit(cache, &ids[..end], false);
+            }
+            req.advance_prefill(chunk);
+            continuations.push(req.clone());
+            continue;
+        }
+        let step = engine.run_forward_cached(
+            CachedStep {
+                uid: req.uid,
+                ids: &ids[start..end],
+                start,
+                cache,
+                params: &req.sampling,
+                images: images.as_deref(),
+            },
+            rng,
+        )?;
+        if phase == Phase::Prefill {
+            // The whole prompt is now cached: commit its prefix and a
+            // prompt-end GDN snapshot, so a later request that extends this
+            // prompt can resume from here.
+            kv.commit(cache, ids.as_slice(), false);
+        }
+        out.push(step);
+    }
+    Ok(out)
+}
+
+/// One generated token's bookkeeping, shared by the plain and speculative
+/// paths: record it, apply the stop rules, stream it, and hand the request back
+/// while it should keep decoding.
+fn emit_token(
+    engine: &Engine,
+    sessions: &mut HashMap<u64, Session>,
+    sinks: &mut Option<&mut dyn SinkSet>,
+    uid: u64,
+    token: u32,
+) -> Result<Option<Req>, EngineError> {
+    let s = sessions.get_mut(&uid).expect("emitted row has a session");
+    s.ids.push(token);
+    s.generated.push(token);
+    let stop = match check_stop(&s.req, token, engine.eos_ids()) {
+        Some(reason) => Some(reason),
+        None => stop_string_hit(engine, s)?,
+    };
+    match stop {
+        Some(reason) => s.req.finish(reason),
+        None => s.req.complete_one(),
+    }
+    if let Some(set) = sinks.as_deref_mut() {
+        let piece = engine.decode(std::slice::from_ref(&token))?;
+        // The token that ends the run is still streamed; only the reason a sink
+        // stops it never overwrites a real one.
+        if !set.token(uid, &piece, token, s.generated.len() - 1)? && !s.req.finished() {
+            s.req.finish(FinishReason::Abort);
+        }
+    }
+    Ok(if s.req.finished() {
+        None
+    } else {
+        Some(s.req.clone())
+    })
 }
 
 /// One batched decode step over the engine's captured graphs: reserve one token
@@ -652,6 +795,40 @@ mod tests {
         );
         assert_eq!(calls[1].positions, vec![0, 1, 2]);
         assert_eq!(calls[1].answers, vec![2], "answer row is the last token");
+    }
+
+    #[test]
+    fn speculation_emits_the_plain_runs_tokens() {
+        let limits_on = crate::application::engine::EngineLimits {
+            speculative_steps: 3,
+            ..limits()
+        };
+        for offset in [0u32, 1] {
+            let (engine, _rec, _cache) =
+                crate::application::engine::fake::test_cached_engine_with_drafts(limits_on, offset);
+            let g = generate(&engine, req(&engine, 1, "ab", params(5))).unwrap();
+            assert_eq!(
+                g.tokens,
+                vec![99, 100, 101, 102, 103],
+                "offset {offset}: speculative output matches the plain run"
+            );
+            assert_eq!(g.text, "cdefg");
+        }
+    }
+
+    #[test]
+    fn speculation_still_honours_stop_tokens() {
+        // `<before-eos>` makes the target answer EOS immediately; the seed step
+        // emits it and the loop must stop there, not commit draft rows.
+        let limits_on = crate::application::engine::EngineLimits {
+            speculative_steps: 3,
+            ..limits()
+        };
+        let (engine, _rec, _cache) =
+            crate::application::engine::fake::test_cached_engine_with_drafts(limits_on, 0);
+        let g = generate(&engine, req(&engine, 1, "<before-eos>", params(4))).unwrap();
+        assert_eq!(g.tokens.len(), 1, "EOS ends the run at the seed step");
+        assert_eq!(g.finish_reason, FinishReason::Stop);
     }
 
     #[test]

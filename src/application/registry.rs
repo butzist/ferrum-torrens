@@ -154,6 +154,40 @@ pub fn build(
                     cache.clone(),
                 )
                 .map_err(RegistryError::build)?;
+                // M9: the MTP draft head loads *before* the auto cache budget so
+                // its ~0.5 GB resident bank comes out of what the target's
+                // expert cache may size itself to, not out of the reserve.
+                if config.speculative_algorithm() == Some("mtp") {
+                    if index.has_mtp == Some(true) {
+                        match model.enable_draft(config.kv_tokens()) {
+                            Ok(_) => {
+                                match draft_moe_port(
+                                    config,
+                                    &params,
+                                    index.clone(),
+                                    reader.clone(),
+                                    device,
+                                    stream,
+                                ) {
+                                    Ok(moe) => model.attach_draft_moe(moe),
+                                    Err(e) => eprintln!(
+                                        "warning: the MTP draft's expert bank did not build ({e}); \
+                                         speculation stays off"
+                                    ),
+                                }
+                            }
+                            Err(e) => eprintln!(
+                                "warning: the MTP draft head did not load ({e}); \
+                                 speculation stays off"
+                            ),
+                        }
+                    } else {
+                        eprintln!(
+                            "warning: [spec] asks for mtp but this checkpoint has no draft head; \
+                             decode stays plain"
+                        );
+                    }
+                }
                 let slots = resolve_cache_slots(config, &params, device, Some(driver.as_ref()))?;
                 let moe = moe_port(
                     config,
@@ -365,6 +399,52 @@ fn kv_cache(
         reserve_padding,
     );
     DeviceCache::new(params, config.kv_tokens(), slots, dtype, device)
+}
+
+/// The MTP draft's expert port: the same adapter and slot machine as the
+/// target's, over a `draft_`-prefixed bank space and sized to hold every draft
+/// expert (433 MiB NVFP4), so after warmup the draft never copies a bank. No
+/// pinned host staging: the draft's whole bank budget is resident.
+#[cfg(feature = "cudarc")]
+fn draft_moe_port(
+    config: &crate::config::Config,
+    params: &ModelParams,
+    index: Arc<FtwIndex>,
+    reader: Arc<dyn WeightsReader>,
+    device: Device,
+    stream: crate::infrastructure::cuda_driver::CUstream,
+) -> Result<Option<Arc<dyn MoEExecutor>>, RegistryError> {
+    use crate::application::run_experts::CachedExperts;
+    use crate::domain::expert_kernel::ExpertShapes;
+    use crate::infrastructure::banks::FtwBanks;
+    use crate::infrastructure::cuda_moe::CudaMoE;
+
+    if !config.kernel.triton {
+        return Ok(None);
+    }
+    let shapes = ExpertShapes::new(params.hidden_size, params.moe_intermediate_size)
+        .map_err(|e| RegistryError::build(e.to_string()))?;
+    // Every draft expert stays resident (433 MiB of NVFP4): a draft row is on
+    // the critical path of every step, so a miss's 1.7 MiB read is worth
+    // avoiding. `resolve_cache_slots` runs after this and sizes the target's
+    // cache around whatever is left.
+    let slots = params.num_experts;
+    let adapter = CudaMoE::new_with_stream(
+        device,
+        Arc::new(FtwBanks::draft(reader, index)),
+        shapes,
+        slots,
+        stream,
+    )
+    .map_err(|e| RegistryError::build(e.to_string()))?;
+    let moe = Arc::new(std::sync::Mutex::new(adapter));
+    Ok(Some(Arc::new(CachedExperts::new(
+        moe.clone(),
+        moe,
+        1,
+        params.num_experts,
+        slots,
+    ))))
 }
 
 /// The engine's MoE port for `kernel.triton = true`: the driver-API adapter over

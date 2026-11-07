@@ -12,7 +12,7 @@ use std::sync::{Arc, OnceLock};
 
 use crate::domain::dequant::{nvfp4_expert, nvfp4_globals};
 use crate::domain::expert_kernel::{MoEDeviceRequest, MoEError, MoEExecutor};
-use crate::domain::kvcache::{CachedModel, KvCache, KvcacheError, SequenceCache};
+use crate::domain::kvcache::{CachedModel, Drafted, KvCache, KvcacheError, SequenceCache};
 use crate::domain::model::{ForwardInput, Model, ModelParams};
 use crate::domain::weights::{TensorKind, WeightsReader};
 use crate::infrastructure::cuda_attention::PagedAttention;
@@ -75,6 +75,20 @@ fn split_mixed(
         .contiguous()?
         .reshape(&[t, vb, dv])?;
     Ok((q, k, v))
+}
+
+/// The index of the largest logit, ties going to the first (the sampler's own
+/// greedy rule).
+fn argmax(logits: &[f32]) -> usize {
+    let mut best = 0usize;
+    let mut bestv = f32::NEG_INFINITY;
+    for (i, &v) in logits.iter().enumerate() {
+        if v > bestv {
+            bestv = v;
+            best = i;
+        }
+    }
+    best
 }
 
 /// add_rmsnorm cubin bakes one hidden width, so a head-sized norm is computed
@@ -464,6 +478,20 @@ pub struct CudarcQwen3_6 {
     /// engine runs one verify at a time, so one slot is enough; the mutex is
     /// what lets `&self` fill it from inside a layer.
     verify: std::sync::Mutex<Option<VerifyStash>>,
+    /// The MTP draft head, present only when the engine enabled speculation.
+    draft: Option<super::load_cudarc::DraftWeights>,
+    /// The draft's own K/V, one row per absolute position, bf16. Two KV heads at
+    /// 256 dims is 2 KiB/token, a tenth of the target's slab. It is a plain
+    /// position-indexed buffer, not a page table: only the single speculative
+    /// request ever reads it and rollback is just "overwrite the stale labels".
+    draft_kv: std::sync::Mutex<Option<DraftKv>>,
+    /// The draft's expert executor (its own bank space, resident on the device).
+    draft_moe: Option<Arc<dyn MoEExecutor>>,
+}
+
+struct DraftKv {
+    pool: crate::infrastructure::kvcache_dev::MhaPool,
+    capacity: usize,
 }
 
 impl CudarcQwen3_6 {
@@ -509,6 +537,9 @@ impl CudarcQwen3_6 {
             rope_sin,
             mrope_axis,
             verify: std::sync::Mutex::new(None),
+            draft: None,
+            draft_kv: std::sync::Mutex::new(None),
+            draft_moe: None,
         })
     }
 
@@ -521,6 +552,53 @@ impl CudarcQwen3_6 {
 
     pub fn attach_moe(&mut self, moe: Option<Arc<dyn MoEExecutor>>) {
         self.moe = moe;
+    }
+
+    /// Load the checkpoint's MTP draft head and size its own K/V at
+    /// `max_positions` tokens. `Err` means the head is absent or did not load;
+    /// the caller then keeps decoding without speculation.
+    pub fn enable_draft(&mut self, max_positions: usize) -> Result<usize> {
+        if max_positions == 0 {
+            return Err(moe_bad("the draft KV needs at least one position"));
+        }
+        if self.draft.is_none() {
+            let weights = super::load_cudarc::DraftWeights::load(
+                &self.params,
+                self.rt.clone(),
+                self.index.clone(),
+                self.reader.clone(),
+            )
+            .map_err(|e| moe_bad(e.to_string()))?;
+            let mut kv_params = self.params.clone();
+            kv_params.num_layers = 1;
+            kv_params.layer_types = vec![crate::domain::model::LayerType::FullAttention];
+            let pool = crate::infrastructure::kvcache_dev::MhaPool::with_runtime(
+                &kv_params,
+                max_positions,
+                KvDType::BFloat16,
+                // The pool must share the model's runtime: its own stream would
+                // let a store read a draft row the layer is still writing, and a
+                // gather read a row the store has not landed.
+                self.rt.clone(),
+            );
+            self.draft = Some(weights);
+            *self.draft_kv.lock().expect("draft kv") = Some(DraftKv {
+                pool,
+                capacity: max_positions,
+            });
+        }
+        Ok(max_positions)
+    }
+
+    /// Hand the draft its expert executor. Its banks live in the same FTW under
+    /// `draft_*#L00000`, so it must be a separate executor over that bank space.
+    pub fn attach_draft_moe(&mut self, moe: Option<Arc<dyn MoEExecutor>>) {
+        self.draft_moe = moe;
+    }
+
+    /// The draft head's resident bytes, for the memory arithmetic.
+    pub fn draft_bytes(&self) -> usize {
+        self.draft.as_ref().map_or(0, |d| d.bytes())
     }
 
     fn apply_dense(&self, d: &Dense, x: &Tensor) -> Result<Tensor> {
@@ -980,17 +1058,140 @@ impl CudarcQwen3_6 {
         Tensor::stack(&cores)
     }
 
-    fn moe(&self, li: usize, x_post: &Tensor) -> Result<Tensor> {
-        let layer = &self.tower.layers[li];
+    /// The MTP draft's one decoder layer: a full-attention block over the
+    /// draft's own KV, then its own expert bank. `from..from+n` are the row
+    /// labels, which are also the draft KV positions and the rope positions.
+    fn draft_attention(
+        &self,
+        layer: &Layer,
+        x: &Tensor,
+        kv: &DraftKv,
+        from: usize,
+        n: usize,
+    ) -> Result<Tensor> {
+        let p = &self.params;
+        let positions: Vec<u32> = (from..from + n).map(|i| i as u32).collect();
+        let (q, k, v, gate) = self.project_attention(layer, x, &Positions::Host(&positions))?;
+        let locs: Vec<u32> = (from..from + n).map(|i| i as u32).collect();
+        kv.pool.store(0, &locs, &k, &v);
+        let all: Vec<u32> = (0..from + n).map(|i| i as u32).collect();
+        let (k_all, v_all) = kv.pool.gather_native(0, &all);
+        let attn = q.causal_sdpa(&k_all, &v_all, from)?;
+        let q_dim = p.num_q_heads * p.head_dim;
+        let Mixer::Full { o, .. } = &layer.mixer else {
+            return Err(moe_bad("the draft layer is not full attention"));
+        };
+        let gated = attn.reshape(&[n, q_dim])?.mul(&sigmoid(&gate)?)?;
+        self.apply_dense(o, &gated)
+    }
+
+    /// One MTP draft pass over consecutive row labels. Row `i` embeds
+    /// `tokens[i]` (the token at label `from + i + 1`) with `hiddens[i]` (the
+    /// target hidden at label `from + i`), runs the draft layer and the shared
+    /// LM head, and answers the token after it.
+    fn draft_forward(&self, tokens: &[u32], hiddens: &[f32], from: usize) -> Result<Drafted> {
+        let d = self
+            .draft
+            .as_ref()
+            .ok_or_else(|| moe_bad("no draft weights loaded"))?;
+        let p = &self.params;
+        let h = p.hidden_size;
+        let n = tokens.len();
+        if n == 0 || hiddens.len() != n * h {
+            return Err(moe_bad(
+                "the draft needs one token and one hidden row per label",
+            ));
+        }
+        let kv_guard = self.draft_kv.lock().expect("draft kv");
+        let kv = kv_guard
+            .as_ref()
+            .ok_or_else(|| moe_bad("the draft KV is not enabled"))?;
+        if from + n > kv.capacity {
+            return Err(moe_bad(format!(
+                "draft labels {from}..{} past the {} positions the draft KV holds",
+                from + n,
+                kv.capacity
+            )));
+        }
+        let idx: Vec<i32> = tokens.iter().map(|t| *t as i32).collect();
+        let idx = self.rt.from_slice_i32(&idx, &[n])?;
+        let DenseWeight::Bf16(embed) = &self.tower.embed.w else {
+            return Err(moe_bad("the embedding is not bf16"));
+        };
+        let embeds = embed.gather_rows(&idx)?;
+        let ne = rms_norm(&embeds, &d.pre_fc_norm_embedding, p.rms_norm_eps)?;
+        let prev = self
+            .rt
+            .from_slice_f32(hiddens, &[n, h])?
+            .cast(TensorDType::Bf16)?;
+        let nh = rms_norm(&prev, &d.pre_fc_norm_hidden, p.rms_norm_eps)?;
+        let x = self
+            .apply_dense(&d.fc_embed, &ne)?
+            .add(&self.apply_dense(&d.fc_hidden, &nh)?)?;
+
+        let h1 = rms_norm(&x, &d.layer.input_norm, p.rms_norm_eps)?;
+        let attn = self.draft_attention(&d.layer, &h1, kv, from, n)?;
+        let (xsum, h2) = attn.add_rms_norm(&x, &d.layer.post_norm, p.rms_norm_eps)?;
+        let moe = self.moe_parts(&d.layer, 0, self.draft_moe.as_ref(), &h2, false)?;
+        let normed = rms_norm(&moe.add(&xsum)?, &d.norm, p.rms_norm_eps)?;
+        let mut hidden = Vec::with_capacity(n * h);
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let row = normed.narrow(0, i, 1)?;
+            hidden.extend(row.cast(TensorDType::F32)?.to_host_f32()?);
+            let logits = self.lm_head_logits(&row)?;
+            out.push(argmax(&logits) as u32);
+        }
+        Ok(Drafted {
+            hidden,
+            tokens: out,
+        })
+    }
+
+    fn moe(&self, li: usize, x_post: &Tensor, per_row_router: bool) -> Result<Tensor> {
+        self.moe_parts(
+            &self.tower.layers[li],
+            li,
+            self.moe.as_ref(),
+            x_post,
+            per_row_router,
+        )
+    }
+
+    /// One MoE block over `layer`'s router and shared expert, with the routed
+    /// half handed to `port` under `bank_layer`'s expert banks. The draft head
+    /// calls this with its own layer, bank space and executor; the target calls
+    /// it with `moe`.
+    fn moe_parts(
+        &self,
+        layer: &Layer,
+        bank_layer: usize,
+        port: Option<&Arc<dyn MoEExecutor>>,
+        x_post: &Tensor,
+        per_row_router: bool,
+    ) -> Result<Tensor> {
         let p = &self.params;
         let t = x_post.shape()[0];
 
-        let logits = x_post
-            .cast(TensorDType::F32)?
-            .matmul_nt_f32(&layer.gate.cast(TensorDType::F32)?)?;
+        // A verify runs several rows of one request, but the router must pick
+        // each row's experts the way a one-row decode does: a batched GEMV over
+        // k + 1 rows rounds differently, and on a checkpoint with high routing
+        // entropy that flips an expert and the token with it (decision 151).
+        let logits = if per_row_router && t > 1 {
+            let gate = layer.gate.cast(TensorDType::F32)?;
+            let mut rows = Vec::with_capacity(t);
+            for i in 0..t {
+                let row = x_post.narrow(0, i, 1)?.cast(TensorDType::F32)?;
+                rows.push(row.matmul_nt_f32(&gate)?);
+            }
+            Tensor::cat(&rows)?
+        } else {
+            x_post
+                .cast(TensorDType::F32)?
+                .matmul_nt_f32(&layer.gate.cast(TensorDType::F32)?)?
+        };
         let probs = logits.softmax_last()?;
         let (ids, weights) = topk_renorm(&probs, p.top_k)?;
-
         let se_gate = x_post
             .cast(TensorDType::F32)?
             .matmul_nt_f32(&layer.shared_gate.cast(TensorDType::F32)?)?
@@ -1004,11 +1205,11 @@ impl CudarcQwen3_6 {
             .apply_dense(&layer.shared.down, &ic2)?
             .row_mul(&se_gate.reshape(&[t])?)?;
 
-        let routed = match &self.moe {
+        let routed = match port {
             Some(port) => {
                 let mut out = self.rt.zeros(&[t, p.hidden_size], TensorDType::Bf16)?;
                 let req = MoEDeviceRequest {
-                    layer: li,
+                    layer: bank_layer,
                     hidden: p.hidden_size,
                     inter: p.moe_intermediate_size,
                     top_k: p.top_k,
@@ -1019,7 +1220,7 @@ impl CudarcQwen3_6 {
                 port.execute_device(&req, &mut out)?;
                 out
             }
-            None => self.routed_inline(li, x_post, &ids, &weights)?,
+            None => self.routed_inline(bank_layer, x_post, &ids, &weights)?,
         };
         se.add(&routed)
     }
@@ -1241,7 +1442,14 @@ impl CudarcQwen3_6 {
             x = if ablated("moe") {
                 h2.clone()
             } else {
-                self.moe(li, &h2)?
+                let per_row_router = matches!(
+                    access,
+                    Access::Device {
+                        rows: DeviceRows::Sequential,
+                        ..
+                    }
+                );
+                self.moe(li, &h2, per_row_router)?
             };
             residual = Some(sum2);
         }
@@ -1499,6 +1707,23 @@ impl CachedModel for CudarcQwen3_6 {
                 .map_err(|e| KvcacheError::MisalignedCache { why: e.to_string() })?;
         }
         Ok(())
+    }
+
+    fn draft_ready(&self) -> bool {
+        self.draft.is_some()
+            && self.draft_moe.is_some()
+            && self.draft_kv.lock().expect("draft kv").is_some()
+    }
+
+    fn draft_rows(
+        &self,
+        _cache: &SequenceCache,
+        tokens: &[u32],
+        hiddens: &[f32],
+        from: usize,
+    ) -> std::result::Result<Drafted, KvcacheError> {
+        self.draft_forward(tokens, hiddens, from)
+            .map_err(|e| KvcacheError::MisalignedCache { why: e.to_string() })
     }
 }
 

@@ -21,6 +21,8 @@ pub struct EngineLimits {
     pub max_output_tokens: usize,
     pub max_running_requests: usize,
     pub max_prefill_length: usize,
+    /// Draft tokens per speculative step; `0` keeps plain decode.
+    pub speculative_steps: usize,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -506,11 +508,36 @@ pub fn engine_limits_from_config(
     if config.model.page_size != 1 {
         return Err(LoadError::PageSize(config.model.page_size));
     }
+    // Speculation drafts, verifies and commits for exactly one request: the
+    // per-row GDN commit and the draft's single KV buffer are single-request by
+    // construction, so the batch width drops to one while it is on.
+    let speculative_steps = match config.speculative_algorithm() {
+        None => 0,
+        Some("mtp") => {
+            if config.model.max_running_requests > 1 {
+                eprintln!(
+                    "warning: [spec] mtp runs one request at a time; \
+                     max_running_requests = {} is clamped to 1",
+                    config.model.max_running_requests
+                );
+            }
+            config.speculative_num_steps()
+        }
+        Some(other) => {
+            eprintln!("warning: [spec] algorithm {other:?} is not supported; decode stays plain");
+            0
+        }
+    };
     Ok(EngineLimits {
         max_seq_len: config.model.max_seq_len,
         max_output_tokens: config.model.max_output_tokens,
-        max_running_requests: config.model.max_running_requests,
+        max_running_requests: if speculative_steps > 0 {
+            1
+        } else {
+            config.model.max_running_requests
+        },
         max_prefill_length: config.model.max_prefill_length,
+        speculative_steps,
     })
 }
 
@@ -849,6 +876,21 @@ impl Engine {
 
     pub fn limits(&self) -> EngineLimits {
         self.limits
+    }
+
+    /// The resident model handle, rebuilding it after an idle release. The
+    /// speculative loop needs the concrete port because it drafts and verifies
+    /// outside the one-forward-per-step shape.
+    pub(crate) fn resident_model(
+        &self,
+    ) -> Result<Arc<dyn crate::domain::kvcache::CachedModel>, EngineError> {
+        Ok(self.residency()?.model.clone())
+    }
+
+    /// Whether the resident checkpoint can draft and verify. `false` before the
+    /// first load, after an idle release, or when the head is absent.
+    pub fn draft_ready(&self) -> bool {
+        self.peek().is_some_and(|r| r.model.draft_ready())
     }
 
     pub fn eos_ids(&self) -> &[u32] {
@@ -1338,10 +1380,19 @@ pub(crate) mod fake {
         rec: Recorder,
         cache: Arc<FakeCache>,
         steps: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        /// How far the fake draft head's answer is from the target's. `0` makes
+        /// every draft right (full acceptance), `1` makes every one wrong (the
+        /// target's own token is emitted); both must produce the plain run's
+        /// tokens.
+        draft_offset: u32,
     }
 
     impl FakeCachedModel {
         pub fn new() -> (Self, Recorder, Arc<FakeCache>) {
+            Self::with_draft_offset(0)
+        }
+
+        pub fn with_draft_offset(draft_offset: u32) -> (Self, Recorder, Arc<FakeCache>) {
             let rec = Recorder::default();
             let cache = Arc::new(FakeCache::new());
             (
@@ -1349,6 +1400,7 @@ pub(crate) mod fake {
                     rec: rec.clone(),
                     cache: cache.clone(),
                     steps: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                    draft_offset,
                 },
                 rec,
                 cache,
@@ -1393,6 +1445,59 @@ pub(crate) mod fake {
             self.steps
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(FakeModel::argmax_logits(input))
+        }
+
+        fn verify_cached(
+            &self,
+            input: &ForwardInput,
+            cache: &crate::domain::kvcache::SequenceCache,
+        ) -> Result<crate::domain::kvcache::VerifyOut, crate::domain::kvcache::KvcacheError>
+        {
+            let n = input.input_ids.len();
+            assert_eq!(
+                cache.cached(),
+                input.positions[0] as usize + n,
+                "the engine must grow the cache before a verify"
+            );
+            self.steps
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let hidden = self.params().hidden_size;
+            Ok(crate::domain::kvcache::VerifyOut {
+                logits: FakeModel::argmax_logits(input),
+                hidden: vec![0.0f32; input.answers.len() * hidden],
+            })
+        }
+
+        fn commit_verify(
+            &self,
+            _cache: &crate::domain::kvcache::SequenceCache,
+            rows: usize,
+        ) -> Result<(), crate::domain::kvcache::KvcacheError> {
+            assert!(rows >= 1, "the pending row is always committed");
+            Ok(())
+        }
+
+        fn draft_ready(&self) -> bool {
+            true
+        }
+
+        fn draft_rows(
+            &self,
+            _cache: &crate::domain::kvcache::SequenceCache,
+            tokens: &[u32],
+            hiddens: &[f32],
+            from: usize,
+        ) -> Result<crate::domain::kvcache::Drafted, crate::domain::kvcache::KvcacheError> {
+            let hidden = self.params().hidden_size;
+            assert_eq!(hiddens.len(), tokens.len() * hidden);
+            assert!(from < 64, "the fake never drafts past its window");
+            Ok(crate::domain::kvcache::Drafted {
+                hidden: vec![0.0f32; tokens.len() * hidden],
+                tokens: tokens
+                    .iter()
+                    .map(|t| (t + 1 + self.draft_offset) % FAKE_VOCAB as u32)
+                    .collect(),
+            })
         }
     }
 
@@ -1482,7 +1587,15 @@ pub(crate) mod fake {
     }
 
     pub fn test_cached_engine(limits: EngineLimits) -> (Engine, Recorder, Arc<FakeCache>) {
-        let (model, rec, cache) = FakeCachedModel::new();
+        test_cached_engine_with_drafts(limits, 0)
+    }
+
+    /// A cached engine whose draft head is `draft_offset` away from the target.
+    pub fn test_cached_engine_with_drafts(
+        limits: EngineLimits,
+        draft_offset: u32,
+    ) -> (Engine, Recorder, Arc<FakeCache>) {
+        let (model, rec, cache) = FakeCachedModel::with_draft_offset(draft_offset);
         (
             Engine::new(
                 Arc::new(model),
@@ -1578,6 +1691,7 @@ pub(crate) mod fake {
             max_output_tokens: 8,
             max_running_requests: 4,
             max_prefill_length: 16,
+            speculative_steps: 0,
         }
     }
 }

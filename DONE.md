@@ -3079,6 +3079,33 @@ settled.
        are `GemmaPlusOneRMSNorm` upstream, so `is_gemma_norm` bakes the `+1`
        into them like the target's; the host reference in `mtp.rs` no longer
        adds it a second time.
+     - **The verify's router must run per row.** A `k + 1`-row verify through a
+       batched router GEMM rounds differently from a one-row decode GEMV, and on
+       a checkpoint with high routing entropy that flips an expert and the token
+       with it: Ornith-1.5 (the +5.4% miss-rate checkpoint) diverged at token 4
+       with the batched router, and only the *router* was involved (the accepted
+       tokens come from the target's own verify rows). `moe_parts` therefore
+       takes a `per_row_router` flag that `Access::Device { rows: Sequential }`
+       sets, evaluating the gate one row at a time; the rest of the block stays
+       batched. That made Ornith token-identical and lifted its accept length
+       from 1.30 to 2.57 drafts/step.
+     - **The draft KV pool must share the model's runtime.** `MhaPool::new`
+       opens its own `Runtime`, and therefore its own stream: the draft's store
+       and gather then race the layer that produced the values, which showed up
+       as two NaN elements in one gathered draft row and a `topk` that answered
+       the out-of-range expert 256. `enable_draft` uses
+       `MhaPool::with_runtime(..., self.rt.clone())`.
+     - **Measured (reference checkpoint, 24 greedy tokens, k = 3):** identical
+       tokens, 1.50 drafts accepted per step, 12.2 tok/s against 18.1 plain.
+       Ornith: identical, 2.57/step, 15.4 against 16.7. The draft's own forward
+       (a chain row plus a refresh pass, each with a per-row NVFP4 LM-head GEMV
+       transferred to the host for the argmax) costs more than the accepted
+       tokens save; R14 in OPTIMIZATION.md lists the levers. A 64-token
+       reference run flips a near-tie at token 45, which is the residual
+       batched-GEMM drift (not the router): making the verify's dense ops
+       per-row would restore bit-exactness at the cost of the amortization that
+       makes speculation worth it, so the plan is margin-gated acceptance
+       instead.
      - **Gated M9 runs need an overlay.** Both store FTWs predate M9.1
        (`counts` 1148 dense + 240 banks, no `has_mtp`) and the two writable
        16 GiB tmpfs cannot hold a 21 GiB re-conversion. The recipe used here:

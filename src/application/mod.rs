@@ -6,3 +6,4 @@ pub mod engine;
 pub mod generation;
 pub mod registry;
 pub mod run_experts;
+pub mod spec_decode;

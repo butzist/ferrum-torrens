@@ -826,6 +826,42 @@ a service is present; without one the per-request cached step is unchanged.
 `tests/decode_graph_capture.rs` gates bs=1 and bs=2 replay against the eager
 step, and `tests/cudarc_engine_generate.rs` gates the registry-built path.
 
+### 3.10 Speculative decoding with the MTP draft -- implemented (M9)
+
+`[spec] algorithm = "mtp"` drafts with the checkpoint's own MTP head and verifies
+with the target, so the emitted tokens are the target's. The loop is
+`application/spec_decode.rs` over the domain ports only (`CachedModel`'s
+`verify_cached` / `commit_verify` / `draft_rows`, and `KvCache::rollback`), which
+is what makes the accept/commit/rollback bookkeeping unit-testable with mocks.
+
+```mermaid
+flowchart LR
+  Draft["draft_rows\n(MTP layer, own KV)"] -->|"k tokens"| Verify["verify_cached\nk+1 rows, decode kernels"]
+  Verify -->|"argmax per row"| Reject["reject_greedy\nprefix match"]
+  Reject -->|"n accepted"| Commit["commit_verify(n+1)\n+ rollback(k-n)"]
+  Commit -->|"target hidden at the\nlast committed label"| Draft
+  Commit --> Emit["emit n+1 tokens"]
+```
+
+- **Verify** is a decode-shaped batch (`Access::Device { rows: Sequential }`):
+  paged attention and KV stores as a captured step does, the GDN recurrence
+  replayed row by row (`gdn_replay`), and the router evaluated *per row* so a
+  row's expert choice cannot depend on the batch width (decision 151).
+- **Commit** replays only the accepted rows from the stashed `conv_in`/`ba`
+  against the live slot. No snapshot slot and no kernel change were needed: the
+  verify works on a gathered copy of the state, so a rejection leaves no trace.
+- **Draft**: `load_cudarc::DraftWeights` loads `draft.*` (the two pre-fc norms,
+  `fc` split into its two half-width GEMMs, one full-attention layer, `norm`);
+  the embedding and the LM head are the target's. Its KV is a plain
+  position-indexed bf16 `MhaPool` (2 KiB/token) on the model's runtime, and its
+  expert bank is a second `CachedExperts` over `FtwBanks::draft`
+  (`draft_*#L00000`), sized to hold every draft expert.
+- **Wiring**: `registry::build` loads the draft before `resolve_cache_slots` so
+  its ~0.5 GB comes out of the target's auto expert budget; `engine_limits_from_config`
+  turns `[spec]` into `speculative_steps` and clamps `max_running_requests` to 1;
+  `generation` runs the step only for a greedy, image-free, single-request
+  decode, and falls back to plain decode for anything else.
+
 ## 4. External libraries and where they are used
 
 | Library / tool | Kind | Used by | Purpose |

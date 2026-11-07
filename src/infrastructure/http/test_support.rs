@@ -159,6 +159,7 @@ pub(crate) fn script_router(script: &'static str) -> Router {
         max_output_tokens: 256,
         max_running_requests: 4,
         max_prefill_length: 16,
+        speculative_steps: 0,
     };
     let engine = Engine::new(
         Arc::new(model),

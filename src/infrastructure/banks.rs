@@ -34,8 +34,12 @@ fn prefix(part: Part) -> &'static str {
     }
 }
 
+fn entry_with(bank_prefix: &str, part: Part, layer: usize, field: &str) -> String {
+    format!("{bank_prefix}{}_{field}#L{layer:05}", prefix(part))
+}
+
 fn entry(part: Part, layer: usize, field: &str) -> String {
-    format!("{}_{field}#L{layer:05}", prefix(part))
+    entry_with("", part, layer, field)
 }
 
 fn bank_entry(bank: Bank, layer: usize) -> String {
@@ -80,11 +84,35 @@ pub fn read_bank_layer(
 pub struct FtwBanks {
     reader: Arc<dyn WeightsReader>,
     index: Arc<FtwIndex>,
+    /// ``""`` for the target's layers, ``"draft_"`` for the MTP draft's single
+    /// layer, whose three NVFP4 fields live in the same checkpoint.
+    bank_prefix: &'static str,
 }
 
 impl FtwBanks {
     pub fn new(reader: Arc<dyn WeightsReader>, index: Arc<FtwIndex>) -> Self {
-        Self { reader, index }
+        Self::with_prefix(reader, index, "")
+    }
+
+    /// The MTP draft's banks: ``draft_{gate_up,down}_{packed,scale,global}#L00000``.
+    pub fn draft(reader: Arc<dyn WeightsReader>, index: Arc<FtwIndex>) -> Self {
+        Self::with_prefix(reader, index, "draft_")
+    }
+
+    fn with_prefix(
+        reader: Arc<dyn WeightsReader>,
+        index: Arc<FtwIndex>,
+        bank_prefix: &'static str,
+    ) -> Self {
+        Self {
+            reader,
+            index,
+            bank_prefix,
+        }
+    }
+
+    fn entry(&self, part: Part, layer: usize, field: &str) -> String {
+        entry_with(self.bank_prefix, part, layer, field)
     }
 
     fn desc(&self, name: &str) -> Result<&TensorDesc, MoEError> {
@@ -99,7 +127,7 @@ impl FtwBanks {
     /// `(experts, rows, cols)` from the packed entry, the shape the scales and
     /// globals are derived from (decision 23).
     fn packed_shape(&self, part: Part, layer: usize) -> Result<(usize, usize, usize), MoEError> {
-        let name = entry(part, layer, "packed");
+        let name = self.entry(part, layer, "packed");
         let t = self.desc(&name)?;
         match t.shape.as_slice() {
             [experts, rows, packed_cols] => Ok((*experts, *rows, *packed_cols * 2)),
@@ -117,7 +145,7 @@ impl FtwBanks {
         expert: u32,
         field: &str,
     ) -> Result<Vec<u8>, MoEError> {
-        let name = entry(part, layer, field);
+        let name = self.entry(part, layer, field);
         let t = self.desc(&name)?;
         let experts = *t
             .shape
