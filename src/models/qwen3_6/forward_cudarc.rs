@@ -50,6 +50,33 @@ fn moe_bad(msg: impl std::fmt::Display) -> MoEError {
 }
 
 /// `rms_norm(x) * w` over the last dimension of a tensor of any rank. The fused
+/// Split a GDN mixer's pre-conv projection into the (q, k, v) views the fused
+/// decode kernel takes. The conv output is the same `[t, 2 * key_dim +
+/// value_dim]` buffer both the batched and the row-by-row path produce.
+fn split_mixed(
+    p: &crate::domain::model::ModelParams,
+    mixed: &Tensor,
+    t: usize,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    let (kb, vb) = (p.linear_num_key_heads, p.linear_num_value_heads);
+    let (dk, dv) = (p.linear_key_head_dim, p.linear_value_head_dim);
+    let key_dim = kb * dk;
+    let value_dim = vb * dv;
+    let q = mixed
+        .narrow(1, 0, key_dim)?
+        .contiguous()?
+        .reshape(&[t, kb, dk])?;
+    let k = mixed
+        .narrow(1, key_dim, key_dim)?
+        .contiguous()?
+        .reshape(&[t, kb, dk])?;
+    let v = mixed
+        .narrow(1, 2 * key_dim, value_dim)?
+        .contiguous()?
+        .reshape(&[t, vb, dv])?;
+    Ok((q, k, v))
+}
+
 /// add_rmsnorm cubin bakes one hidden width, so a head-sized norm is computed
 /// from the generic elementwise kernels instead.
 fn rms_norm_last(x: &Tensor, w: &Tensor, eps: f32) -> Result<Tensor> {
@@ -370,7 +397,19 @@ enum Access<'a> {
         out_locs: &'a Tensor,
         kv_locs: &'a Tensor,
         slots: &'a Tensor,
+        rows: DeviceRows,
     },
+}
+
+/// How a device step's rows relate to each other.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeviceRows {
+    /// Independent requests: every row reads its own GDN state slot.
+    Independent,
+    /// One request's consecutive positions (a speculative verify): every row
+    /// reads the same slot and the recurrence advances row by row. The state is
+    /// *not* written back; `commit_verify` replays the accepted prefix.
+    Sequential,
 }
 
 /// The absolute rope positions for the tokens of one step, as host values for
@@ -381,6 +420,24 @@ enum Positions<'a> {
     Host(&'a [u32]),
     Triples(&'a [[u32; 3]]),
     Device(&'a Tensor),
+}
+
+/// One linear layer's GDN inputs during a verify step: the pre-conv projection
+/// (`qkvz @ x`) and the gate/prep projection (`ba @ x`), kept so
+/// `commit_verify` can replay the accepted rows through the same kernels
+/// without re-running the layer.
+struct GdnStash {
+    layer: usize,
+    conv_in: Tensor,
+    ba: Tensor,
+}
+
+/// What a verify step leaves for `commit_verify`: the slot it ran against, the
+/// rows it wrote K/V for, and every linear layer's stashed GDN inputs.
+struct VerifyStash {
+    slot: u32,
+    rows: usize,
+    layers: Vec<GdnStash>,
 }
 
 /// The torch-less Qwen3.6 text tower over the cudarc adapter.
@@ -403,6 +460,10 @@ pub struct CudarcQwen3_6 {
     /// axis (0=t, 1=h, 2=w) every pair follows. All temporal when the model
     /// has no mrope, which never leaves the flat path.
     mrope_axis: Tensor,
+    /// The last verify step's GDN inputs, consumed by `commit_verify`. The
+    /// engine runs one verify at a time, so one slot is enough; the mutex is
+    /// what lets `&self` fill it from inside a layer.
+    verify: std::sync::Mutex<Option<VerifyStash>>,
 }
 
 impl CudarcQwen3_6 {
@@ -447,6 +508,7 @@ impl CudarcQwen3_6 {
             rope_cos,
             rope_sin,
             mrope_axis,
+            verify: std::sync::Mutex::new(None),
         })
     }
 
@@ -705,42 +767,58 @@ impl CudarcQwen3_6 {
             .cast(TensorDType::Bf16)?;
         substep_end(&self.rt, "gdn_ba", s);
 
-        if let Access::Device { slots, .. } = access {
-            let state = self.cache.state();
+        if let Access::Device { slots, rows, .. } = access {
             let s = substep_begin(&self.rt);
-            let conv_w = conv.reshape(&[conv_dim, k])?;
-            let conv_state = state.conv_state_rows(slots, li);
-            let rec_state = state.recurrent_state_rows(slots, li);
-            let mixed = self.rt.zeros(&[t, conv_dim], TensorDType::Bf16)?;
-            // SAFETY: all four tensors are live device allocations in this
-            // model's context and the gathered state is `[rows, ..]`, the shape
-            // the batched conv cubin was built for; it updates the state rows.
-            unsafe { self.gdn.conv_decode(&conv_in, &conv_w, &conv_state, &mixed) }?;
-            substep_end(&self.rt, "gdn_conv", s);
-            let q = mixed
-                .narrow(1, 0, key_dim)?
-                .contiguous()?
-                .reshape(&[t, kb, dk])?;
-            let k = mixed
-                .narrow(1, key_dim, key_dim)?
-                .contiguous()?
-                .reshape(&[t, kb, dk])?;
-            let v = mixed
-                .narrow(1, 2 * key_dim, value_dim)?
-                .contiguous()?
-                .reshape(&[t, vb, dv])?;
-            let s = substep_begin(&self.rt);
-            let core = self.rt.zeros(&[t, vb, dv], TensorDType::Bf16)?;
-            // SAFETY: the state rows are contiguous f32 device tensors and every
-            // other operand is a live tensor of the geometry the launcher
-            // checks; the kernel updates `rec_state` in place and fills `core`.
-            unsafe {
-                self.gdn
-                    .decode(&ba, a_log, dt_bias, &q, &k, &v, &rec_state, &core)
-            }?;
-            state.set_conv_state_rows(slots, li, &conv_state);
-            state.set_recurrent_state_rows(slots, li, &rec_state);
-            substep_end(&self.rt, "gdn_recur", s);
+            let core = match rows {
+                DeviceRows::Independent => {
+                    let state = self.cache.state();
+                    let conv_w = conv.reshape(&[conv_dim, k])?;
+                    let conv_state = state.conv_state_rows(slots, li);
+                    let rec_state = state.recurrent_state_rows(slots, li);
+                    let mixed = self.rt.zeros(&[t, conv_dim], TensorDType::Bf16)?;
+                    // SAFETY: all four tensors are live device allocations in
+                    // this model's context and the gathered state is `[rows, ..]`,
+                    // the shape the batched conv cubin was built for; it updates
+                    // the state rows.
+                    unsafe { self.gdn.conv_decode(&conv_in, &conv_w, &conv_state, &mixed) }?;
+                    substep_end(&self.rt, "gdn_conv", s);
+                    let (q, k, v) = split_mixed(p, &mixed, t)?;
+                    let s = substep_begin(&self.rt);
+                    let core = self.rt.zeros(&[t, vb, dv], TensorDType::Bf16)?;
+                    // SAFETY: the state rows are contiguous f32 device tensors
+                    // and every other operand is a live tensor of the geometry
+                    // the launcher checks; the kernel updates `rec_state` in
+                    // place and fills `core`.
+                    unsafe {
+                        self.gdn
+                            .decode(&ba, a_log, dt_bias, &q, &k, &v, &rec_state, &core)
+                    }?;
+                    state.set_conv_state_rows(slots, li, &conv_state);
+                    state.set_recurrent_state_rows(slots, li, &rec_state);
+                    substep_end(&self.rt, "gdn_recur", s);
+                    core
+                }
+                DeviceRows::Sequential => {
+                    // A verify step: the rows are one request's consecutive
+                    // positions, so the recurrence advances row by row, and the
+                    // state is left alone for `commit_verify` to settle on the
+                    // accepted prefix.
+                    self.verify
+                        .lock()
+                        .expect("verify stash")
+                        .as_mut()
+                        .ok_or_else(|| moe_bad("a sequential step needs an open verify"))?
+                        .layers
+                        .push(GdnStash {
+                            layer: li,
+                            conv_in: conv_in.clone(),
+                            ba: ba.clone(),
+                        });
+                    let core = self.gdn_replay(slots, li, &conv_in, &ba, t, false)?;
+                    substep_end(&self.rt, "gdn_recur", s);
+                    core
+                }
+            };
             let s = substep_begin(&self.rt);
             let core_n = rms_norm_last(&core, norm, p.rms_norm_eps)?.reshape(&[t, value_dim])?;
             let out = core_n.mul(&z.silu()?)?;
@@ -840,6 +918,66 @@ impl CudarcQwen3_6 {
         let out = self.apply_dense(o, &out);
         substep_end(&self.rt, "gdn_tail", s);
         out
+    }
+
+    /// Replay one request's GDN inputs row by row against its slot: each row
+    /// sees the state the previous row left, which is exactly what a decode step
+    /// per token does, so a replay is bit-identical to advancing the prefix one
+    /// token at a time. `write_back` scatters the evolved state; a verify leaves
+    /// it at the pre-step value for `commit_verify` to settle.
+    fn gdn_replay(
+        &self,
+        slot: &Tensor,
+        li: usize,
+        conv_in: &Tensor,
+        ba: &Tensor,
+        rows: usize,
+        write_back: bool,
+    ) -> Result<Tensor> {
+        let p = &self.params;
+        let Mixer::Linear {
+            conv,
+            a_log,
+            dt_bias,
+            ..
+        } = &self.tower.layers[li].mixer
+        else {
+            return Err(moe_bad("not a linear-attention layer"));
+        };
+        let (kb, vb) = (p.linear_num_key_heads, p.linear_num_value_heads);
+        let (dk, dv) = (p.linear_key_head_dim, p.linear_value_head_dim);
+        let key_dim = kb * dk;
+        let value_dim = vb * dv;
+        let conv_dim = 2 * key_dim + value_dim;
+        let ck = p.linear_conv_kernel_dim;
+        let state = self.cache.state();
+        let conv_w = conv.reshape(&[conv_dim, ck])?;
+        let conv_state = state.conv_state_rows(slot, li);
+        let rec_state = state.recurrent_state_rows(slot, li);
+        let rec_one = rec_state.reshape(&[1, vb, dk, dv])?;
+        let mut cores = Vec::with_capacity(rows);
+        for i in 0..rows {
+            let x_one = conv_in.narrow(0, i, 1)?.contiguous()?;
+            let mixed = self.rt.zeros(&[1, conv_dim], TensorDType::Bf16)?;
+            // SAFETY: one row of the verify batch and its single gathered state
+            // row, so the batched conv cubin's shapes hold; it updates the row.
+            unsafe { self.gdn.conv_decode(&x_one, &conv_w, &conv_state, &mixed) }?;
+            let (q, k, v) = split_mixed(p, &mixed, 1)?;
+            let ba_one = ba.narrow(0, i, 1)?.contiguous()?;
+            let core = self.rt.zeros(&[1, vb, dv], TensorDType::Bf16)?;
+            // SAFETY: the same one-row geometry the fused decode kernel checks;
+            // it updates `rec_one` in place and fills `core`.
+            unsafe {
+                self.gdn
+                    .decode(&ba_one, a_log, dt_bias, &q, &k, &v, &rec_one, &core)
+            }?;
+            cores.push(core);
+        }
+        if write_back {
+            state.set_conv_state_rows(slot, li, &conv_state);
+            state.set_recurrent_state_rows(slot, li, &rec_state);
+        }
+        Tensor::stack(&cores)
     }
 
     fn moe(&self, li: usize, x_post: &Tensor) -> Result<Tensor> {
@@ -1021,9 +1159,9 @@ impl CudarcQwen3_6 {
         access: &Access<'_>,
         answers: &[usize],
     ) -> Result<Vec<f32>> {
-        let out = self.run_tower_inner(ids, positions, access, answers);
+        let out = self.run_tower_rows(ids, positions, access, answers);
         substep_report(ids.len());
-        out
+        out.map(|(logits, _)| logits)
     }
 
     /// `lm_head` straight into a `[rows, vocab]` f32 device buffer, with no
@@ -1114,32 +1252,34 @@ impl CudarcQwen3_6 {
         }
     }
 
-    fn run_tower_inner(
+    fn run_tower_rows(
         &self,
         ids: &[u32],
         positions: Positions<'_>,
         access: &Access<'_>,
         answers: &[usize],
-    ) -> Result<Vec<f32>> {
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
         let p = &self.params;
         let t = ids.len();
         if t == 0 {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
         let idx: Vec<i32> = ids.iter().map(|i| *i as i32).collect();
         let idx = self.rt.from_slice_i32(&idx, &[t])?;
         let stream = self.tower_stream(&idx, t, &positions, access)?;
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(answers.len() * p.vocab_size);
+        let mut hidden = Vec::with_capacity(answers.len() * p.hidden_size);
         for &a in answers {
             let row = stream.narrow(0, a, 1)?;
             let normed = rms_norm(&row, &self.tower.final_norm, p.rms_norm_eps)?;
+            hidden.extend(normed.cast(TensorDType::F32)?.to_host_f32()?);
             if ablated("head") {
                 out.extend(vec![0.0; p.vocab_size]);
                 continue;
             }
             out.extend(self.lm_head_logits(&normed)?);
         }
-        Ok(out)
+        Ok((out, hidden))
     }
 }
 
@@ -1234,6 +1374,132 @@ impl CachedModel for CudarcQwen3_6 {
         self.run_tower(&input.input_ids, positions, &access, &input.answers)
             .map_err(|e| KvcacheError::MisalignedCache { why: e.to_string() })
     }
+
+    /// One speculative verify step: every row goes through the paged attention
+    /// and fused GDN kernels a decode step runs, so the K/V and the accepted
+    /// prefix's state are the same bytes a per-token decode would have written.
+    ///
+    /// The GDN recurrence advances row by row over a *gathered* copy and is not
+    /// scattered back; [`commit_verify`](Self::commit_verify) replays the
+    /// accepted rows against the live slot.
+    fn verify_cached(
+        &self,
+        input: &ForwardInput,
+        cache: &SequenceCache,
+    ) -> std::result::Result<crate::domain::kvcache::VerifyOut, KvcacheError> {
+        let n = input.input_ids.len();
+        let misaligned = |why: String| KvcacheError::MisalignedCache { why };
+        if n == 0 || input.positions.len() != n {
+            return Err(misaligned(
+                "a verify takes at least one token and one position per token".to_string(),
+            ));
+        }
+        if input.mrope_positions.is_some() {
+            return Err(misaligned(
+                "the verify path stages flat positions, not mrope triples".to_string(),
+            ));
+        }
+        let start = input.positions[0] as usize;
+        if cache.cached() != start + n {
+            return Err(misaligned(format!(
+                "the cache must be grown by exactly this step's {n} tokens, to {}",
+                start + n
+            )));
+        }
+        if input.answers.is_empty() || input.answers.iter().any(|&a| a >= n) {
+            return Err(misaligned(
+                "the verify answers must be in-range row indices".to_string(),
+            ));
+        }
+        *self.verify.lock().expect("verify stash") = Some(VerifyStash {
+            slot: cache.state_slot(),
+            rows: n,
+            layers: Vec::new(),
+        });
+        let i32s = |v: &[u32]| -> Result<Tensor> {
+            let data: Vec<i32> = v.iter().map(|x| *x as i32).collect();
+            self.rt.from_slice_i32(&data, &[data.len()])
+        };
+        let positions = i32s(&input.positions).map_err(|e| misaligned(e.to_string()))?;
+        let out_locs = i32s(cache.tail(n)).map_err(|e| misaligned(e.to_string()))?;
+        let window: Vec<u32> = cache.filled().to_vec();
+        let mut kv = Vec::with_capacity(n * window.len());
+        for _ in 0..n {
+            kv.extend_from_slice(&window);
+        }
+        let kv_locs = self
+            .rt
+            .from_slice_i32(
+                &kv.iter().map(|l| *l as i32).collect::<Vec<_>>(),
+                &[n, window.len()],
+            )
+            .map_err(|e| misaligned(e.to_string()))?;
+        let slots = self
+            .rt
+            .from_slice_i32(&[cache.state_slot() as i32], &[1])
+            .map_err(|e| misaligned(e.to_string()))?;
+        let access = Access::Device {
+            out_locs: &out_locs,
+            kv_locs: &kv_locs,
+            slots: &slots,
+            rows: DeviceRows::Sequential,
+        };
+        let (logits, hidden) = self
+            .run_tower_rows(
+                &input.input_ids,
+                Positions::Device(&positions),
+                &access,
+                &input.answers,
+            )
+            .map_err(|e| misaligned(e.to_string()))?;
+        Ok(crate::domain::kvcache::VerifyOut { logits, hidden })
+    }
+
+    /// Settle the last verify's GDN state on its accepted prefix. The KV pages of
+    /// the rejected rows are the caller's to return (`KvCache::rollback`).
+    ///
+    /// `rows` must be at least 1 (the pending token is always committed) and no
+    /// more than the verify ran.
+    fn commit_verify(
+        &self,
+        cache: &SequenceCache,
+        rows: usize,
+    ) -> std::result::Result<(), KvcacheError> {
+        let stash = self
+            .verify
+            .lock()
+            .expect("verify stash")
+            .take()
+            .ok_or_else(|| KvcacheError::MisalignedCache {
+                why: "commit_verify without a verify step".to_string(),
+            })?;
+        if stash.slot != cache.state_slot() {
+            return Err(KvcacheError::MisalignedCache {
+                why: format!(
+                    "commit_verify for slot {}, verified slot {}",
+                    cache.state_slot(),
+                    stash.slot
+                ),
+            });
+        }
+        if rows == 0 || rows > stash.rows {
+            return Err(KvcacheError::MisalignedCache {
+                why: format!(
+                    "commit_verify row count {rows} is outside 1..={}",
+                    stash.rows
+                ),
+            });
+        }
+        let slot = self
+            .rt
+            .from_slice_i32(&[stash.slot as i32], &[1])
+            .map_err(|e| KvcacheError::MisalignedCache { why: e.to_string() })?;
+        for layer in stash.layers {
+            self.gdn_replay(&slot, layer.layer, &layer.conv_in, &layer.ba, rows, true)
+                .map_err(|e| KvcacheError::MisalignedCache { why: e.to_string() })?;
+        }
+        Ok(())
+    }
 }
 
 impl CudarcQwen3_6 {
@@ -1258,6 +1524,7 @@ impl CudarcQwen3_6 {
             out_locs: &out_locs,
             kv_locs: &kv_locs,
             slots: &slots,
+            rows: DeviceRows::Independent,
         };
         let stream = self.tower_stream(&ids, 1, &Positions::Device(&positions), &access)?;
         let normed = rms_norm(&stream, &self.tower.final_norm, self.params.rms_norm_eps)?;
@@ -1322,6 +1589,7 @@ impl CudarcQwen3_6 {
             out_locs,
             kv_locs: kv,
             slots,
+            rows: DeviceRows::Independent,
         };
         let stream = self.tower_stream(ids, t, &Positions::Device(positions), &access)?;
         let normed = rms_norm(&stream, &self.tower.final_norm, self.params.rms_norm_eps)?;

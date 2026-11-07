@@ -1010,6 +1010,17 @@ pub trait KvCache: Send + Sync {
     /// Give the request's pages and state slot back.
     fn end(&self, cache: &mut SequenceCache);
 
+    /// Give back `n` of the request's own tail pages. A speculative verify writes
+    /// K/V for every row it proposes and keeps only the accepted prefix, so the
+    /// rejected rows' pages must return to the pool before the next step reuses
+    /// their positions. Never crosses the tree-owned `reused` boundary.
+    fn rollback(&self, cache: &mut SequenceCache, n: usize) -> Result<(), KvcacheError> {
+        let _ = (cache, n);
+        Err(KvcacheError::MisalignedCache {
+            why: "this cache cannot roll back a speculative verify".to_string(),
+        })
+    }
+
     /// Pages the pool can still hand out.
     fn available(&self) -> usize;
 
@@ -1037,6 +1048,19 @@ pub trait KvCache: Send + Sync {
     fn commit(&self, cache: &mut SequenceCache, ids: &[u32], finished: bool) {
         let _ = (cache, ids, finished);
     }
+}
+
+/// A speculative verify step's answer: the logits and final-norm hidden of every
+/// row the caller asked for, in `answers` order.
+///
+/// The hidden rows are what an MTP draft head consumes (the next draft row pairs
+/// a token embedding with the previous row's hidden), so they ride along instead
+/// of costing a second pass.
+pub struct VerifyOut {
+    /// `answers.len() * params.vocab_size` f32.
+    pub logits: Vec<f32>,
+    /// `answers.len() * params.hidden_size` f32.
+    pub hidden: Vec<f32>,
 }
 
 /// A forward that reads and writes a `SequenceCache` instead of re-running the
@@ -1074,6 +1098,34 @@ pub trait CachedModel: Model {
     ) -> Result<Vec<f32>, KvcacheError> {
         let _ = cache;
         Ok(self.forward(input))
+    }
+
+    /// A speculative verify step: run every row of `input` through the model,
+    /// storing K/V for each, and answer each row in `input.answers` (in order).
+    ///
+    /// The linear-attention state is *not* advanced: the caller decides the
+    /// accepted prefix and commits it with [`commit_verify`](Self::commit_verify),
+    /// so a rejected row leaves no trace in the recurrence. `cache` must already
+    /// be grown by `input`'s token count.
+    fn verify_cached(
+        &self,
+        input: &ForwardInput,
+        cache: &SequenceCache,
+    ) -> Result<VerifyOut, KvcacheError> {
+        let _ = (input, cache);
+        Err(KvcacheError::MisalignedCache {
+            why: "this model has no speculative verify path".to_string(),
+        })
+    }
+
+    /// Advance the linear-attention state over the first `rows` rows of the last
+    /// [`verify_cached`](Self::verify_cached), so the state matches the accepted
+    /// prefix rather than the whole proposed batch.
+    fn commit_verify(&self, cache: &SequenceCache, rows: usize) -> Result<(), KvcacheError> {
+        let _ = (cache, rows);
+        Err(KvcacheError::MisalignedCache {
+            why: "this model has no speculative verify path".to_string(),
+        })
     }
 }
 

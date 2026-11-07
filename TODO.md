@@ -1,6 +1,17 @@
 # FerrumTorrens -- FreeToken MVP port to Rust: TODO
 
-Status (2026-11-07): **M8.1b is complete: both checkpoints build from the flake
+Status (2026-11-07): **M9 (speculative decoding, section 6d) is in progress:
+M9.1-M9.4 are green on both checkpoints.** The draft head stays in the FTW
+(converter, NVFP4 experts), the verify answers every drafted row and returns its
+final-norm hidden, and the GDN state is committed for exactly the accepted rows
+with no kernel change and no state snapshot. `tests/cudarc_spec_verify.rs` proves
+on both checkpoints that a verify + commit + rollback leaves the cache where
+plain decode would, including after a rejection. Remaining: M9.5 (the device
+draft forward and the draft/verify/accept loop) and M9.6 (token identity, accept
+length, tg A/B). Note for gated M9 tests: the store FTWs predate M9.1 and carry
+no draft head, and neither 16 GiB tmpfs can hold a 21 GiB FTW, so the draft
+gates run on a two-part overlay (decision 151).
+**M8.1b is complete: both checkpoints build from the flake
 into the Nix store and the fetched Ornith artifact is gated.** `nix/checkpoints.nix`
 pins the Ornith fixed-output hash (`sha256-NLs7...`); the HF artifact is not the
 local export measured earlier (shard 2 is 700 MB shorter), so the store-converted
@@ -684,28 +695,39 @@ Ordered slices, each its own gated change:
       tests pass; `ftw_real_checkpoint` grows an `mtp` assertion. (DONE: converter
       keeps `mtp.*`, renames to `draft.*`, quantizes both layouts, emits
       `draft_*#L00000` banks; `has_mtp`/`max_draft_depth` in index meta.)
-- [ ] **M9.2 draft forward** (`models/qwen3_6/mtp.rs`): `embed(token_{p+1})` and
+- [x] **M9.2 draft forward** (`models/qwen3_6/mtp.rs`): `embed(token_{p+1})` and
   the target hidden at `p` -> pre-fc norms -> `fc` -> one decoder layer ->
   `mtp.norm` -> the shared LM head, with the draft's own KV pool (one layer, 2 KV
-  heads at 256: ~1 KiB/token, so 4096 tokens is 4 MiB per slot). It reuses the
+  heads at 256: ~2 KiB/token, so 4096 tokens is 8 MiB per slot). It reuses the
   tower's attention/MoE ops; there is no new kernel. Gate: a host oracle of the
   draft layer against the device path, and the draft's next-token hit rate over
-  a real prompt (the accept-rate proxy).
-- [ ] **M9.3 verify.** Multi-row `answers` in the cudarc forward (project the
+  a real prompt (the accept-rate proxy). (DONE for the host reference +
+  converter: `mtp.rs` computes the draft forward on the host, the converter
+  bakes the draft's GemmaPlusOne norms and emits its NVFP4 bank on both expert
+  layouts. The *device* draft forward and its hit-rate gate are M9.5.)
+- [x] **M9.3 verify.** Multi-row `answers` in the cudarc forward (project the
   drafted rows through the final norm + lm_head), then one forward over
   `[pending, d1..dk]` at the session's position. Gate: verifying `k+1` rows gives
   the same logits per row as `k+1` single-token forwards, token for token.
-- [ ] **M9.4 commit `n` of `k+1`.** First implementation with no kernel change:
-  snapshot the GDN state slot before the verify (the snapshot primitive already
-  exists for hybrid_radix), truncate the KV page table to the accepted rows, and
-  replay the accepted prefix to leave the live state where `n` decode steps
-  would. Measure that replay's cost; only if it eats the win, give the GDN
-  recurrence a per-row scratch (upstream #836's approach). Gate: after accepting
-  `n < k+1`, the next step's logits equal a plain decode of the same `n` tokens.
+  (DONE: `run_tower_rows` projects every answered row and returns the final-norm
+  hidden beside the logits; the M9.4 gate checks the per-row agreement.)
+- [x] **M9.4 commit `n` of `k+1`.** No kernel change and no state snapshot: the
+  verify runs the rows through the *decode* kernels (`DeviceRows::Sequential`)
+  against a gathered copy of the slot state and stashes each linear layer's
+  `conv_in`/`ba`; `commit_verify(rows)` replays just the accepted rows through
+  the same `conv_decode` + fused `gdn.decode` launches against the live slot, and
+  `KvCache::rollback` returns the rejected pages. Gate: after accepting
+  `n < k+1`, the next step's logits equal a plain decode of the same `n` tokens
+  (argmax exact; the value bound is the batched-GEMM drift, decision 151).
+  (DONE: `tests/cudarc_spec_verify.rs` passes on both checkpoints.)
 - [ ] **M9.5 loop and config.** `[spec] algorithm = "mtp"`, `num_steps = 3`
   (off by default), draft -> verify -> accept -> stream accepted tokens, with
   stop tokens, `max_tokens`, abort and usage counted correctly. Batching stays
   out while speculating (`max_running_requests = 1`) for the first slice.
+  The device draft forward (draft `Layer` load from `draft.*`, its own
+  contiguous KV at 2 KiB/token keyed by absolute position, the draft MoE bank
+  executor) lands here: `[spec]` is a no-op until it does, because the host
+  draft is far too slow to serve.
 - [ ] **M9.6 gates and numbers.** Output **token-for-token identical** to greedy
   decoding with speculation on and off (the exactness contract), accept length,
   and a tg A/B (128 decoded tokens) with the reference checkpoint; prefill

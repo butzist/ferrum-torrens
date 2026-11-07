@@ -673,6 +673,19 @@ impl KvCache for DeviceCache {
         }
     }
 
+    fn rollback(&self, cache: &mut SequenceCache, n: usize) -> Result<(), KvcacheError> {
+        if n > cache.cached() - cache.reused() {
+            return Err(KvcacheError::MisalignedCache {
+                why: format!(
+                    "rollback of {n} pages over the {} this request owns",
+                    cache.cached() - cache.reused()
+                ),
+            });
+        }
+        cache.truncate(n, &mut self.pages.lock().expect("kvcache lock"));
+        Ok(())
+    }
+
     fn available(&self) -> usize {
         self.pages.lock().expect("kvcache lock").available()
     }

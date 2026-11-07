@@ -3035,7 +3035,65 @@ settled.
 ---
 
 
+151. **Speculative verify commits by replay, and the real MTP head exposed three
+     converter gaps** (2026-11-07, M9.3/M9.4).
+     - **Verify runs the decode kernels.** A `k + 1`-row verify is a
+       decode-shaped batch: `Access::Device { rows: DeviceRows::Sequential }`
+       stores K/V through `MhaPool::store_at` and reads it through the paged
+       attention kernel, exactly as a captured one-token step does. Only the GDN
+       layers differ: the rows are one request's consecutive positions, so the
+       recurrence advances row by row (`gdn_replay`: `conv_decode` then the fused
+       `gdn.decode`, one launch per row) against a *gathered* copy of the slot
+       state. This is why the verify agrees with single-token decode on the
+       argmax: it is the same arithmetic, not a re-derivation.
+     - **No state snapshot.** The gather is a copy, so the live slot is untouched
+       while the verify runs; `commit_verify(rows)` replays rows `0..rows` from
+       the stashed per-layer `conv_in` / `ba` through the same two kernels and
+       scatters the result. The rejected rows never enter the recurrence, so the
+       alternative "snapshot the slot, then replay the prefix" (which needs a
+       fifth state slot at `max_running_requests = 1`) was not built. The stash
+       is `Mutex<Option<VerifyStash>>` on the model because `gdn_layer` only has
+       `&self`; one verify runs at a time.
+     - **Rollback is a page-pool operation.** `KvCache::rollback(cache, n)` calls
+       `SequenceCache::truncate`, so the rejected rows' pages return before the
+       next step reserves the same positions. The trait default errors instead of
+       silently ignoring the call.
+     - **The gate's tolerance is banner, not physics.** A verify runs `k + 1`
+       rows through the dense GEMMs where a decode step runs one, so bf16
+       accumulation order differs (~1e-1 on logits after 40 layers, measured
+       0.065 and 0.102 on the reference checkpoint). `tests/cudarc_spec_verify.rs`
+       therefore asserts the argmax exactly and bounds the logit drift at 0.25;
+       the token-for-token identity contract is M9.6's job at the engine level.
+     - **Converter gaps the real checkpoint exposed** (M9.1 had only been gated
+       against a tiny synthetic export):
+       (a) the stacked Qwen MTP expert tensors are named
+       `mtp.layers.0.mlp.experts.gate_up_proj` with *no* `.weight` suffix, so
+       draft-bank detection found no layout and silently emitted nothing; both
+       spellings are now accepted (the per-expert Ornith export keeps `.weight`);
+       (b) `quant_target` classified `mtp.*` linears from the target's quant
+       table, so `mtp.layers.0.mlp.shared_expert.down_proj` was planned as
+       pre-packed NVFP4 while the source is bf16 (the checkpoint's
+       `exclude_modules` is `mtp*`); draft modules now only fuse (qkv, gate_up)
+       and pass bf16 through;
+       (c) the draft's `pre_fc_norm_embedding`, `pre_fc_norm_hidden` and `norm`
+       are `GemmaPlusOneRMSNorm` upstream, so `is_gemma_norm` bakes the `+1`
+       into them like the target's; the host reference in `mtp.rs` no longer
+       adds it a second time.
+     - **Gated M9 runs need an overlay.** Both store FTWs predate M9.1
+       (`counts` 1148 dense + 240 banks, no `has_mtp`) and the two writable
+       16 GiB tmpfs cannot hold a 21 GiB re-conversion. The recipe used here:
+       `--limit-tensors` a draft-only FTW into `/tmp` (14 dense + 6 banks,
+       533,233,664 bytes) with
+       `draft.*` and `draft_*#L00000` globs, then write an overlay directory
+       whose `freetoken_weight.json` keeps the store's shard entries with
+       absolute `file` paths, appends the draft shard at the store's
+       `total_bytes`, and shifts the draft tensor offsets by it. `FtwReader`
+       joins shard names onto the directory, so an absolute name reads the store
+       and the 533 MB local shard together. `FERRUM_FTW_DIR` then points at the
+       overlay; `tests/common::ftw_dir` already honours it.
+
 ## Progress log (narrative, pre-2026-10-15 compaction)
+
 
 Status (2026-10-15): M2 (API) current, late M3 in practice. This pass closed the Tier-1 hardening (scalar-oracle note, one-stream debug_assert, `serial_test`, `scripts/check-kernels.sh`, OpenAI compat fields) and the serving-memory blocker (KV now defaults to bf16, decision 64), so a default config fits the 8 GiB device. Section 8's item 7 (radix wiring) is **blocked**: for a 30-GDN/10-attention tower, prefix reuse is zero without GDN snapshot donation (decision 65). Item 8's **slice 1 landed** (decision 66): prefill now runs the device-staged MoE path (chunked over the `BLOCK_K` route cap) and no longer falls back to the host plan; slice 2 (copy/compute overlap) is budget-blocked on the 8 GiB target. Earlier: M2 (API) current; M3 prerequisite 4 (device staging: lru_ensure + index_copy + pinned banks + wiring) complete, and decision 40's capture work advances: decision 49 gives the fixed-address `DecodeBuffers` batch-metadata staging, decision 50 settles the mempool -- torch's graph pool behind a tiny C++ bridge, with `tests/cuda_graph_torch_probe.rs` green on the device -- and the forward's output tail is now a device-logits step (`forward_cached_into`, no host round-trip). The decode step's inputs are now staged off the buffers (decision 54: `forward_decode_into`; only device tensors address the cache), attention gathers a fixed-length padded window (decision 55), and the gated `tests/device_decode_matches_refeed.rs` proves the device path equals the re-fed host forward at ~1e-6 on the real checkpoint. The MoE staging split is out of the captured path (decision 56: a resident E2M1 table and an on-device rope table remove the last host uploads), and the gated `tests/decode_graph_capture.rs` now captures one whole real decode step and replays it equal to the uncaptured twin. The device decode is now batch-generic (decision 58): `forward_decode_into` runs every row of `DecodeBuffers`, and the gated `a_batched_decode_step_matches_n_single_row_steps` pins a batch-3 step to three single-row steps on the real checkpoint. The per-batch-size executables are landed (decision 59): `infrastructure/decode_graph.rs` captures one `DecodeGraph` (its own private pool and fixed-address buffers) per size and a `DecodeGraphSet` picks the smallest captured size that fits and pads with dummy rows, and the gated `tests/decode_graph_capture.rs::a_captured_batch_decode_step_replays_equal_to_an_uncaptured_step` replays batch `{1,2,4}` equal to the uncaptured twin on the real checkpoint. Remaining in P1: the engine-owned allocation of the buffers and graphs (the "pinned batch-metadata staging" line) and `max_running` in the captured set -- both now landed (decision 61): the composition root (`application/registry.rs`) creates the non-legacy side stream, builds the MoE and attention ports on it, sizes the pool `max_running_requests + 1` for the reserved dummy padding row, captures `{1,2,4,max_running}` and hands `Engine::with_captured` the service; `model.cuda_graph` turns it on, and the generation loop replays the smallest graph that fits. The gated `tests/engine_real_generate.rs::a_captured_engine_decodes_on_its_graphs` reaches the oracle token through the captured batch-1 graph, which closes P1. The paged GQA decode attention kernel is now authored and AOT-registered (decision 60): `python/ferrum_kernel/attention.py`, a new `attention` manifest section and `AttentionAbi`, the interpreter selftest against the torch oracle at ~1e-7 and the ABI units green; the driver-API launcher (`infrastructure/cuda_attention.rs`), the `MhaPool` paged gather and the forward wiring are landed too, and the gated `tests/device_decode_matches_refeed.rs` and `tests/decode_graph_capture.rs` prove the paged device step equals the re-fed forward and replays from a captured graph at batch `{1,2,4}` on the real checkpoint. Decision 36 is
 done end to end: the serving path is Python-free. The sm_120 cubins are

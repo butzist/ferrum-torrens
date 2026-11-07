@@ -1291,6 +1291,20 @@ pub(crate) mod fake {
             cache.release(&mut self.pages.lock().unwrap());
         }
 
+        fn rollback(
+            &self,
+            cache: &mut crate::domain::kvcache::SequenceCache,
+            n: usize,
+        ) -> Result<(), crate::domain::kvcache::KvcacheError> {
+            if n > cache.cached() - cache.reused() {
+                return Err(crate::domain::kvcache::KvcacheError::MisalignedCache {
+                    why: format!("rollback of {n} over the request's own pages"),
+                });
+            }
+            cache.truncate(n, &mut self.pages.lock().unwrap());
+            Ok(())
+        }
+
         fn available(&self) -> usize {
             self.pages_left()
         }
