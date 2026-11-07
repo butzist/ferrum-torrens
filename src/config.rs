@@ -248,6 +248,34 @@ pub struct Sampling {
     pub top_p: f32,
 }
 
+/// `[spec]` speculative decoding. Off by default (`algorithm = None`); set
+/// `algorithm = "mtp"` to enable the checkpoint's own MTP head. `num_steps`
+/// is the draft length k (default 3, matching upstream's default).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Spec {
+    #[serde(default)]
+    pub algorithm: Option<String>,
+    #[serde(default = "default_spec_num_steps")]
+    pub num_steps: usize,
+    #[serde(default)]
+    pub draft_model_path: Option<String>,
+}
+
+impl Default for Spec {
+    fn default() -> Self {
+        Self {
+            algorithm: None,
+            num_steps: default_spec_num_steps(),
+            draft_model_path: None,
+        }
+    }
+}
+
+fn default_spec_num_steps() -> usize {
+    3
+}
+
 impl Default for Sampling {
     fn default() -> Self {
         Self {
@@ -272,6 +300,8 @@ pub struct Config {
     pub sampling: Sampling,
     #[serde(default)]
     pub kernel: Kernel,
+    #[serde(default)]
+    pub spec: Spec,
 }
 
 impl FromStr for Config {
@@ -390,6 +420,14 @@ impl Config {
             .or(self.kv.num_pages)
             .unwrap_or(DEFAULT_NUM_TOKENS)
     }
+
+    pub fn speculative_algorithm(&self) -> Option<&str> {
+        self.spec.algorithm.as_deref()
+    }
+
+    pub fn speculative_num_steps(&self) -> usize {
+        self.spec.num_steps
+    }
 }
 
 fn default_port() -> u16 {
@@ -500,6 +538,10 @@ triton = true
         assert_eq!(c.sampling.top_k, -1);
         assert_eq!(c.sampling.top_p, 1.0);
         assert!(c.kernel.triton, "the example turns the kernel on");
+        assert_eq!(c.spec.algorithm, None);
+        assert_eq!(c.spec.num_steps, 3);
+        assert_eq!(c.speculative_algorithm(), None);
+        assert_eq!(c.speculative_num_steps(), 3);
     }
 
     #[test]
