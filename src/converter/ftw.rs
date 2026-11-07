@@ -52,6 +52,8 @@ pub struct Counts {
 pub struct FtwMeta {
     pub quant_format: Option<String>,
     pub expert_bank_num_layers: Option<usize>,
+    pub has_mtp: Option<bool>,
+    pub max_draft_depth: Option<usize>,
     pub counts: Counts,
     pub source_model_path: String,
     pub fingerprint: String,
@@ -77,6 +79,8 @@ struct IndexOut<'a> {
     shards: &'a [ShardEntry],
     quant_format: Option<&'a str>,
     expert_bank_num_layers: Option<usize>,
+    has_mtp: Option<bool>,
+    max_draft_depth: Option<usize>,
     counts: Counts,
     source_model_path: &'a str,
     fingerprint: &'a str,
@@ -203,6 +207,8 @@ impl FtwWriter {
             shards: &self.shards,
             quant_format: meta.quant_format.as_deref(),
             expert_bank_num_layers: meta.expert_bank_num_layers,
+            has_mtp: meta.has_mtp,
+            max_draft_depth: meta.max_draft_depth,
             counts: meta.counts,
             source_model_path: &meta.source_model_path,
             fingerprint: &meta.fingerprint,
@@ -310,6 +316,8 @@ mod tests {
             .finalize(FtwMeta {
                 quant_format: Some("nvfp4".into()),
                 expert_bank_num_layers: Some(1),
+                has_mtp: None,
+                max_draft_depth: None,
                 counts: Counts {
                     weight: 2,
                     experts_bank: 1,
@@ -370,6 +378,8 @@ mod tests {
             .finalize(FtwMeta {
                 quant_format: None,
                 expert_bank_num_layers: None,
+                has_mtp: None,
+                max_draft_depth: None,
                 counts: Counts::default(),
                 source_model_path: "/src".into(),
                 fingerprint: "x".into(),
@@ -406,6 +416,8 @@ mod tests {
             .finalize(FtwMeta {
                 quant_format: None,
                 expert_bank_num_layers: None,
+                has_mtp: None,
+                max_draft_depth: None,
                 counts: Counts::default(),
                 source_model_path: "/src".into(),
                 fingerprint: "x".into(),

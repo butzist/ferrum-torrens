@@ -290,6 +290,8 @@ mod tests {
             shards: Vec::new(),
             quant_format: None,
             expert_bank_num_layers: Some(1),
+            has_mtp: None,
+            max_draft_depth: None,
             meta: Default::default(),
         }
     }
@@ -420,6 +422,8 @@ mod tests {
             shards: Vec::new(),
             quant_format: None,
             expert_bank_num_layers: Some(layers as u64),
+            has_mtp: None,
+            max_draft_depth: None,
             meta: Default::default(),
         }
     }

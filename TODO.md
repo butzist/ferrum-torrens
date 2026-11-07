@@ -676,15 +676,14 @@ embedding and the LM head are the target's.
 
 Ordered slices, each its own gated change:
 
-- [ ] **M9.1 draft weights in the FTW.** Keep `mtp.*` (handle both the stacked and
-  the per-expert layout), group it as a `draft` section in the index with meta
-  (`has_mtp`, the maximum draft depth), and **quantize the draft's experts to
-  NVFP4 in the converter** (round-to-nearest with the same group-16 layout the
-  kernels already read), which takes 1.7 GB to ~0.5 GB -- resident next to the
-  target's cache on 8 GB is the whole point, and only the accept rate depends on
-  draft precision. Gate: a converter test that the head round-trips for both
-  layouts and that the index sizes match; `ftw_real_checkpoint` grows a
-  `mtp` assertion.
+- [x] **M9.1 draft weights in the FTW.** Keep `mtp.*` (handle both the stacked and
+      the per-expert layout), group it as a `draft` section in the index with meta
+      (`has_mtp`, the maximum draft depth), and **quantize the draft's experts to
+      NVFP4 in the converter** (round-to-nearest with the same group-16 layout the
+      kernels already read), which takes 1.7 GB to ~0.5 GB. Gate: converter
+      tests pass; `ftw_real_checkpoint` grows an `mtp` assertion. (DONE: converter
+      keeps `mtp.*`, renames to `draft.*`, quantizes both layouts, emits
+      `draft_*#L00000` banks; `has_mtp`/`max_draft_depth` in index meta.)
 - [ ] **M9.2 draft forward** (`models/qwen3_6/mtp.rs`): `embed(token_{p+1})` and
   the target hidden at `p` -> pre-fc norms -> `fc` -> one decoder layer ->
   `mtp.norm` -> the shared LM head, with the draft's own KV pool (one layer, 2 KV

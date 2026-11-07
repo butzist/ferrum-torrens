@@ -225,12 +225,14 @@ fn full_conversion_matches_golden() {
 
     let new = parse_index(out.path());
     let golden = parse_index(&golden_dir);
-    assert_eq!(report.weight_count, 1148);
-    assert_eq!(report.experts_bank_count, 240);
-    assert_eq!(new.tensors.len(), 1388);
+    assert_eq!(report.weight_count, 1149);
+    assert_eq!(report.experts_bank_count, 246);
+    assert_eq!(new.tensors.len(), 1394);
     assert_eq!(new.tensors.len(), golden.tensors.len());
     assert_eq!(new.quant_format, Some(QuantFormat::Nvfp4));
     assert_eq!(new.expert_bank_num_layers, Some(40));
+    assert_eq!(new.has_mtp, Some(true));
+    assert_eq!(new.max_draft_depth, Some(1));
     assert_eq!(
         new.tensors
             .iter()

@@ -595,6 +595,8 @@ mod tests {
             shards: Vec::new(),
             quant_format: None,
             expert_bank_num_layers: None,
+            has_mtp: None,
+            max_draft_depth: None,
             meta: Default::default(),
         }
     }

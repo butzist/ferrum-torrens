@@ -76,6 +76,7 @@ pub fn convert(opts: &ConvertOptions) -> Result<ConvertReport, ConvertError> {
     emitter.emit_pass(&pass)?;
     emitter.emit_groups(&groups)?;
     let bank_layers = emitter.emit_banks(opts.layers)?;
+    let draft_layers = emitter.emit_draft_banks()?;
     let (weight_count, bank_count) = (emitter.weight_count, emitter.bank_count);
 
     let copied_metadata = copy_metadata(&opts.model_dir, &opts.out_dir)?;
@@ -87,6 +88,8 @@ pub fn convert(opts: &ConvertOptions) -> Result<ConvertReport, ConvertError> {
     let fin = writer.finalize(FtwMeta {
         quant_format: bank_layers.is_some().then(|| "nvfp4".to_string()),
         expert_bank_num_layers: bank_layers,
+        has_mtp: Some(draft_layers.is_some()),
+        max_draft_depth: draft_layers,
         counts: Counts {
             weight: weight_count,
             experts_bank: bank_count,
@@ -225,6 +228,9 @@ fn set_slot(slot: &mut Option<String>, src: &str) -> Result<(), ConvertError> {
 }
 
 fn rename(name: &str) -> String {
+    if let Some(rest) = name.strip_prefix("mtp.") {
+        return format!("draft.{rest}");
+    }
     if name.starts_with("model.visual.") || name.starts_with("visual.") {
         return format!(
             "visual.{}",
@@ -250,13 +256,13 @@ fn layer_of(name: &str) -> Option<usize> {
 }
 
 fn skip_source(name: &str) -> bool {
-    name.starts_with("mtp.")
-        || name.ends_with(".k_scale")
+    name.ends_with(".k_scale")
         || name.ends_with(".v_scale")
         || name.ends_with(".q_scale")
         || name.ends_with(".prob_scale")
         || name.ends_with(".input_global_scale")
         || is_expert_piece(name)
+        || (name.starts_with("mtp.") && name.contains(".mlp.experts."))
 }
 
 fn is_expert_piece(name: &str) -> bool {
@@ -655,6 +661,253 @@ impl Emitter<'_> {
         }
         Ok(true)
     }
+
+    fn emit_draft_banks(&mut self) -> Result<Option<usize>, ConvertError> {
+        // Detect layout.
+        let stacked_gate = "mtp.layers.0.mlp.experts.gate_up_proj.weight";
+        let per_expert_gate = "mtp.layers.0.mlp.experts.0.gate_proj.weight";
+        let (stacked, num_experts) = if self.store.info(stacked_gate).is_some() {
+            let info = self.store.info(stacked_gate).unwrap();
+            (true, info.shape.first().copied().unwrap_or(0))
+        } else if self.store.info(per_expert_gate).is_some() {
+            // count experts
+            let mut n = 0usize;
+            while self
+                .store
+                .info(&format!("mtp.layers.0.mlp.experts.{n}.gate_proj.weight"))
+                .is_some()
+            {
+                n += 1;
+            }
+            (false, n)
+        } else {
+            return Ok(None);
+        };
+        if num_experts == 0 {
+            return Ok(None);
+        }
+        // Determine dims from gate_up (rows = 2*inter, cols = hidden).
+        let (gate_rows, gate_cols, down_rows, down_cols) = if stacked {
+            let info = self.store.info(stacked_gate).unwrap();
+            // shape [E, 2I, H]
+            let r = info.shape[1];
+            let c = info.shape[2];
+            // down
+            let dinfo = self
+                .store
+                .info("mtp.layers.0.mlp.experts.down_proj.weight")
+                .unwrap();
+            (r, c, dinfo.shape[1], dinfo.shape[2])
+        } else {
+            let ginfo = self
+                .store
+                .info("mtp.layers.0.mlp.experts.0.gate_proj.weight")
+                .unwrap();
+            let dinfo = self
+                .store
+                .info("mtp.layers.0.mlp.experts.0.down_proj.weight")
+                .unwrap();
+            // gate_proj [I, H]
+            (
+                ginfo.shape[0] * 2,
+                ginfo.shape[1],
+                dinfo.shape[0],
+                dinfo.shape[1],
+            )
+        };
+        let inter = gate_rows / 2;
+        let hidden = gate_cols;
+
+        // Build f32 matrices [E, gate_rows, gate_cols] and [E, down_rows, down_cols].
+        let mut gate_up = vec![0.0f32; num_experts * gate_rows * gate_cols];
+        let mut down = vec![0.0f32; num_experts * down_rows * down_cols];
+
+        if stacked {
+            // read bf16 bytes
+            let bytes = self.store.read(stacked_gate).unwrap();
+            bf16_bytes_to_f32(&bytes, &mut gate_up);
+            let dbytes = self
+                .store
+                .read("mtp.layers.0.mlp.experts.down_proj.weight")
+                .unwrap();
+            bf16_bytes_to_f32(&dbytes, &mut down);
+        } else {
+            for e in 0..num_experts {
+                // gate_proj and up_proj -> concat along rows
+                let gname = format!("mtp.layers.0.mlp.experts.{e}.gate_proj.weight");
+                let uname = format!("mtp.layers.0.mlp.experts.{e}.up_proj.weight");
+                let dname = format!("mtp.layers.0.mlp.experts.{e}.down_proj.weight");
+                let gb = self.store.read(&gname).unwrap();
+                let ub = self.store.read(&uname).unwrap();
+                let db = self.store.read(&dname).unwrap();
+                let i = inter;
+                // gate: [i, hidden], up: [i, hidden] -> gate_up expert: [2i, hidden]
+                let mut off = e * gate_rows * gate_cols;
+                // gate rows first
+                bf16_bytes_to_f32_into(&gb, &mut gate_up[off..off + i * hidden]);
+                off += i * hidden;
+                bf16_bytes_to_f32_into(&ub, &mut gate_up[off..off + i * hidden]);
+                // down
+                let doff = e * down_rows * down_cols;
+                bf16_bytes_to_f32_into(&db, &mut down[doff..doff + down_rows * down_cols]);
+            }
+        }
+
+        // Quantize.
+        let (gu_packed, gu_scale, gu_global) =
+            quantize_nvfp4_3d(&gate_up, num_experts, gate_rows, gate_cols);
+        let (dn_packed, dn_scale, dn_global) =
+            quantize_nvfp4_3d(&down, num_experts, down_rows, down_cols);
+
+        // Emit bank tensors with names draft_*#L00000
+        let layer = 0usize;
+        let names = [
+            format!("draft_gate_up_packed#L{layer:05}"),
+            format!("draft_gate_up_scale#L{layer:05}"),
+            format!("draft_gate_up_global#L{layer:05}"),
+            format!("draft_down_packed#L{layer:05}"),
+            format!("draft_down_scale#L{layer:05}"),
+            format!("draft_down_global#L{layer:05}"),
+        ];
+        let enabled: Vec<bool> = names.iter().map(|n| self.enabled(n)).collect();
+        if !enabled.iter().any(|&e| e) {
+            // still count as present? We need the bank for the runtime. Emit anyway (enabled check only gates output).
+        }
+        // packed
+        if self.enabled(&names[0]) {
+            let shape = [num_experts, gate_rows, gate_cols / 2];
+            self.add(&names[0], "experts_bank", DType::U8, &shape, &gu_packed)?;
+        }
+        if self.enabled(&names[1]) {
+            let shape = [num_experts, gate_rows, gate_cols / 16];
+            self.add(&names[1], "experts_bank", DType::F8E4M3, &shape, &gu_scale)?;
+        }
+        if self.enabled(&names[2]) {
+            let mut bytes = Vec::with_capacity(num_experts * gate_rows * 2);
+            for _ in 0..(num_experts * gate_rows) {
+                let bits = half::f16::from_f32(gu_global).to_bits();
+                bytes.extend_from_slice(&bits.to_le_bytes());
+            }
+            let shape = [num_experts, gate_rows];
+            self.add(&names[2], "experts_bank", DType::F16, &shape, &bytes)?;
+        }
+        if self.enabled(&names[3]) {
+            let shape = [num_experts, down_rows, down_cols / 2];
+            self.add(&names[3], "experts_bank", DType::U8, &shape, &dn_packed)?;
+        }
+        if self.enabled(&names[4]) {
+            let shape = [num_experts, down_rows, down_cols / 16];
+            self.add(&names[4], "experts_bank", DType::F8E4M3, &shape, &dn_scale)?;
+        }
+        if self.enabled(&names[5]) {
+            let mut bytes = Vec::with_capacity(num_experts * down_rows * 2);
+            for _ in 0..(num_experts * down_rows) {
+                let bits = half::f16::from_f32(dn_global).to_bits();
+                bytes.extend_from_slice(&bits.to_le_bytes());
+            }
+            let shape = [num_experts, down_rows];
+            self.add(&names[5], "experts_bank", DType::F16, &shape, &bytes)?;
+        }
+        Ok(Some(1))
+    }
+}
+
+fn bf16_bytes_to_f32(bytes: &[u8], out: &mut [f32]) {
+    for (i, chunk) in bytes.chunks(2).enumerate() {
+        if i >= out.len() || chunk.len() < 2 {
+            break;
+        }
+        let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+        out[i] = crate::domain::numerics::bf16_to_f32(bits);
+    }
+}
+
+fn bf16_bytes_to_f32_into(bytes: &[u8], out: &mut [f32]) {
+    bf16_bytes_to_f32(bytes, out);
+}
+
+fn f32_to_e4m3(x: f32) -> u8 {
+    // round to nearest representable E4M3 by scanning all 256 codes.
+    let mut best = 0u8;
+    let mut best_err = f32::INFINITY;
+    for code in 0u8..=255u8 {
+        let v = crate::domain::numerics::e4m3fn_to_f32(code);
+        let err = (v - x).abs();
+        if err < best_err {
+            best_err = err;
+            best = code;
+        }
+    }
+    best
+}
+
+fn f32_to_e2m1_code(x: f32) -> u8 {
+    // nearest of the 16 e2m1 magnitudes, preserving sign.
+    let sign = if x < 0.0 { 8u8 } else { 0u8 };
+    let ax = x.abs();
+    let mags: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+    let mut best = 0usize;
+    let mut best_err = f32::INFINITY;
+    for (i, &m) in mags.iter().enumerate() {
+        let err = (m - ax).abs();
+        if err < best_err {
+            best_err = err;
+            best = i;
+        }
+    }
+    sign | (best as u8)
+}
+
+fn quantize_nvfp4_3d(data: &[f32], e: usize, rows: usize, cols: usize) -> (Vec<u8>, Vec<u8>, f32) {
+    let mut tensor_max: f32 = 0.0;
+    for v in data {
+        tensor_max = tensor_max.max(v.abs());
+    }
+    let global = if tensor_max == 0.0 {
+        0.0
+    } else {
+        tensor_max / (6.0 * 448.0)
+    };
+
+    let mut packed = vec![0u8; e * rows * (cols / 2)];
+    let mut scale = vec![0u8; e * rows * (cols / 16)];
+
+    for ei in 0..e {
+        for r in 0..rows {
+            for bi in 0..(cols / 16) {
+                let mut block_max: f32 = 0.0;
+                for k in 0..16usize {
+                    let idx = (ei * rows + r) * cols + bi * 16 + k;
+                    block_max = block_max.max(data[idx].abs());
+                }
+                let local = if global == 0.0 || block_max == 0.0 {
+                    0.0
+                } else {
+                    block_max / (6.0 * global)
+                };
+                let local_e4m3 = f32_to_e4m3(local);
+                let local_f = crate::domain::numerics::e4m3fn_to_f32(local_e4m3);
+                scale[(ei * rows + r) * (cols / 16) + bi] = local_e4m3;
+                for k in 0..16usize {
+                    let idx = (ei * rows + r) * cols + bi * 16 + k;
+                    let denom = global * local_f;
+                    let code = if denom == 0.0 {
+                        0u8
+                    } else {
+                        let q = (data[idx] / denom).clamp(-6.0, 6.0);
+                        f32_to_e2m1_code(q)
+                    };
+                    let byte_idx = (ei * rows + r) * (cols / 2) + (bi * 16 + k) / 2;
+                    if k % 2 == 0 {
+                        packed[byte_idx] = (packed[byte_idx] & 0xf0) | code;
+                    } else {
+                        packed[byte_idx] = (packed[byte_idx] & 0x0f) | (code << 4);
+                    }
+                }
+            }
+        }
+    }
+    (packed, scale, global)
 }
 
 fn ordered_parts(group: &GroupPlan, role: Role) -> Result<Vec<(usize, &str)>, ConvertError> {
@@ -1338,7 +1591,7 @@ mod tests {
 
         let opts = ConvertOptions::new(dir.path(), out.path());
         let report = convert(&opts).unwrap();
-        assert_eq!(report.weight_count, 20);
+        assert_eq!(report.weight_count, 21);
         assert_eq!(report.experts_bank_count, 6);
         assert_eq!(report.copied_metadata, vec!["config.json"]);
 
@@ -1346,7 +1599,7 @@ mod tests {
             &std::fs::read_to_string(out.path().join("freetoken_weight.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(index.tensors.len(), 26);
+        assert_eq!(index.tensors.len(), 27);
         assert_eq!(
             index.quant_format,
             Some(crate::domain::weights::QuantFormat::Nvfp4)

@@ -70,6 +70,8 @@ pub struct FtwIndex {
     pub shards: Vec<ShardDesc>,
     pub quant_format: Option<QuantFormat>,
     pub expert_bank_num_layers: Option<u64>,
+    pub has_mtp: Option<bool>,
+    pub max_draft_depth: Option<u64>,
     /// Anything else in the index top level (per-shard metadata, counts, ...).
     pub meta: HashMap<String, Value>,
 }
@@ -202,6 +204,8 @@ impl FtwIndex {
             .and_then(Value::as_str)
             .map(|s| QuantFormat::from_str(s).unwrap());
         let expert_bank_num_layers = v.get("expert_bank_num_layers").and_then(Value::as_u64);
+        let has_mtp = v.get("has_mtp").and_then(Value::as_bool);
+        let max_draft_depth = v.get("max_draft_depth").and_then(Value::as_u64);
         for (k, val) in v.as_object().unwrap() {
             if matches!(
                 k.as_str(),
@@ -214,6 +218,8 @@ impl FtwIndex {
                     | "shards"
                     | "quant_format"
                     | "expert_bank_num_layers"
+                    | "has_mtp"
+                    | "max_draft_depth"
             ) {
                 continue;
             }
@@ -227,6 +233,8 @@ impl FtwIndex {
             shards,
             quant_format,
             expert_bank_num_layers,
+            has_mtp,
+            max_draft_depth,
             meta,
         })
     }

@@ -27,6 +27,8 @@ fn real_checkpoint_parses_and_is_coherent() {
     }
     assert_eq!(ix.quant_format, Some(QuantFormat::Nvfp4));
     assert_eq!(ix.expert_bank_num_layers, Some(40));
+    assert_eq!(ix.has_mtp, Some(true));
+    assert_eq!(ix.max_draft_depth, Some(1));
 
     // Every 4096-aligned offset is resolvable to exactly-total shard coverage.
     let _ = ALIGN;
@@ -62,4 +64,13 @@ fn real_checkpoint_parses_and_is_coherent() {
     assert_eq!(bank.nbytes, 256 * 1024 * 1024);
     assert!(ix.entry("gate_up_scale#L00000").is_some());
     assert!(ix.entry("gate_up_global#L00000").is_some());
+
+    // Draft (MTP) head bank, NVFP4-quantized.
+    let dbank = ix.entry("draft_gate_up_packed#L00000").unwrap();
+    assert_eq!(dbank.kind, TensorKind::ExpertsBank);
+    assert_eq!(dbank.dtype, DType::U8);
+    assert_eq!(dbank.shape, vec![256, 1024, 1024]);
+    assert!(ix.entry("draft_gate_up_scale#L00000").is_some());
+    assert!(ix.entry("draft_gate_up_global#L00000").is_some());
+    assert!(ix.entry("draft_down_packed#L00000").is_some());
 }
