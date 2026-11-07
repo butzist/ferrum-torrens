@@ -1019,8 +1019,9 @@ impl CudarcQwen3_6 {
         ids: &[u32],
         positions: Positions<'_>,
         access: &Access<'_>,
+        answers: &[usize],
     ) -> Result<Vec<f32>> {
-        let out = self.run_tower_inner(ids, positions, access);
+        let out = self.run_tower_inner(ids, positions, access, answers);
         substep_report(ids.len());
         out
     }
@@ -1118,6 +1119,7 @@ impl CudarcQwen3_6 {
         ids: &[u32],
         positions: Positions<'_>,
         access: &Access<'_>,
+        answers: &[usize],
     ) -> Result<Vec<f32>> {
         let p = &self.params;
         let t = ids.len();
@@ -1127,12 +1129,17 @@ impl CudarcQwen3_6 {
         let idx: Vec<i32> = ids.iter().map(|i| *i as i32).collect();
         let idx = self.rt.from_slice_i32(&idx, &[t])?;
         let stream = self.tower_stream(&idx, t, &positions, access)?;
-        let last = stream.narrow(0, t - 1, 1)?;
-        let normed = rms_norm(&last, &self.tower.final_norm, p.rms_norm_eps)?;
-        if ablated("head") {
-            return Ok(vec![0.0; p.vocab_size]);
+        let mut out = Vec::new();
+        for &a in answers {
+            let row = stream.narrow(0, a, 1)?;
+            let normed = rms_norm(&row, &self.tower.final_norm, p.rms_norm_eps)?;
+            if ablated("head") {
+                out.extend(vec![0.0; p.vocab_size]);
+                continue;
+            }
+            out.extend(self.lm_head_logits(&normed)?);
         }
-        self.lm_head_logits(&normed)
+        Ok(out)
     }
 }
 
@@ -1152,8 +1159,13 @@ impl Model for CudarcQwen3_6 {
                     None => Positions::Host(&input.positions[s..i]),
                 };
                 out.extend(
-                    self.run_tower(&input.input_ids[s..i], positions, &Access::Stateless)
-                        .expect("cudarc forward"),
+                    self.run_tower(
+                        &input.input_ids[s..i],
+                        positions,
+                        &Access::Stateless,
+                        &[i - s - 1],
+                    )
+                    .expect("cudarc forward"),
                 );
                 s = i;
             }
@@ -1188,9 +1200,9 @@ impl CachedModel for CudarcQwen3_6 {
                 why: "the cached forward wants one mrope triple per token".to_string(),
             });
         }
-        if input.answers != vec![n - 1] {
+        if input.answers.is_empty() || input.answers.iter().any(|&a| a >= n) {
             return Err(KvcacheError::MisalignedCache {
-                why: "the cached forward takes one sequence and answers its last token".to_string(),
+                why: "the cached forward answers must be in-range row indices".to_string(),
             });
         }
         let start = input.positions[0] as usize;
@@ -1219,7 +1231,7 @@ impl CachedModel for CudarcQwen3_6 {
             Some(triples) => Positions::Triples(triples),
             None => Positions::Host(&input.positions),
         };
-        self.run_tower(&input.input_ids, positions, &access)
+        self.run_tower(&input.input_ids, positions, &access, &input.answers)
             .map_err(|e| KvcacheError::MisalignedCache { why: e.to_string() })
     }
 }
