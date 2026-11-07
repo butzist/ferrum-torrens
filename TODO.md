@@ -1,22 +1,22 @@
 # FerrumTorrens -- FreeToken MVP port to Rust: TODO
 
-Status (2026-11-04): **M7 complete and the second checkpoint is merged: M8.1 is
-done except the Nix store path (M8.1b), which is in progress on branch
-`feat/m8.1b-model-variant`.** The Nix side there is implemented and verified
-(`nix/checkpoints.nix` table, `model.variant` in the NixOS module, one flake
-package per checkpoint, lazy evaluation proven by `nix build --dry-run`); the one
-blocker is the Ornith HF fixed-output hash, which a download in flight fills, and
-the HF artifact turns out to differ from the export gated so far, so it also
-needs a re-gate. `Ornith-1.5-35B-A3B-NVFP4` (the local export) converts
-with no code change, passes every device gate, and lands at pp parity and 1-3%
-behind on tg; the difference is routing entropy, measured as +5.4% expert-cache
-misses per decode step and scoped as R13 in `OPTIMIZATION.md`. M8.1c is closed
-by decision 148 -- eager and captured decode had been two implementations of the
-same math, and one-token text decode now runs the device kernels on both arms
-(`maxabs_delta = 0.000000` per step). Two new footprint findings: a load pins
-16.93 GiB of host expert banks (peak RSS 18.6 GiB measured, so one load at a
-time is the rule, not a preference), and a dropped engine keeps its device slot
-banks (M8.1e). The
+Status (2026-11-07): **M8.1b is complete: both checkpoints build from the flake
+into the Nix store and the fetched Ornith artifact is gated.** `nix/checkpoints.nix`
+pins the Ornith fixed-output hash (`sha256-NLs7...`); the HF artifact is not the
+local export measured earlier (shard 2 is 700 MB shorter), so the store-converted
+FTW was re-gated end to end (parse, load, " Paris", the eager kernel gate with 40
+expert steps, and captured parity over 8 tokens). The reference store FTW was
+re-gated too -- its tensor packing differs from the old local one -- and still
+reproduces the pinned oracle on the scalar and kernel paths. The 104 GB
+`.model-cache` is gone; point `FERRUM_FTW_DIR` at the store outputs recorded in
+`DONE.md` 149. Remaining: M8.1e (a dropped engine keeps its device slot banks),
+M8.2 (per-checkpoint cubins), M8.3 (a second architecture) and M9 (speculative
+decoding). `Ornith-1.5-35B-A3B-NVFP4` lands at pp parity and 1-3% behind on tg
+(routing entropy: +5.4% expert-cache misses per decode step, R13). M8.1c is
+closed by decision 148 -- one-token text decode runs the device kernels on both
+arms (`maxabs_delta = 0.000000` per step). Two footprint findings remain: a load
+pins 16.93 GiB of host expert banks (peak RSS 18.6 GiB, so one load at a time),
+and a dropped engine keeps its device slot banks (M8.1e). The
 vision tower runs on the device (decision 139); busy devices and a full GPU both
 answer `503` + `Retry-After` instead of crashing (140, 144); the idle release
 stages the GPU back to the host behind an exclusive batch lease (141); mrope
@@ -588,56 +588,10 @@ Ordered slices, each its own gated change:
   whole-layer prefill, decode-cache retention). The gates take the checkpoint
   from `FERRUM_FTW_DIR` (`tests/common`); the exact token-id pins stay on the
   reference checkpoint and a second checkpoint asserts semantics instead.
-- [ ] **M8.1b Class A -- a second checkpoint as a store path (IN PROGRESS,
-  branch `feat/m8.1b-model-variant`).** Implemented and verified on that branch:
-  `nix/checkpoints.nix` is the single table of served checkpoints (`repo`, the
-  fixed-output NAR `hash` of its HF snapshot, the advertised `name`); both
-  `flake.nix` and `nix/module.nix` import it, so the values cannot drift.
-  `flake.nix` exposes one package per entry (`ferrum-torrens-model`,
-  `ferrum-torrens-model-ornith`), and the module grew `model.variant` (enum, the
-  reference by default) which `lib.mkDefault`s `model.repo`, `model.hash` and
-  `servedModelName`; an explicit value still wins, and `model.path` skips the
-  model build entirely. Lazy evaluation verified with `nix build --dry-run`:
-  `.#ferrum-torrens` plans **no** model derivation at all, and
-  `.#ferrum-torrens-model` plans only the `nvidia` HF fixed-output derivation
-  (no Ornith). Module behaviour verified with a NixOS eval: variant ornith gives
-  the ornith repo and name, an explicit `model.hash` overrides it, and the
-  reference variant is unchanged. README and `ARCHITECTURE.md` 2 are updated.
-  **Blocker: `nix/checkpoints.nix` still carries `hash =
-  "__ORNITH_HF_HASH__"`**, so `nix build .#ferrum-torrens-model-ornith` cannot
-  evaluate yet. The hash comes from `bash scripts/fetch-hf-hash.sh <repo> <dir>`
-  (new: it fetches the snapshot the way `nix/model.nix` does, resumes with
-  `curl -C -`, verifies every file against the Hub API's size and LFS sha256,
-  then prints `nix hash path`; run it through `bash`, the jail has no
-  `/usr/bin/env`); the method is proven, because hashing the reference snapshot
-  minus `.cache` reproduces the pinned reference hash exactly
-  (`sha256-JTcnVr...`). **The fetch was interrupted at 12.4 of ~23.5 GB** (the
-  shell that ran it was cancelled and `/tmp` was cleaned, so its log and the
-  ad-hoc script are gone; the script now lives in the repo and logs to
-  `.model-cache/fetch-ornith.log`). The partial tree is
-  `.model-cache/hf-hf/Ornith-1.5-35B-A3B-NVFP4`: `model-00001` 4,743,331,840 of
-  10,005,851,848 bytes, `model-00002` 4,245,229,568 of 10,006,454,416,
-  `model-00003` complete at 3,408,113,436 (the repo is 23,460,228,712 bytes,
-  21.85 GiB, so ~11 GB of shard 1 and 2 are left). Re-run the same command to
-  resume; it skips complete files and continues the partial ones.
-  **The HF artifact is not the snapshot we gated.** The current HF `main` has 22
-  files; our `.model-cache/hf/Ornith-1.5-35B-A3B-NVFP4` export lacks four of them
-  (`README.md`, `.gitattributes`, two `assets/*.png`) and its
-  `model-00002-of-00003.safetensors` is 10,706,653,328 bytes against the repo's
-  10,006,454,416 (a 700,198,912-byte difference), so every number and gate
-  recorded for Ornith so far belongs to the local export, not to the artifact the
-  flake will serve. So the next steps are: (1) fill the hash from the fetch and
-  re-check `nix build .#ferrum-torrens-model-ornith --dry-run`; (2) convert the
-  fetched tree with the Rust converter and run `ftw_real_checkpoint`,
-  `engine_real_load`, one `engine_real_generate` and `cudarc_engine_generate` on
-  it (`FERRUM_FTW_DIR`), because the converted bytes differ; (3) record the
-  outcome in `DONE.md` and add the `model.variant` decision to section 7 as 149
-  (take the next free number at merge time; `feat/spec-decode` holds 149 for M9
-  until then); (4) merge and push. Remove `.model-cache/hf-hf/` afterwards
-  (~24 GB) and the `.model-cache/.hashcheck/` hardlink tree.
-  Acceptance: `nix build .#ferrum-torrens-model-ornith` yields a servable FTW,
-  and `servedModelName` follows the variant when the unit is configured with
-  `model.variant = "ornith-1.5-35b-a3b-nvfp4"`.
+- [x] **M8.1b Class A -- a second checkpoint as a store path -- DONE (decision
+  149).** `nix build .#ferrum-torrens-model-ornith` yields a servable FTW from
+  the pinned HF snapshot, `model.variant` selects it, and the fetched artifact
+  passed every gate. Store paths and gate results are in `DONE.md`.
 - [x] **M8.1c Captured decode on a second checkpoint -- DONE (decision 148).**
   The divergence was never capture-specific: eager decode ran the dense gather
   plus `causal_sdpa` and `conv_prefill`, while a captured step runs paged
@@ -752,6 +706,19 @@ history.
   captured graph skips image requests for the same reason. The rule binds open
   work: never add a second decode implementation, because a bit-identical gate
   is the only honest test of capture fidelity.
+
+- **149** -- **a served checkpoint is selected by `model.variant`, and the
+  store conversion is the gated artifact.** `nix/checkpoints.nix` holds the
+  repo, the fixed-output NAR hash of the HF snapshot and the advertised name;
+  the flake builds one package per entry and the module defaults `model.repo`,
+  `model.hash` and `servedModelName` from the variant, so a second checkpoint
+  is a table row, not a second binary (decision 146 still binds: one binary,
+  one checkpoint). Refresh a hash with `scripts/fetch-hf-hash.sh`; it verifies
+  every LFS sha256 and prints the `nix hash path` value. Gate the **store**
+  artifact, not a hand-converted copy: the fetched HF snapshot can differ from
+  a local export (Ornith's shard 2 did), and the converter can pack tensors in
+  a different order (the reference Rust FTW did), so `FERRUM_FTW_DIR` takes the
+  `nix build` output. The local `.model-cache` is disposable.
 
 - **113** -- the kernel artifacts are **built by Nix, never committed**
   (`nix/kernels.nix`). `build.rs` requires `$FERRUM_KERNEL_DIR` and copies its

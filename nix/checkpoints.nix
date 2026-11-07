@@ -16,7 +16,7 @@
 
   "ornith-1.5-35b-a3b-nvfp4" = {
     repo = "ornith-ai/Ornith-1.5-35B-A3B-NVFP4";
-    hash = "__ORNITH_HF_HASH__";
+    hash = "sha256-NLs7zpWCMVtzLjI4a8me6ad2zTcbctppWuaS5tk31/w=";
     name = "Ornith-1.5-35B-A3B-NVFP4";
   };
 }

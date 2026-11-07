@@ -4731,3 +4731,58 @@ subsection names are kept verbatim.
        a path difference. The remaining lever is the decode-cache policy in
        `lru_ensure`, which is shared with the reference; scoped as R13 in
        `OPTIMIZATION.md`.
+
+149. **The second checkpoint is a store path, and the fetched HF artifact is what
+     gets gated** (2026-11-07). M8.1b's code was already on
+     `feat/m8.1b-model-variant`: a `nix/checkpoints.nix` table, one flake
+     package per checkpoint and a `model.variant` option that defaults
+     repo/hash/name (an explicit value still wins, and `model.path` skips the
+     build). What remained was the Ornith fixed-output hash and a re-gate,
+     because the HF snapshot differs from the local export used by M8.1a.
+     - **Fetch and hash.** `scripts/fetch-hf-hash.sh` resumed the interrupted
+       download: 22 files, 23,460,228,712 bytes, with the three shards,
+       `tokenizer.json` and the two assets verified against the Hub's LFS
+       sha256. The NAR hash is
+       `sha256-NLs7zpWCMVtzLjI4a8me6ad2zTcbctppWuaS5tk31/w=`, now pinned in
+       `nix/checkpoints.nix`.
+     - **No second download for Nix.** Adding the fetched tree with
+       `nix-store --add-fixed --recursive sha256` under the derivation's own
+       name (`ferrum-torrens-hf-ornith-ai-Ornith-1.5-35B-A3B-NVFP4-main`)
+       produced exactly the fixed-output path, so `nix build` only ran the
+       converter. The same trick seeded the reference snapshot from
+       `.model-cache/hf` (its hash was already pinned). Resolved paths:
+       - HF snapshots:
+         `/nix/store/wxl3gc96jdf2awy5vsxjq6idgpzxi6mw-ferrum-torrens-hf-nvidia-Qwen3.6-35B-A3B-NVFP4-main`
+         and
+         `/nix/store/ar8pa71w1z6gyhf983lz4p8w82rc5kc7-ferrum-torrens-hf-ornith-ai-Ornith-1.5-35B-A3B-NVFP4-main`
+       - FTW outputs:
+         `/nix/store/4p3svna89pm1pg9p52k9w57qnbxsh77p-ferrum-torrens-model-0.1.0`
+         (reference) and
+         `/nix/store/7zfxxv5a3c8jh3ph3ybp98ixf23p71m4-ferrum-torrens-model-0.1.0`
+         (Ornith). Both verify with `nix-store --verify-path`; indirect gc
+         roots live in the gitignored `.home/nix-gc-roots/` so the cache
+         cleanup cannot let a GC remove them.
+     - **The HF artifact is not the local export.** The fetched
+       `model-00002-of-00003.safetensors` is 10,006,454,416 bytes against the
+       export's 10,706,653,328, so every earlier Ornith number belongs to the
+       export. Gates on the store-converted Ornith FTW:
+       `ftw_real_checkpoint` passed; `engine_real_load` passed (eos
+       `[248046, 248044]`, vocab 248320); `one_token_prediction_matches_the_oracle`
+       gave `[11751]` = " Paris" through the engine loop; the eager kernel gate
+       gave the same `[11751]` with 40 expert steps over 40 layers; and
+       `the_captured_cudarc_engine_generates_the_same_tokens_as_the_eager_one`
+       gave `[11751, 13, 198, 760, 6511, 314, 9338, 369]` on both arms
+       (eager 0.71 s, captured 0.49 s).
+     - **The reference store artifact was re-gated too.** Its
+       `freetoken_weight.json` is 199,429 bytes against the old local FTW's
+       216,523, and the shards are packed in a different order (the same 1388
+       tensors: 1148 dense + 240 banks, with identical names, shapes and
+       sizes), so the old local gates did not cover the deployed bytes. The
+       store FTW reproduces the pinned oracle: `engine_real_load`,
+       `one_token_prediction_matches_the_oracle` -> `[11751]`, and
+       `one_token_through_the_kernel_matches_the_oracle` -> `[11751]` with 40
+       expert steps all pass.
+     - **Cleanup.** The 104 GB `.model-cache` (HF exports, FTW conversions, the
+       hardlink trees and the logs) was removed. `FERRUM_FTW_DIR` now takes one
+       of the store FTW paths above, and `scripts/fetch-hf-hash.sh` remains the
+       way to refresh a hash.
