@@ -5,7 +5,11 @@ M9.7: speculation runs end to end on both checkpoints, token-identical to greedy
 at the gated length, and is a measured 0.70-0.92x on tg.** M9.7's conclusion is a
 number, not a patch: a verify row is only ~1.24x cheaper than a plain token
 against a host-offloaded expert bank, while speculation needs 3-4 rows per 2.5-3.6
-tokens, so the exchange rate cannot win here (OPTIMIZATION.md R14). The draft head stays in the FTW
+tokens, so the exchange rate cannot win here (OPTIMIZATION.md R14). FreeToken's
+own MTP, re-measured on this card at the 40 W cap, is 0.86x against its
+uncapped-cache plain and 1.06x against the same-cache plain, so the direction is
+confirmed; our absolute decode is 1.7x behind it, and M9.8 lists what closes that
+(R14b). The draft head stays in the FTW
 (converter, NVFP4 experts), the verify answers every drafted row and returns its
 final-norm hidden, and the GDN state is committed for exactly the accepted rows
 with no kernel change and no state snapshot. `tests/cudarc_spec_verify.rs` proves
@@ -760,9 +764,24 @@ Ordered slices, each its own gated change:
   at `k=2`). Expert staging, not the implementation, sets the ceiling.
 - [ ] **R13 shared work: a resident expert working set.** The one lever that
   would make speculation pay: `c_row < c_plain / 1.24` needs the hot expert set
-  to stop crossing the host bus on every row. Capacity is capped at ~1920 slots
-  by the prefill scratch; the open half is the policy (frequency-aware LRU / a
-  pinned hot set), which is R13.
+  to stop crossing the host bus on every row. Capacity is capped at ~1024 slots
+  on this card by our device footprint; the open half is the policy
+  (frequency-aware LRU / a pinned hot set), which is R13.
+- [ ] **M9.8 close the FreeToken gap (measured in OPTIMIZATION.md R14b).**
+  FreeToken's own MTP is 1.06-1.07x at the *same* cache and 1.7x faster in
+  absolute decode; ours is 0.62-0.70x. Ordered by the measured gap:
+  (a) device memory for the expert cache -- host-stream the embedding (1.0 GiB),
+  keep the shared experts FP8 instead of widening them to bf16, keep the router
+  gate in its checkpoint dtype, and share one slot pool between draft and
+  target; FreeToken fits 2012 slots where we top out at ~1024, and 2012 -> 1072
+  costs it 19% of plain throughput, so this is the single biggest term;
+  (b) a captured verify (`rows = k + 1`) -- ours is eager and its step costs
+  4.0x a plain step against their 3.0x; (c) a fused GDN commit (one stash kernel
+  per layer plus one all-layer replay, not per-row `conv_decode`+`gdn.decode`
+  twice); (d) draft depth at k = 3: accept 0.53 against their 0.72, while
+  k = 2 matches (0.73 vs 0.71), so the third draft's hidden chain is the defect;
+  (e) `radix_lookahead` prefix keys `(t_i, t_{i+1})`, which our spec path needs
+  before it can adopt a target prefix without a stale draft KV.
 
 Non-goals: DFlash (the other method in #828), MTP for an architecture that ships
 no head (Qwen3-Coder), TP > 1, and GGUF draft packs.

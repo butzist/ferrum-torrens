@@ -3132,6 +3132,50 @@ settled.
        and the 533 MB local shard together. `FERRUM_FTW_DIR` then points at the
        overlay; `tests/common::ftw_dir` already honours it.
 
+152. **The reference MTP was re-measured here, and its own output is not
+     token-exact either** (2026-11-08). FreeToken 0.2.1 (`14119b8`) was rebuilt
+     from source in `/tmp/opencode/FreeToken` and served the same checkpoint on
+     this card at the current 40 W cap (`nvidia-smi -q -d POWER`: 40 W current
+     against 50 W default, 115 W max). Results and the difference list are in
+     OPTIMIZATION.md R14b; the durable findings:
+     - **The equal-cache comparison is the only fair one.** FreeToken's draft
+       costs ~940 of its 2012 slots; plain at 1072 slots is 38.1 tok/s against
+       47.0 at 2012, and MTP at 1072 is 40.2 (k=3) / 40.8 (k=2). So MTP is
+       1.06-1.07x of the *same-cache* plain and 0.86x of the uncapped-cache one.
+       The "1.64x" in its docs is a 50%-cache, larger-VRAM point.
+     - **Its verify is cheaper per token than ours**: 3.0x a plain step for 3.15
+       tokens (0.95x/token) against our 4.0x for 2.56 (1.57x/token).
+     - **Its accept at k=3 is 0.72 against our 0.53**, while at k=2 both are
+       ~0.72: our first two drafts match, the third does not.
+     - **Its MTP output diverges from its own greedy output at token ~10**
+       ("rich his" against "iconic l", deterministic within each arm), so the
+       batched-verify drift in R14 is not ours alone. `[spec] trust_margin` is
+       the only exactness mechanism in either tree.
+     - **Device memory is the largest single gap**: FreeToken fits 2012 slots
+       where our loader OOMs above ~1024 on the same card.
+     Reproducing the benchmark (the environment needs three deviations from the
+     stock recipe, all of them NixOS-specific):
+     1. `uv venv --python 3.12`, then `uv pip install torch==2.14.1 triton`, then
+        build the extension in place: `env -u CC -u CXX CUDA_HOME=/tmp/cuda13
+        .venv/bin/python setup.py build_ext --inplace` (the devshell's
+        `CC=clang` resolves to a gcc-wrapper without `clang`; the PyPI `ninja`
+        wheel cannot exec on NixOS, so keep the store `ninja` on PATH).
+     2. `/tmp/cuda13` is a hand-built CUDA 13.4 home: `bin`/`nvvm` symlinked from
+        `cuda13.4-cuda_nvcc-13.4.92`, `include` from that package plus
+        `cuda13.4-cuda_cudart` and `cuda13.4-cuda_crt`, `lib64` from cudart.
+        torch 2.14 is cu130, so 13.4 passes its major-only check.
+     3. The devshell's gcc wrapper injects the 12.9 CUDA include
+        (`-isystem .../cuda-merged-12.9/include`), whose `host_config.h` rejects
+        gcc 16. `CPATH=/tmp/cuda13/include` plus
+        `CUDAHOSTCXX=<gcc-16.2.0-unwrapped>/bin/g++` makes nvcc pick the 13.4
+        headers; tvm-ffi's JIT then compiles for sm_120.
+     Then `ft serve --model <HF snapshot> --max-running-requests 1
+     --max-prefill-length 1024 --max-seq-len-override 4096
+     --kv-reserve-tokens 4096 --text-model-only --enable-timings-report`, and
+     read `timings.predicted_per_second` / `draft_n` / `draft_n_accepted` from
+     `/v1/completions` (greedy). `--moe-cache-size 1072` reproduces the
+     same-cache plain arm.
+
 ## Progress log (narrative, pre-2026-10-15 compaction)
 
 

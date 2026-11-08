@@ -10,6 +10,14 @@
 // value-level logits differ slightly from a one-token step (a `k + 1`-row GEMM
 // against a one-row GEMV), so a near-tie could in principle flip; that is why
 // this gate asserts the sequences rather than the logits.
+//
+// Measurement knobs, all optional: `SPEC_K` (draft length), SPEC_MARGIN
+// (`[spec] trust_margin`), `FERRUM_SPEC_TOKENS` (generated tokens),
+// `FERRUM_SPEC_PROFILE` (per-phase timing), `FERRUM_TEST_SLOTS` (target expert
+// cache; 384 leaves room for the draft's 433 MiB bank), `FERRUM_TEST_GRAPH`
+// (captured decode for the plain arm) and `FERRUM_PLAIN_ONLY` (skip the
+// speculative arm). The comparison against FreeToken in OPTIMIZATION.md R14
+// used exactly these.
 
 #![cfg(feature = "cudarc")]
 
@@ -49,8 +57,9 @@ fn config(spec: Option<usize>) -> Config {
     };
     let budget = tokens_budget();
     let slots = std::env::var("FERRUM_TEST_SLOTS").unwrap_or_else(|_| "384".to_string());
+    let graph = std::env::var("FERRUM_TEST_GRAPH").unwrap_or_else(|_| "false".to_string());
     format!(
-        "[model]\npath = \"{dir}\"\nmax_seq_len = 4096\nmax_output_tokens = {budget}\n\
+        "[model]\npath = \"{dir}\"\ncuda_graph = {graph}\nmax_seq_len = 4096\nmax_output_tokens = {budget}\n\
          max_prefill_length = 1024\nmax_running_requests = 1\n\n\
          [kernel]\ntriton = true\n\n\
          [kv]\nnum_tokens = 4096\ndtype = \"f32\"\n\n\
@@ -101,6 +110,16 @@ fn spec_decode_is_token_identical_to_greedy() {
         let plain = load_engine(&config(None)).unwrap();
         run(&plain, 1)
     };
+    if std::env::var_os("FERRUM_PLAIN_ONLY").is_some() {
+        eprintln!(
+            "plain {} tokens in {:.2}s ({:.1} tok/s)",
+            plain_tokens.len(),
+            plain_secs,
+            plain_tokens.len() as f64 / plain_secs
+        );
+        eprintln!("plain {plain_tokens:?}");
+        return;
+    }
     ferrum_torrens::application::spec_decode::reset_stats();
     let (spec_tokens, spec_secs) = {
         let spec = load_engine(&config(Some(spec_steps()))).unwrap();

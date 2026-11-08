@@ -1863,3 +1863,76 @@ target's experts are resident and a row is compute-bound.
 
 Do not re-open this without a measured `c_row` improvement: at the current accept
 fractions the code cannot pay for the rows it adds.
+
+## R14b -- FreeToken's own MTP, re-measured on this card (2026-11-08)
+
+The R14 numbers above are ours. This section is the reference implementation's,
+measured here, on the same checkpoint, the same prompt, the same power cap, so
+the two can be compared. FreeToken 0.2.1 from `/tmp/opencode/FreeToken`
+(`git 14119b8`), torch 2.14.1+cu130, its auto backends (`offload` MoE,
+`triton` attention, decode CUDA graphs on), `--max-running-requests 1
+--max-prefill-length 1024 --max-seq-len-override 4096 --kv-reserve-tokens 4096
+--text-model-only --enable-timings-report`, 4-6 requests per arm after one
+warmup request, spread < 2%.
+
+**Power cap: 40 W** (`nvidia-smi -q -d POWER`: current 40 W, default/requested
+50 W, max 115 W). All absolute numbers below are at 40 W.
+
+| engine | arm | expert slots | tok/s | tokens/step | accept/step | vs its plain |
+| --- | --- | --- | --- | --- | --- | --- |
+| FreeToken | plain | 2012 (auto) | 47.0 | 1 | -- | -- |
+| FreeToken | plain | 1072 (capped) | 38.1 | 1 | -- | -- |
+| FreeToken | mtp k=2 | 1073 (unified) | 40.8 | 2.42 | 1.42 | **1.07x** |
+| FreeToken | mtp k=3 | 1072 (unified) | 40.2 | 3.15 | 2.15 | **1.06x** |
+| ours | plain | 1024 + graph | 27.1 | 1 | -- | -- |
+| ours | plain | 384 + graph | 21.9 | 1 | -- | -- |
+| ours | mtp k=2 | 384 + draft 256 | 15.2 | 2.46 | 1.46 | 0.70x |
+| ours | mtp k=3 | 384 + draft 256 | 13.6 | 2.56 | 1.60 | 0.62x |
+
+Three things this settles:
+
+1. **MTP loses at this cache size for FreeToken too -- but only just, and only
+   against its own smaller-cache plain.** Its draft costs ~940 slots (2012 ->
+   1072), and those slots are worth 19% of plain throughput (47.0 -> 38.1).
+   Against the *same-cache* plain it is 1.06-1.07x, i.e. the draft's tokens
+   exactly pay for its slots and the verify rows, nothing more. That is the
+   honest reference point, and it is close to R14's own conclusion; the
+   "1.64x" in FreeToken's docs is a 50%-cache, bigger-VRAM point.
+2. **Our verify is the gap, not the arithmetic.** A FreeToken verify step costs
+   3.0x a plain step and yields 3.15 tokens (0.95x per token); ours costs 4.0x
+   a plain step and yields 2.56 (1.57x per token). Per accepted token we spend
+   ~65% more on the target forward than they do.
+3. **Our draft is weaker at depth k=3.** Accept fraction 0.53 against their 0.72
+   at k=3, but 0.73 against their 0.71 at k=2: our first two drafts are as good,
+   the third is not. Their `post_verify` re-drafts every committed row with the
+   target's verify hiddens; we refresh, so the difference is elsewhere (their
+   draft KV is written by a captured chain on the target's page table, and their
+   prefill drafts the prompt, which we tried and could not make pay).
+
+Also measured, and worth recording because it bounds the exactness contract:
+**FreeToken's own MTP output is not token-identical to its own greedy output.**
+Same prompt, `temperature: 0`, deterministic across 3 reps in each arm, plain
+gives `" Paris, a city renowned for its rich his..."` and k=3 gives
+`" Paris, a city renowned for its iconic l..."` -- the streams diverge around
+token 10, exactly the batched-verify drift R14 describes. Our margin gate
+(`[spec] trust_margin`) is the only mechanism in either tree that addresses it.
+
+Where the remaining gaps are, in the order this measurement ranks them:
+
+1. **Device memory for the expert cache.** FreeToken fits 2012 slots where our
+   loader tops out at ~1024 on the same card: it keeps the embedding on the host
+   (`--embed-weights host`), keeps dense linears in the checkpoint's FP8, its
+   router gate in the checkpoint dtype, and shares one slot pool across draft
+   and target (`--moe-cache-scope unified`). We keep the embedding bf16 on the
+   device (1.0 GiB), widen the shared experts to bf16 and the gates to f32, and
+   run two pools. `Tower::resident_bytes` versus the free-VRAM line is the
+   measurement to start from.
+2. **A captured verify.** FreeToken captures `rows_per_req = k + 1`; ours is
+   eager whenever speculation is on, which is most of the 3.0x vs 4.0x step cost
+   (plus its per-row GDN launches).
+3. **Fused GDN commit.** One fused verify kernel per layer with stashed inputs
+   and a single all-layer replay kernel at commit, against our per-row
+   `conv_decode` + `gdn.decode` at both verify and commit (~4x the launches).
+4. **Draft depth at k=3** (0.53 vs 0.72), i.e. the third draft's hidden chain.
+5. **Prefill drafting** (`on_prefill`) and `radix_lookahead` prefix keys, both of
+   which FreeToken has and we do not.
