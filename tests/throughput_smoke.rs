@@ -201,6 +201,16 @@ fn graph_from_env() -> bool {
     std::env::var("FERRUM_SMOKE_GRAPH").as_deref() == Ok("1")
 }
 
+/// Skip the f32 vision tower when `FERRUM_SMOKE_TEXT_ONLY` is set to any value
+/// other than `0` or absent (default false): the tower costs ~1.7 GiB and is what
+/// keeps the auto cache planner below its 2048-slot ceiling.
+fn text_only_from_env() -> bool {
+    !matches!(
+        std::env::var("FERRUM_SMOKE_TEXT_ONLY").as_deref(),
+        Err(_) | Ok("0")
+    )
+}
+
 /// The serving shape: bf16 KV (the default), the committed NVFP4 cubins via
 /// `kernel.triton`, whole-layer prefill overlap, decode capture on or off.
 ///
@@ -219,6 +229,7 @@ fn config(graph: bool) -> Config {
     // The config default is `auto` (item 12); `FERRUM_SMOKE_CACHE` pins a slot
     // count for a cache-size sweep, or `auto` for the planner.
     let slots = std::env::var("FERRUM_SMOKE_CACHE").unwrap_or_else(|_| "auto".into());
+    let text_only = text_only_from_env();
     // `auto` is a string value in TOML; a number is written bare.
     let slots = if slots == "auto" {
         "\"auto\"".to_string()
@@ -242,7 +253,7 @@ fn config(graph: bool) -> Config {
     format!(
         "[model]\npath = \"{dir}\"\ndevice = \"cuda\"\nmax_seq_len = {max_seq_len}\n\
          max_output_tokens = {}\nmax_prefill_length = {prefill_chunk}\n\
-         max_running_requests = 4\ncuda_graph = {graph}\n\n\
+         max_running_requests = 4\ncuda_graph = {graph}\ntext_only = {text_only}\n\n\
          [kv]\nnum_tokens = {kv_tokens}\ndtype = \"{kv}\"\n\n\
          [moe]\ncache_size_slots = {slots}\nprefill_overlap = true\n\n\
          [kernel]\ntriton = true\n",
