@@ -2185,7 +2185,41 @@ colder box and should not be used as an absolute control any more. Rank a slice
 by its same-session, same-token-count A/B, and quote 29.0-29.2 as the current
 128-token captured baseline.
 
-### R15 S7: the shared expert reads 10x below the roofline -- next
+### Decode config matrix (2026-11-08)
+
+The R15 slices disagreed on the baseline (32.2-32.9, 29.0, 24.5 tok/s at "the
+same config") because the inline smoke config left `model.text_only = false`, so
+the 1.7 GiB f32 vision tower stayed resident and the auto cache planner saw
+only `free=2848 MiB` -> 1280 slots. With the tower skipped (`FERRUM_SMOKE_TEXT_ONLY=1`,
+new knob, mirroring `FERRUM_TEST_TEXT_ONLY`) the planner reaches the 2048-slot
+kernel ceiling. Captured smoke, `FERRUM_SMOKE_GRAPH=1`, `FERRUM_SMOKE_TOKENS=128`,
+`FERRUM_SMOKE_REPS=2`, `FERRUM_SMOKE_PREFILL=517`, one model load per cell,
+logs under `/tmp/opencode/r15_matrix/`.
+
+| cell | text_only | cache | [slots] line | VRAM after load | pp (tok/s) | tg samples (tok/s) |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 (legacy control) | 0 | auto | free=2848 MiB, resolved=1280 | 7612 MiB | 402.2, 404.8 | 23.4, 23.7 |
+| 2 (standing control) | 1 | auto | free=4544 MiB, resolved=2048 | 7228 MiB | 402.6, 405.0 | 30.3, 30.0 |
+| 3 | 1 | 2048 | n/a (explicit) | 7228 MiB | 402.6, 405.1 | 29.1, 28.8 |
+| 4 (expected fail) | 0 | 2048 | n/a (OOM during load) | n/a (process start 444 MiB) | n/a | n/a |
+
+Cell 4 fails as predicted: `Registry(OutOfDeviceMemory(... CUDA_ERROR_OUT_OF_MEMORY))`
+in the MoE bank allocation, confirming the tower is what costs the slots -- a
+text-only build fits 2048 slots, a non-text-only build does not. The generated
+ids are the same repeating sequence in cells 1-3, so the tower skip changes
+throughput, not output.
+
+Standing control for future same-binary A/Bs: **cell 2** (`FERRUM_SMOKE_TEXT_ONLY=1`,
+`FERRUM_SMOKE_CACHE=auto`): 2048 slots, 7228 MiB, tg 30.0-30.3 tok/s. It is the
+production-intended config (tower skipped) and sits at the kernel ceiling.
+
+Correction to the R15 close-out: its quoted "24.5-24.7 tok/s" was measured in
+cell 1 (text_only=0, auto, 1280 slots), which this matrix re-measures at
+**23.4-23.7 tok/s**; quote 23.4-23.7 for that cell going forward. The S8
+rejection numbers (fused 24.0/23.9 vs control 24.5/24.6/24.5/24.7) are
+untouched -- both arms ran in cell 1, so the -2.5% delta stands.
+
+### R15 S7 scoping: the shared expert reads 10x below the roofline (closed below)
 
 The new profile also prices the non-GDN blocks: `moe_shared` **3.1-3.9 ms**,
 `moe_router` **1.7-3.0 ms**, `moe_routed` 19-27 (copy ~7 + gemv 3.4 + lru 1.9 +
@@ -2195,9 +2229,9 @@ i.e. ~10x below the read roofline. The cause is the launch geometry:
 `nvfp4_dense_gemv` runs `grid = (m=1, N/BLOCK_N=32)`, so the shared gate_up
 is **32 single-warp programs** on 26 SMs and most of the card idles while each
 program walks the whole K serially. The head does not show this because its
-N is 248320 (thousands of programs). Next slice: a small-N variant (or a second
-AOT entry) with a narrow `BLOCK_N` (8/16) and/or split-K, so the shared expert
-reaches ~150-250 GB/s; target `moe_shared` 3.2 -> ~1 ms. The f32 router gate
+N is 248320 (thousands of programs). The small-N variant this scoping proposed
+was measured and closed in R15 S7 (the epilogue, not the GEMV, dominates). The
+f32 router gate
 (`[1,2048] x [2048,256]`, 80 MB/step at ~40 GB/s) is the same shape of problem
 and the follow-up.
 
@@ -2307,10 +2341,10 @@ S8 is the proof: 1.82 -> 0.38 ms eager for the fused norm, and -2.5% captured.
 **Rank a captured-step optimization only by a captured A/B.** Eager substeps
 remain useful for finding bytes (the roofline audit below), not for sizing wins.
 
-**Where the step actually stands** (auto cache, 7606 MiB, captured, 128-token
-greedy): 24.5-24.7 tok/s. The same binary at 32 tokens measures 33.1, and an
-explicit 2048-slot cache measured 29.0 earlier in the session, so quote the
-config with the number.
+**Where the step actually stands** (standing control = cell 2: `text_only=1`,
+auto cache, 2048 slots, 7228 MiB, captured, 128-token greedy): **30.0-30.3
+tok/s**. The legacy non-text-only cell 1 is 23.4-23.7, and a 32-token decode is
+33.1, so always quote the cell and the token count with the number.
 
 **Byte audit (why little is left).** The per-block costs are at or near their
 traffic floors: `gdn_qkvz` 2.9-3.5 ms for 378 MB of FP8 weights (~220 GB/s,
