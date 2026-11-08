@@ -132,9 +132,8 @@ fn time(engine: &Engine, request: generation::Request, arm: &str) -> usize {
 fn curve(prefill_overlap: bool, arm: &str) {
     let engine = load_engine(&config(prefill_overlap)).unwrap();
     let vision = engine
-        .vision()
-        .expect("the serving checkpoint carries a vision tower")
-        .clone();
+        .build_vision()
+        .expect("the serving checkpoint carries a vision tower");
     assert_eq!(vision.image_token_id(), 248056);
 
     let request = engine

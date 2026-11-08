@@ -19,9 +19,9 @@
 //! attention as two f32 `bmm`s around `softmax_last`, a f32 GELU composed
 //! from scalar/unary ops, and a f32 row gather for the merge groups.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
-use half::bf16;
 use serde_json::Value;
 
 use crate::infrastructure::cudarc::{Runtime, Tensor};
@@ -38,10 +38,6 @@ const GELU_C2: f32 = 0.044_715;
 
 fn io<T>(r: Result<T, crate::domain::expert_kernel::MoEError>) -> R<T> {
     r.map_err(|e| e.to_string())
-}
-
-fn need<T>(v: Option<T>, what: &str) -> R<T> {
-    v.ok_or_else(|| format!("missing {what}"))
 }
 
 fn upload_f32(rt: &Runtime, vals: &[f32], shape: &[usize]) -> R<Tensor> {
@@ -137,7 +133,7 @@ fn thost(a: &Tensor) -> R<Vec<f32>> {
 
 /// A loaded vision tower whose encode runs on the CUDA device.
 pub struct Qwen3_6VisionCudarc {
-    tower: vision::VisionTower,
+    config: crate::models::qwen3_6::config::VisionConfig,
     rt: Runtime,
     image_token_id: u32,
     dev: DevWeights,
@@ -151,6 +147,9 @@ struct DevWeights {
     ones: Tensor,
     blocks: Vec<BlockW>,
     merger: MergerW,
+    // Base position embedding table, widened to f32, for per-image grid
+    // interpolation at encode time.
+    pos_embed: Vec<f32>,
 }
 
 struct BlockW {
@@ -181,7 +180,7 @@ impl crate::domain::model::VisionTower for Qwen3_6VisionCudarc {
     fn encode(&self, image_bytes: &[u8]) -> R<crate::domain::model::EncodedImage> {
         // Identical host preprocessing to the host tower's entry point.
         let (w, h, px) = image_prep::decode_rgb(image_bytes)?;
-        let cfg = &self.tower.config;
+        let cfg = &self.config;
         let (nw, nh) =
             vision::Qwen3_6Vision::vision_resize(w, h, cfg.patch_size, cfg.spatial_merge_size, 224);
         let shrunk = image_prep::resize_rgb(&px, w, h, nw, nh);
@@ -252,7 +251,7 @@ impl Qwen3_6VisionCudarc {
     fn probe_x1(&self, pixels: &[f32], h: usize, w: usize) -> R<Vec<f32>> {
         let x = self.patch_pos(pixels, h, w)?;
         let bl = &self.dev.blocks[0];
-        thost(&self.block(&x, bl, self.tower.config.num_heads)?)
+        thost(&self.block(&x, bl, self.config.num_heads)?)
     }
 
     fn probe_ln0(&self, pixels: &[f32], h: usize, w: usize) -> R<Vec<f32>> {
@@ -295,7 +294,7 @@ impl Qwen3_6VisionCudarc {
         let x = self.patch_pos(pixels, h, w)?;
         let bl = &self.dev.blocks[0];
         let dim = x.shape()[1];
-        let heads = self.tower.config.num_heads;
+        let heads = self.config.num_heads;
         let hd = dim / heads;
         let seq = x.shape()[0];
         let a = layer_norm(&x, &bl.ln1_g, &bl.ln1_b, &self.dev.ones)?;
@@ -310,7 +309,7 @@ impl Qwen3_6VisionCudarc {
     /// The state after `n` ViT blocks.
     fn probe_xn(&self, pixels: &[f32], h: usize, w: usize, n: usize) -> R<Vec<f32>> {
         let mut x = self.patch_pos(pixels, h, w)?;
-        let heads = self.tower.config.num_heads;
+        let heads = self.config.num_heads;
         for bl in self.dev.blocks.iter().take(n) {
             x = self.block(&x, bl, heads)?;
         }
@@ -320,7 +319,7 @@ impl Qwen3_6VisionCudarc {
     fn probe_ctx0(&self, pixels: &[f32], h: usize, w: usize) -> R<Vec<f32>> {
         let x = self.patch_pos(pixels, h, w)?;
         let bl = &self.dev.blocks[0];
-        let heads = self.tower.config.num_heads;
+        let heads = self.config.num_heads;
         let dim = x.shape()[1];
         let hd = dim / heads;
         let seq = x.shape()[0];
@@ -353,7 +352,7 @@ impl Qwen3_6VisionCudarc {
     /// Host preprocessing plus the device patch-embed and pos embed: the per
     /// patch features as a f32 `[seq, hidden]` token matrix.
     fn patch_pos(&self, pixels: &[f32], h: usize, w: usize) -> R<Tensor> {
-        let cfg = &self.tower.config;
+        let cfg = &self.config;
         if !cfg.deepstack_visual_indexes.is_empty() {
             return Err("deepstack visual indexes are not supported".into());
         }
@@ -395,10 +394,7 @@ impl Qwen3_6VisionCudarc {
                 cfg.num_position_embeddings
             )
         })?;
-        let pos = need(
-            vision::tensor_f32(&self.tower.weights, "visual.pos_embed.weight"),
-            "visual.pos_embed.weight",
-        )?;
+        let pos = self.dev.pos_embed.clone();
         if pos.len() != cfg.num_position_embeddings * hidden {
             return Err("pos_embed weight does not match the vision config".into());
         }
@@ -415,7 +411,7 @@ impl Qwen3_6VisionCudarc {
     /// the ViT blocks, then the merger. Shapes and validation mirror
     /// `vision::encode`.
     fn encode_pixels(&self, pixels: &[f32], h: usize, w: usize) -> R<Vec<Vec<f32>>> {
-        let cfg = &self.tower.config;
+        let cfg = &self.config;
         let merge = cfg.spatial_merge_size;
         let hidden = cfg.hidden_size;
         let p = cfg.patch_size;
@@ -429,7 +425,7 @@ impl Qwen3_6VisionCudarc {
         }
 
         for bl in &self.dev.blocks {
-            x = self.block(&x, bl, self.tower.config.num_heads)?;
+            x = self.block(&x, bl, self.config.num_heads)?;
         }
 
         // Merger: per-token LayerNorm, merge^2 consecutive tokens concatenated,
@@ -543,13 +539,14 @@ fn layer_norm(x: &Tensor, g: &Tensor, b: &Tensor, ones: &Tensor) -> R<Tensor> {
 }
 
 /// Build the device vision tower when the checkpoint declares one and the
-/// cudarc runtime is open. The vision weights upload eagerly, so the auto
-/// expert-cache budget sees them resident on the GPU.
+/// cudarc runtime is open. The widened f32 weights are cached on the host on
+/// first use, so a repeat build pays only the H2D upload.
 pub fn build_device_vision(
     config_json: &Value,
     index: Arc<crate::infrastructure::ftw::FtwIndex>,
     reader: Arc<dyn crate::domain::weights::WeightsReader>,
     rt: Runtime,
+    cache_key: &str,
 ) -> R<Option<Arc<dyn crate::domain::model::VisionTower>>> {
     let Some(vc) = config_json.get("vision_config") else {
         return Ok(None);
@@ -560,82 +557,135 @@ pub fn build_device_vision(
         .and_then(|v| u32::try_from(v).ok())
         .ok_or_else(|| "vision_config present but image_token_id is not a u32".to_string())?;
     let vcfg = parse_vision_config(vc).map_err(|e| e.to_string())?;
-    let weights = crate::models::qwen3_6::weights::VisionWeights::load(&index, reader.as_ref())
-        .map_err(|e| e.to_string())?;
-    let tower = vision::VisionTower::new(vcfg, weights);
-    if !tower.config.deepstack_visual_indexes.is_empty() {
+    if !vcfg.deepstack_visual_indexes.is_empty() {
         return Err("deepstack visual indexes are not supported".into());
     }
-    let cfg = &tower.config;
+    let cfg = &vcfg;
     let hidden = cfg.hidden_size;
     let in_dim = hidden * cfg.spatial_merge_size * cfg.spatial_merge_size;
     let time_dim = cfg.in_channels * cfg.temporal_patch_size * cfg.patch_size * cfg.patch_size;
 
-    let raw = |name: &str| -> R<&[u8]> { need(tower.weights.bytes(name), name) };
+    // Host-side cache of the widened f32 weights: load + widen once per process.
+    let host = host_vision_weights(index.clone(), reader.clone(), cache_key)?;
 
-    let proj_w = f32_mat(
+    let proj_w = f32_cached(
         &rt,
-        raw("visual.patch_embed.proj.weight")?,
+        &host,
+        "visual.patch_embed.proj.weight",
         hidden,
         time_dim,
     )?;
-    let proj_b = f32_row(&rt, raw("visual.patch_embed.proj.bias")?, hidden)?;
+    let proj_b = f32_cached_row(&rt, &host, "visual.patch_embed.proj.bias", hidden)?;
     let ones = upload_f32(&rt, &vec![1.0f32; hidden], &[hidden, 1])?;
 
     let mut blocks = Vec::with_capacity(cfg.depth);
     for li in 0..cfg.depth {
         let pfx = format!("visual.blocks.{li}");
-        let t = |name: &str| -> R<&[u8]> { raw(&format!("{pfx}.{name}")) };
         blocks.push(BlockW {
-            qkv_w: f32_mat(&rt, t("attn.qkv.weight")?, 3 * hidden, hidden)?,
-            qkv_b: f32_row(&rt, t("attn.qkv.bias")?, 3 * hidden)?,
-            proj_w: f32_mat(&rt, t("attn.proj.weight")?, hidden, hidden)?,
-            proj_b: f32_row(&rt, t("attn.proj.bias")?, hidden)?,
-            fc1_w: f32_mat(
+            qkv_w: f32_cached(
                 &rt,
-                t("mlp.linear_fc1.weight")?,
+                &host,
+                &format!("{pfx}.attn.qkv.weight"),
+                3 * hidden,
+                hidden,
+            )?,
+            qkv_b: f32_cached_row(&rt, &host, &format!("{pfx}.attn.qkv.bias"), 3 * hidden)?,
+            proj_w: f32_cached(
+                &rt,
+                &host,
+                &format!("{pfx}.attn.proj.weight"),
+                hidden,
+                hidden,
+            )?,
+            proj_b: f32_cached_row(&rt, &host, &format!("{pfx}.attn.proj.bias"), hidden)?,
+            fc1_w: f32_cached(
+                &rt,
+                &host,
+                &format!("{pfx}.mlp.linear_fc1.weight"),
                 cfg.intermediate_size,
                 hidden,
             )?,
-            fc1_b: f32_row(&rt, t("mlp.linear_fc1.bias")?, cfg.intermediate_size)?,
-            fc2_w: f32_mat(
+            fc1_b: f32_cached_row(
                 &rt,
-                t("mlp.linear_fc2.weight")?,
+                &host,
+                &format!("{pfx}.mlp.linear_fc1.bias"),
+                cfg.intermediate_size,
+            )?,
+            fc2_w: f32_cached(
+                &rt,
+                &host,
+                &format!("{pfx}.mlp.linear_fc2.weight"),
                 hidden,
                 cfg.intermediate_size,
             )?,
-            fc2_b: f32_row(&rt, t("mlp.linear_fc2.bias")?, hidden)?,
-            ln1_g: f32_row(&rt, t("norm1.weight")?, hidden)?,
-            ln1_b: f32_row(&rt, t("norm1.bias")?, hidden)?,
-            ln2_g: f32_row(&rt, t("norm2.weight")?, hidden)?,
-            ln2_b: f32_row(&rt, t("norm2.bias")?, hidden)?,
+            fc2_b: f32_cached_row(&rt, &host, &format!("{pfx}.mlp.linear_fc2.bias"), hidden)?,
+            ln1_g: f32_cached_row(&rt, &host, &format!("{pfx}.norm1.weight"), hidden)?,
+            ln1_b: f32_cached_row(&rt, &host, &format!("{pfx}.norm1.bias"), hidden)?,
+            ln2_g: f32_cached_row(&rt, &host, &format!("{pfx}.norm2.weight"), hidden)?,
+            ln2_b: f32_cached_row(&rt, &host, &format!("{pfx}.norm2.bias"), hidden)?,
         });
     }
 
-    let merger_w1 = raw("visual.merger.linear_fc1.weight")?;
+    let merger_w1 = host
+        .get("visual.merger.linear_fc1.weight")
+        .ok_or_else(|| "missing visual.merger.linear_fc1.weight".to_string())?;
     if merger_w1.len() % (2 * in_dim) != 0 {
         return Err("merger fc1 does not match the vision config".into());
     }
-    let mid = merger_w1.len() / (2 * in_dim);
-    let merger_w2 = raw("visual.merger.linear_fc2.weight")?;
-    if merger_w2.len() != 2 * cfg.out_hidden_size * mid {
+    let mid = merger_w1.len() / in_dim;
+    let merger_w2 = host
+        .get("visual.merger.linear_fc2.weight")
+        .ok_or_else(|| "missing visual.merger.linear_fc2.weight".to_string())?;
+    if merger_w2.len() != cfg.out_hidden_size * mid {
         return Err("merger fc2 does not match the vision config".into());
     }
+    let merger_b1 = host
+        .get("visual.merger.linear_fc1.bias")
+        .ok_or_else(|| "missing visual.merger.linear_fc1.bias".to_string())?;
+    if merger_b1.len() != mid {
+        return Err("merger fc1 bias does not match".into());
+    }
+    let merger_b2 = host
+        .get("visual.merger.linear_fc2.bias")
+        .ok_or_else(|| "missing visual.merger.linear_fc2.bias".to_string())?;
+    if merger_b2.len() != cfg.out_hidden_size {
+        return Err("merger fc2 bias does not match".into());
+    }
+    let merger_g = host
+        .get("visual.merger.norm.weight")
+        .ok_or_else(|| "missing visual.merger.norm.weight".to_string())?;
+    if merger_g.len() != hidden {
+        return Err("merger norm weight does not match".into());
+    }
+    let merger_b = host
+        .get("visual.merger.norm.bias")
+        .ok_or_else(|| "missing visual.merger.norm.bias".to_string())?;
+    if merger_b.len() != hidden {
+        return Err("merger norm bias does not match".into());
+    }
     let merger = MergerW {
-        w1: f32_mat(&rt, merger_w1, mid, in_dim)?,
-        b1: f32_row(&rt, raw("visual.merger.linear_fc1.bias")?, mid)?,
-        w2: f32_mat(&rt, merger_w2, cfg.out_hidden_size, mid)?,
-        b2: f32_row(
-            &rt,
-            raw("visual.merger.linear_fc2.bias")?,
-            cfg.out_hidden_size,
-        )?,
-        g: f32_row(&rt, raw("visual.merger.norm.weight")?, hidden)?,
-        b: f32_row(&rt, raw("visual.merger.norm.bias")?, hidden)?,
+        w1: upload_f32(&rt, merger_w1, &[mid, in_dim])?,
+        b1: upload_f32(&rt, merger_b1, &[mid])?,
+        w2: upload_f32(&rt, merger_w2, &[cfg.out_hidden_size, mid])?,
+        b2: upload_f32(&rt, merger_b2, &[cfg.out_hidden_size])?,
+        g: upload_f32(&rt, merger_g, &[hidden])?,
+        b: upload_f32(&rt, merger_b, &[hidden])?,
     };
 
+    let pos_embed = host
+        .get("visual.pos_embed.weight")
+        .ok_or_else(|| "missing visual.pos_embed.weight".to_string())?
+        .to_vec();
+    let expected_pos = cfg.num_position_embeddings * hidden;
+    if pos_embed.len() != expected_pos {
+        return Err(format!(
+            "pos_embed weight does not match the vision config: expected {expected_pos}, got {}",
+            pos_embed.len()
+        ));
+    }
+
     Ok(Some(Arc::new(Qwen3_6VisionCudarc {
-        tower,
+        config: vcfg,
         rt,
         image_token_id: id,
         dev: DevWeights {
@@ -644,41 +694,84 @@ pub fn build_device_vision(
             ones,
             blocks,
             merger,
+            pos_embed,
         },
     })))
 }
 
-/// A raw bf16 checkpoint tensor as a device bf16 `[rows, cols]`.
-fn f32_mat(rt: &Runtime, val: &[u8], rows: usize, cols: usize) -> R<Tensor> {
-    let want = rows * cols;
-    if val.len() != want * 2 {
-        return Err(format!(
-            "expected {want} bf16 values for a {rows}x{cols} tensor, got {} bytes",
-            val.len()
-        ));
-    }
-    let vals: Vec<f32> = val
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|c| bf16::from_le_bytes(*c).to_f32())
-        .collect();
-    upload_f32(rt, &vals, &[rows, cols])
+/// Host-side cache of the widened f32 vision weights.
+struct HostVisionWeights {
+    map: HashMap<String, Vec<f32>>,
 }
 
-/// A raw bf16 checkpoint vector as a device f32 `[/cols]` vector.
-fn f32_row(rt: &Runtime, val: &[u8], cols: usize) -> R<Tensor> {
-    if val.len() != cols * 2 {
+impl HostVisionWeights {
+    fn get(&self, name: &str) -> Option<&[f32]> {
+        self.map.get(name).map(|v| v.as_slice())
+    }
+}
+
+type CachedHostVision = Option<(String, Arc<HostVisionWeights>)>;
+
+static HOST_VISION_WEIGHTS: OnceLock<Mutex<CachedHostVision>> = OnceLock::new();
+
+fn host_vision_weights(
+    index: Arc<crate::infrastructure::ftw::FtwIndex>,
+    reader: Arc<dyn crate::domain::weights::WeightsReader>,
+    cache_key: &str,
+) -> R<Arc<HostVisionWeights>> {
+    let mutex = HOST_VISION_WEIGHTS.get_or_init(|| Mutex::new(None));
+    let mut guard = mutex.lock().map_err(|e| e.to_string())?;
+    if let Some((key, cached)) = &*guard
+        && key == cache_key
+    {
+        return Ok(cached.clone());
+    }
+    let vw = crate::models::qwen3_6::weights::VisionWeights::load(&index, reader.as_ref())
+        .map_err(|e| e.to_string())?;
+    let mut map = HashMap::new();
+    for name in vw.names() {
+        let bytes = vw.bytes(&name).ok_or_else(|| format!("missing {name}"))?;
+        if bytes.len() % 2 != 0 {
+            return Err(format!("odd byte length for {name}"));
+        }
+        let vals: Vec<f32> = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| half::bf16::from_le_bytes(*c).to_f32())
+            .collect();
+        map.insert(name, vals);
+    }
+    let cached = Arc::new(HostVisionWeights { map });
+    *guard = Some((cache_key.to_string(), cached.clone()));
+    Ok(cached)
+}
+
+fn f32_cached(
+    rt: &Runtime,
+    host: &HostVisionWeights,
+    name: &str,
+    rows: usize,
+    cols: usize,
+) -> R<Tensor> {
+    let vals = host.get(name).ok_or_else(|| format!("missing {name}"))?;
+    if vals.len() != rows * cols {
         return Err(format!(
-            "expected {cols} bf16 values for a {cols}-wide vector, got {} bytes",
-            val.len()
+            "expected {} f32 values for {name} ({rows}x{cols}), got {}",
+            rows * cols,
+            vals.len()
         ));
     }
-    let vals: Vec<f32> = val
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|c| bf16::from_le_bytes(*c).to_f32())
-        .collect();
-    upload_f32(rt, &vals, &[cols])
+    upload_f32(rt, vals, &[rows, cols])
+}
+
+fn f32_cached_row(rt: &Runtime, host: &HostVisionWeights, name: &str, cols: usize) -> R<Tensor> {
+    let vals = host.get(name).ok_or_else(|| format!("missing {name}"))?;
+    if vals.len() != cols {
+        return Err(format!(
+            "expected {cols} f32 values for {name}, got {}",
+            vals.len()
+        ));
+    }
+    upload_f32(rt, vals, &[cols])
 }

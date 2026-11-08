@@ -43,6 +43,18 @@ fn config(max_output_tokens: u32) -> Config {
     .unwrap()
 }
 
+fn config_auto(max_output_tokens: u32) -> Config {
+    let dir = common::ftw_dir();
+    format!(
+        "[model]\npath = \"{dir}\"\nmax_seq_len = 4096\nmax_output_tokens = {max_output_tokens}\n\
+         max_prefill_length = 1024\nmax_running_requests = 1\ntext_only = false\n\n\
+         [kernel]\ntriton = true\n\n\
+         [kv]\nnum_tokens = 4096\ndtype = \"bf16\"\n\n[moe]\ncache_size_slots = \"auto\"\n"
+    )
+    .parse()
+    .unwrap()
+}
+
 fn greedy(max_tokens: u32) -> SamplingParams {
     SamplingParams {
         temperature: 0.0,
@@ -74,9 +86,8 @@ fn red_disk_png() -> Vec<u8> {
 fn an_image_request_answers_from_the_vision_tower() {
     let engine = load_engine(&config(32)).unwrap();
     let vision = engine
-        .vision()
-        .expect("the serving checkpoint carries a vision tower")
-        .clone();
+        .build_vision()
+        .expect("the serving checkpoint carries a vision tower");
     assert_eq!(
         vision.image_token_id(),
         248056,
@@ -124,5 +135,54 @@ fn an_image_request_answers_from_the_vision_tower() {
             .any(|w| answer.contains(w)),
         "the description should mention the picture ({:?})",
         answer
+    );
+}
+
+#[test]
+#[ignore = "requires converted checkpoint in .model-cache"]
+#[serial]
+fn residency_contract_no_tower_between_requests() {
+    let engine = load_engine(&config_auto(8)).unwrap();
+    // The tower is never resident, even with text_only = false.
+    assert!(engine.vision().is_none(), "no resident tower after load");
+    assert_eq!(
+        engine.cache_size_slots(),
+        2048,
+        "auto cache reaches the 2048-slot ceiling without the tower loaded"
+    );
+
+    // A text request leaves no tower resident.
+    let ids = engine.encode("The capital of France is").unwrap();
+    let req = generation::make_request(&engine, 1, ids, greedy(4), 0).unwrap();
+    let g = generation::generate(&engine, req).unwrap();
+    assert!(!g.text.trim().is_empty());
+    assert!(
+        engine.vision().is_none(),
+        "no resident tower after a text request"
+    );
+
+    // An image request still succeeds and leaves no tower resident afterwards.
+
+    let marker: &str = "<|vision_start|><|image_pad|><|vision_end|>";
+
+    let conversation = [
+        ChatMessage::new("system", "be brief"),
+        ChatMessage::new("user", &format!("{marker}\ndescribe this image")),
+    ];
+    let prompt = engine.render_chat(&conversation, &[]).unwrap();
+    let ids = engine.encode(&prompt).unwrap();
+    let pads = ids.iter().filter(|&&i| i == 248056).count();
+    assert_eq!(pads, 1, "the template would render exactly one image run");
+
+    engine.release_moe().unwrap();
+    let request = engine
+        .make_request_with_images(2, ids, vec![red_disk_png()], greedy(8), 0)
+        .unwrap();
+    engine.rehydrate_moe().unwrap();
+    let g = generation::generate(&engine, request).unwrap();
+    assert!(!g.text.trim().is_empty(), "the image request must answer");
+    assert!(
+        engine.vision().is_none(),
+        "no resident tower after an image request"
     );
 }

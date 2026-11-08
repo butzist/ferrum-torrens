@@ -2094,7 +2094,14 @@ mod tests {
 
         let (model, _rec) = FakeModel::new();
         let engine = Engine::with_residency(
-            Residency::new(Arc::new(model), None, None, None, None),
+            Residency::new(
+                Arc::new(model),
+                crate::application::engine::VisionSource::Absent,
+                None,
+                None,
+                None,
+                0,
+            ),
             Some(Arc::new(|| {
                 Err(RebuildError::OutOfDeviceMemory(
                     "cuda: out of memory".into(),

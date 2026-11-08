@@ -2,6 +2,7 @@
 // `Model` implementation. There is no arch label in the FTW index meta, so the
 // FTW dir's copied config.json is the dispatch key (TODO.md section 3).
 
+use crate::application::engine::VisionSource;
 use crate::domain::decode::CapturedDecode;
 use crate::domain::kvcache::CachedModel;
 use crate::domain::model::Model;
@@ -60,9 +61,10 @@ pub struct BuiltModel {
     pub moe: Option<Arc<dyn crate::domain::expert_kernel::MoEExecutor>>,
     /// The resolved expert-cache slot count (explicit or auto-sized, item 12).
     pub cache_size_slots: usize,
-    /// The arch's vision tower, when the checkpoint declares a `vision_config`,
-    /// loaded for multimodal requests. `None` for a text-only checkpoint.
-    pub vision: Option<Arc<dyn crate::domain::model::VisionTower>>,
+    /// Where the arch's vision tower comes from for this build: `Absent` when
+    /// the checkpoint has no `vision_config`, `Refused` when `model.text_only`
+    /// is set, `OnDemand` (device path) when images are supported.
+    pub vision: VisionSource,
 }
 
 /// The arch label from `config.json` `architectures[0]`, used to dispatch.
@@ -129,22 +131,33 @@ pub fn build(
                 let driver = rt.driver().clone();
                 let head_gemv = head_port(device, stream)?;
                 let fp8_linear = fp8_port(device, stream)?;
-                // The vision tower uploads its bf16 weights eagerly, before
-                // the auto expert-cache budget reads the free VRAM, so the
-                // budget sees it resident just like the dense tower.
+                // The vision tower is never resident on the device between
+                // requests: a text-only deployment refuses image input, a
+                // checkpoint without a `vision_config` has no tower, and an
+                // image-capable deployment builds it on demand from the
+                // captured runtime. The factory captures the *current* runtime
+                // so it keeps working after an idle release + rebuild.
                 let vision = if config.model.text_only {
-                    // A text-only deployment spends the ~1.7 GiB the f32
-                    // vision tower would hold on expert-cache slots instead.
-                    // An image request then fails at admission, not at encode.
-                    None
+                    VisionSource::Refused
+                } else if config_json.get("vision_config").is_some() {
+                    let cj = config_json.clone();
+                    let idx = index.clone();
+                    let rdr = reader.clone();
+                    let rt2 = rt.clone();
+                    let cache_key = config.model.path.clone();
+                    VisionSource::OnDemand(Arc::new(move || {
+                        crate::models::qwen3_6::vision_cudarc::build_device_vision(
+                            &cj,
+                            idx.clone(),
+                            rdr.clone(),
+                            rt2.clone(),
+                            &cache_key,
+                        )
+                        .map(|tower| tower.expect("vision_config is present"))
+                        .map_err(crate::application::engine::RebuildError::Failed)
+                    }))
                 } else {
-                    crate::models::qwen3_6::vision_cudarc::build_device_vision(
-                        config_json,
-                        index.clone(),
-                        reader.clone(),
-                        rt.clone(),
-                    )
-                    .map_err(RegistryError::build)?
+                    VisionSource::Absent
                 };
                 // Load the tower with the MoE port detached: the auto cache
                 // budget (item 12) reads the free VRAM after the tower, the KV
@@ -288,9 +301,15 @@ fn scalar_built(
             .explicit()
             .unwrap_or(crate::config::DEFAULT_CACHE_SIZE_SLOTS),
         vision: if config.model.text_only {
-            None
+            VisionSource::Refused
         } else {
-            load_vision(config_json, index, reader)?
+            match load_vision(config_json, index, reader)? {
+                Some(tower) => {
+                    let t = tower.clone();
+                    VisionSource::OnDemand(Arc::new(move || Ok(t.clone())))
+                }
+                None => VisionSource::Absent,
+            }
         },
     })
 }

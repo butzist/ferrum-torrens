@@ -368,11 +368,25 @@ mod tests {
                     ));
                 }
                 let (model, _) = FakeModel::new();
-                Ok(Residency::new(Arc::new(model), None, None, None, None))
+                Ok(Residency::new(
+                    Arc::new(model),
+                    crate::application::engine::VisionSource::Absent,
+                    None,
+                    None,
+                    None,
+                    0,
+                ))
             })
         };
         let engine = Arc::new(Engine::with_residency(
-            Residency::new(Arc::new(model), None, None, None, None),
+            Residency::new(
+                Arc::new(model),
+                crate::application::engine::VisionSource::Absent,
+                None,
+                None,
+                None,
+                0,
+            ),
             Some(rebuild),
             Arc::new(FakeTokenizer),
             vec![FAKE_EOS],

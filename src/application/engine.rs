@@ -187,56 +187,6 @@ pub struct CachedStep<'a> {
     pub images: Option<&'a RequestImages>,
 }
 
-/// Everything the engine needs on the device, as one droppable unit.
-///
-/// `captured` is first on purpose: a decode graph bakes the model's weight, KV
-/// pool and expert-bank addresses into its nodes, so it has to drop before any
-/// of the allocations it replays over. Dropping the whole residency is how the
-/// server gives the GPU back after an idle timeout; `Engine::rebuild` puts it
-/// back on the next request.
-pub struct Residency {
-    captured: std::sync::Mutex<Option<Arc<dyn CapturedDecode>>>,
-    /// Rebuilds `captured` after a MoE release dropped it. `None` when the
-    /// engine was built without capture.
-    recapture: Option<crate::domain::decode::Recapture>,
-    model: Arc<dyn CachedModel>,
-    cache: Option<Arc<dyn KvCache>>,
-    vision: Option<Arc<dyn crate::domain::model::VisionTower>>,
-    /// The routed-expert executor, when the composition root attached one. The
-    /// engine keeps its own handle so it can free the expert banks without
-    /// naming the arch's concrete model.
-    moe: Option<Arc<dyn crate::domain::expert_kernel::MoEExecutor>>,
-}
-
-impl Residency {
-    /// A residency over an already-built model. `cache` comes from the model so
-    /// the engine and the forward read the same pool.
-    pub fn new(
-        model: Arc<dyn CachedModel>,
-        vision: Option<Arc<dyn crate::domain::model::VisionTower>>,
-        moe: Option<Arc<dyn crate::domain::expert_kernel::MoEExecutor>>,
-        captured: Option<Arc<dyn CapturedDecode>>,
-        recapture: Option<crate::domain::decode::Recapture>,
-    ) -> Self {
-        let cache = model.cache();
-        Self {
-            captured: std::sync::Mutex::new(captured),
-            recapture,
-            model,
-            cache,
-            vision,
-            moe,
-        }
-    }
-}
-
-/// How long a client is told to wait after a rebuild found the GPU full. Short
-/// enough that a transient holder (a short-lived trainer, a desktop compositor
-/// spike) clears, long enough that a retry storm does not re-run the rebuild
-/// upload on every request. The condition is a foreign process's, so there is
-/// no per-request estimate like the busy path's.
-pub const OUT_OF_MEMORY_RETRY_AFTER_MS: u64 = 5_000;
-
 /// Why a residency rebuild failed. The engine maps the memory case onto a
 /// retryable `EngineError` instead of flattening it into a string, so an idle
 /// release that cannot find VRAM answers 503 rather than 4xx/5xx-fault.
@@ -256,6 +206,78 @@ impl std::fmt::Display for RebuildError {
         }
     }
 }
+
+/// Where the arch's vision tower comes from for this residency. It is never
+/// resident on the device between requests: `Absent` means the checkpoint has
+/// no `vision_config`; `Refused` means `model.text_only` is set; `OnDemand`
+/// builds it from the captured runtime on first use and lets it drop at the
+/// end of the encode.
+#[derive(Clone)]
+pub enum VisionSource {
+    Absent,
+    Refused,
+    OnDemand(
+        Arc<
+            dyn Fn() -> Result<Arc<dyn crate::domain::model::VisionTower>, RebuildError>
+                + Send
+                + Sync,
+        >,
+    ),
+}
+
+/// Everything the engine needs on the device, as one droppable unit.
+///
+/// `captured` is first on purpose: a decode graph bakes the model's weight, KV
+/// pool and expert-bank addresses into its nodes, so it has to drop before any
+/// of the allocations it replays over. Dropping the whole residency is how the
+/// server gives the GPU back after an idle timeout; `Engine::rebuild` puts it
+/// back on the next request.
+pub struct Residency {
+    captured: std::sync::Mutex<Option<Arc<dyn CapturedDecode>>>,
+    /// Rebuilds `captured` after a MoE release dropped it. `None` when the
+    /// engine was built without capture.
+    recapture: Option<crate::domain::decode::Recapture>,
+    model: Arc<dyn CachedModel>,
+    cache: Option<Arc<dyn KvCache>>,
+    vision: VisionSource,
+    /// The resolved expert-cache slot count for this residency.
+    cache_size_slots: usize,
+    /// The routed-expert executor, when the composition root attached one. The
+    /// engine keeps its own handle so it can free the expert banks without
+    /// naming the arch's concrete model.
+    moe: Option<Arc<dyn crate::domain::expert_kernel::MoEExecutor>>,
+}
+
+impl Residency {
+    /// A residency over an already-built model. `cache` comes from the model so
+    /// the engine and the forward read the same pool.
+    pub fn new(
+        model: Arc<dyn CachedModel>,
+        vision: VisionSource,
+        moe: Option<Arc<dyn crate::domain::expert_kernel::MoEExecutor>>,
+        captured: Option<Arc<dyn CapturedDecode>>,
+        recapture: Option<crate::domain::decode::Recapture>,
+        cache_size_slots: usize,
+    ) -> Self {
+        let cache = model.cache();
+        Self {
+            captured: std::sync::Mutex::new(captured),
+            recapture,
+            model,
+            cache,
+            vision,
+            cache_size_slots,
+            moe,
+        }
+    }
+}
+
+/// How long a client is told to wait after a rebuild found the GPU full. Short
+/// enough that a transient holder (a short-lived trainer, a desktop compositor
+/// spike) clears, long enough that a retry storm does not re-run the rebuild
+/// upload on every request. The condition is a foreign process's, so there is
+/// no per-request estimate like the busy path's.
+pub const OUT_OF_MEMORY_RETRY_AFTER_MS: u64 = 5_000;
 
 pub struct Engine {
     /// The device model, or `None` after an idle release. `residency()` rebuilds
@@ -619,6 +641,7 @@ pub fn load_engine(config: &crate::config::Config) -> Result<Engine, LoadError> 
                 built.moe,
                 built.captured,
                 built.recapture,
+                built.cache_size_slots,
             ))
         })
     };
@@ -628,6 +651,7 @@ pub fn load_engine(config: &crate::config::Config) -> Result<Engine, LoadError> 
         built.moe,
         built.captured,
         built.recapture,
+        built.cache_size_slots,
     );
     Ok(Engine::with_residency(
         residency,
@@ -665,7 +689,7 @@ impl Engine {
         device: Device,
         captured: Option<Arc<dyn CapturedDecode>>,
     ) -> Self {
-        let residency = Residency::new(model, None, None, captured, None);
+        let residency = Residency::new(model, VisionSource::Absent, None, captured, None, 0);
         Self::with_residency(residency, None, tokenizer, eos_ids, limits, device)
     }
 
@@ -702,7 +726,9 @@ impl Engine {
     /// a builder step so the capture-free constructor signature stays put.
     pub fn with_vision(mut self, vision: Arc<dyn crate::domain::model::VisionTower>) -> Self {
         if let Some(res) = self.residency.get_mut().ok().and_then(Option::as_mut) {
-            Arc::get_mut(res).expect("one residency at build").vision = Some(vision);
+            let v = vision.clone();
+            Arc::get_mut(res).expect("one residency at build").vision =
+                VisionSource::OnDemand(Arc::new(move || Ok(v.clone())));
         }
         self
     }
@@ -834,9 +860,39 @@ impl Engine {
             .unwrap_or(true)
     }
 
-    /// The vision tower port, when the engine's checkpoint declares one.
+    /// No vision tower is resident between requests: it is built on demand by
+    /// `build_vision` and dropped again before the MoE cache is rehydrated.
+    /// Kept as `None`-returning so callers can observe non-residency.
     pub fn vision(&self) -> Option<Arc<dyn crate::domain::model::VisionTower>> {
-        self.peek().and_then(|res| res.vision.clone())
+        None
+    }
+
+    /// The resolved expert-cache slot count of the resident model (0 when the
+    /// device model is not resident).
+    pub fn cache_size_slots(&self) -> usize {
+        self.peek().map(|r| r.cache_size_slots).unwrap_or(0)
+    }
+
+    /// Build the arch's vision tower on demand from the residency's factory.
+    /// Returns an error when the checkpoint has no `vision_config` or when
+    /// `model.text_only` refuses image input.
+    pub fn build_vision(&self) -> Result<Arc<dyn crate::domain::model::VisionTower>, EngineError> {
+        let res = self.residency()?;
+        match &res.vision {
+            VisionSource::OnDemand(factory) => factory().map_err(|e| match e {
+                RebuildError::OutOfDeviceMemory(detail) => EngineError::OutOfDeviceMemory {
+                    retry_after_ms: OUT_OF_MEMORY_RETRY_AFTER_MS,
+                    detail,
+                },
+                RebuildError::Failed(m) => EngineError::Rebuild(m),
+            }),
+            VisionSource::Refused => Err(EngineError::Vision(
+                "image input is refused for this text-only deployment".into(),
+            )),
+            VisionSource::Absent => Err(EngineError::Vision(
+                "this checkpoint has no vision tower".into(),
+            )),
+        }
     }
 
     /// The engine's captured decode service, when it has one. The generation
@@ -969,10 +1025,25 @@ impl Engine {
         seed: u64,
     ) -> Result<crate::application::generation::Request, EngineError> {
         let res = self.residency()?;
-        let vision = res
-            .vision
-            .as_ref()
-            .ok_or_else(|| EngineError::Vision("this checkpoint has no vision tower".into()))?;
+        let vision = match &res.vision {
+            VisionSource::OnDemand(factory) => factory().map_err(|e| match e {
+                RebuildError::OutOfDeviceMemory(detail) => EngineError::OutOfDeviceMemory {
+                    retry_after_ms: OUT_OF_MEMORY_RETRY_AFTER_MS,
+                    detail,
+                },
+                RebuildError::Failed(m) => EngineError::Rebuild(m),
+            })?,
+            VisionSource::Refused => {
+                return Err(EngineError::Vision(
+                    "image input is refused for this text-only deployment".into(),
+                ));
+            }
+            VisionSource::Absent => {
+                return Err(EngineError::Vision(
+                    "this checkpoint has no vision tower".into(),
+                ));
+            }
+        };
         let pad = vision.image_token_id();
         let (ids, splice) =
             expand_image_pads(&prompt_ids, &images, pad, self.params.mrope, |bytes| {
@@ -2046,7 +2117,7 @@ mod tests {
     #[test]
     fn a_rebuild_without_gpu_memory_is_retryable_and_leaves_the_engine_cold() {
         let (model, _rec) = fake::FakeModel::new();
-        let residency = Residency::new(Arc::new(model), None, None, None, None);
+        let residency = Residency::new(Arc::new(model), VisionSource::Absent, None, None, None, 0);
         let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let room = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let rebuild: Arc<dyn Fn() -> Result<Residency, RebuildError> + Send + Sync> = {
@@ -2060,7 +2131,14 @@ mod tests {
                     ));
                 }
                 let (model, _) = fake::FakeModel::new();
-                Ok(Residency::new(Arc::new(model), None, None, None, None))
+                Ok(Residency::new(
+                    Arc::new(model),
+                    VisionSource::Absent,
+                    None,
+                    None,
+                    None,
+                    0,
+                ))
             })
         };
         let engine = Engine::with_residency(

@@ -778,7 +778,9 @@ Ordered slices, each its own gated change:
   FreeToken's own MTP is 1.06-1.07x at the *same* cache and 1.7x faster in
   absolute decode; ours is 0.62-0.70x (worse at 2048 slots: 0.44-0.53x).
   (a) **device memory: LANDED (R14c)** -- the embedding is pinned host memory
-  (+594 auto slots) and text-only skips the 1.7 GiB f32 vision tower (+512),
+  (+594 auto slots); the vision tower is no longer resident between requests
+  (built on demand per image pass), so the 2048-slot ceiling holds for every
+  deployment, and `text_only` is now a capability switch, not a load-time skip
   so auto reaches the 2048-slot kernel ceiling against FreeToken's 2012;
   plain 27.1 -> 32.9 tok/s. Still open in (a): keep the router gate in its
   checkpoint dtype (40 MiB) and share one slot pool between draft and target
@@ -1674,7 +1676,7 @@ default do not fit the 8 GiB device (item 6).
 ```
 max_seq_len = 65536            # floor; KV makes ~200k feasible if prompted
 kv_dtype = "bf16"              # [kv] dtype; half of f32, fits the 8 GB target
-text_only = false              # true skips the 1.7 GiB f32 vision tower (M9.8a)
+text_only = false              # true refuses image input (capability switch); the tower is never resident between requests
 embed_host = true              # implicit: the 970 MiB bf16 table is pinned host RAM
                                # (FT_EMBED_HOST=0 restores the device copy)
 moe_cache_size_slots = "auto"  # auto sizes from free VRAM (decisions 90, 127); or 256..2048

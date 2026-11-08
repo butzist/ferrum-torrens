@@ -320,7 +320,7 @@ fn the_device_tower_matches_the_host_tower() -> Result<(), Box<dyn std::error::E
 
     let rt = Runtime::open(0).expect("open the cudarc runtime");
     let timer = Instant::now();
-    let device = build_device_vision(&config_json, index.clone(), reader.clone(), rt)
+    let device = build_device_vision(&config_json, index.clone(), reader.clone(), rt, FTW_DIR)
         .expect("build the device vision tower")
         .expect("the checkpoint declares a vision tower");
     eprintln!(

@@ -2213,6 +2213,17 @@ Standing control for future same-binary A/Bs: **cell 2** (`FERRUM_SMOKE_TEXT_ONL
 `FERRUM_SMOKE_CACHE=auto`): 2048 slots, 7228 MiB, tg 30.0-30.3 tok/s. It is the
 production-intended config (tower skipped) and sits at the kernel ceiling.
 
+Correction (slice A, M9.8a follow-up): the vision tower is no longer resident on
+the device in an idle engine, even with `model.text_only = false`. It is built
+per image request inside the exclusive lease and dropped again before the MoE
+cache is rehydrated, so the auto cache planner now sees the tower-free budget
+(`free=4544 MiB -> resolved=2048`) for every deployment. `model.text_only` is
+now a capability switch ("this deployment refuses image input"), not a load-time
+tower skip: `text_only = true` makes an image request fail at admission, and
+`text_only = false` builds the tower on demand. The historical cell 1 (tower
+resident, 1280 slots) is no longer reachable on current code; new measurements
+should use cell 2's numbers without the `FERRUM_SMOKE_TEXT_ONLY` knob.
+
 Correction to the R15 close-out: its quoted "24.5-24.7 tok/s" was measured in
 cell 1 (text_only=0, auto, 1280 slots), which this matrix re-measures at
 **23.4-23.7 tok/s**; quote 23.4-23.7 for that cell going forward. The S8

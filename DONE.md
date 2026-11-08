@@ -5010,3 +5010,31 @@ subsection names are kept verbatim.
     the only path again. The substep labels are kept as diagnostics. A captured
     node-count reason is needed before re-landing. Logs:
     `/tmp/opencode/r15_s8/`, `/tmp/opencode/r15_s8_orch/ab.log`.
+
+156. **The vision tower is built on demand, never resident in an idle engine**
+    (slice A). `model.text_only` becomes a capability switch ("this deployment
+    refuses image input"), not "load the tower at boot": a checkpoint with no
+    `vision_config` still answers "this checkpoint has no vision tower", and
+    `text_only = true` refuses image input at admission. The device path no
+    longer calls `build_device_vision` or uploads the 1.7 GiB f32 tower at
+    load, so the auto cache planner sees the tower-free budget
+    (`free=4544 MiB -> resolved=2048`) for every deployment and the throughput
+    smoke reaches 2048 slots / ~29 tok/s without the `FERRUM_SMOKE_TEXT_ONLY`
+    knob. `Residency` now carries
+    `vision: VisionSource::{Absent, Refused, OnDemand(factory)}`; the factory
+    captures the current runtime and is recreated on every rebuild, so it keeps
+    working after an idle release + rebuild and after `release_cache`/
+    `rehydrate_cache`. `Engine::make_request_with_images` builds the tower from
+    the factory, runs `expand_image_pads`' encode, and lets it drop at the end of
+    the call; `chat.rs` already takes `release_moe()` before and
+    `rehydrate_moe()` after, so the drop ordering is guaranteed by scope. The
+    exclusive-lease contract and `EngineError::Busy` answers are unchanged, and
+    neither `release_moe`/`rehydrate_moe` nor the idle unload
+    (`release_residency` -> `release_banks`) was weakened or bypassed.
+    `Engine::vision()` now returns `None` (no resident tower); tests use the new
+    `Engine::build_vision()` on-demand builder. The widened f32 weights are
+    cached on the host on first use, so a first image request builds the tower
+    in ~1.49 s and a repeat in ~0.14 s (only the H2D upload). Host RSS cost is
+    ~1.7 GiB for the cached f32 weights. Partial MoE eviction is deliberately
+    not implemented here; the encode keeps the existing full `release_moe()`
+    borrow and is the planned follow-up (VMM-backed slot banks).
