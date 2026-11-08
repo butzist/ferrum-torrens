@@ -1193,6 +1193,7 @@ impl CudarcQwen3_6 {
         // each row's experts the way a one-row decode does: a batched GEMV over
         // k + 1 rows rounds differently, and on a checkpoint with high routing
         // entropy that flips an expert and the token with it (decision 151).
+        let s = substep_begin(&self.rt);
         let logits = if per_row_router && t > 1 {
             let gate = layer.gate.cast(TensorDType::F32)?;
             let mut rows = Vec::with_capacity(t);
@@ -1208,6 +1209,8 @@ impl CudarcQwen3_6 {
         };
         let probs = logits.softmax_last()?;
         let (ids, weights) = topk_renorm(&probs, p.top_k)?;
+        substep_end(&self.rt, "moe_router", s);
+        let s = substep_begin(&self.rt);
         let se_gate = x_post
             .cast(TensorDType::F32)?
             .matmul_nt_f32(&layer.shared_gate.cast(TensorDType::F32)?)?
@@ -1220,7 +1223,9 @@ impl CudarcQwen3_6 {
         let se = self
             .apply_dense(&layer.shared.down, &ic2)?
             .row_mul(&se_gate.reshape(&[t])?)?;
+        substep_end(&self.rt, "moe_shared", s);
 
+        let s = substep_begin(&self.rt);
         let routed = match port {
             Some(port) => {
                 let mut out = self.rt.zeros(&[t, p.hidden_size], TensorDType::Bf16)?;
@@ -1238,6 +1243,7 @@ impl CudarcQwen3_6 {
             }
             None => self.routed_inline(bank_layer, x_post, &ids, &weights)?,
         };
+        substep_end(&self.rt, "moe_routed", s);
         se.add(&routed)
     }
 
@@ -1789,7 +1795,9 @@ impl CudarcQwen3_6 {
         if ablated("head") {
             return Ok(vec![0.0; self.params.vocab_size]);
         }
-        self.lm_head_logits(&normed)
+        let logits = self.lm_head_logits(&normed)?;
+        substep_report(1);
+        Ok(logits)
     }
 
     /// One batched decode step with every input already staged on the device:
@@ -1854,6 +1862,8 @@ impl CudarcQwen3_6 {
         if ablated("head") {
             return Ok(());
         }
-        self.lm_head_into_device(&normed, bufs.logits())
+        self.lm_head_into_device(&normed, bufs.logits())?;
+        substep_report(t);
+        Ok(())
     }
 }
