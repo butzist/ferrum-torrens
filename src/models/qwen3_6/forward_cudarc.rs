@@ -918,9 +918,13 @@ impl CudarcQwen3_6 {
             };
             let s = substep_begin(&self.rt);
             let core_n = rms_norm_last(&core, norm, p.rms_norm_eps)?.reshape(&[t, value_dim])?;
-            let out = core_n.mul(&z.silu()?)?;
-            let out = self.apply_dense(o, &out);
-            substep_end(&self.rt, "gdn_tail", s);
+            substep_end(&self.rt, "gdn_tail_norm", s);
+            let s = substep_begin(&self.rt);
+            let gated = core_n.mul(&z.silu()?)?;
+            substep_end(&self.rt, "gdn_tail_gate", s);
+            let s = substep_begin(&self.rt);
+            let out = self.apply_dense(o, &gated);
+            substep_end(&self.rt, "gdn_tail_proj", s);
             return out;
         }
 
@@ -1011,9 +1015,13 @@ impl CudarcQwen3_6 {
         substep_end(&self.rt, "gdn_recur", s);
         let s = substep_begin(&self.rt);
         let core_n = rms_norm_last(&core, norm, p.rms_norm_eps)?.reshape(&[t, value_dim])?;
-        let out = core_n.mul(&z.silu()?)?;
-        let out = self.apply_dense(o, &out);
-        substep_end(&self.rt, "gdn_tail", s);
+        substep_end(&self.rt, "gdn_tail_norm", s);
+        let s = substep_begin(&self.rt);
+        let gated = core_n.mul(&z.silu()?)?;
+        substep_end(&self.rt, "gdn_tail_gate", s);
+        let s = substep_begin(&self.rt);
+        let out = self.apply_dense(o, &gated);
+        substep_end(&self.rt, "gdn_tail_proj", s);
         out
     }
 
@@ -1209,21 +1217,28 @@ impl CudarcQwen3_6 {
         };
         let probs = logits.softmax_last()?;
         let (ids, weights) = topk_renorm(&probs, p.top_k)?;
-        substep_end(&self.rt, "moe_router", s);
+        substep_end(&self.rt, "moe_gate", s);
         let s = substep_begin(&self.rt);
         let se_gate = x_post
             .cast(TensorDType::F32)?
             .matmul_nt_f32(&layer.shared_gate.cast(TensorDType::F32)?)?
             .sigmoid()?;
+        substep_end(&self.rt, "moe_shared_epi", s);
+        let s = substep_begin(&self.rt);
         let gate_up = self.apply_dense(&layer.shared.gate_up, x_post)?;
+        substep_end(&self.rt, "moe_shared_gemm", s);
+        let s = substep_begin(&self.rt);
         let si = p.shared_expert_intermediate_size;
         let gate_part = gate_up.narrow(1, 0, si)?.contiguous()?;
         let up_part = gate_up.narrow(1, si, si)?.contiguous()?;
         let ic2 = gate_part.silu()?.mul(&up_part)?;
-        let se = self
-            .apply_dense(&layer.shared.down, &ic2)?
-            .row_mul(&se_gate.reshape(&[t])?)?;
-        substep_end(&self.rt, "moe_shared", s);
+        substep_end(&self.rt, "moe_shared_epi", s);
+        let s = substep_begin(&self.rt);
+        let down_out = self.apply_dense(&layer.shared.down, &ic2)?;
+        substep_end(&self.rt, "moe_shared_gemm", s);
+        let s = substep_begin(&self.rt);
+        let se = down_out.row_mul(&se_gate.reshape(&[t])?)?;
+        substep_end(&self.rt, "moe_shared_epi", s);
 
         let s = substep_begin(&self.rt);
         let routed = match port {
