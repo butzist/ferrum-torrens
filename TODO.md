@@ -12,7 +12,9 @@ where FreeToken fits 2012. FreeToken plain is still 47.0 tok/s at the 40 W cap,
 so the remaining gap is inside MoE and the GDN layers, not the embedding
 (OPTIMIZATION.md R14b/R14c). The decode campaign continues in R15: S1 (read
 misses straight from the pinned host banks) was measured slower and reverted
-(decision 154); S2 (fuse the GDN block) is next. The draft head stays in the FTW
+(decision 154); S2 (fuse the GDN block) closed as no lever (R15.2); S7
+(shared-expert attribution) closed as no safe win (R15 S7); S8 (fused GDN tail)
+rejected at -2.5% captured (R15 S8). The draft head stays in the FTW
 (converter, NVFP4 experts), the verify answers every drafted row and returns its
 final-norm hidden, and the GDN state is committed for exactly the accepted rows
 with no kernel change and no state snapshot. `tests/cudarc_spec_verify.rs` proves
@@ -1338,10 +1340,19 @@ Standing: 32.2-32.9 tok/s captured at 2048 slots against FreeToken's 47.0 at
   compute, not launches: `gdn_recur` is 0.5 ms, `gdn_qkvz` is at the read
   roofline, and the only free item (a per-step `ba` weight cast) measured 0%.
   Do not re-open the recurrence tile, the conv fusion or the `ba` cast.
-- [ ] **R15 S7 small-N dense NVFP4 GEMV** (next): the shared expert reads ~63 MB
-  per step in 3.2 ms (~20 GB/s) because `nvfp4_dense_gemv` launches
-  `grid = (1, N/32)` = 32 single-warp programs; a narrow-N/split-K variant
-  targets 3.2 -> ~1 ms. The f32 router gate (80 MB/step at ~40 GB/s) is the
+- [x] **R15 S7 shared-expert attribution -- measured, no safe win (2026-11-08).**
+  New labels (`moe_gate`, `moe_shared_gemm`, `moe_shared_epi`, `moe_routed`)
+- [x] **R15 S8 fuse the GDN tail (gated RMSNorm) -- rejected (2026-11-08).**
+  `gdn_tail` split into `gdn_tail_norm` / `gdn_tail_gate` / `gdn_tail_proj`; the
+  norm+gate group was fused into `gdn_gated_norm` behind `FERRUM_GDN_FUSED_TAIL`,
+  correct and gate-green, but measured **-2.5%** captured tg at the production
+  cache (23.9 vs 24.6 tok/s). Reverted; split chain is the only path. Eager
+  substep deltas are not predictive of the captured step. See
+  `OPTIMIZATION.md` R15 S8, DONE.md 155.
+  split the shared expert into 1.6 ms GEMV vs 2.2 ms epilogue (58/42), so the
+  epilogue dominates, not the GEMV. A simple elementwise `silu_mul` fusion is
+  <1% and does not clear the 2% bar; no code change shipped. See
+  `OPTIMIZATION.md` R15 S7. The f32 router gate (80 MB/step at ~40 GB/s) is the
   same shape of problem and the follow-up.
 - [ ] **R15 S3 pin a pre-collected hot expert set** (`locked_fetch` /
   profile-sized pool; online LFU was measured and rejected). Target 2-4 ms.

@@ -4987,3 +4987,26 @@ subsection names are kept verbatim.
        hardlink trees and the logs) was removed. `FERRUM_FTW_DIR` now takes one
        of the store FTW paths above, and `scripts/fetch-hf-hash.sh` remains the
        way to refresh a hash.
+
+155. **The GDN tail gated-RMSNorm fusion was rejected; -2.5% captured tg**
+    (2026-11-08, R15 S8). `gdn_tail` was split into `gdn_tail_norm` /
+    `gdn_tail_gate` / `gdn_tail_proj`; the dominant norm chain (1.95 ms/token)
+    plus the gate (0.61) were fused into a `gdn_gated_norm` kernel (one program
+    per 128-wide value head, bf16 in/out, f32 variance, scale by the norm
+    weight, multiply by `silu(z)` in the same launch), registered through
+    `signatures.py` / `aot.py` / `kernel_abi.rs` and wired in
+    `forward_cudarc.rs` behind `FERRUM_GDN_FUSED_TAIL` (default on; `=0` control
+    arm). The kernel was correct and gate-green (oracle 11751 " Paris", captured
+    parity, refeed, graph capture), and the eager substep profile reported
+    `gdn_tail_norm` 1.82 -> 0.38 ms/step, which predicted a win. The
+    orchestrator re-measured at the production cache (`FERRUM_SMOKE_CACHE=auto`)
+    and found the fused tail is **-2.5%** captured (23.9 vs 24.6 tok/s; fused
+    24.0/23.9/23.9/23.9, control 24.5/24.6/24.5/24.7; VRAM 7606 vs 7612 MiB).
+    The eager substep profile with per-boundary syncs is not predictive of the
+    captured step: the fused kernel is a single-program-per-row kernel with only
+    32 CTAs at t=1 and 8 warps for 128 columns, and the captured graph already
+    hides the op-chain launches. The kernel and its wiring were reverted; the
+    split chain (`rms_norm_last` -> `z.silu()` -> `mul` -> `apply_dense(o)`) is
+    the only path again. The substep labels are kept as diagnostics. A captured
+    node-count reason is needed before re-landing. Logs:
+    `/tmp/opencode/r15_s8/`, `/tmp/opencode/r15_s8_orch/ab.log`.

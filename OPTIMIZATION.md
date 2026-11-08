@@ -2200,3 +2200,138 @@ AOT entry) with a narrow `BLOCK_N` (8/16) and/or split-K, so the shared expert
 reaches ~150-250 GB/s; target `moe_shared` 3.2 -> ~1 ms. The f32 router gate
 (`[1,2048] x [2048,256]`, 80 MB/step at ~40 GB/s) is the same shape of problem
 and the follow-up.
+
+### R15 S7 measured attribution (2026-11-08)
+
+Step 1 attribution landed the new substep labels (`moe_gate`, `moe_shared_gemm`,
+`moe_shared_epi`, `moe_routed`) in `moe_parts`. Re-profiled at HEAD
+(`FT_PROFILE=1`, eager, 1536 slots, 40 tokens; an explicit cache above what fits
+OOMs on this box -- the auto planner at production config lands 7606-7612 MiB
+and runs fine, so the OOM was a config choice, not a box limit -- so 1536 is
+the highest stable cache used for the profile; the shares, not the absolute, are
+what matter):
+
+| stage | ms/token (decode) |
+| --- | ---: |
+| `moe_gate` (f32 router matvec + softmax + topk) | 1.6-1.7 |
+| `moe_shared_gemm` (two `apply_dense` NVFP4 GEMVs) | 1.6 |
+| `moe_shared_epi` (cast/matvec/sigmoid/narrow/contig/silu/mul/row_mul) | 2.2 |
+| `moe_routed` (copy ~7 + gemv 3.4 + lru 1.9 + rest) | 24.7-33.6 |
+
+So the shared expert's 3.8 ms/token splits **58% epilogue / 42% GEMV**; the
+epilogue dominates, not the GEMV. The model-free read on the GEMV shapes
+(`[1,2048]x[1024,2048]` gate_up and `[1,512]x[2048,512]` down, 40 layers)
+confirms it: the two GEMVs together cost ~1.6 ms/step (0.04 ms/layer, ~37 GB/s
+effective) against a 250 GB/s roofline of ~0.24 ms/step, so the GEMV is
+launch-bound (80 launches) rather than bandwidth-bound, but it is still smaller
+than the epilogue.
+
+Step 2 decision: the epilogue dominates, so the candidate fix is fusion. The
+cheap elementwise fusion (a `silu_mul` kernel replacing
+`narrow`/`contiguous`/`silu`/`mul`) saves ~2 launches/layer (~0.4 ms, <1%) and
+does not clear the 2% bar; a deeper fusion (se_gate matvec + row_mul, or
+chaining gate_up->silu_mul->down into one kernel) is high-risk, touches
+numerics, and needs the exact-token oracle. The GEMV small-N branch is not
+taken because the GEMV is not the dominant term, and a narrower `BLOCK_N`
+would only add launches.
+
+**Verdict: no safe win.** The shared expert is 7.8% of the 49 ms step; even
+eliminating all of it would be ~7.8%, but only the 2.2 ms epilogue is
+realistically removable without a large kernel rewrite, and the simple fusion
+is <1%. The labels stay as diagnostics. Logs: `/tmp/opencode/r15_s7/`.
+
+### R15 S8: fuse the GDN tail (gated RMSNorm) -- REJECTED (2026-11-08)
+
+Step 1 attribution split `gdn_tail` into three substeps over the 30 GDN layers
+(eager, 1536 slots, 40 tokens):
+
+| stage | ms/token |
+| --- | ---: |
+| `gdn_tail_norm` (rms_norm_last chain) | 1.95 |
+| `gdn_tail_gate` (`z.silu()` + `mul`) | 0.61 |
+| `gdn_tail_proj` (`apply_dense(o)`) | 1.64 |
+
+These numbers are the measurement that **misled** us: the eager substep profile
+with per-boundary syncs is not predictive of the captured step. The fused kernel
+was a single-program-per-row kernel with only 32 CTAs at t=1 and 8 warps for
+128 columns, and the captured graph already hides the op-chain launches, so the
+eager delta does not survive capture.
+
+Step 2 fused the norm + gate into a `gdn_gated_norm` kernel and shipped it
+behind `FERRUM_GDN_FUSED_TAIL` (default on). It was correct and gate-green
+(oracle 11751 " Paris", captured parity, refeed, graph capture), but the
+captured A/B at the production cache shows a regression, not a win.
+
+Orchestrator re-measurement (production config `FERRUM_SMOKE_CACHE=auto`, same
+binary, order-balanced fused/control/control/fused, 128 tokens x 2 reps per
+run, logs `/tmp/opencode/r15_s8_orch/ab.log`):
+
+| arm | tg samples (tok/s) | VRAM after load |
+| --- | --- | --- |
+| fused (default) | 24.0, 23.9, 23.9, 23.9 | 7606 MiB |
+| control (`=0`) | 24.5, 24.6, 24.5, 24.7 | 7612 MiB |
+
+Fused tail is **-2.5%** at the production config (23.9 vs 24.6 tok/s). The
+kernel was reverted: the split chain (`rms_norm_last` -> `z.silu()` -> `mul` ->
+`apply_dense(o)`) is the only path again, and the substep labels
+(`gdn_tail_norm`, `gdn_tail_gate`, `gdn_tail_proj`) are kept as diagnostics.
+
+Rule for future slices: **rank by a captured A/B, never by an eager substep
+delta.** An eager substep profile with per-boundary syncs inflates op-soup
+costs and is not a valid predictor of the captured step. A captured node-count
+reason is needed before re-landing this fusion.
+
+R9.2 interaction: R9.2's fused GDN gated norm regressed ~6% captured for the
+same class of reason (broader fusion, lost L2 locality / lengthened dependency
+chain). The narrower gated-tail fusion here was expected to win but did not; both
+are now parked. The q/k RMSNorms remain on the existing path. Logs:
+`/tmp/opencode/r15_s8/`, `/tmp/opencode/r15_s8_orch/ab.log`.
+
+## R15 close-out (2026-11-08): what the campaign established
+
+Four slices were implemented, gated and measured against a same-binary control;
+none cleared the 2% captured bar, and three were reverted. The record matters
+more than the patches, because each one closes a lever:
+
+| slice | idea | result |
+| --- | --- | --- |
+| S1 | decode GEMV reads misses from the pinned host banks | -6.6% uncaptured, -15% captured; copy is bandwidth-bound, in-kernel host reads are latency-bound (R15.1) |
+| S2 | fuse the GDN block / hoist the `ba` weight cast | GDN is compute (recur 0.51, conv 0.72); the cast is 0% (R15.2) |
+| S7 | small-N dense NVFP4 GEMV / shared-expert epilogue | 58% epilogue, 42% GEMV; the simple fusion is <1% (R15 S7) |
+| S8 | fused gated-RMSNorm tail (one kernel, 30 sites) | **-2.5% captured** despite a 1.4 ms eager delta (R15 S8) |
+
+**The method correction is the durable result.** Every slice was ranked on an
+eager `FT_PROFILE` substep delta, and the eager substep timer synchronizes per
+boundary, so it inflates op-soup cost by roughly the per-op launch/ramp term.
+S8 is the proof: 1.82 -> 0.38 ms eager for the fused norm, and -2.5% captured.
+**Rank a captured-step optimization only by a captured A/B.** Eager substeps
+remain useful for finding bytes (the roofline audit below), not for sizing wins.
+
+**Where the step actually stands** (auto cache, 7606 MiB, captured, 128-token
+greedy): 24.5-24.7 tok/s. The same binary at 32 tokens measures 33.1, and an
+explicit 2048-slot cache measured 29.0 earlier in the session, so quote the
+config with the number.
+
+**Byte audit (why little is left).** The per-block costs are at or near their
+traffic floors: `gdn_qkvz` 2.9-3.5 ms for 378 MB of FP8 weights (~220 GB/s,
+read roofline), the FP8 attention projections and the routed GEMV at the same
+rate, the NVFP4 head at ~350 GB/s, and `moe_copy` at the 14.7 GB/s PCIe line
+rate (NVML reports a Gen4 x8 link, ~15.75 GB/s theoretical). On this 26-SM,
+40 W-capped part that leaves the small-kernel tail (`moe_gate` 1.5,
+`moe_shared_epi` 2.2, `gdn_tail` 2.6 eager) and the copy bytes as the only
+remaining terms, and a single-site fusion of the tail measured negative.
+
+**The open question that outranks more kernels.** The recorded reference is
+FreeToken 0.2.1 at 47.0 tok/s (R14b, 2012 slots, 40 W) against R9's 30.3 tok/s
+for the same engine at the same box (decision 76 config). A 55% jump between
+reference versions on the same hardware, with the same checkpoint, is either
+real upstream progress (nvfp4_b12x, flashinfer, unified cache, host embedding)
+or a shorter-decode/longer-queue artifact in the 0.2.1 measurement. Until that
+is settled like-for-like (same prompt, same decoded length, same power cap,
+timings reported by both), the size of the gap -- and therefore whether any
+bs=1 kernel work can close it -- is unknown. Do this before the next kernel
+slice.
+
+**Do not re-chase** (all measured): S1 host fetch, S2 GDN block fusion and the
+`ba` cast, S7's standalone small-N GEMV and simple shared-epilogue fusion, S8's
+gated-norm fusion, R9.2's fused q/k + gated norms, and online LFU admission.
