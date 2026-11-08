@@ -63,6 +63,14 @@ pub const CAPTURE_MODE_GLOBAL: u32 = 0;
 /// device address space, which is what gives a pinned buffer a `CUdeviceptr`.
 pub const MEMHOSTALLOC_DEVICEMAP: u32 = 0x02;
 
+/// VMM constants.
+pub const MEM_ALLOCATION_TYPE_PINNED: i32 = 1;
+pub const MEM_LOCATION_TYPE_DEVICE: i32 = 1;
+/// `CU_MEM_ACCESS_FLAGS_PROT_READWRITE`.
+pub const MEM_ACCESS_FLAGS_PROT_READWRITE: u32 = 3;
+/// `CU_MEM_ALLOC_GRANULARITY_RECOMMENDED`.
+pub const MEM_ALLOC_GRANULARITY_RECOMMENDED: i32 = 1;
+
 /// `CU_STREAM_NON_BLOCKING`: the stream does not implicitly synchronize with the
 /// legacy stream. The prefill overlap needs this so the expert copy can run
 /// concurrently with the compute stream, ordered only by explicit events.
@@ -84,6 +92,51 @@ pub struct MemcpyAttributes {
     pub src_id: i32,
     pub dst_type: i32,
     pub dst_id: i32,
+    pub flags: u32,
+}
+
+/// `CUmemLocation`: where an allocation lives.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct MemLocation {
+    pub type_: i32,
+    pub id: i32,
+}
+
+/// `CUmemAllocationProp`: properties for `cuMemCreate`/granularity queries.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MemAllocationProp {
+    pub type_: i32,
+    pub requested_handle_types: u32,
+    pub location: MemLocation,
+    pub win32_handle_meta_data: *mut c_void,
+    pub compression_type: u8,
+    pub gpu_direct_rdma_capable: u8,
+    pub usage: u16,
+    pub reserved: [u8; 4],
+}
+
+impl Default for MemAllocationProp {
+    fn default() -> Self {
+        Self {
+            type_: 0,
+            requested_handle_types: 0,
+            location: MemLocation::default(),
+            win32_handle_meta_data: std::ptr::null_mut(),
+            compression_type: 0,
+            gpu_direct_rdma_capable: 0,
+            usage: 0,
+            reserved: [0; 4],
+        }
+    }
+}
+
+/// `CUmemAccessDesc`: access rights for `cuMemSetAccess`.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct MemAccessDesc {
+    pub location: MemLocation,
     pub flags: u32,
 }
 
@@ -146,6 +199,18 @@ type MemGetInfoFn = unsafe extern "C" fn(*mut usize, *mut usize) -> CUresult;
 type MemHostGetDevicePointerFn =
     unsafe extern "C" fn(*mut CUdeviceptr, *mut c_void, u32) -> CUresult;
 type MemFreeHostFn = unsafe extern "C" fn(*mut c_void) -> CUresult;
+// VMM (virtual memory management) entry points, required on this CUDA 13 driver.
+type MemAddressReserveFn =
+    unsafe extern "C" fn(*mut CUdeviceptr, usize, usize, usize, u64) -> CUresult;
+type MemAddressFreeFn = unsafe extern "C" fn(CUdeviceptr, usize) -> CUresult;
+type MemCreateFn = unsafe extern "C" fn(*mut u64, usize, *const MemAllocationProp, u64) -> CUresult;
+type MemReleaseFn = unsafe extern "C" fn(u64) -> CUresult;
+type MemMapFn = unsafe extern "C" fn(CUdeviceptr, usize, usize, u64, u64) -> CUresult;
+type MemUnmapFn = unsafe extern "C" fn(CUdeviceptr, usize) -> CUresult;
+type MemSetAccessFn =
+    unsafe extern "C" fn(CUdeviceptr, usize, *const MemAccessDesc, usize) -> CUresult;
+type MemGetAllocationGranularityFn =
+    unsafe extern "C" fn(*mut usize, *const MemAllocationProp, i32) -> CUresult;
 type StreamCreateFn = unsafe extern "C" fn(*mut CUstream, u32) -> CUresult;
 type StreamDestroyFn = unsafe extern "C" fn(CUstream) -> CUresult;
 type StreamBeginCaptureFn = unsafe extern "C" fn(CUstream, u32) -> CUresult;
@@ -182,6 +247,14 @@ struct Fns {
     cu_mem_host_get_device_pointer: MemHostGetDevicePointerFn,
     cu_mem_free_host: MemFreeHostFn,
     cu_mem_get_info: MemGetInfoFn,
+    cu_mem_address_reserve: MemAddressReserveFn,
+    cu_mem_address_free: MemAddressFreeFn,
+    cu_mem_create: MemCreateFn,
+    cu_mem_release: MemReleaseFn,
+    cu_mem_map: MemMapFn,
+    cu_mem_unmap: MemUnmapFn,
+    cu_mem_set_access: MemSetAccessFn,
+    cu_mem_get_allocation_granularity: MemGetAllocationGranularityFn,
     cu_stream_create: StreamCreateFn,
     cu_stream_destroy: StreamDestroyFn,
     cu_stream_begin_capture: StreamBeginCaptureFn,
@@ -303,6 +376,18 @@ impl Driver {
             cu_mem_free_host: sym!("cuMemFreeHost", MemFreeHostFn),
             // Free/total device memory for the auto cache-budget planner (item 12).
             cu_mem_get_info: sym!("cuMemGetInfo_v2", MemGetInfoFn),
+            // VMM: reserve/map/unmap virtual ranges for partial slot-bank eviction.
+            cu_mem_address_reserve: sym!("cuMemAddressReserve", MemAddressReserveFn),
+            cu_mem_address_free: sym!("cuMemAddressFree", MemAddressFreeFn),
+            cu_mem_create: sym!("cuMemCreate", MemCreateFn),
+            cu_mem_release: sym!("cuMemRelease", MemReleaseFn),
+            cu_mem_map: sym!("cuMemMap", MemMapFn),
+            cu_mem_unmap: sym!("cuMemUnmap", MemUnmapFn),
+            cu_mem_set_access: sym!("cuMemSetAccess", MemSetAccessFn),
+            cu_mem_get_allocation_granularity: sym!(
+                "cuMemGetAllocationGranularity",
+                MemGetAllocationGranularityFn
+            ),
             cu_stream_create: sym!("cuStreamCreate", StreamCreateFn),
             cu_stream_destroy: sym!("cuStreamDestroy_v2", StreamDestroyFn),
             cu_stream_begin_capture: sym!("cuStreamBeginCapture_v2", StreamBeginCaptureFn),
@@ -389,6 +474,73 @@ impl Driver {
     /// Retain the primary context of `device` and make it current on this
     /// thread. Retaining (not creating) keeps a launch here in the same context
     /// as the cudarc compute runtime.
+    /// Reserve a virtual address range of `bytes`. Returns the base pointer.
+    pub fn mem_address_reserve(&self, bytes: usize) -> Result<CUdeviceptr, CudaError> {
+        let mut ptr: CUdeviceptr = 0;
+        // SAFETY: `ptr` is a live slot; alignment 0 lets the driver pick.
+        self.check(unsafe { (self.fns.cu_mem_address_reserve)(&raw mut ptr, bytes, 0, 0, 0) })?;
+        Ok(ptr)
+    }
+
+    /// Free a previously reserved virtual address range.
+    pub fn mem_address_free(&self, ptr: CUdeviceptr, bytes: usize) -> Result<(), CudaError> {
+        self.check(unsafe { (self.fns.cu_mem_address_free)(ptr, bytes) })
+    }
+
+    /// Create a physical allocation for `size` bytes with the given properties.
+    pub fn mem_create(&self, size: usize, prop: &MemAllocationProp) -> Result<u64, CudaError> {
+        let mut handle: u64 = 0;
+        // SAFETY: `handle` is a live slot and `prop` is a valid pointer for the call.
+        self.check(unsafe {
+            (self.fns.cu_mem_create)(&raw mut handle, size, prop as *const _, 0)
+        })?;
+        Ok(handle)
+    }
+
+    /// Release a physical allocation handle.
+    pub fn mem_release(&self, handle: u64) -> Result<(), CudaError> {
+        self.check(unsafe { (self.fns.cu_mem_release)(handle) })
+    }
+
+    /// Map a physical allocation into a reserved virtual range.
+    pub fn mem_map(&self, ptr: CUdeviceptr, size: usize, handle: u64) -> Result<(), CudaError> {
+        // SAFETY: `ptr` is a reserved range, `handle` a live allocation.
+        self.check(unsafe { (self.fns.cu_mem_map)(ptr, size, 0, handle, 0) })
+    }
+
+    /// Unmap a previously mapped virtual range.
+    pub fn mem_unmap(&self, ptr: CUdeviceptr, size: usize) -> Result<(), CudaError> {
+        self.check(unsafe { (self.fns.cu_mem_unmap)(ptr, size) })
+    }
+
+    /// Set access rights (read/write) on a mapped virtual range.
+    pub fn mem_set_access(
+        &self,
+        ptr: CUdeviceptr,
+        size: usize,
+        desc: &MemAccessDesc,
+    ) -> Result<(), CudaError> {
+        // SAFETY: `desc` is valid for the call's duration.
+        self.check(unsafe { (self.fns.cu_mem_set_access)(ptr, size, desc as *const _, 1) })
+    }
+
+    /// Query the allocation granularity for a property set.
+    pub fn mem_get_allocation_granularity(
+        &self,
+        prop: &MemAllocationProp,
+    ) -> Result<usize, CudaError> {
+        let mut gran: usize = 0;
+        // SAFETY: `gran` is a live slot and `prop` is a valid pointer.
+        self.check(unsafe {
+            (self.fns.cu_mem_get_allocation_granularity)(
+                &raw mut gran,
+                prop as *const _,
+                MEM_ALLOC_GRANULARITY_RECOMMENDED,
+            )
+        })?;
+        Ok(gran)
+    }
+
     pub fn attach_primary_context(&self, device: CUdevice) -> Result<CUcontext, CudaError> {
         let mut ctx: CUcontext = std::ptr::null_mut();
         // SAFETY: `ctx` is a live pointer-sized slot for the duration of the call.
@@ -1402,10 +1554,278 @@ impl StagingKernels {
     }
 }
 
+/// VMM-backed virtual range split into fixed-size chunks, so a slot-bank
+/// allocation can be partially unmapped (and its physical memory freed) for
+/// the on-demand vision borrow while the base address the kernels and captured
+/// graphs bake in stays stable.
+#[allow(dead_code)]
+pub struct VmmRange {
+    driver: Arc<Driver>,
+    device: i32,
+    base: CUdeviceptr,
+    slot_bytes: usize,
+    chunk_slots: usize,
+    chunk_bytes: usize,
+    num_chunks: usize,
+    reserved_bytes: usize,
+    chunk_slot_counts: Vec<usize>,
+    prop: MemAllocationProp,
+    state: std::sync::Mutex<VmmState>,
+}
+
+struct VmmState {
+    chunks: Vec<Option<u64>>,
+    mapped: Vec<bool>,
+}
+
+// SAFETY: the driver handle is thread-safe and the mutex guards the handles.
+unsafe impl Send for VmmRange {}
+unsafe impl Sync for VmmRange {}
+
+#[allow(dead_code)]
+impl VmmRange {
+    /// Reserve `total_slots * slot_bytes` bytes of virtual address space and map
+    /// every chunk. `chunk_slots` slots (rounded up to the driver granularity)
+    /// make one chunk, so all banks sharing `CHUNK_SLOTS` can evict the same
+    /// slot range by chunk index.
+    pub fn new(
+        driver: Arc<Driver>,
+        device: i32,
+        total_slots: usize,
+        slot_bytes: usize,
+        chunk_slots: usize,
+    ) -> Result<Self, CudaError> {
+        if total_slots == 0 || slot_bytes == 0 || chunk_slots == 0 {
+            return Err(CudaError::Driver("VmmRange: empty range".into()));
+        }
+        let prop = MemAllocationProp {
+            type_: MEM_ALLOCATION_TYPE_PINNED,
+            location: MemLocation {
+                type_: MEM_LOCATION_TYPE_DEVICE,
+                id: device,
+            },
+            ..MemAllocationProp::default()
+        };
+
+        let granularity = driver.mem_get_allocation_granularity(&prop)?;
+        let raw_chunk = chunk_slots * slot_bytes;
+        let chunk_bytes = raw_chunk.div_ceil(granularity) * granularity;
+        let num_chunks = total_slots.div_ceil(chunk_slots);
+        let reserved_bytes = num_chunks * chunk_bytes;
+
+        let mut chunk_slot_counts = Vec::with_capacity(num_chunks);
+        for i in 0..num_chunks {
+            let start = i * chunk_slots;
+            let n = (total_slots - start).min(chunk_slots);
+            chunk_slot_counts.push(n);
+        }
+
+        let base = driver.mem_address_reserve(reserved_bytes)?;
+        let mut chunks = vec![None; num_chunks];
+        let mut mapped = vec![false; num_chunks];
+        for i in 0..num_chunks {
+            let handle_res = (|| {
+                let handle = driver.mem_create(chunk_bytes, &prop)?;
+                let ptr = base + (i * chunk_bytes) as u64;
+                driver.mem_map(ptr, chunk_bytes, handle)?;
+                let desc = MemAccessDesc {
+                    location: MemLocation {
+                        type_: MEM_LOCATION_TYPE_DEVICE,
+                        id: device,
+                    },
+                    flags: MEM_ACCESS_FLAGS_PROT_READWRITE,
+                };
+                driver.mem_set_access(ptr, chunk_bytes, &desc)?;
+                Ok(handle)
+            })();
+            match handle_res {
+                Ok(h) => {
+                    chunks[i] = Some(h);
+                    mapped[i] = true;
+                }
+                Err(e) => {
+                    for j in 0..i {
+                        if mapped[j] {
+                            let p = base + (j * chunk_bytes) as u64;
+                            let _ = driver.mem_unmap(p, chunk_bytes);
+                            if let Some(h) = chunks[j].take() {
+                                let _ = driver.mem_release(h);
+                            }
+                            mapped[j] = false;
+                        }
+                    }
+                    let _ = driver.mem_address_free(base, reserved_bytes);
+                    return Err(e);
+                }
+            }
+        }
+
+        Ok(Self {
+            driver,
+            device,
+            base,
+            slot_bytes,
+            chunk_slots,
+            chunk_bytes,
+            num_chunks,
+            reserved_bytes,
+            chunk_slot_counts,
+            prop,
+            state: std::sync::Mutex::new(VmmState { chunks, mapped }),
+        })
+    }
+
+    pub(crate) fn base_ptr(&self) -> CUdeviceptr {
+        self.base
+    }
+
+    pub fn total_slots(&self) -> usize {
+        self.num_chunks * self.chunk_slots
+    }
+
+    pub fn slot_bytes(&self) -> usize {
+        self.slot_bytes
+    }
+
+    pub fn chunk_slots(&self) -> usize {
+        self.chunk_slots
+    }
+
+    pub fn num_chunks(&self) -> usize {
+        self.num_chunks
+    }
+
+    pub fn chunk_bytes(&self) -> usize {
+        self.chunk_bytes
+    }
+
+    pub fn reserved_bytes(&self) -> usize {
+        self.reserved_bytes
+    }
+
+    pub fn chunk_slot_count(&self, chunk: usize) -> usize {
+        if chunk < self.chunk_slot_counts.len() {
+            self.chunk_slot_counts[chunk]
+        } else {
+            0
+        }
+    }
+
+    pub fn mapped_slots(&self) -> usize {
+        let st = self.state.lock().unwrap();
+        self.chunk_slot_counts
+            .iter()
+            .zip(st.mapped.iter())
+            .filter(|(_, m)| **m)
+            .map(|(c, _)| *c)
+            .sum()
+    }
+
+    pub(crate) fn unmap_chunks(&self, range: std::ops::Range<usize>) -> Result<(), CudaError> {
+        let mut st = self.state.lock().unwrap();
+        for i in range {
+            if i >= self.num_chunks {
+                return Err(CudaError::Driver("vmm chunk index out of range".into()));
+            }
+            if !st.mapped[i] {
+                continue;
+            }
+            let ptr = self.base + (i * self.chunk_bytes) as u64;
+            self.driver.mem_unmap(ptr, self.chunk_bytes)?;
+            if let Some(h) = st.chunks[i].take() {
+                self.driver.mem_release(h)?;
+            }
+            st.mapped[i] = false;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn map_chunks(&self, range: std::ops::Range<usize>) -> Result<(), CudaError> {
+        let mut st = self.state.lock().unwrap();
+        for i in range {
+            if i >= self.num_chunks {
+                return Err(CudaError::Driver("vmm chunk index out of range".into()));
+            }
+            if st.mapped[i] {
+                continue;
+            }
+            let handle = self.driver.mem_create(self.chunk_bytes, &self.prop)?;
+            let ptr = self.base + (i * self.chunk_bytes) as u64;
+            if let Err(e) = self.driver.mem_map(ptr, self.chunk_bytes, handle) {
+                let _ = self.driver.mem_release(handle);
+                return Err(e);
+            }
+            let desc = MemAccessDesc {
+                location: MemLocation {
+                    type_: MEM_LOCATION_TYPE_DEVICE,
+                    id: self.device,
+                },
+                flags: MEM_ACCESS_FLAGS_PROT_READWRITE,
+            };
+            if let Err(e) = self.driver.mem_set_access(ptr, self.chunk_bytes, &desc) {
+                let _ = self.driver.mem_unmap(ptr, self.chunk_bytes);
+                let _ = self.driver.mem_release(handle);
+                return Err(e);
+            }
+            st.chunks[i] = Some(handle);
+            st.mapped[i] = true;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for VmmRange {
+    fn drop(&mut self) {
+        let mut st = self.state.lock().unwrap();
+        for i in 0..self.num_chunks {
+            if st.mapped[i] {
+                let ptr = self.base + (i * self.chunk_bytes) as u64;
+                let _ = self.driver.mem_unmap(ptr, self.chunk_bytes);
+                if let Some(h) = st.chunks[i].take() {
+                    let _ = self.driver.mem_release(h);
+                }
+                st.mapped[i] = false;
+            }
+        }
+        let _ = self.driver.mem_address_free(self.base, self.reserved_bytes);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    #[test]
+    fn a_vmm_range_maps_and_unmaps_chunks() {
+        let driver = match Driver::open() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        if driver.init().is_err() {
+            return;
+        }
+        let count = driver.device_count().unwrap_or(0);
+        if count == 0 {
+            return;
+        }
+        let ctx = match driver.attach_primary_context(0) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let _ = ctx;
+        let arc = std::sync::Arc::new(driver);
+        let range = match VmmRange::new(Arc::clone(&arc), 0, 4, 1024, 2) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        assert_eq!(range.mapped_slots(), 4);
+        assert_ne!(range.base_ptr(), 0);
+        range.unmap_chunks(0..1).unwrap();
+        assert_eq!(range.mapped_slots(), 2);
+        range.map_chunks(0..1).unwrap();
+        assert_eq!(range.mapped_slots(), 4);
+    }
 
     /// The GEMV pair shares one Triton entry, so the table has to key on the
     /// manifest name. Handles here are fabricated integers, never dereferenced:

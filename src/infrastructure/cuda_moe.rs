@@ -97,11 +97,19 @@ struct Banks {
 
 impl Banks {
     fn new(rt: &Runtime, slots: usize, rows: usize, cols: usize) -> Result<Self, MoEError> {
-        let bytes = |n: usize| rt.zeros(&[n], TensorDType::U8);
+        // The four large banks are VMM-backed so a slot range can be unmapped
+        // (and its physical memory freed) for the on-demand vision borrow while
+        // the base address the kernels and captured graphs bake in stays put.
+        // CHUNK_SLOTS keeps every bank's chunk boundary on the same slot range.
+        const CHUNK_SLOTS: usize = 128;
+        let packed_slots_bytes = rows * cols / 2;
+        let scale_slots_bytes = rows * cols / 16;
         Ok(Self {
-            packed: bytes(slots * rows * cols / 2)?,
-            scale: bytes(slots * rows * cols / 16)?,
-            global: bytes(slots * rows * 2)?,
+            packed: rt.vmm_slot_bank(slots, packed_slots_bytes, CHUNK_SLOTS)?,
+            scale: rt.vmm_slot_bank(slots, scale_slots_bytes, CHUNK_SLOTS)?,
+            // The global banks are 2 KiB per slot (4 MiB total) and are never
+            // evicted, so they stay ordinary allocations.
+            global: rt.zeros(&[slots * rows * 2], TensorDType::U8)?,
         })
     }
 

@@ -600,6 +600,20 @@ dispatcher releases the device in stages (decision 141): the expert banks first
 (`release_moe`), then the whole residency (`release_residency`);
 `rehydrate_moe`/`rehydrate` put them back before the next request runs.
 
+**VMM-backed slot banks `[core]` (infrastructure only).** The four large slot
+banks (gate_up packed/scale, down packed/scale) are now allocated through the
+driver's virtual-memory-management API (`cuMemAddressReserve`/`cuMemCreate`/
+`cuMemMap`/`cuMemSetAccess`) instead of one flat `cuMemAlloc`, as a
+`VmmRange` split into fixed 128-slot chunks. The base address of each bank is
+stable across map/unmap, so the kernel args and captured decode graphs keep
+pointing at it while a slot range is unmapped and its physical memory freed.
+This is the substrate for the planned partial borrow of the expert cache by the
+on-demand vision tower: free only the slot range the tower needs and keep the
+rest resident, instead of `release_moe` dropping the whole cache. The global
+banks (2 KiB per slot) stay ordinary allocations and are never evicted. The
+eviction/restore API (`unmap_chunks`/`map_chunks`, `mapped_slots`) is in place
+but not yet wired; it is the next slice.
+
 ### 3.6 KV cache, radix, and GDN state `[core]`
 
 **Static.** The domain owns the bookkeeping (pages, page table, radix tree,

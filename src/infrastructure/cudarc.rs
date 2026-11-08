@@ -26,7 +26,7 @@ use ::cudarc::driver::{CudaContext, CudaGraph, CudaSlice, CudaStream, DevicePtr,
 use half::bf16;
 
 use crate::domain::expert_kernel::MoEError;
-use crate::infrastructure::cuda_driver::{CUstream, CudaError, Driver, GdnKernels};
+use crate::infrastructure::cuda_driver::{CUstream, CudaError, Driver, GdnKernels, VmmRange};
 use crate::infrastructure::kernel_abi::{
     ADD_BF16, ADD_F32, ADD_RMSNORM, AddRmsnormArgs, ArgPack, CAST_BF16_F32, CAST_F32_BF16,
     CAUSAL_SDPA_BF16, CAUSAL_SDPA_F32, COL_MUL_BF16, COL_MUL_F32, COPY_STRIDED_BF16,
@@ -148,6 +148,7 @@ struct RuntimeInner {
     stream: Arc<CudaStream>,
     blas: CudaBlas,
     kernels: LinearKernels,
+    ordinal: usize,
 }
 
 impl Runtime {
@@ -173,6 +174,7 @@ impl Runtime {
                 stream,
                 blas,
                 kernels,
+                ordinal,
             }),
         })
     }
@@ -209,12 +211,17 @@ impl Runtime {
                 stream,
                 blas,
                 kernels,
+                ordinal,
             }),
         })
     }
 
     pub fn driver(&self) -> &Arc<Driver> {
         &self.inner.driver
+    }
+
+    pub fn ordinal(&self) -> usize {
+        self.inner.ordinal
     }
 
     pub fn context(&self) -> &Arc<CudaContext> {
@@ -499,6 +506,65 @@ impl Runtime {
         Ok(Tensor::new(self.clone(), buf, shape.to_vec()))
     }
 
+    /// Allocate a VMM-backed u8 tensor whose storage is split into
+    /// `chunk_slots`-slot chunks, so a slot range can be unmapped later without
+    /// moving the base address. Every chunk is mapped and zeroed on return.
+    pub fn vmm_slot_bank(
+        &self,
+        total_slots: usize,
+        slot_bytes: usize,
+        chunk_slots: usize,
+    ) -> Result<Tensor, MoEError> {
+        let bytes = total_slots * slot_bytes;
+        let range = VmmRange::new(
+            Arc::clone(self.driver()),
+            self.ordinal() as i32,
+            total_slots,
+            slot_bytes,
+            chunk_slots,
+        )
+        .map_err(driver)?;
+        let base = range.base_ptr();
+        let total = range.reserved_bytes();
+        // SAFETY: `base` is a freshly mapped, writable range of `total` bytes.
+        unsafe {
+            ::cudarc::driver::result::memset_d8_async(base, 0, total, self.inner.stream.cu_stream())
+        }
+        .map_err(bad)?;
+        self.synchronize()?;
+        let buf = Buffer::Vmm(Arc::new(range), TensorDType::U8);
+        Ok(Tensor::new(self.clone(), buf, vec![bytes]))
+    }
+
+    /// Generic VMM-backed allocation (one chunk per call by default). Used by
+    /// tests and non-bank callers; banks use `vmm_slot_bank` for slot-aligned
+    /// chunking.
+    pub fn vmm_zeros(&self, shape: &[usize], dtype: TensorDType) -> Result<Tensor, MoEError> {
+        let numel = numel_of(shape)?;
+        let bytes = numel * dtype.element_size();
+        if bytes == 0 {
+            return self.zeros(shape, dtype);
+        }
+        let range = VmmRange::new(
+            Arc::clone(self.driver()),
+            self.ordinal() as i32,
+            bytes,
+            1,
+            bytes,
+        )
+        .map_err(driver)?;
+        let base = range.base_ptr();
+        let total = range.reserved_bytes();
+        // SAFETY: `base` is a freshly mapped, writable range of `total` bytes.
+        unsafe {
+            ::cudarc::driver::result::memset_d8_async(base, 0, total, self.inner.stream.cu_stream())
+        }
+        .map_err(bad)?;
+        self.synchronize()?;
+        let buf = Buffer::Vmm(Arc::new(range), dtype);
+        Ok(Tensor::new(self.clone(), buf, shape.to_vec()))
+    }
+
     pub fn from_slice_bf16(&self, values: &[bf16], shape: &[usize]) -> Result<Tensor, MoEError> {
         check_len(values.len(), shape)?;
         let buf = Buffer::Bf16(Arc::new(self.upload_bf16(values)?));
@@ -537,6 +603,9 @@ enum Buffer {
     I32(Arc<CudaSlice<i32>>),
     I64(Arc<CudaSlice<i64>>),
     U8(Arc<CudaSlice<u8>>),
+    /// VMM-backed range: the base address is stable across map/unmap of its
+    /// chunks, so captured graphs and kernel args keep pointing at it.
+    Vmm(Arc<VmmRange>, TensorDType),
 }
 
 impl Buffer {
@@ -547,16 +616,18 @@ impl Buffer {
             Self::I32(_) => TensorDType::I32,
             Self::I64(_) => TensorDType::I64,
             Self::U8(_) => TensorDType::U8,
+            Self::Vmm(_, d) => *d,
         }
     }
 
-    fn ptr(&self, stream: &Arc<CudaStream>) -> u64 {
+    fn ptr(&self, _stream: &Arc<CudaStream>) -> u64 {
         match self {
-            Self::Bf16(s) => s.device_ptr(stream).0,
-            Self::F32(s) => s.device_ptr(stream).0,
-            Self::I32(s) => s.device_ptr(stream).0,
-            Self::I64(s) => s.device_ptr(stream).0,
-            Self::U8(s) => s.device_ptr(stream).0,
+            Self::Bf16(s) => s.device_ptr(_stream).0,
+            Self::F32(s) => s.device_ptr(_stream).0,
+            Self::I32(s) => s.device_ptr(_stream).0,
+            Self::I64(s) => s.device_ptr(_stream).0,
+            Self::U8(s) => s.device_ptr(_stream).0,
+            Self::Vmm(r, _) => r.base_ptr(),
         }
     }
 
@@ -668,6 +739,7 @@ impl Tensor {
                 Ok(values.into_iter().map(|v| v as f32).collect())
             }
             Buffer::U8(_) => Err(bad("no f32 view of a u8 tensor")),
+            Buffer::Vmm(_, _) => Err(bad("no f32 view of a vmm tensor")),
         }
     }
 
@@ -675,9 +747,29 @@ impl Tensor {
     pub fn to_host_u8(&self) -> Result<Vec<u8>, MoEError> {
         let src = self.contiguous()?;
         self.rt.synchronize()?;
-        let b = src.buf.u8()?;
-        let view = b.slice(src.offset..src.offset + src.numel());
-        self.rt.inner.stream.clone_dtoh(&view).map_err(bad)
+        let n = src.numel();
+        match &src.buf {
+            Buffer::U8(s) => {
+                let view = s.slice(src.offset..src.offset + n);
+                self.rt.inner.stream.clone_dtoh(&view).map_err(bad)
+            }
+            Buffer::Vmm(r, _) => {
+                let mut out = vec![0u8; n];
+                let ptr = r.base_ptr() + (src.offset as u64);
+                // SAFETY: `ptr` is a live mapped range of at least `n` bytes.
+                unsafe {
+                    ::cudarc::driver::result::memcpy_dtoh_async(
+                        &mut out,
+                        ptr,
+                        self.rt.inner.stream.cu_stream(),
+                    )
+                }
+                .map_err(bad)?;
+                self.rt.synchronize()?;
+                Ok(out)
+            }
+            other => Err(bad(format!("want u8, got {}", other.dtype().name()))),
+        }
     }
 
     /// `i32` words, for the K-major NVFP4 bank whose words are bit patterns and
