@@ -2145,3 +2145,58 @@ substep labels stay (diagnostics, no behaviour change, zero cost without
 per-row loads into shared memory (one wide tile per bank row, then dequant from
 smem), not a `[16,16]` strided read per K-iteration. Logs
 `/tmp/opencode/r15_s1/` (gate_*.log, tg_*.log, profile_*.log).
+
+### R15.2 S2 measured: the GDN block is compute, not launches (2026-11-08)
+
+Re-profiled the GDN block at HEAD with the substep labels before changing
+anything (`FT_PROFILE=1 FERRUM_SMOKE_NOGRAPH=1 FERRUM_SMOKE_CACHE=2048
+FERRUM_SMOKE_TOKENS=40`), ms/token over the 30 linear layers:
+
+| stage | ms/token | floor |
+| --- | ---: | --- |
+| `gdn_qkvz` (FP8 W8A16, N=12288) | 2.9-3.5 | ~2.3 at the 220 GB/s read roofline |
+| `gdn_tail` (rmsnorm + silu gate + out_proj) | 2.7-3.0 | ~0.6 (out_proj) |
+| `gdn_conv` | 0.72 | depthwise work |
+| `gdn_ba` (f32 matvec, N=64) | 0.69 | launch |
+| `gdn_recur` (`gdn_decode`) | 0.51 | ~0.5 (state traffic) |
+
+Two corrections to the R6/R15 picture: the recurrence is **0.51 ms**, not the
+2.6 the R6 profile recorded (that number predates the fused kernel and the
+bf16 mixer), so H1 (tile sweep) and the conv fusion have no headroom; and the
+block's remaining cost is the **tail** (a libtorch norm/gate op chain) plus the
+roofline qkvz read, not launch count.
+
+The one cheap, numerics-identical item was the per-step
+`ba.weight.cast(F32)` (512 KB x 30 layers); hoisting it to load time
+(`FERRUM_GDN_BA_F32=0` control arm) measured **28.9-29.2 vs 28.7-29.0 tok/s**,
+i.e. inside drift, so it was reverted with the rest of the slice: 0% is not a
+win, and it moved the widen of a quantized weight from per-step to per-load.
+An S2-wide verdict: **the GDN block has no >= 2% lever left**; do not re-open
+the recurrence tile, the conv fusion, or the `ba` cast. Logs
+`/tmp/opencode/r15_s2/`.
+
+### Baseline note (2026-11-08): the same-binary control is 29 tok/s at 128 tokens
+
+Every R15 A/B above ran the captured smoke with `FERRUM_SMOKE_CACHE=2048
+FERRUM_SMOKE_TOKENS=128 FERRUM_SMOKE_PREFILL=517`, where HEAD measures
+**29.0-29.2 tok/s**; the same binary at 32 tokens measures **33.1**. The R14c
+record of 32.2-32.9 at "128 tok" therefore came from a different prompt or a
+colder box and should not be used as an absolute control any more. Rank a slice
+by its same-session, same-token-count A/B, and quote 29.0-29.2 as the current
+128-token captured baseline.
+
+### R15 S7: the shared expert reads 10x below the roofline -- next
+
+The new profile also prices the non-GDN blocks: `moe_shared` **3.1-3.9 ms**,
+`moe_router` **1.7-3.0 ms**, `moe_routed` 19-27 (copy ~7 + gemv 3.4 + lru 1.9 +
+rest). The shared expert moves only ~63 MB of NVFP4 weights per step (gate_up
+`[1024, 2048]` + down `[2048, 512]` over 40 layers), so 3.2 ms is **~20 GB/s**,
+i.e. ~10x below the read roofline. The cause is the launch geometry:
+`nvfp4_dense_gemv` runs `grid = (m=1, N/BLOCK_N=32)`, so the shared gate_up
+is **32 single-warp programs** on 26 SMs and most of the card idles while each
+program walks the whole K serially. The head does not show this because its
+N is 248320 (thousands of programs). Next slice: a small-N variant (or a second
+AOT entry) with a narrow `BLOCK_N` (8/16) and/or split-K, so the shared expert
+reaches ~150-250 GB/s; target `moe_shared` 3.2 -> ~1 ms. The f32 router gate
+(`[1,2048] x [2048,256]`, 80 MB/step at ~40 GB/s) is the same shape of problem
+and the follow-up.

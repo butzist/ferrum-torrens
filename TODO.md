@@ -1334,8 +1334,15 @@ Standing: 32.2-32.9 tok/s captured at 2048 slots against FreeToken's 47.0 at
 - [x] **R15 S1 hybrid host fetch -- measured and rejected (decision 154).** The
   in-kernel pinned-host read is PCIe latency-bound where the bulk copy is
   bandwidth-bound; reverted. See `OPTIMIZATION.md` R15.1.
-- [ ] **R15 S2 fuse the GDN block** (conv + recurrence + tail into one launch
-  per layer; ~120 launches per step today). Target GDN 7.3 -> ~5 ms.
+- [x] **R15 S2 fuse the GDN block -- measured, closed (R15.2).** The block is
+  compute, not launches: `gdn_recur` is 0.5 ms, `gdn_qkvz` is at the read
+  roofline, and the only free item (a per-step `ba` weight cast) measured 0%.
+  Do not re-open the recurrence tile, the conv fusion or the `ba` cast.
+- [ ] **R15 S7 small-N dense NVFP4 GEMV** (next): the shared expert reads ~63 MB
+  per step in 3.2 ms (~20 GB/s) because `nvfp4_dense_gemv` launches
+  `grid = (1, N/32)` = 32 single-warp programs; a narrow-N/split-K variant
+  targets 3.2 -> ~1 ms. The f32 router gate (80 MB/step at ~40 GB/s) is the
+  same shape of problem and the follow-up.
 - [ ] **R15 S3 pin a pre-collected hot expert set** (`locked_fetch` /
   profile-sized pool; online LFU was measured and rejected). Target 2-4 ms.
 - [ ] **R15 S4 fused router** (full-softmax arithmetic, iterative top-k), small.
