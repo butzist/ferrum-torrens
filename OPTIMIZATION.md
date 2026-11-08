@@ -2012,3 +2012,136 @@ next lever (M9.8b), then the fused GDN commit (M9.8c).
 The oracle gate was re-run after change 3 on the reference checkpoint and still
 answers `11751` (" Paris"), so the fp4 shared-expert path did not move the
 first-token pin.
+## R15 -- bs=1 plain decode gap after M9.8a (2026-11-08, suggestions only)
+
+Standing (RTX 5060 Laptop, 40 W, 2048 slots = the BLOCK_C kernel ceiling,
+captured, 128-token greedy): ours 32.2-32.9 tok/s (~31 ms/token) vs FreeToken
+47.0 tok/s at 2012 slots (~21.3 ms/token). Gap ~9-10 ms/token, ~1.45x. M9.8a
+closed the device-memory terms (embedding in pinned host RAM, text-only skips
+the vision tower, NVFP4 shared experts at M=1, dead casts removed); the gap is
+now inside the step, not the footprint.
+
+Stage profile (uncaptured `FT_PROFILE` substep timer; shares matter, the
+absolute sum is ~+4-5 ms over the captured step): MoE 18.6 ms (copy 7.1, gemv
+3.4, `lru_ensure` 1.9, router 1.5, shared expert 3.4, residual 0.4), GDN 7.3,
+attention 2.4, head 1.0, norms/rest ~2.0. The MoE copy runs at the 14.4 GB/s
+PCIe ceiling and GDN qkvz at the ~220 GB/s read roofline, so pure byte-cutting
+has diminishing returns; the remaining levers are launch count, kernel fusion,
+and a resident hot working set.
+
+Ordered suggestions (biggest expected effect first):
+
+**S1. Read missing experts straight from pinned host in the decode GEMV
+(hybrid host/device slots). REJECTED (R15.1).** Today a miss costs an H2D copy
+(7.1 ms at the PCIe ceiling) into a device slot, and then the GEMV reads the
+same bytes again from HBM. FreeToken's hybrid fetch moves those bytes once,
+in-kernel: hits read from resident device slots, misses read from the pinned
+host banks through their device-mapped alias with dequant in-K (the
+`gather_rows_from_host` path already exists for the embedding). Implemented and
+measured; the in-kernel host read is slower than the copy it replaces (see
+R15.1). Do not re-chase without a wider host-load tile.
+
+**S2. Fuse the GDN block into one kernel per layer.** Today GDN is qkvz + ba +
+conv + recur + tail, roughly four launches per layer times 30 layers =
+~120 launches per step, plus intermediate f32 buffers. The fused `gdn_decode`
+kernel (decision 77 spec) does gating + q/k l2norm + the delta-rule update +
+in-place indexed state in one launch; fold in conv+silu as a second fused
+kernel or merge it in. Expected single-digit ms: GDN 7.3 -> ~5 ms by removing
+launch overhead and temporary traffic. Risk: numerics must stay within the
+fused add_rmsnorm tolerance, and the state layout `[slot, NV, K, V]` f32 must
+match exactly. Cost: one Triton kernel, one AOT entry, a `--interp` selftest
+against `gdn_recurrence_step_batch`.
+
+**S3. Pin a pre-collected hot expert set (locked_fetch / profile-sized pools).**
+Online LFU was measured and rejected (3% on a real trace, 0% end to end;
+R14c). The alternative is offline: run a representative trace, collect the hot
+expert set, pin it resident at load, and let LRU manage only the cold tail.
+Misses/step would fall from ~52 toward the hot-set size, shrinking the PCIe
+copy. Expected ~2-4 ms/token. Risk: profile drift across prompts, and it needs
+a calibration step plus a pin/unpin API in `CudaMoE`.
+
+**S4. Fused Triton router (full-softmax arithmetic, iterative top-k).** Keep the
+f32 gate matmul; replace softmax + topk + renormalize with one kernel that keeps
+the reference's full-softmax arithmetic so the exact-token oracle is untouched
+(the topk-then-softmax variant was tried and flips near-tie routings). router
+1.5 -> ~0.7 ms, plus fewer launches in the captured graph. Small lever; do
+after S2-S3.
+
+**S5. `lru_ensure` partial victim selection instead of a full BLOCK_C sort.** The
+sort walks all 2048 slots per layer to pick the `num_missing` coldest; a partial
+sort or bitonic top-k over the cold candidates would cut `lru_ensure` 1.9 ->
+~1.0 ms. A bitonic `tl.topk` version was implemented and gate-green in R9
+(2.52 -> 1.41 ms p50) and moved eager tg +1.5% but captured tg -2%, so it is a
+measured captured no-win; do not re-chase without a different reason.
+
+**S6. Cross-layer overlap: stage layer l+1's misses while layer l computes.**
+Withdrawn within a layer (R3: MoE is the last op of a layer, so nothing to
+prefetch). Across layers, the router-independent shared expert of l+1 could
+overlap l's MoE copy, but the earlier prefetch/finish split was measured
+neutral (decision 97: copy CTAs occupy every SM while stalled on PCIe, so an
+independent compute kernel cannot co-schedule). Not viable on this 26-SM part
+without a dedicated copy stream that does not saturate the SMs. Parked.
+
+Not a decode lever (do not re-chase): capture (only +2% tg; eager == captured),
+growing the cache past 2048 (BLOCK_C is a hard power-of-two ceiling),
+paged-attention kernel changes (captured attention cost is ~0.1-0.25 ms; the
+2.4 ms is the FP8 projections at the read roofline), mmapping dense weights
+(the loader always dequant-transforms), and speculative decode (a separate
+milestone; its verify is 4.0x a plain step and loses at this cache size).
+
+Parity checkpoint: after S2+S3 the stage sum targets ~22-24 ms/token
+(~25-27 tok/s), within ~15% of FreeToken's 21.3 ms; the remainder is
+serving-level (batching, item 11) and the read-roofline projections, not a
+single kernel.
+
+### R15.1 S1 measured and rejected (2026-11-08)
+
+Implemented the hybrid host fetch behind `FERRUM_MOE_HOST_FETCH` (default on;
+`=0` restores the committed `lru_ensure` + `copy_missing` path): `lru_ensure`
+wrote a per-route `route_expert` plan (layer-local expert id for a miss, -1 for
+a hit), `_nvfp4_gemv_kernel` read a miss's three bank rows from the pinned host
+banks' device alias and wrote the words/scales/globals it read into the admitted
+slot, and `staged_group` skipped `copy_missing`. It is correct: the `--interp`
+self-test grew a host-fetch case (rel ~4e-7, device banks rewritten equal to the
+host banks) and every gate passed, including the captured parity gate.
+
+Measured (2048 slots, captured, 128 tokens, 3 runs x 2 reps/arm, same binary,
+warm-up discarded, `FERRUM_SMOKE_GRAPH=1 FERRUM_SMOKE_CACHE=2048`; the 40 W cap
+is the standing one):
+
+| arm | tg samples (tok/s) | mean |
+| --- | --- | --- |
+| host fetch on | 27.2, 27.2, 27.3, 27.6, 27.6, 27.7 | **27.4** |
+| host fetch off | captured replay crashed (SIGSEGV); no sample | -- |
+
+The off arm's crash is a defect of the new fallback branch, not of HEAD (HEAD
+ran this exact smoke at 32.2-32.9 in R14c), so the comparison uses the
+same-session uncaptured A/B and the stage profile instead:
+
+- uncaptured, 32 tokens: off **31.5 / 31.6 / 31.8 / 32.3** (mean 31.8) vs on
+  **28.8 / 29.2 / 30.3 / 30.6** (mean 29.7), i.e. **-6.6%**;
+- uncaptured, 128 tokens, on arm: 26.7 / 26.8 / 27.2 / 27.4 (baseline HEAD 128
+  tokens captured is 32.2-32.9);
+- `FT_PROFILE` stage split, same binary, only the knob differs: a **66-token
+  staged chunk** (528 routes, below the whole-layer gate) goes
+  `moe_routed` **641.5 -> 1536.1 ms** (2.4x), and a decode step's `moe_routed`
+  goes **19.5-28.3 -> 20.1-33.9 ms** (`moe_router` and `moe_shared` unchanged at
+  ~1.6 / ~3.0 ms). The rest of the step is flat.
+
+**Why it loses.** The copy it removes is a bulk transfer: `copy_missing` moves
+whole expert rows at the measured 14.7 GB/s line rate. The replacement reads the
+same bytes as `[BLOCK_KW=16, BLOCK_N=16]` tiles, i.e. 1 KiB strided requests per
+program per K-iteration, one program per (route, N-tile), so the miss path
+becomes PCIe **latency**-bound instead of bandwidth-bound, and it still pays the
+slot write-back. The win was expected to scale with the miss fraction; at 2048
+slots the miss fraction is already small (~52 misses/step), so there is little
+traffic to save and the latency penalty dominates. The prefill tail chunk, which
+routes 528 ids through the same staged path, is the clearest case (2.4x).
+
+**Verdict: reverted.** The slice, its A/B knob, the `route_expert` argument and
+the host pointers are gone; only the `moe_router` / `moe_shared` / `moe_routed`
+substep labels stay (diagnostics, no behaviour change, zero cost without
+`FT_PROFILE`). A revisit would need the host fetch to issue large contiguous
+per-row loads into shared memory (one wide tile per bank row, then dequant from
+smem), not a `[16,16]` strided read per K-iteration. Logs
+`/tmp/opencode/r15_s1/` (gate_*.log, tg_*.log, profile_*.log).

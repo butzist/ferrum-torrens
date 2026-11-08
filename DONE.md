@@ -3208,6 +3208,33 @@ settled.
        single-request trace and 0% measured, so the committed policy stays
        strict LRU; a real win needs a pre-collected hot set.
 
+154. **The decode GEMV does not read misses from the pinned host banks; the
+     bulk copy stays** (2026-11-08, R15.1). The largest lever R15 ranked was to
+     move a miss's bytes once instead of twice: today `copy_missing` stages a
+     missed expert into its slot at the 14.7 GB/s PCIe line rate and the GEMV
+     re-reads it from HBM, so a hit/miss split that read the host bank
+     in-kernel looked like up to 5-7 ms/token. It was implemented behind
+     `FERRUM_MOE_HOST_FETCH` (`lru_ensure` writes a per-route `route_expert`
+     plan, the GEMV reads the three bank rows of a miss through their pinned
+     host alias and writes back the words it read, `staged_group` skips the
+     copy), was correct (a new `--interp` host-fetch case at ~4e-7, all gates
+     green including captured parity), and was **measured slower**:
+     - captured 128 tokens at 2048 slots: 27.2-27.7 tok/s against the R14c
+       baseline of 32.2-32.9 (the A/B's fallback arm crashed in capture, so the
+       same-session control is the uncaptured pair below);
+     - uncaptured 32 tokens: 29.7 mean against 31.8 for the copy path (-6.6%);
+     - `FT_PROFILE`: a 66-token staged prefill chunk goes `moe_routed`
+       641.5 -> 1536.1 ms (2.4x), a decode step 19.5-28.3 -> 20.1-33.9 ms, with
+       the router and shared expert flat.
+     The reason is the access shape, not the bytes: the copy is one bulk
+     transfer per expert row, while the in-kernel fetch issues `[16,16]` word
+     tiles (1 KiB) per K-iteration per (route, N-tile), so the miss path is PCIe
+     latency-bound and still pays the write-back. At 2048 slots there are only
+     ~52 misses/step to save, so the penalty dominates. **Reverted**; the
+     substep labels it added (`moe_router`, `moe_shared`, `moe_routed`) stay.
+     A revisit needs one wide contiguous per-row load into shared memory, not a
+     tile per K-iteration. Full numbers in OPTIMIZATION.md R15.1.
+
 ## Progress log (narrative, pre-2026-10-15 compaction)
 
 

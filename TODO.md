@@ -10,7 +10,9 @@ deployment skips the 1.7 GiB f32 vision tower, and the shared experts decode
 through their packed NVFP4 banks; auto now reaches the 2048-slot kernel ceiling
 where FreeToken fits 2012. FreeToken plain is still 47.0 tok/s at the 40 W cap,
 so the remaining gap is inside MoE and the GDN layers, not the embedding
-(OPTIMIZATION.md R14b/R14c). The draft head stays in the FTW
+(OPTIMIZATION.md R14b/R14c). The decode campaign continues in R15: S1 (read
+misses straight from the pinned host banks) was measured slower and reverted
+(decision 154); S2 (fuse the GDN block) is next. The draft head stays in the FTW
 (converter, NVFP4 experts), the verify answers every drafted row and returns its
 final-norm hidden, and the GDN state is committed for exactly the accepted rows
 with no kernel change and no state snapshot. `tests/cudarc_spec_verify.rs` proves
@@ -1322,6 +1324,21 @@ performance work.
      `a_whole_layer_prefill_overlap_matches_the_host_plan`. KV-vs-expert eviction
      is deliberately not wired: prefill needs only the 512 buffer slots and the
      resident tower is never evicted. Details in `OPTIMIZATION.md` R7.2.
+
+### Post-M9.8a decode gap (R15): open order
+
+Standing: 32.2-32.9 tok/s captured at 2048 slots against FreeToken's 47.0 at
+2012 (~1.45x). The stage split and the full rationale are in
+`OPTIMIZATION.md` R15.
+
+- [x] **R15 S1 hybrid host fetch -- measured and rejected (decision 154).** The
+  in-kernel pinned-host read is PCIe latency-bound where the bulk copy is
+  bandwidth-bound; reverted. See `OPTIMIZATION.md` R15.1.
+- [ ] **R15 S2 fuse the GDN block** (conv + recurrence + tail into one launch
+  per layer; ~120 launches per step today). Target GDN 7.3 -> ~5 ms.
+- [ ] **R15 S3 pin a pre-collected hot expert set** (`locked_fetch` /
+  profile-sized pool; online LFU was measured and rejected). Target 2-4 ms.
+- [ ] **R15 S4 fused router** (full-softmax arithmetic, iterative top-k), small.
 
 ### Decode speed plan (decision 82): status and next steps
 
