@@ -1,22 +1,23 @@
 # FerrumTorrens -- FreeToken MVP port to Rust: TODO
 
-Status (2026-11-07): **M9 (speculative decoding, section 6d) is complete through
-M9.7: speculation runs end to end on both checkpoints, token-identical to greedy
-at the gated length, and is a measured 0.70-0.92x on tg.** M9.7's conclusion is a
-number, not a patch: a verify row is only ~1.24x cheaper than a plain token
-against a host-offloaded expert bank, while speculation needs 3-4 rows per 2.5-3.6
-tokens, so the exchange rate cannot win here (OPTIMIZATION.md R14). FreeToken's
-own MTP, re-measured on this card at the 40 W cap, is 0.86x against its
-uncapped-cache plain and 1.06x against the same-cache plain, so the direction is
-confirmed; our absolute decode is 1.7x behind it, and M9.8 lists what closes that
-(R14b). The draft head stays in the FTW
+Status (2026-11-08): **M9 (speculative decoding, section 6d) is complete through
+M9.7, and M9.8a has landed.** Speculation runs end to end on both checkpoints,
+token-identical to greedy at the gated length, and remains a measured slowdown:
+0.44-0.53x at the new 2048-slot cache (a verify step's extra rows miss more than
+the plain step), so `[spec]` stays off by default. M9.8a moved plain decode from
+27.1 to 32.9 tok/s: the embedding is streamed from pinned host RAM, a text-only
+deployment skips the 1.7 GiB f32 vision tower, and the shared experts decode
+through their packed NVFP4 banks; auto now reaches the 2048-slot kernel ceiling
+where FreeToken fits 2012. FreeToken plain is still 47.0 tok/s at the 40 W cap,
+so the remaining gap is inside MoE and the GDN layers, not the embedding
+(OPTIMIZATION.md R14b/R14c). The draft head stays in the FTW
 (converter, NVFP4 experts), the verify answers every drafted row and returns its
 final-norm hidden, and the GDN state is committed for exactly the accepted rows
 with no kernel change and no state snapshot. `tests/cudarc_spec_verify.rs` proves
 on both checkpoints that a verify + commit + rollback leaves the cache where
-plain decode would, including after a rejection. Remaining: M9.7, the
-optimization slice that makes speculation pay (margin-gated acceptance, device
-argmax, one draft pass, captured verify). Note for gated M9 tests: the store FTWs predate M9.1 and carry
+plain decode would, including after a rejection. Remaining: M9.8 (b) captured
+verify, (c) fused GDN commit, (d) k = 3 draft depth, (e) `radix_lookahead`
+prefix keys. Note for gated M9 tests: the store FTWs predate M9.1 and carry
 no draft head, and neither 16 GiB tmpfs can hold a 21 GiB FTW, so the draft
 gates run on a two-part overlay (decision 151).
 **M8.1b is complete: both checkpoints build from the flake
@@ -764,24 +765,29 @@ Ordered slices, each its own gated change:
   at `k=2`). Expert staging, not the implementation, sets the ceiling.
 - [ ] **R13 shared work: a resident expert working set.** The one lever that
   would make speculation pay: `c_row < c_plain / 1.24` needs the hot expert set
-  to stop crossing the host bus on every row. Capacity is capped at ~1024 slots
-  on this card by our device footprint; the open half is the policy
-  (frequency-aware LRU / a pinned hot set), which is R13.
-- [ ] **M9.8 close the FreeToken gap (measured in OPTIMIZATION.md R14b).**
+  to stop crossing the host bus on every row. M9.8a lifted capacity from ~1024
+  to the 2048-slot ceiling (host embedding + text-only), which is FreeToken's
+  ballpark. The policy half is now measured and closed for online LFU (3% on a
+  real trace, 0% end to end, R14c); what remains is a *pre-collected* hot set
+  (profile-sized pinning, FreeToken's `locked_fetch` shape).
+- [ ] **M9.8 close the FreeToken gap (measured in OPTIMIZATION.md R14b/R14c).**
   FreeToken's own MTP is 1.06-1.07x at the *same* cache and 1.7x faster in
-  absolute decode; ours is 0.62-0.70x. Ordered by the measured gap:
-  (a) device memory for the expert cache -- host-stream the embedding (1.0 GiB),
-  keep the shared experts FP8 instead of widening them to bf16, keep the router
-  gate in its checkpoint dtype, and share one slot pool between draft and
-  target; FreeToken fits 2012 slots where we top out at ~1024, and 2012 -> 1072
-  costs it 19% of plain throughput, so this is the single biggest term;
+  absolute decode; ours is 0.62-0.70x (worse at 2048 slots: 0.44-0.53x).
+  (a) **device memory: LANDED (R14c)** -- the embedding is pinned host memory
+  (+594 auto slots) and text-only skips the 1.7 GiB f32 vision tower (+512),
+  so auto reaches the 2048-slot kernel ceiling against FreeToken's 2012;
+  plain 27.1 -> 32.9 tok/s. Still open in (a): keep the router gate in its
+  checkpoint dtype (40 MiB) and share one slot pool between draft and target
+  (the draft's 256 fully-resident experts are 433 MiB when speculating).
   (b) a captured verify (`rows = k + 1`) -- ours is eager and its step costs
-  4.0x a plain step against their 3.0x; (c) a fused GDN commit (one stash kernel
-  per layer plus one all-layer replay, not per-row `conv_decode`+`gdn.decode`
-  twice); (d) draft depth at k = 3: accept 0.53 against their 0.72, while
-  k = 2 matches (0.73 vs 0.71), so the third draft's hidden chain is the defect;
-  (e) `radix_lookahead` prefix keys `(t_i, t_{i+1})`, which our spec path needs
-  before it can adopt a target prefix without a stale draft KV.
+  4.0x a plain step against their 3.0x; at 2048 slots verify is 155 ms of a
+  24-token step, so this is now the leading spec lever;
+  (c) a fused GDN commit (one stash kernel per layer plus one all-layer replay,
+  not per-row `conv_decode`+`gdn.decode` twice); (d) draft depth at k = 3:
+  accept 0.53 against their 0.72, while k = 2 matches (0.73 vs 0.71), so the
+  third draft's hidden chain is the defect; (e) `radix_lookahead` prefix keys
+  `(t_i, t_{i+1})`, which our spec path needs before it can adopt a target
+  prefix without a stale draft KV.
 
 Non-goals: DFlash (the other method in #828), MTP for an architecture that ships
 no head (Qwen3-Coder), TP > 1, and GGUF draft packs.
@@ -1633,9 +1639,13 @@ default do not fit the 8 GiB device (item 6).
 ```
 max_seq_len = 65536            # floor; KV makes ~200k feasible if prompted
 kv_dtype = "bf16"              # [kv] dtype; half of f32, fits the 8 GB target
+text_only = false              # true skips the 1.7 GiB f32 vision tower (M9.8a)
+embed_host = true              # implicit: the 970 MiB bf16 table is pinned host RAM
+                               # (FT_EMBED_HOST=0 restores the device copy)
 moe_cache_size_slots = "auto"  # auto sizes from free VRAM (decisions 90, 127); or 256..2048
                                # floor 256; >= 512 enables whole-layer prefill overlap (>= 2*E)
-                               # ceiling 2048 (decision 85); 512 MiB reserve -> ~1920 slots
+                               # ceiling 2048 (decision 85); 512 MiB reserve
+                               # ~2048 slots text-only, ~1536 with the vision tower
 max_running_requests = 4
 max_prefill_length = 8192
 prefill_overlap = true         # needs cache_size_slots >= 512; streams only at >= 1536 routes (decision 145)

@@ -136,10 +136,60 @@ pub struct Layer {
     pub shared: Shared,
 }
 
+/// The token embedding table: on the device (the pre-host-stream default) or
+/// in pinned host memory, read zero-copy over the bus by the gather kernel.
+// A tower has exactly one of these; boxing would only add an indirection to the
+// one row gather per step.
+#[allow(clippy::large_enum_variant)]
+pub enum Embedding {
+    Device(Dense),
+    Host(HostEmbed),
+}
+
+impl Embedding {
+    pub fn bytes(&self) -> usize {
+        match self {
+            Embedding::Device(d) => d.bytes(),
+            // Pinned host memory is not VRAM; it costs the device budget nothing.
+            Embedding::Host(_) => 0,
+        }
+    }
+}
+
+/// The checkpoint's embedding table in a page-locked host allocation whose
+/// device alias the gather kernel dereferences. A decode step reads one 4 KiB
+/// row, so the 970 MiB table is better spent on the expert cache.
+pub struct HostEmbed {
+    buf: crate::infrastructure::cuda_driver::PinnedBuf,
+    rows: usize,
+    cols: usize,
+}
+
+impl HostEmbed {
+    pub fn gather(&self, rt: &Runtime, index: &Tensor) -> Result<Tensor> {
+        rt.gather_rows_from_host(self.buf.ptr, index, self.cols)
+            .map_err(|e| LoadError::Device(e.to_string()))
+    }
+
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    pub fn cols(&self) -> usize {
+        self.cols
+    }
+
+    /// The pinned host table, row-major bf16, for the load gate to compare
+    /// against the checkpoint bytes.
+    pub fn host_bytes(&self) -> &[u8] {
+        self.buf.as_slice()
+    }
+}
+
 /// Every dense weight of the text tower, resident on the device.
 pub struct Tower {
     pub params: ModelParams,
-    pub embed: Dense,
+    pub embed: Embedding,
     pub final_norm: Tensor,
     pub layers: Vec<Layer>,
     pub lm_head: Head,
@@ -194,7 +244,7 @@ impl Tower {
             reader: reader.as_ref(),
         };
         let h = params.hidden_size;
-        let embed = ld.dense("model.embed_tokens.weight")?;
+        let embed = load_embedding(&ld, &rt)?;
         let final_norm = ld.norm("model.norm.weight", h)?;
 
         let mut layers = Vec::with_capacity(params.num_layers);
@@ -217,6 +267,36 @@ impl Tower {
             lm_head,
         })
     }
+}
+
+/// The embedding table: pinned host memory by default, so its 970 MiB does not
+/// come out of the device expert-cache budget. `FT_EMBED_HOST=0` keeps the
+/// device copy for an A/B, and a refused pin falls back with a warning.
+fn load_embedding(ld: &Loader<'_>, rt: &Runtime) -> Result<Embedding> {
+    let name = "model.embed_tokens.weight";
+    let want_host = !matches!(
+        std::env::var("FT_EMBED_HOST").as_deref(),
+        Ok("0") | Ok("false")
+    );
+    if want_host {
+        let t = ld.desc(name)?;
+        if t.dtype == DType::Bf16 && t.shape.len() == 2 {
+            let (rows, cols) = (t.shape[0], t.shape[1]);
+            match rt.driver().alloc_pinned(t.nbytes as usize) {
+                Ok(mut buf) => {
+                    ld.reader
+                        .read_range(t.global_off, t.nbytes, buf.as_mut_slice())
+                        .map_err(|e| LoadError::Read(name.into(), e))?;
+                    return Ok(Embedding::Host(HostEmbed { buf, rows, cols }));
+                }
+                Err(e) => eprintln!(
+                    "warning: the host embedding allocation was refused ({e}); \
+                     keeping the table on the device"
+                ),
+            }
+        }
+    }
+    Ok(Embedding::Device(ld.dense(name)?))
 }
 
 /// One decoder layer at `prefix`, which is either `model.layers.N` or the MTP

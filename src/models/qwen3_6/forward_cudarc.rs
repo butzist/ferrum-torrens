@@ -25,7 +25,7 @@ use crate::infrastructure::kvcache_dev::{DeviceCache, KvDType, LinearStateSlabs}
 use crate::infrastructure::profile::{substep_begin, substep_end, substep_report};
 use crate::infrastructure::torch::Device;
 
-use super::load_cudarc::{Dense, DenseWeight, HeadWeight, Layer, Mixer, Tower};
+use super::load_cudarc::{Dense, DenseWeight, Embedding, HeadWeight, Layer, Mixer, Tower};
 use super::weights::bank_name;
 
 type Result<T> = std::result::Result<T, MoEError>;
@@ -141,15 +141,15 @@ pub fn softplus(x: &Tensor) -> Result<Tensor> {
 /// bf16 weight). Matches the serving storage policy: bf16 GEMM, f32 scale, bf16
 /// storage for the activation stream.
 pub fn linear(x: &Tensor, w: &Tensor, row_scale: Option<&Tensor>) -> Result<Tensor> {
-    let y = x
-        .cast(TensorDType::Bf16)?
-        .matmul_nt(w)?
-        .cast(TensorDType::F32)?;
-    let y = match row_scale {
-        Some(s) => y.col_mul(s)?,
-        None => y,
-    };
-    y.cast(TensorDType::Bf16)
+    let y = x.cast(TensorDType::Bf16)?.matmul_nt(w)?;
+    match row_scale {
+        // The GEMM already returns bf16, so the unscaled path needs no cast.
+        None => Ok(y),
+        Some(s) => Ok(y
+            .cast(TensorDType::F32)?
+            .col_mul(s)?
+            .cast(TensorDType::Bf16)?),
+    }
 }
 
 /// `probs.topk(k)[1]` plus the renormalized weights, the router's hand-off to
@@ -602,6 +602,25 @@ impl CudarcQwen3_6 {
     }
 
     fn apply_dense(&self, d: &Dense, x: &Tensor) -> Result<Tensor> {
+        // A one-row NVFP4 projection runs the packed-weight gemv: the decode
+        // step reads the checkpoint's 4-bit bytes instead of the widened bf16
+        // copy, and the kernel dequantizes as it goes. The bf16 GEMM stays for
+        // prefill, where one weight read serves every row.
+        if let (DenseWeight::Bf16(_), Some(banks), Some(gemv)) = (&d.w, &d.nvfp4, &self.head_gemv)
+            && x.numel() == d.cols
+        {
+            let a = x.cast(TensorDType::Bf16)?.reshape(&[1, d.cols])?;
+            let out = self.rt.zeros(&[1, d.rows], TensorDType::F32)?;
+            // SAFETY: the banks, the activation and the output are live device
+            // allocations in this launcher's context, and the launcher checks
+            // the geometry before it writes the whole output.
+            unsafe { gemv.gemv(&a, &banks.packed, &banks.scale, &banks.global, &out) }?;
+            let mut shape = x.shape().to_vec();
+            if let Some(last) = shape.last_mut() {
+                *last = d.rows;
+            }
+            return out.cast(TensorDType::Bf16)?.reshape(&shape);
+        }
         match &d.w {
             DenseWeight::Bf16(w) => linear(x, w, d.row_scale.as_ref()),
             DenseWeight::Fp8 { bytes, scale } => {
@@ -1115,10 +1134,7 @@ impl CudarcQwen3_6 {
         }
         let idx: Vec<i32> = tokens.iter().map(|t| *t as i32).collect();
         let idx = self.rt.from_slice_i32(&idx, &[n])?;
-        let DenseWeight::Bf16(embed) = &self.tower.embed.w else {
-            return Err(moe_bad("the embedding is not bf16"));
-        };
-        let embeds = embed.gather_rows(&idx)?;
+        let embeds = self.embed_rows(&idx)?;
         let ne = rms_norm(&embeds, &d.pre_fc_norm_embedding, p.rms_norm_eps)?;
         let prev = self
             .rt
@@ -1401,6 +1417,21 @@ impl CudarcQwen3_6 {
         }
     }
 
+    /// The token embeddings of `idx`, from pinned host memory or the device
+    /// table depending on how the embedding loaded. Both branches run the same
+    /// gather kernel; only the source pointer differs.
+    fn embed_rows(&self, idx: &Tensor) -> Result<Tensor> {
+        match &self.tower.embed {
+            Embedding::Device(d) => {
+                let DenseWeight::Bf16(w) = &d.w else {
+                    return Err(moe_bad("the embedding is not bf16"));
+                };
+                w.gather_rows(idx)
+            }
+            Embedding::Host(h) => h.gather(&self.rt, idx).map_err(|e| moe_bad(e.to_string())),
+        }
+    }
+
     /// The transformer stack shared by every path: embedding through the final
     /// residual, returning the `[t, hidden]` stream before the final norm.
     fn tower_stream(
@@ -1411,10 +1442,7 @@ impl CudarcQwen3_6 {
         access: &Access<'_>,
     ) -> Result<Tensor> {
         let p = &self.params;
-        let DenseWeight::Bf16(embed) = &self.tower.embed.w else {
-            return Err(moe_bad("the embedding is not bf16"));
-        };
-        let mut x = embed.gather_rows(idx)?;
+        let mut x = self.embed_rows(idx)?;
         let mut residual: Option<Tensor> = None;
 
         for (li, layer) in self.tower.layers.iter().enumerate() {

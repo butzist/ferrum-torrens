@@ -10,14 +10,21 @@
 
 use std::sync::Arc;
 
+use half::bf16;
+
 use ferrum_torrens::domain::dequant::{bf16_array, nvfp4_block};
 use ferrum_torrens::domain::weights::WeightsReader;
 use ferrum_torrens::infrastructure::cudarc::Runtime;
 use ferrum_torrens::infrastructure::ftw::{FtwIndex, FtwReader};
-use ferrum_torrens::models::qwen3_6::load_cudarc::{DenseWeight, HeadWeight, Mixer, Tower};
+use ferrum_torrens::models::qwen3_6::load_cudarc::{
+    DenseWeight, Embedding, HeadWeight, Mixer, Tower,
+};
 use serial_test::serial;
 
-const FTW_DIR: &str = ".model-cache/Qwen3.6-35B-A3B-NVFP4.ftw";
+fn ftw_dir() -> String {
+    std::env::var("FERRUM_FTW_DIR")
+        .unwrap_or_else(|_| ".model-cache/Qwen3.6-35B-A3B-NVFP4.ftw".to_string())
+}
 
 fn raw(index: &FtwIndex, reader: &dyn WeightsReader, name: &str) -> Vec<u8> {
     let t = index
@@ -54,7 +61,8 @@ fn max_rel(got: &[f32], want: &[f32]) -> f32 {
 #[ignore = "needs the converted checkpoint and a CUDA device"]
 #[serial]
 fn the_dense_tower_loads_through_cudarc() {
-    let dir = std::path::Path::new(FTW_DIR);
+    let ftw = ftw_dir();
+    let dir = std::path::Path::new(&ftw);
     let index = Arc::new(
         FtwIndex::parse(
             &std::fs::read_to_string(dir.join("freetoken_weight.json"))
@@ -77,25 +85,40 @@ fn the_dense_tower_loads_through_cudarc() {
     let (free1, _) = rt.driver().mem_info().unwrap();
 
     assert_eq!(tower.layers.len(), params.num_layers);
-    assert_eq!(tower.embed.rows, params.vocab_size);
-    assert_eq!(tower.embed.cols, params.hidden_size);
     assert_eq!(tower.lm_head.rows, params.vocab_size);
 
     // The three storage policies: bf16 stays bf16, FP8 keeps its e4m3 bytes,
-    // the NVFP4 head keeps its K-major banks.
-    assert!(matches!(tower.embed.w, DenseWeight::Bf16(_)));
+    // the NVFP4 head keeps its K-major banks. The embedding is pinned host
+    // memory by default (`FT_EMBED_HOST=0` keeps the device copy).
     assert!(matches!(tower.lm_head.weight, HeadWeight::Nvfp4(_)));
 
     let h = params.hidden_size;
 
-    // Embedding row 0 is the checkpoint's bf16 row, bit for bit.
+    // Embedding row 0 is the checkpoint's bf16 row, bit for bit, from whichever
+    // storage the loader chose.
     let want = bf16_array(
         &raw(&index, reader.as_ref(), "model.embed_tokens.weight"),
         h,
     );
-    let got = match &tower.embed.w {
-        DenseWeight::Bf16(t) => t.narrow(0, 0, 1).unwrap().to_host_f32().unwrap(),
-        _ => unreachable!(),
+    let got = match &tower.embed {
+        Embedding::Host(host) => {
+            assert_eq!(host.rows(), params.vocab_size);
+            assert_eq!(host.cols(), params.hidden_size);
+            host.host_bytes()[..2 * h]
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| f32::from(bf16::from_bits(u16::from_le_bytes(*c))))
+                .collect::<Vec<f32>>()
+        }
+        Embedding::Device(d) => {
+            let DenseWeight::Bf16(t) = &d.w else {
+                panic!("a device embedding must be bf16");
+            };
+            assert_eq!(d.rows, params.vocab_size);
+            assert_eq!(d.cols, params.hidden_size);
+            t.narrow(0, 0, 1).unwrap().to_host_f32().unwrap()
+        }
     };
     assert_eq!(got, want, "embedding row 0");
 

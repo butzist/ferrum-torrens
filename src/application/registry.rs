@@ -132,13 +132,20 @@ pub fn build(
                 // The vision tower uploads its bf16 weights eagerly, before
                 // the auto expert-cache budget reads the free VRAM, so the
                 // budget sees it resident just like the dense tower.
-                let vision = crate::models::qwen3_6::vision_cudarc::build_device_vision(
-                    config_json,
-                    index.clone(),
-                    reader.clone(),
-                    rt.clone(),
-                )
-                .map_err(RegistryError::build)?;
+                let vision = if config.model.text_only {
+                    // A text-only deployment spends the ~1.7 GiB the f32
+                    // vision tower would hold on expert-cache slots instead.
+                    // An image request then fails at admission, not at encode.
+                    None
+                } else {
+                    crate::models::qwen3_6::vision_cudarc::build_device_vision(
+                        config_json,
+                        index.clone(),
+                        reader.clone(),
+                        rt.clone(),
+                    )
+                    .map_err(RegistryError::build)?
+                };
                 // Load the tower with the MoE port detached: the auto cache
                 // budget (item 12) reads the free VRAM after the tower, the KV
                 // pool and the ports are all resident, then sizes the expert
@@ -280,7 +287,11 @@ fn scalar_built(
             .cache_size_slots
             .explicit()
             .unwrap_or(crate::config::DEFAULT_CACHE_SIZE_SLOTS),
-        vision: load_vision(config_json, index, reader)?,
+        vision: if config.model.text_only {
+            None
+        } else {
+            load_vision(config_json, index, reader)?
+        },
     })
 }
 

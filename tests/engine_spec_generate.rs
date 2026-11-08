@@ -14,10 +14,11 @@
 // Measurement knobs, all optional: `SPEC_K` (draft length), SPEC_MARGIN
 // (`[spec] trust_margin`), `FERRUM_SPEC_TOKENS` (generated tokens),
 // `FERRUM_SPEC_PROFILE` (per-phase timing), `FERRUM_TEST_SLOTS` (target expert
-// cache; 384 leaves room for the draft's 433 MiB bank), `FERRUM_TEST_GRAPH`
-// (captured decode for the plain arm) and `FERRUM_PLAIN_ONLY` (skip the
-// speculative arm). The comparison against FreeToken in OPTIMIZATION.md R14
-// used exactly these.
+// cache; "auto" lets the loader size it, 384 leaves room for the draft's
+// 433 MiB bank), `FERRUM_TEST_TEXT_ONLY` (skip the vision tower, which is worth
+// ~1.7 GiB of f32 weights), `FERRUM_TEST_GRAPH` (captured decode for the plain
+// arm) and `FERRUM_PLAIN_ONLY` (skip the speculative arm). The comparison
+// against FreeToken in OPTIMIZATION.md R14/R14b/R14c used exactly these.
 
 #![cfg(feature = "cudarc")]
 
@@ -56,10 +57,16 @@ fn config(spec: Option<usize>) -> Config {
         }
     };
     let budget = tokens_budget();
-    let slots = std::env::var("FERRUM_TEST_SLOTS").unwrap_or_else(|_| "384".to_string());
+    let slots = match std::env::var("FERRUM_TEST_SLOTS").as_deref() {
+        Ok("auto") => "\"auto\"".to_string(),
+        Ok(s) => s.to_string(),
+        Err(_) => "384".to_string(),
+    };
     let graph = std::env::var("FERRUM_TEST_GRAPH").unwrap_or_else(|_| "false".to_string());
+    let text_only = std::env::var("FERRUM_TEST_TEXT_ONLY").unwrap_or_else(|_| "false".to_string());
     format!(
-        "[model]\npath = \"{dir}\"\ncuda_graph = {graph}\nmax_seq_len = 4096\nmax_output_tokens = {budget}\n\
+        "[model]\npath = \"{dir}\"\ncuda_graph = {graph}\ntext_only = {text_only}\n\
+         max_seq_len = 4096\nmax_output_tokens = {budget}\n\
          max_prefill_length = 1024\nmax_running_requests = 1\n\n\
          [kernel]\ntriton = true\n\n\
          [kv]\nnum_tokens = 4096\ndtype = \"f32\"\n\n\

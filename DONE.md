@@ -3176,6 +3176,38 @@ settled.
      `/v1/completions` (greedy). `--moe-cache-size 1072` reproduces the
      same-cache plain arm.
 
+153. **The embedding lives in pinned host RAM and a text-only deployment does
+     not load the vision tower** (2026-11-08, M9.8a). The expert cache is the
+     decode bottleneck (R14c): at 2048 slots the target still misses ~52
+     experts per token, and the copy is already at the 14.4 GB/s PCIe ceiling,
+     so capacity is the lever. Two allocations were spending VRAM for nothing:
+     - **Embedding: 970 MiB of bf16.** A decode step gathers exactly one 4 KiB
+       row, so the table now loads into a `cuMemHostAlloc` buffer (the same
+       pinned + device-mapped allocation the prefill banks use) and the
+       existing gather kernel dereferences the device alias of that host
+       memory. A prefill chunk gathers its rows over the bus too (4 MiB for a
+       1024-token chunk). `FT_EMBED_HOST=0` keeps the old device copy for the
+       A/B; a refused pinned allocation falls back with a warning.
+     - **Vision tower: 1.7 GiB of f32.** `vision_cudarc` widens the 852 MiB of
+       bf16 vision weights to f32 and uploads them before the auto cache
+       budget runs, on every load, image input or not. `[model] text_only =
+       true` skips it; an image request then fails at admission. This mirrors
+       FreeToken's `--text-model-only`, which the R14b benchmark already used,
+       so the comparison is like for like.
+     Two smaller MoE-path fixes landed with them: a one-row NVFP4 `Dense`
+     (the shared experts) now runs the packed-weight gemv instead of the
+     widened bf16 copy, and `linear()` no longer does a `bf16 -> f32 -> bf16`
+     round trip when it has no row scale. `tests/cudarc_load.rs` checks the
+     host table against the checkpoint bytes, and the reference oracle gate
+     still answers `11751` after the shared-expert path change.
+     - **Measured:** auto slots 896 -> 2048, plain 27.1 -> 32.2-32.9 tok/s
+       (128 tokens, captured, 40 W). Full numbers and the remaining breakdown
+       in OPTIMIZATION.md R14c.
+     - **Rejected in the same slice:** frequency admission (LFU) in
+       `lru_ensure`. It wins 41% on a repeated trace but only 3% on a real
+       single-request trace and 0% measured, so the committed policy stays
+       strict LRU; a real win needs a pre-collected hot set.
+
 ## Progress log (narrative, pre-2026-10-15 compaction)
 
 

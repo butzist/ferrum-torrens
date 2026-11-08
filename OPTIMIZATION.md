@@ -1936,3 +1936,79 @@ Where the remaining gaps are, in the order this measurement ranks them:
 4. **Draft depth at k=3** (0.53 vs 0.72), i.e. the third draft's hidden chain.
 5. **Prefill drafting** (`on_prefill`) and `radix_lookahead` prefix keys, both of
    which FreeToken has and we do not.
+
+## R14c -- closing the device-memory gap (measured 2026-11-08, M9.8a)
+
+R14b ranked "device memory for the expert cache" as the largest single gap:
+FreeToken fits 2012 slots where our loader refused anything above ~1024 on the
+same card. This slice took the two cleanest terms, and the result is the first
+plain-decode win since R11.
+
+| change | free after tower | auto slots | plain tok/s (128 tok) |
+| --- | --- | --- | --- |
+| before (R14b, 1024 explicit) | 2242 MiB | 896 (auto) | 27.1 (64 tok, R14b) |
+| embedding in pinned host RAM | 3168 MiB | 1536 | 30.7 - 30.8 |
+| + `model.text_only = true` | 4832 MiB | 2048 (kernel ceiling) | 32.2 - 32.9 |
+
+Decode misses per step (summed over 40 layers, `FT_MISS_TRACE=1`, eager):
+95 at 1024 slots, 65 at 1536, ~52 at 2048. The copy itself runs at 14.7 GB/s,
+which is the measured PCIe ceiling of this box (`ft bench bw`: 14.4 GB/s), so
+fewer misses is the only way to shrink it.
+
+What landed (all in `models/qwen3_6/load_cudarc.rs` / `forward_cudarc.rs`
+unless noted):
+
+1. **Host-streamed embedding.** The 970 MiB bf16 table is loaded into a
+   `cuMemHostAlloc` buffer and the existing `gather_rows` kernel reads the row
+   over the bus through the buffer's device alias (`Runtime::gather_rows_from_host`).
+   A decode step reads 4 KiB; a 1024-token prefill chunk reads 4 MiB. This is
+   FreeToken's `--embed-weights host` and it is now our default
+   (`FT_EMBED_HOST=0` restores the device copy for an A/B).
+2. **`model.text_only`.** The f32 vision tower is 1.7 GiB: 852 MiB of bf16
+   checkpoint weights widened to f32 and uploaded eagerly, before the auto
+   cache budget runs. A text-only deployment now skips it and an image request
+   fails at admission instead of competing for the expert cache. This is
+   FreeToken's `--text-model-only`; the FT benchmark in R14b already ran with
+   it, so the comparison is now like for like.
+3. **Shared experts through the packed NVFP4 gemv at M = 1.** `apply_dense`
+   already held the K-major banks (kept for prefill) but ran the decode through
+   the widened bf16 copy. A one-row projection now reads 1.5 MiB instead of
+   6 MiB per layer. The prefill GEMM still uses the bf16 copy.
+4. **`linear()` drops two dead casts.** The bf16 GEMM already returns bf16, so
+   the old `bf16 -> f32 -> bf16` round trip was two elementwise kernels per
+   unscaled projection, 100 of them per token.
+5. **`FERRUM_TEST_TEXT_ONLY` and `cache_size_slots = "auto"` in the spec gate.**
+   The measurement harness can now reach the 2048-slot ceiling.
+
+The uncaptured stage profile at 2048 (substep timer, one synchronize per
+boundary, so the shares matter and the absolute sum is inflated): MoE 18.6 ms
+(copy 7.1, grouped gemv 3.4, `lru_ensure` 1.9, router 1.5, shared expert 3.4,
+residual 0.4), GDN layers 7.3, attention 2.4, head 1.0. At 32.2 tok/s the
+captured token is ~31 ms against FreeToken's 21.3 ms, so the remaining gap is
+inside MoE plus the 30 GDN layers, not the embedding or the head.
+
+### The LFU cache policy was tried and rejected
+
+R13 left the admission policy open. I implemented frequency admission in
+`lru_ensure` (per-slot hit count, packed `(freq, recency, slot)` victim key,
+halve every 4096 layer-steps) with the full ABI/self-test update and measured
+it: repeating one 47-step route trace ten times showed LFU at 34.2 misses/step
+against LRU's 58.0 (41% fewer), but that repetition is not a steady state. On
+the real single-request trace the same simulation gives LRU 75.4 against LFU
+72.8 (3%), and the measured run was 32.1 tok/s against 32.0 for LRU, inside
+the box drift. Reverted; the committed kernel is still strict LRU. A real win
+needs a *pre-collected* hot set (FreeToken's `locked_fetch` / profile-sized
+pools), not online LFU.
+
+### Speculative decode at the new cache size
+
+The 2048-slot cache helps the plain arm more than the verify arm, because a
+`k + 1`-row verify misses on roughly `k + 1` times as many distinct experts per
+step. At 24 tokens: k = 3 is 11.7 tok/s (10 steps, 1.50 accept/step, verify
+155.6 ms of each step), k = 2 is 13.9. The verify is still eager, so it gets
+none of the capture win the plain arm does; a captured verify graph is the
+next lever (M9.8b), then the fused GDN commit (M9.8c).
+
+The oracle gate was re-run after change 3 on the reference checkpoint and still
+answers `11751` (" Paris"), so the fp4 shared-expert path did not move the
+first-token pin.

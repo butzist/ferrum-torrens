@@ -170,6 +170,10 @@ pub struct Model {
     pub attention_backend: AttentionBackend,
     #[serde(default)]
     pub cuda_graph: bool,
+    /// Skip the vision tower entirely: a text-only deployment does not pay its
+    /// device footprint, and an image request is refused instead of encoded.
+    #[serde(default)]
+    pub text_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -537,6 +541,7 @@ triton = true
         assert_eq!(c.model.page_size, 1);
         assert_eq!(c.model.cache_type, CacheType::HybridRadix);
         assert_eq!(c.model.attention_backend, AttentionBackend::Fi);
+        assert!(!c.model.text_only, "vision loads unless text_only asks");
         assert_eq!(c.moe.strategy, MoeStrategy::Offload);
         assert_eq!(c.moe.expert_load, ExpertLoad::Serial);
         assert_eq!(c.moe.cache_size_slots, CacheSize::Slots(512));
@@ -579,6 +584,18 @@ path = "/tmp/Qwen.ftw"
         assert_eq!(c.sampling.top_k, -1);
         assert_eq!(c.sampling.top_p, 1.0);
         assert!(!c.kernel.triton, "the inline host widening is the default");
+    }
+
+    #[test]
+    fn text_only_is_a_plain_flag() {
+        let c = Config::from_str(
+            r#"[model]
+path = "/tmp/Qwen.ftw"
+text_only = true
+"#,
+        )
+        .unwrap();
+        assert!(c.model.text_only);
     }
 
     #[test]

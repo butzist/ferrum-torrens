@@ -140,7 +140,7 @@ stays pure: `Tensor` and CUDA handles never cross it (section 4).
 | Generation loop + KV page-table bookkeeping (`SequenceCache`) | Host | `domain/kvcache.rs`, `application/engine.rs` |
 | FTW index parse + O_DIRECT pread of the checkpoint | Host | `infrastructure/ftw.rs` |
 | Pinned expert banks (17.3 GiB, page-locked, device-mapped) | Host memory | `infrastructure/banks.rs` (`FtwPinnedBanks`) |
-| Dense weights: embedding + all projections + `lm_head` (4.51 GiB bf16; the lm_head kept packed NVFP4 on CUDA) | Device | `models/qwen3_6/forward_cudarc.rs`, `models/qwen3_6/load_cudarc.rs` |
+| Dense weights: projections + `lm_head` (3.5 GiB; the lm_head packed NVFP4); the 970 MiB bf16 embedding in pinned host RAM, gathered over the bus | Device + host | `models/qwen3_6/forward_cudarc.rs`, `models/qwen3_6/load_cudarc.rs` |
 | Embedding gather, RMSNorm, RoPE, attention (GQA), GDN recurrence, `lm_head` | Device | `models/qwen3_6/forward_cudarc.rs` (cudarc) + `infrastructure/cuda_linear.rs` (dense NVFP4 head) |
 | Router: gate matmul + softmax + top-8 | Device | `forward_cudarc.rs` (ids stay device) |
 | Routed experts: slot cache + grouped GEMV | Device | `infrastructure/cuda_moe.rs` (cudarc storage + driver-API cubins) |
@@ -402,7 +402,7 @@ sequenceDiagram
     Ld->>Ld: dequant to f32, cast to bf16
     Ld->>Dev: copy window into resident tensor
   end
-  Note over Ld: ~4.5 GiB resident bf16;<br/>apply/gather never re-read
+  Note over Ld: ~3.5 GiB resident bf16;<br/>embedding pinned on host
   Reg->>Reg: resolve_cache_slots (auto: cuMemGetInfo - reserve) / expert_bytes
   Reg->>MoE: if kernel.triton: CudaMoE(slots) + FtwPinnedBanks
   Reg->>Ld: attach_moe(port)
@@ -546,7 +546,12 @@ is a route cap, and its committed `BLOCK_C = 2048` caps the slot cache it can
 address (decision 85). The slot count itself is `moe.cache_size_slots`: an
 integer or `"auto"` (default), where auto sizes it from the free device memory
 once the tower and KV pool are resident, reserving 512 MiB for the prefill
-scratch and transient activations (item 12, decisions 90, 127, `registry::resolve_cache_slots`). `CudaMoE::grouped_moe_staged` chunks a larger list by tokens
+scratch and transient activations (item 12, decisions 90, 127, `registry::resolve_cache_slots`).
+Two allocations are deliberately outside that device budget: the bf16 embedding
+table lives in pinned host RAM and a gather reads its rows over the bus
+(decision 153), and `model.text_only = true` skips the f32 vision tower. With
+both, auto resolves the kernel's `BLOCK_C = 2048` ceiling; with the vision tower
+resident it resolves ~1536. `CudaMoE::grouped_moe_staged` chunks a larger list by tokens
 (`staged_chunk_tokens`) and repeats the sequence per chunk, the device LRU and
 the pinned banks carrying across, so prefill uses the same device path as decode
 (decision 66). `CachedExperts` without device staging still takes the host plan

@@ -238,6 +238,36 @@ impl Runtime {
         self.inner.stream.synchronize().map_err(bad)
     }
 
+    /// Gather rows of a bf16 table that lives in pinned host memory (the
+    /// device-visible alias `src`) by a device i32 index. The gather kernel
+    /// reads the rows over the bus, so the table costs no VRAM.
+    pub fn gather_rows_from_host(
+        &self,
+        src: u64,
+        index: &Tensor,
+        cols: usize,
+    ) -> Result<Tensor, MoEError> {
+        if index.dtype() != TensorDType::I32 || index.dim() != 1 {
+            return Err(bad("a host row gather wants a 1-d i32 index"));
+        }
+        let index = index.contiguous()?;
+        let rows = index.shape()[0];
+        let out = self.zeros(&[rows, cols], TensorDType::Bf16)?;
+        if rows == 0 || cols == 0 {
+            return Ok(out);
+        }
+        self.inner.kernels.gather_rows(
+            self.raw_stream(),
+            GATHER_ROWS_BF16,
+            src,
+            index.device_ptr(),
+            out.device_ptr(),
+            cols,
+            rows,
+        )?;
+        Ok(out)
+    }
+
     /// An engine-owned bf16 buffer. Nothing is allocated inside a capture; the
     /// caller allocates first and reuses the same address across replays.
     pub fn alloc_bf16(&self, len: usize) -> Result<CudaSlice<bf16>, MoEError> {
