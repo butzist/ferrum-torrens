@@ -1,6 +1,10 @@
 # FerrumTorrens -- FreeToken MVP port to Rust: TODO
 
-Status (2026-11-09): **The decode step is attributed** (R15 S11, decision 160):
+Status (2026-11-09): **A dropped engine now returns its device slot banks**
+(M8.1e, decision 163): the adapter's `Drop` freed them too late, so
+`Engine::retire` releases the cache before dropping the residency (3945 -> 7471
+MiB free after `drop(engine)`), which also unblocks in-process arm loops.
+**The decode step is attributed** (R15 S11, decision 160):
 29.2 ms/token, of which `moe_copy` -- the expert miss staging over PCIe -- is
 9.4 ms (32%); the routed GEMV and the lm_head are at roofline. R15 S12 landed
 the copy/shared-expert overlap (+2.4%). **The expert-cache policy lever is now
@@ -656,21 +660,18 @@ Ordered slices, each its own gated change:
   not a path change. Absolute numbers sit below the 32.8 tok/s baseline because
   the card was power/thermally capped during the session. Details in `DONE.md`
   147.
-- [x] **M8.1e A dropped engine keeps its device slot banks.** Fixed by giving `CudaMoE` a `Drop` that calls `release_banks()`, so a dropped `Engine` returns its slot banks (measured: 4058 MiB -> 1048 MiB vs 444 MiB baseline). `throughput_smoke`
-  grows a `vram("process start" | "after load" | "after drop")` probe, and the
-  numbers are unambiguous: with `[moe] cache_size_slots = 256` a 6794 MiB load
-  drops to 1160 MiB against a 526 MiB process baseline, and with 1024 slots an
-  8106 MiB load drops to 2440 MiB. The retained amount is
-  `slots x 1.775 MiB` -- exactly one expert bank row per slot, plus ~140 MiB of
-  context -- so the banks outlive the `Engine`, and a second load in the same
-  process is 1.5 GiB poorer (at 1024 slots it fails with
-  `CUDA_ERROR_OUT_OF_MEMORY` in the MoE bank allocation). Host memory is *not*
-  retained: peak RSS stays 18.6 GiB and the 16.9 GiB of pinned banks come back.
-  `release_banks()` on the idle-release path frees them explicitly, so serving
-  is not affected today; dropping a whole `Engine` is what leaks. Next step: the
-  `Arc<Mutex<adapter>>` that `moe_port` clones into `CachedExperts` (twice) and
-  the model is still alive after the drop -- find the clone (a `Drop` log on the
-  adapter, then `Arc::strong_count`) before adding any in-process arm loop.
+- [x] **M8.1e A dropped engine keeps its device slot banks -- CLOSED (decision
+  163).** The residual was not an `Arc` clone and not the CUDA memory pool (the
+  driver's own free count agreed with NVML, and a plain tensor drop plus a pool
+  trim does return memory): the adapter's `Drop`-time `release_banks` is simply
+  too late once the residency is being torn down. `Engine::retire` now asks the
+  MoE port to release its cache *before* the residency drops, and a dropped
+  engine returns its banks: 3945 of 7707 MiB free after `drop(engine)` before,
+  7471 of 7514 after (a 526 MiB process baseline), stable after a 200 ms settle.
+  Two unit tests pin the call (`release_residency` and `drop` each release
+  exactly once), and `throughput_smoke` prints the driver's free count at every
+  stage plus an optional `FERRUM_SMOKE_RELEASE_MOE=1` step. In-process arm loops
+  no longer start poorer.
 - [x] **M8.2 Class B -- per-checkpoint cubin set.** Serving shapes moved into
   `ServingShapes` (python/ferrum_kernel/signatures.py), threaded through
   `aot.py` via env/CLI flags, `nix/kernels.nix` parameterized by `profileArgs`,

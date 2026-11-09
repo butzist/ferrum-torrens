@@ -5202,3 +5202,36 @@ subsection names are kept verbatim.
     next step is 4096 slots = 7.1 GiB, which does not fit), and a two-block
     victim search would be needed in between. Decode is therefore
     workload-bound, not engine-bound, on this card.
+
+163. **A dropped engine was freeing its slot banks too late, not leaking them**
+    (2026-11-09, closing M8.1e). The residual was 3.7 GiB after `drop(engine)`
+    with no `Arc` in sight, so the recorded hypothesis ("find the clone") was
+    tested and rejected, along with the other obvious suspect. Both were
+    measured, not argued:
+    - *Not a pool artifact.* cudarc allocates with `cuMemAllocAsync` whenever the
+      device has memory pools, and frees with `cuMemFreeAsync`, so a freed block
+      goes back to the pool and NVML keeps counting it. But the driver's own
+      `cuMemGetInfo` agreed with NVML (3945 of 7707 MiB free after a drop), and a
+      standalone experiment (allocate 64 MiB through the runtime, drop it,
+      `cuMemPoolTrimTo` the device's default pool) returned the bytes once the
+      stream was drained. The pool-trim primitive was implemented, wired into
+      `CudaMoE::release_banks` and then removed: it never once succeeded on the
+      release path (`cuMemPoolTrimTo` answers "context is destroyed" there) and
+      the frees alone are sufficient. Do not re-add it.
+    - *The ordering was the bug.* `CudaMoE` already had a `Drop` that calls
+      `release_banks`, but it runs while the residency (and the model's runtime)
+      is being torn down, and the released banks do not actually come back from
+      there: measured 4205 MiB used / 3945 MiB free after `drop(engine)` with
+      that path alone, even with a stream synchronize in `release_banks`.
+      `Engine::retire` now clones the MoE port, asks it to `release_cache()`
+      *before* dropping the residency, and drops the residency after: 680 MiB
+      used / **7471 of 7514 MiB free**, unchanged after a 200 ms settle. Both
+      `release_residency` and `Drop for Engine` go through it, so the idle
+      release path gets the same guarantee.
+    Tests: two `Engine` unit tests (`release_residency` releases the cache
+    exactly once and a second drop does not; dropping a live engine releases it
+    exactly once) with `MockMoEExecutor`, and `throughput_smoke` now prints the
+    driver's free/total at each stage (NVML alone cannot tell a pool-held block
+    from a free one) plus an optional `FERRUM_SMOKE_RELEASE_MOE=1` stage that
+    measures the intermediate release. A dropped engine no longer costs the next
+    in-process load its banks, so a multi-arm comparison can run in one process.
