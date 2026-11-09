@@ -195,6 +195,15 @@ pub struct CudaMoE {
 unsafe impl Send for CudaMoE {}
 unsafe impl Sync for CudaMoE {}
 
+impl Drop for CudaMoE {
+    fn drop(&mut self) {
+        // The device slot banks (and everything baking their addresses) must not
+        // outlive the adapter: release them explicitly so a dropped engine gives
+        // the VRAM back even if a captured graph or a prefill group held a clone.
+        self.release_banks();
+    }
+}
+
 /// One step's device buffers, kept alive across calls so a CUDA graph can be
 /// captured over their addresses (decision 39): the launches are the graph,
 /// and everything that writes these tensors happens before it. A group must
@@ -2195,7 +2204,7 @@ pub fn expert_slot_bytes(shapes: ExpertShapes) -> usize {
 /// The committed cubins are constexpr-specialized, so a model they were not built
 /// for cannot be served by them at all. Checking at load turns a silently wrong
 /// answer into an error.
-fn check_shapes(shapes: &ExpertShapes, abi: &Abi) -> Result<(), MoEError> {
+pub fn check_shapes(shapes: &ExpertShapes, abi: &Abi) -> Result<(), MoEError> {
     if shapes.hidden != abi.hidden || shapes.inter != abi.inter {
         return Err(MoEError::Bad(format!(
             "the committed cubins are for hidden {} inter {} (bf16, top_k {}), not hidden {} inter {}",

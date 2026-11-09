@@ -432,6 +432,10 @@ impl GdnDecode {
 /// The cubin bakes the GDN geometry, so a checkpoint whose head shape differs
 /// would launch a kernel walking the wrong strides. Fail at construction instead,
 /// the same way `PagedAttention` checks its head geometry.
+pub fn check_shapes(params: &ModelParams, abi: &LinearAbi) -> Result<(), MoEError> {
+    check_geometry(params, abi)
+}
+
 fn check_geometry(params: &ModelParams, abi: &LinearAbi) -> Result<(), MoEError> {
     let kernel = abi.kernel(GDN_DECODE).map_err(bad_abi)?;
     let c = |name: &str| kernel.constexpr(name).map_err(bad_abi);

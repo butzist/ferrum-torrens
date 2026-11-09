@@ -663,6 +663,16 @@ pub fn load_engine(config: &crate::config::Config) -> Result<Engine, LoadError> 
     ))
 }
 
+impl Drop for Engine {
+    fn drop(&mut self) {
+        if let Ok(mut slot) = self.residency.write() {
+            // Dropping the residency frees the device banks too: the MoE adapter
+            // owns them, and nothing else may keep it alive past the engine.
+            let _ = slot.take();
+        }
+    }
+}
+
 impl Engine {
     /// `cache` is the model's own KV cache, if it has one: the registry builds
     /// it from `[kv]` and hands the same allocation to the engine and the model
@@ -1565,6 +1575,7 @@ pub(crate) mod fake {
             tokens: &[u32],
             hiddens: &[f32],
             from: usize,
+            _chain_base: usize,
         ) -> Result<crate::domain::kvcache::Drafted, crate::domain::kvcache::KvcacheError> {
             let hidden = self.params().hidden_size;
             assert_eq!(hiddens.len(), tokens.len() * hidden);
