@@ -444,14 +444,18 @@ struct GdnStash {
     layer: usize,
     conv_in: Tensor,
     ba: Tensor,
+    /// Conv state after each of the verify's rows, on the gathered slot copy.
+    conv_states: Vec<Tensor>,
+    /// Recurrent state after each of the verify's rows, on the gathered slot copy.
+    rec_states: Vec<Tensor>,
 }
 
 /// What a verify step leaves for `commit_verify`: the slot it ran against, the
 /// rows it wrote K/V for, and every linear layer's stashed GDN inputs.
 struct VerifyStash {
-    slot: u32,
     rows: usize,
     layers: Vec<GdnStash>,
+    hidden: Tensor,
 }
 
 /// The torch-less Qwen3.6 text tower over the cudarc adapter.
@@ -478,6 +482,10 @@ pub struct CudarcQwen3_6 {
     /// engine runs one verify at a time, so one slot is enough; the mutex is
     /// what lets `&self` fill it from inside a layer.
     verify: std::sync::Mutex<Option<VerifyStash>>,
+    /// A captured verify service, when one was attached at load. `verify_cached`
+    /// replays it instead of the eager tower when it is present.
+    captured_verify:
+        std::sync::Mutex<Option<std::sync::Arc<dyn crate::domain::decode::CapturedDecode>>>,
     /// The MTP draft head, present only when the engine enabled speculation.
     draft: Option<super::load_cudarc::DraftWeights>,
     /// The draft's own K/V, one row per absolute position, bf16. Two KV heads at
@@ -537,6 +545,7 @@ impl CudarcQwen3_6 {
             rope_sin,
             mrope_axis,
             verify: std::sync::Mutex::new(None),
+            captured_verify: std::sync::Mutex::new(None),
             draft: None,
             draft_kv: std::sync::Mutex::new(None),
             draft_moe: None,
@@ -900,6 +909,8 @@ impl CudarcQwen3_6 {
                     // positions, so the recurrence advances row by row, and the
                     // state is left alone for `commit_verify` to settle on the
                     // accepted prefix.
+                    let (core, conv_states, rec_states) =
+                        self.gdn_replay(slots, li, &conv_in, &ba, t, false)?;
                     self.verify
                         .lock()
                         .expect("verify stash")
@@ -910,8 +921,9 @@ impl CudarcQwen3_6 {
                             layer: li,
                             conv_in: conv_in.clone(),
                             ba: ba.clone(),
+                            conv_states,
+                            rec_states,
                         });
-                    let core = self.gdn_replay(slots, li, &conv_in, &ba, t, false)?;
                     substep_end(&self.rt, "gdn_recur", s);
                     core
                 }
@@ -1038,7 +1050,7 @@ impl CudarcQwen3_6 {
         ba: &Tensor,
         rows: usize,
         write_back: bool,
-    ) -> Result<Tensor> {
+    ) -> Result<(Tensor, Vec<Tensor>, Vec<Tensor>)> {
         let p = &self.params;
         let Mixer::Linear {
             conv,
@@ -1061,6 +1073,8 @@ impl CudarcQwen3_6 {
         let rec_state = state.recurrent_state_rows(slot, li);
         let rec_one = rec_state.reshape(&[1, vb, dk, dv])?;
         let mut cores = Vec::with_capacity(rows);
+        let mut conv_states = Vec::new();
+        let mut rec_states = Vec::new();
         for i in 0..rows {
             let x_one = conv_in.narrow(0, i, 1)?.contiguous()?;
             let mixed = self.rt.zeros(&[1, conv_dim], TensorDType::Bf16)?;
@@ -1077,12 +1091,16 @@ impl CudarcQwen3_6 {
                     .decode(&ba_one, a_log, dt_bias, &q, &k, &v, &rec_one, &core)
             }?;
             cores.push(core);
+            if !write_back {
+                conv_states.push(conv_state.clone());
+                rec_states.push(rec_state.clone());
+            }
         }
         if write_back {
             state.set_conv_state_rows(slot, li, &conv_state);
             state.set_recurrent_state_rows(slot, li, &rec_state);
         }
-        Tensor::stack(&cores)
+        Ok((Tensor::stack(&cores)?, conv_states, rec_states))
     }
 
     /// The MTP draft's one decoder layer: a full-attention block over the
@@ -1095,15 +1113,22 @@ impl CudarcQwen3_6 {
         kv: &DraftKv,
         from: usize,
         n: usize,
+        chain_base: usize,
     ) -> Result<Tensor> {
         let p = &self.params;
         let positions: Vec<u32> = (from..from + n).map(|i| i as u32).collect();
         let (q, k, v, gate) = self.project_attention(layer, x, &Positions::Host(&positions))?;
         let locs: Vec<u32> = (from..from + n).map(|i| i as u32).collect();
         kv.pool.store(0, &locs, &k, &v);
-        let all: Vec<u32> = (0..from + n).map(|i| i as u32).collect();
+        // Only the current chain's rows are valid attention context: positions
+        // before `chain_base` hold stale K/V from previous chains (or zeros) and
+        // must not be attended. `chain_base` is the first label of this chain.
+        let gather_start = chain_base;
+        let gather_end = from + n;
+        let all: Vec<u32> = (gather_start..gather_end).map(|i| i as u32).collect();
         let (k_all, v_all) = kv.pool.gather_native(0, &all);
-        let attn = q.causal_sdpa(&k_all, &v_all, from)?;
+        let q_offset = from - gather_start;
+        let attn = q.causal_sdpa(&k_all, &v_all, q_offset)?;
         let q_dim = p.num_q_heads * p.head_dim;
         let Mixer::Full { o, .. } = &layer.mixer else {
             return Err(moe_bad("the draft layer is not full attention"));
@@ -1116,7 +1141,13 @@ impl CudarcQwen3_6 {
     /// `tokens[i]` (the token at label `from + i + 1`) with `hiddens[i]` (the
     /// target hidden at label `from + i`), runs the draft layer and the shared
     /// LM head, and answers the token after it.
-    fn draft_forward(&self, tokens: &[u32], hiddens: &[f32], from: usize) -> Result<Drafted> {
+    fn draft_forward(
+        &self,
+        tokens: &[u32],
+        hiddens: &[f32],
+        from: usize,
+        chain_base: usize,
+    ) -> Result<Drafted> {
         let d = self
             .draft
             .as_ref()
@@ -1154,7 +1185,7 @@ impl CudarcQwen3_6 {
             .add(&self.apply_dense(&d.fc_hidden, &nh)?)?;
 
         let h1 = rms_norm(&x, &d.layer.input_norm, p.rms_norm_eps)?;
-        let attn = self.draft_attention(&d.layer, &h1, kv, from, n)?;
+        let attn = self.draft_attention(&d.layer, &h1, kv, from, n, chain_base)?;
         let (xsum, h2) = attn.add_rms_norm(&x, &d.layer.post_norm, p.rms_norm_eps)?;
         let moe = self.moe_parts(&d.layer, 0, self.draft_moe.as_ref(), &h2, false)?;
         let normed = rms_norm(&moe.add(&xsum)?, &d.norm, p.rms_norm_eps)?;
@@ -1580,6 +1611,14 @@ impl CachedModel for CudarcQwen3_6 {
         Some(self.cache.clone() as Arc<dyn KvCache>)
     }
 
+    fn attach_captured_verify(&self, service: Arc<dyn crate::domain::decode::CapturedDecode>) {
+        *self.captured_verify.lock().expect("captured verify") = Some(service);
+    }
+
+    fn verify_hidden(&self) -> Vec<f32> {
+        self.verify_hidden()
+    }
+
     fn forward_cached(
         &self,
         input: &ForwardInput,
@@ -1668,10 +1707,58 @@ impl CachedModel for CudarcQwen3_6 {
                 "the verify answers must be in-range row indices".to_string(),
             ));
         }
+        // A captured verify service, when attached, runs the whole step on the
+        // device and stashes its GDN inputs and hidden there. Fall back to the
+        // eager tower only when no service is present.
+        if let Some(service) = self
+            .captured_verify
+            .lock()
+            .expect("captured verify")
+            .clone()
+        {
+            use crate::domain::decode::DecodeRow;
+            let vocab = self.params.vocab_size;
+            let window: Vec<u32> = cache.filled().to_vec();
+            let tail = cache.tail(n);
+            let slot = cache.state_slot();
+            let mut rows = Vec::with_capacity(n);
+            for i in 0..n {
+                rows.push(DecodeRow {
+                    input_id: input.input_ids[i],
+                    position: input.positions[i],
+                    state_slot: slot,
+                    out_loc: tail[i],
+                });
+            }
+            let windows: Vec<&[u32]> = (0..n).map(|_| window.as_slice()).collect();
+            let logits_rows = service
+                .step(&rows, &windows)
+                .map_err(|e| misaligned(e.to_string()))?;
+            let mut logits = Vec::with_capacity(n * vocab);
+            for row in logits_rows {
+                if row.len() != vocab {
+                    return Err(misaligned(format!(
+                        "the captured verify answered {} logits, expected {vocab}",
+                        row.len()
+                    )));
+                }
+                logits.extend(row);
+            }
+            let mut hidden = self.verify_hidden();
+            let want = n * self.params.hidden_size;
+            if hidden.len() > want {
+                hidden.truncate(want);
+            }
+            return Ok(crate::domain::kvcache::VerifyOut { logits, hidden });
+        }
+
         *self.verify.lock().expect("verify stash") = Some(VerifyStash {
-            slot: cache.state_slot(),
             rows: n,
             layers: Vec::new(),
+            hidden: self
+                .rt
+                .zeros(&[n, self.params.hidden_size], TensorDType::F32)
+                .map_err(|e| misaligned(e.to_string()))?,
         });
         let i32s = |v: &[u32]| -> Result<Tensor> {
             let data: Vec<i32> = v.iter().map(|x| *x as i32).collect();
@@ -1730,15 +1817,6 @@ impl CachedModel for CudarcQwen3_6 {
             .ok_or_else(|| KvcacheError::MisalignedCache {
                 why: "commit_verify without a verify step".to_string(),
             })?;
-        if stash.slot != cache.state_slot() {
-            return Err(KvcacheError::MisalignedCache {
-                why: format!(
-                    "commit_verify for slot {}, verified slot {}",
-                    cache.state_slot(),
-                    stash.slot
-                ),
-            });
-        }
         // Zero rows is a no-op: a verify whose first row is untrusted commits
         // nothing and recomputes that row alone.
         if rows == 0 {
@@ -1754,11 +1832,20 @@ impl CachedModel for CudarcQwen3_6 {
         }
         let slot = self
             .rt
-            .from_slice_i32(&[stash.slot as i32], &[1])
+            .from_slice_i32(&[cache.state_slot() as i32], &[1])
             .map_err(|e| KvcacheError::MisalignedCache { why: e.to_string() })?;
+        let state = self.cache.state();
         for layer in stash.layers {
-            self.gdn_replay(&slot, layer.layer, &layer.conv_in, &layer.ba, rows, true)
-                .map_err(|e| KvcacheError::MisalignedCache { why: e.to_string() })?;
+            if rows >= 1 && layer.conv_states.len() >= rows && layer.rec_states.len() >= rows {
+                let conv_state = &layer.conv_states[rows - 1];
+                let rec_state = &layer.rec_states[rows - 1];
+                state.set_conv_state_rows(&slot, layer.layer, conv_state);
+                state.set_recurrent_state_rows(&slot, layer.layer, rec_state);
+            } else {
+                self.gdn_replay(&slot, layer.layer, &layer.conv_in, &layer.ba, rows, true)
+                    .map(|_| ())
+                    .map_err(|e| KvcacheError::MisalignedCache { why: e.to_string() })?;
+            }
         }
         Ok(())
     }
@@ -1775,8 +1862,9 @@ impl CachedModel for CudarcQwen3_6 {
         tokens: &[u32],
         hiddens: &[f32],
         from: usize,
+        chain_base: usize,
     ) -> std::result::Result<Drafted, KvcacheError> {
-        self.draft_forward(tokens, hiddens, from)
+        self.draft_forward(tokens, hiddens, from, chain_base)
             .map_err(|e| KvcacheError::MisalignedCache { why: e.to_string() })
     }
 }
@@ -1880,5 +1968,88 @@ impl CudarcQwen3_6 {
         self.lm_head_into_device(&normed, bufs.logits())?;
         substep_report(t);
         Ok(())
+    }
+
+    /// A captured speculative verify step: every row runs the sequential (verify)
+    /// tower, the final-norm hidden is stashed for `verify_hidden`, and the
+    /// logits land in `bufs.logits`. Nothing here reads a host value, so the
+    /// step can be captured into a CUDA graph.
+    pub fn forward_verify_into(&self, bufs: &DecodeBuffers) -> Result<()> {
+        let t = bufs.max_bs();
+        let width = self.params.hidden_size;
+        *self.verify.lock().expect("verify stash") = Some(VerifyStash {
+            rows: t,
+            layers: Vec::new(),
+            hidden: self
+                .rt
+                .zeros(&[t, width], TensorDType::F32)
+                .map_err(moe_bad)?,
+        });
+        let ids = bufs.input_ids();
+        let positions = bufs.positions();
+        let slots = bufs.state_slots();
+        let out_locs = bufs.out_locs();
+        let kv = bufs.kv_locs();
+        let logits = bufs.logits();
+        for (name, tensor) in [
+            ("input ids", ids),
+            ("positions", positions),
+            ("state slots", slots),
+            ("out locs", out_locs),
+        ] {
+            if tensor.shape() != [t] {
+                return Err(moe_bad(format!(
+                    "the verify {name} are {:?}, not [{t}]",
+                    tensor.shape()
+                )));
+            }
+        }
+        if kv.shape() != [t, bufs.window()].as_slice() {
+            return Err(moe_bad(format!(
+                "the verify kv window is {:?}, not [{t}, {}]",
+                kv.shape(),
+                bufs.window()
+            )));
+        }
+        if logits.shape() != [t, bufs.vocab()].as_slice() {
+            return Err(moe_bad(format!(
+                "the verify logits are {:?}, not [{t}, {}]",
+                logits.shape(),
+                bufs.vocab()
+            )));
+        }
+        if self.moe.is_none() {
+            return Err(moe_bad(
+                "the device verify path needs the MoE device port attached",
+            ));
+        }
+        let access = Access::Device {
+            out_locs,
+            kv_locs: kv,
+            slots,
+            rows: DeviceRows::Sequential,
+        };
+        let stream = self.tower_stream(ids, t, &Positions::Device(positions), &access)?;
+        let normed = rms_norm(&stream, &self.tower.final_norm, self.params.rms_norm_eps)?;
+        let hidden = normed.cast(TensorDType::F32)?;
+        self.verify
+            .lock()
+            .expect("verify stash")
+            .as_mut()
+            .expect("verify stash open")
+            .hidden = hidden.clone();
+        self.lm_head_into_device(&normed, logits)?;
+        substep_report(t);
+        Ok(())
+    }
+
+    /// Read the hidden the last captured verify wrote.
+    pub fn verify_hidden(&self) -> Vec<f32> {
+        self.verify
+            .lock()
+            .expect("verify stash")
+            .as_ref()
+            .map(|s| s.hidden.to_host_f32().unwrap_or_default())
+            .unwrap_or_default()
     }
 }

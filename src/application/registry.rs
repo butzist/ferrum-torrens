@@ -236,6 +236,19 @@ pub fn build(
                 } else {
                     None
                 };
+                if capture {
+                    let rows = config.speculative_num_steps() + 1;
+                    match capture_verify(config, &model, &cache, model.runtime(), rows) {
+                        Ok(graphs) => {
+                            model.attach_captured_verify(
+                                Arc::new(graphs) as Arc<dyn CapturedDecode>,
+                            );
+                        }
+                        Err(e) => eprintln!(
+                            "warning: verify graph capture failed ({e}); verify stays eager"
+                        ),
+                    }
+                }
                 let recapture = if capture {
                     let weak_model = std::sync::Arc::downgrade(&model);
                     let weak_cache = std::sync::Arc::downgrade(&cache);
@@ -381,6 +394,45 @@ fn capture_decode(
             padding,
             padding_cache,
             |bufs: &DecodeBuffers| model.forward_decode_into(bufs).map_err(|e| e.to_string()),
+        )
+    }
+    .map_err(RegistryError::build)
+}
+
+/// Record one verify graph at `rows` rows (typically `k + 1`).
+#[cfg(feature = "cudarc")]
+fn capture_verify(
+    config: &crate::config::Config,
+    model: &crate::models::qwen3_6::forward_cudarc::CudarcQwen3_6,
+    cache: &crate::infrastructure::kvcache_dev::DeviceCache,
+    rt: &crate::infrastructure::cudarc::Runtime,
+    rows: usize,
+) -> Result<EngineDecodeGraphs<crate::infrastructure::decode_graph::DecodeGraph>, RegistryError> {
+    use crate::domain::decode::DecodeRow;
+    use crate::domain::kvcache::KvCache;
+    use crate::infrastructure::decode_buffers::DecodeBuffers;
+
+    let build_err = |e: String| RegistryError::build(e);
+    let mut padding_cache = cache.begin();
+    cache
+        .reserve(&mut padding_cache, 1)
+        .map_err(|e| build_err(e.to_string()))?;
+    let padding = DecodeRow {
+        input_id: 0,
+        position: 0,
+        state_slot: padding_cache.state_slot(),
+        out_loc: padding_cache.tail(1)[0],
+    };
+    let sizes = vec![rows];
+    unsafe {
+        EngineDecodeGraphs::capture(
+            rt,
+            model.params().vocab_size,
+            config.model.max_seq_len,
+            &sizes,
+            padding,
+            padding_cache,
+            |bufs: &DecodeBuffers| model.forward_verify_into(bufs).map_err(|e| e.to_string()),
         )
     }
     .map_err(RegistryError::build)

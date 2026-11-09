@@ -743,7 +743,8 @@ impl KvCache for DeviceCache {
         };
         let (prefix_len, mamba_exist, node, canonical) = {
             let mut tree = self.tree.lock().expect("kvcache lock");
-            let ins = tree.insert(keys, cache.filled(), donated_slot);
+            let lookahead = ids.get(cached_len).copied();
+            let ins = tree.insert_with_lookahead(keys, cache.filled(), donated_slot, lookahead);
             let m = tree.match_prefix(keys);
             (ins.prefix_len, ins.mamba_exist, m.node, m.kv_indices)
         };

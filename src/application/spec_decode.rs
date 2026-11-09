@@ -205,7 +205,7 @@ fn step_body(
     while drafts.len() < k {
         let j = drafts.len();
         let drafted = model
-            .draft_rows(cache, &[token], &hidden, start - 1 + j)
+            .draft_rows(cache, &[token], &hidden, start - 1 + j, start - 1)
             .map_err(SpecError::Kv)?;
         token = *drafted
             .tokens
@@ -279,7 +279,13 @@ fn step_body(
     refresh_hidden.extend_from_slice(&state.hidden);
     refresh_hidden.extend_from_slice(&committed_hiddens);
     let refreshed = model
-        .draft_rows(cache, &refresh_tokens, &refresh_hidden, start - 1)
+        .draft_rows(
+            cache,
+            &refresh_tokens,
+            &refresh_hidden,
+            start - 1,
+            start - 1,
+        )
         .map_err(SpecError::Kv)?;
     let first = refreshed
         .tokens
@@ -451,6 +457,7 @@ mod tests {
             tokens: &[u32],
             hiddens: &[f32],
             _from: usize,
+            _chain_base: usize,
         ) -> Result<crate::domain::kvcache::Drafted, KvcacheError> {
             assert_eq!(hiddens.len(), tokens.len() * WIDTH);
             let mut drafts = self.drafts.lock().unwrap();

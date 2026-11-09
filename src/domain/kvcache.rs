@@ -129,6 +129,9 @@ struct RadixNode {
     /// sets it; the plain `RadixIndex` leaves it `None`.
     mamba_value: Option<u32>,
     mamba_refcount: u32,
+    /// Lookahead token that must follow this node's span for its snapshot to
+    /// be reusable. `None` is a wildcard (legacy / non-speculative commits).
+    mamba_lookahead: Option<u32>,
 }
 
 /// Radix prefix cache holding token keys and the KV pages that back each span.
@@ -159,6 +162,7 @@ impl RadixIndex {
             timestamp: 0,
             mamba_value: None,
             mamba_refcount: 0,
+            mamba_lookahead: None,
         }];
         Self {
             page_size,
@@ -264,6 +268,7 @@ impl RadixIndex {
             timestamp: self.clock,
             mamba_value: None,
             mamba_refcount: 0,
+            mamba_lookahead: None,
         });
         self.nodes.len() - 1
     }
@@ -351,6 +356,7 @@ impl RadixIndex {
             timestamp: self.clock,
             mamba_value: None,
             mamba_refcount: 0,
+            mamba_lookahead: None,
         });
         let prefix = self.nodes.len() - 1;
         // The suffix is keyed by its own new first token; the parent keeps
@@ -433,6 +439,7 @@ impl HybridRadixIndex {
             timestamp: 0,
             mamba_value: None,
             mamba_refcount: 0,
+            mamba_lookahead: None,
         }];
         Self {
             page_size,
@@ -469,11 +476,23 @@ impl HybridRadixIndex {
         self.mamba_evictable + self.mamba_protected
     }
 
-    /// Insert the committed KV prefix and donate `mamba_value` at the
-    /// page-aligned end boundary. Returns how much was already cached and whether
-    /// the boundary already owns a live snapshot, in which case the caller must
-    /// free its donated slot (dedup).
     pub fn insert(&mut self, token_key: &[u32], pages: &[u32], mamba_value: u32) -> HybridInsert {
+        self.insert_with_lookahead(token_key, pages, mamba_value, None)
+    }
+
+    /// Like [`insert`](Self::insert), but tags the donated snapshot with a
+    /// `lookahead` token that must immediately follow the committed prefix for
+    /// the snapshot to be reusable. This is the `radix_lookahead` prefix key
+    /// `(t_i, t_{i+1})`: a cached prefix can only be adopted when its next
+    /// token matches the request's, so a speculative step never resumes the GDN
+    /// recurrence from a stale draft KV. `None` is a wildcard.
+    pub fn insert_with_lookahead(
+        &mut self,
+        token_key: &[u32],
+        pages: &[u32],
+        mamba_value: u32,
+        lookahead: Option<u32>,
+    ) -> HybridInsert {
         debug_assert_eq!(token_key.len(), pages.len());
         let insert_len = token_key.len() / self.page_size * self.page_size;
         let (mut node, prefix_len) = self.tree_walk(&token_key[..insert_len]);
@@ -493,6 +512,7 @@ impl HybridRadixIndex {
             };
         }
         self.nodes[node].mamba_value = Some(mamba_value);
+        self.nodes[node].mamba_lookahead = lookahead;
         if self.nodes[node].mamba_refcount == 0 {
             self.mamba_evictable += 1;
         }
@@ -502,20 +522,38 @@ impl HybridRadixIndex {
         }
     }
 
+    /// Alias for [`insert_with_lookahead`](Self::insert_with_lookahead).
+    pub fn insert_lookahead(
+        &mut self,
+        token_key: &[u32],
+        pages: &[u32],
+        mamba_value: u32,
+        lookahead: u32,
+    ) -> HybridInsert {
+        self.insert_with_lookahead(token_key, pages, mamba_value, Some(lookahead))
+    }
+
     /// Match the token prefix and truncate the reusable length to the deepest
-    /// node on the path that still owns a live snapshot.
+    /// node on the path that still owns a live (and lookahead-compatible)
+    /// snapshot.
     pub fn match_prefix(&mut self, token_key: &[u32]) -> HybridMatch {
         let (node, _) = self.tree_walk(token_key);
         let mut cur = node;
         let mut end_len = self.path_len(node);
         while cur != self.root {
             if self.nodes[cur].mamba_value.is_some() {
-                return HybridMatch {
-                    node: cur,
-                    kv_indices: self.collect_kv(cur),
-                    cached_len: end_len,
-                    mamba_value: self.nodes[cur].mamba_value,
+                let lookahead_ok = match self.nodes[cur].mamba_lookahead {
+                    None => true,
+                    Some(t) => token_key.get(end_len) == Some(&t),
                 };
+                if lookahead_ok {
+                    return HybridMatch {
+                        node: cur,
+                        kv_indices: self.collect_kv(cur),
+                        cached_len: end_len,
+                        mamba_value: self.nodes[cur].mamba_value,
+                    };
+                }
             }
             end_len -= new_len(&self.nodes[cur]);
             cur = self.nodes[cur].parent.expect("non-root has a parent");
@@ -743,6 +781,7 @@ impl HybridRadixIndex {
             timestamp: self.clock,
             mamba_value: None,
             mamba_refcount: 0,
+            mamba_lookahead: None,
         });
         self.nodes.len() - 1
     }
@@ -799,6 +838,7 @@ impl HybridRadixIndex {
             timestamp: self.clock,
             mamba_value: None,
             mamba_refcount: 0,
+            mamba_lookahead: None,
         });
         let prefix = self.nodes.len() - 1;
         let suffix_key = first_key(&self.nodes[node]);
@@ -1143,6 +1183,20 @@ pub trait CachedModel: Model {
         false
     }
 
+    /// Attach a captured verify service. The default ignores it; a device model
+    /// replays it inside [`verify_cached`](Self::verify_cached) when present.
+    fn attach_captured_verify(
+        &self,
+        _service: std::sync::Arc<dyn crate::domain::decode::CapturedDecode>,
+    ) {
+    }
+
+    /// The final-norm hidden the last captured verify wrote, flattened row major.
+    /// Empty when no captured verify has run.
+    fn verify_hidden(&self) -> Vec<f32> {
+        Vec::new()
+    }
+
     /// Run the MTP draft over consecutive labels `from .. from + tokens.len()`.
     ///
     /// Row `i` embeds `tokens[i]` (the token at label `from + i + 1`) together
@@ -1155,8 +1209,9 @@ pub trait CachedModel: Model {
         tokens: &[u32],
         hiddens: &[f32],
         from: usize,
+        chain_base: usize,
     ) -> Result<Drafted, KvcacheError> {
-        let _ = (cache, tokens, hiddens, from);
+        let _ = (cache, tokens, hiddens, from, chain_base);
         Err(KvcacheError::MisalignedCache {
             why: "this model has no draft head".to_string(),
         })
@@ -1474,6 +1529,64 @@ mod tests {
         assert_eq!(m.kv_indices, vec![10, 11]);
         assert_eq!(m.mamba_value, Some(100));
         assert_eq!(h.live_snapshots(), 1);
+    }
+
+    #[test]
+    fn hybrid_lookahead_requires_the_next_token_to_match() {
+        // A snapshot tagged with lookahead token 3 is only reusable when the
+        // request's token at the boundary equals 3 (radix_lookahead key (2, 3)).
+        let mut h = HybridRadixIndex::new(1);
+        let ins = h.insert_lookahead(&[1, 2], &[10, 11], 100, 3);
+        assert!(!ins.mamba_exist);
+
+        // Matching continuation: the boundary token is 3 -> hit.
+        let m = h.match_prefix(&[1, 2, 3]);
+        assert_eq!(m.cached_len, 2);
+        assert_eq!(m.mamba_value, Some(100));
+
+        // Stale continuation: boundary token differs -> no reuse (cold).
+        let m = h.match_prefix(&[1, 2, 9]);
+        assert_eq!(m.cached_len, 0);
+        assert_eq!(m.mamba_value, None);
+
+        // No lookahead token in the query -> no reuse.
+        let m = h.match_prefix(&[1, 2]);
+        assert_eq!(m.cached_len, 0);
+        assert_eq!(m.mamba_value, None);
+        h.check_integrity();
+    }
+
+    #[test]
+    fn hybrid_lookahead_wildcard_still_reuses() {
+        // A snapshot committed without a lookahead (None) stays a wildcard,
+        // so legacy/non-speculative callers keep reusing it.
+        let mut h = HybridRadixIndex::new(1);
+        h.insert(&[1, 2], &[10, 11], 100);
+        let m = h.match_prefix(&[1, 2]);
+        assert_eq!(m.cached_len, 2);
+        assert_eq!(m.mamba_value, Some(100));
+        h.check_integrity();
+    }
+
+    #[test]
+    fn hybrid_lookahead_falls_back_to_ancestor_snapshot() {
+        // When the deepest snapshot's lookahead mismatches, an ancestor whose
+        // lookahead matches (or is a wildcard) is reused instead.
+        let mut h = HybridRadixIndex::new(1);
+        h.insert(&[1, 2], &[10, 11], 10); // wildcard at boundary 2
+        h.insert(&[1, 2, 3, 4], &[10, 11, 12, 13], 20); // no lookahead
+        // Tag the deep snapshot with a mismatched lookahead by re-inserting
+        // is not possible (dedup); instead commit a sibling boundary. Use the
+        // wildcard ancestor fallback via a mismatched deep lookahead by
+        // inserting a fresh path.
+        let mut h2 = HybridRadixIndex::new(1);
+        h2.insert(&[1, 2], &[10, 11], 10);
+        h2.insert_lookahead(&[1, 2, 3, 4], &[10, 11, 12, 13], 20, 99);
+        // deep lookahead 99 mismatches query boundary 5 -> fall back to ancestor
+        let m = h2.match_prefix(&[1, 2, 3, 4, 5]);
+        assert_eq!(m.cached_len, 2);
+        assert_eq!(m.mamba_value, Some(10));
+        h2.check_integrity();
     }
 
     #[test]
