@@ -2605,3 +2605,19 @@ The one robust lever is **capacity**: +256 slots is -39% / -2.3%, +1024 is
 
 So the copy stays at ~100 misses/step on a repetitive prompt and ~40 on varied
 prose, and the remaining decode headroom is the workload, not the engine.
+
+**Correction (2026-11-09, FreeToken 0.2.2 source): the reference has no hot
+set.** Earlier notes here and in R13 called their `locked_fetch` a
+"profile-sized hot set" and used it to justify the pin. That was a misreading.
+`moe/locked_fetch.py` handles layers whose host banks were OS-locked but could
+not be registered with CUDA (the pin quota ran out): CPU threads stage those
+rows into pinned memory and a kernel copies staging into the slots, and misses
+it does not fetch run on the CPU executor. `moe/bench_profile.py` is a
+*bandwidth* bench (`ft bench bw` -> `~/.cache/freetoken/benchbw/<gpu-uuid>.json`,
+one row per MoE layer kind), and the profile sets each hybrid layer's **fetch
+split**, not a resident set: `fetch_fraction = pcie/(pcie+cpu)`, and for locked
+layers `p/(2p+c)` because the fetch is a CPU memcpy into staging plus the PCIe
+gather. Their expert cache is the same device-side LRU we ported. So the real
+difference in their hybrid mode is that they *compute* some misses on the CPU
+instead of moving them, chosen from measured bandwidths -- a lever we have never
+implemented, and the only one their tree has that ours does not.
