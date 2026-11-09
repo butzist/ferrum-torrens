@@ -875,6 +875,7 @@ impl CudaMoE {
     /// tensor; the kernel owns the rewrite so the host never sees the ids.
     pub fn ensure_experts(&mut self, layer: usize, experts: &Tensor) -> Result<(), MoEError> {
         let routes = experts.numel();
+        self.probe_routes(layer, experts, routes);
         let lru = self.staging_abi.kernel(LRU_ENSURE).map_err(bad_abi)?;
         let block_k = lru.constexpr("BLOCK_K").map_err(bad_abi)? as usize;
         if routes == 0 || routes > block_k {
@@ -1585,6 +1586,41 @@ impl CudaMoE {
             start += n;
         }
         Ok(())
+    }
+
+    /// Dev-only: with `FT_ROUTE_TRACE=<path>` set, append one line per decode
+    /// layer with the router's ids (`layer id id ...`), so an offline simulator
+    /// can replay the real route sequence against cache policies (R15 S3). A
+    /// D2H cannot be captured, so run eager like `FT_MISS_TRACE`; prefill route
+    /// lists are longer than `top_k` and are skipped, and the probe is off
+    /// unless the variable names a path.
+    fn probe_routes(&self, layer: usize, experts: &Tensor, routes: usize) {
+        use std::io::Write;
+        use std::sync::{Mutex, OnceLock};
+        static OUT: OnceLock<Mutex<Option<std::fs::File>>> = OnceLock::new();
+        let Some(path) = std::env::var_os("FT_ROUTE_TRACE") else {
+            return;
+        };
+        if routes != self.abi.top_k {
+            return;
+        }
+        let Ok(ids) = experts.to_host_i32() else {
+            return;
+        };
+        let out = OUT.get_or_init(|| Mutex::new(std::fs::File::create(&path).ok()));
+        let Ok(mut guard) = out.lock() else {
+            return;
+        };
+        let Some(file) = guard.as_mut() else {
+            return;
+        };
+        let mut line = String::with_capacity(8 + ids.len() * 4);
+        line.push_str(&format!("{layer}"));
+        for id in &ids {
+            line.push_str(&format!(" {id}"));
+        }
+        line.push('\n');
+        let _ = file.write_all(line.as_bytes());
     }
 
     /// Dev-only: with `FT_MISS_TRACE` set, accumulate this layer's miss count (a
@@ -2394,6 +2430,7 @@ impl ExpertGemm for Mutex<CudaMoE> {
         // First half on the main stream: slot plan + group assembly.
         let slots = as_i32_ids(experts, routes, guard.runtime())?;
         guard.ensure_experts(req.layer, &slots)?;
+        guard.probe_misses(req.layer);
         let token_t = guard.token_table_for(tokens, top_k)?;
         let g = guard.group_with_slots(x, weights, slots, token_t, tokens, top_k)?;
 
