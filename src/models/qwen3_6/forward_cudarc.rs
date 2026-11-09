@@ -1080,7 +1080,10 @@ impl CudarcQwen3_6 {
         let conv_w = conv.reshape(&[conv_dim, ck])?;
         let conv_state = state.conv_state_rows(slot, li);
         let rec_state = state.recurrent_state_rows(slot, li);
-        let rec_one = rec_state.reshape(&[1, vb, dk, dv])?;
+        // A sequential step replays one row at a time, so it advances one state
+        // row: the slots are one request's, however wide the verify batch is.
+        let conv_one = conv_state.narrow(0, 0, 1)?.contiguous()?;
+        let rec_one = rec_state.narrow(0, 0, 1)?.reshape(&[1, vb, dk, dv])?;
         let mut cores = Vec::with_capacity(rows);
         let mut conv_states = Vec::new();
         let mut rec_states = Vec::new();
@@ -1089,7 +1092,7 @@ impl CudarcQwen3_6 {
             let mixed = self.rt.zeros(&[1, conv_dim], TensorDType::Bf16)?;
             // SAFETY: one row of the verify batch and its single gathered state
             // row, so the batched conv cubin's shapes hold; it updates the row.
-            unsafe { self.gdn.conv_decode(&x_one, &conv_w, &conv_state, &mixed) }?;
+            unsafe { self.gdn.conv_decode(&x_one, &conv_w, &conv_one, &mixed) }?;
             let (q, k, v) = split_mixed(p, &mixed, 1)?;
             let ba_one = ba.narrow(0, i, 1)?.contiguous()?;
             let core = self.rt.zeros(&[1, vb, dv], TensorDType::Bf16)?;
@@ -1101,13 +1104,13 @@ impl CudarcQwen3_6 {
             }?;
             cores.push(core);
             if !write_back {
-                conv_states.push(conv_state.clone());
-                rec_states.push(rec_state.clone());
+                conv_states.push(conv_one.clone());
+                rec_states.push(rec_one.clone());
             }
         }
         if write_back {
-            state.set_conv_state_rows(slot, li, &conv_state);
-            state.set_recurrent_state_rows(slot, li, &rec_state);
+            state.set_conv_state_rows(slot, li, &conv_one);
+            state.set_recurrent_state_rows(slot, li, &rec_one);
         }
         Ok((Tensor::stack(&cores)?, conv_states, rec_states))
     }

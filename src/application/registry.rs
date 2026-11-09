@@ -236,7 +236,10 @@ pub fn build(
                 } else {
                     None
                 };
-                if capture {
+                // A verify graph is only ever replayed by `[spec] mtp`; without
+                // speculation it would cost a capture and its buffers for a
+                // step nothing runs.
+                if capture && config.speculative_algorithm() == Some("mtp") {
                     let rows = config.speculative_num_steps() + 1;
                     match capture_verify(config, &model, &cache, model.runtime(), rows) {
                         Ok(graphs) => {
