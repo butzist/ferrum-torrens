@@ -2381,6 +2381,53 @@ slice.
 `ba` cast, S7's standalone small-N GEMV and simple shared-epilogue fusion, S8's
 gated-norm fusion, R9.2's fused q/k + gated norms, and online LFU admission.
 
+## R15 S9/S10 -- the FreeToken decode kernel ports, measured (2026-11-09)
+
+Two direct ports of FreeToken's decode kernels, both correct, gate-green and
+capturable, and both **neutral** on this box: the split-K paged decode
+attention with its stage-2 merge (S9, `FERRUM_ATTN_SPLITK`) and the fused
+router softmax/top-k/renorm (S10, `FERRUM_FUSED_ROUTER`). Both flags default on;
+`=0` restores the previous path without a rebuild.
+
+Measured on the captured smoke (text-only, auto 2048 slots, 517-token prompt,
+128 decoded tokens, one model load per run, 8 runs per arm, order balanced,
+`FERRUM_SMOKE_REPS=1`; logs `/tmp/opencode/bench/ab/`):
+
+| arm | tg samples (tok/s) | mean | sd |
+| --- | --- | ---: | ---: |
+| control (both flags `0`) | 32.1 30.5 31.5 32.3 31.8 32.1 32.2 31.9 | 31.80 | 0.58 |
+| both ports (default) | 32.8 30.8 32.6 32.8 32.5 31.7 30.9 32.8 | 32.11 | 0.86 |
+
+Delta **+0.31 tok/s (+1.0%)**, paired mean +0.31, 6 of 8 pairs positive,
+se ~0.37: inside the noise. Isolated arms (n = 4 each) put split-K at 32.08 and
+the fused router at 32.40 against a 31.60 control; `pp` moved 389 -> 396 with
+either port, also inside its ~2% run noise. At a ~1900-token prefix, where
+decode attention is a larger share (n = 3 each), split-K is 33.03 against
+32.83 (+0.6%).
+
+Why no win: the captured step already hides the launches the router fusion
+removes (the S2 and S8 conclusion again), and at <= 2048 tokens the decode
+attention kernel is not on the critical path. Correctness: the split-K path
+matches causal SDPA at max|d| 3.8e-6 (`tests/paged_attention_kernel.rs`), the
+end-to-end oracle still answers " Paris" (`one_token_through_the_kernel_...`),
+and captured device decode still matches the host refeed at argmax
+(`tests/device_decode_matches_refeed.rs`, logits within 6e-3 of scale).
+
+**What this leaves.** The 1.45x decode gap (31-32 vs 47 tok/s) is not the
+attention kernel, the router launches, the shared expert (S7), the GDN tail
+(S8) or the recurrence (S2). It sits in `moe_routed`, whose "rest" bucket has
+never been attributed: 24.7-33.6 ms/token of which ~7 copy, ~3.4 marlin GEMV
+(decision 89) and ~1.9 LRU are named and **12-21 ms is not**. The next decode
+slice is to split that bucket (per-route glues: id/weight d2d, output scatter,
+the 8 GEMV launches) before porting anything else.
+
+A second finding from the same runs: at the production 2048-slot cache a dropped
+engine still holds ~3776 MiB of device memory (4302 MiB after `drop(engine)`
+against a 526 MiB process baseline), i.e. 2048 x 1.775 MiB plus ~140 MiB of
+context. That is the M8.1e residual already recorded in `TODO.md` (one bank row
+per slot outlives the `Engine` because a clone keeps the adapter alive), not a
+new regression; an in-process arm loop still needs that clone found first.
+
 ## R14c follow-up -- streamed vision tower (decision 157)
 
 The vision tower is no longer device-resident. Each weight tensor is staged

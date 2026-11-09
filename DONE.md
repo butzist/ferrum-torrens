@@ -5068,3 +5068,47 @@ subsection names are kept verbatim.
     Open follow-up: real overlap (pinned staging + async copies + events) is
     expected to save ~0.1 s on the encode; the current path is a blocking
     pageable H2D per weight with one synchronize() per stage.
+
+158. **The split-K decode attention and the fused router are ported from
+    FreeToken and measured neutral** (2026-11-09, R15 S9/S10). Both are direct
+    ports, not re-derivations: `attention.py` gains
+    `_paged_attention_decode_splitk_stage1_kernel` and
+    `_paged_attention_decode_splitk_stage2_kernel` (per-split partial softmax
+    over a `[rows, q_heads, SPLITS, head_dim]` f32/bf16 scratch plus a merge),
+    and `elementwise.py` gains `_fused_topk_softmax_kernel` (softmax over the
+    f32 router logits, descending top-k with lowest-index tie-break, renorm).
+    Divergences from upstream are only what the stack needs: NHD pages with
+    `page_size = 1`, a bf16 KV cubin variant per stage, and a fixed scratch
+    shape (32 splits) so a captured graph can bake the grid. `concat_k` is not
+    ported; the reference's `fused_topk_softmax` keeps the same ordering.
+    Flags: `FERRUM_ATTN_SPLITK` and `FERRUM_FUSED_ROUTER` default on, `=0`
+    restores the previous path without a rebuild. The gated-RMSNorm kernel
+    (`rmsnorm_gated`, S8) is registered and selftested but deliberately dormant:
+    the serving path keeps the three-launch chain because the fusion is a
+    measured regression (decision 155).
+    Measured (8 runs per arm, order balanced, one load per run, `/tmp/
+    opencode/bench/ab/`): 31.80 -> 32.11 tok/s (+1.0%, paired mean +0.31, 6/8
+    pairs positive, se ~0.37), i.e. inside the ~5% run noise; isolated arms
+    +0.5% (split-K) and +2.5% (router) at n = 4. Numerics: split-K matches
+    causal SDPA at 3.8e-6, the " Paris" oracle holds, and captured decode still
+    matches the host refeed (max logit delta 6e-3 of scale, argmax identical).
+    The scheduler's conclusion is in `OPTIMIZATION.md` R15 S9/S10: launch-count
+    levers are dead in a captured step, and the remaining gap is inside
+    `moe_routed`'s unattributed "rest" (12-21 ms/token).
+
+159. **A verify graph is captured only under `[spec] mtp`, and a sequential GDN
+    replay advances one state row** (2026-11-09). M9.8b captured a verify graph
+    on every load, speculation or not, and the capture failed on every run with
+    `2097152 values for shape [1, 32, 128, 128]`: `gdn_replay` reshaped the
+    *whole* gathered recurrent-state batch (one row per verify row, 4 at
+    `k = 3`) to a single row. The engine fell back to eager verify, so serving
+    was correct but the M9.8b claim was not true in practice. Two fixes:
+    `registry::build` only captures when `config.speculative_algorithm() ==
+    Some("mtp")` (a verify graph nothing replays costs a capture and its
+    buffers), and `gdn_replay` narrows the gathered state to the single row it
+    is replaying before `conv_decode`/`decode`, stashing that row per step.
+    Verified: the load warning is gone, the captured decode graph still
+    captures (`captured decode graph: true`), `cargo test --features cudarc`
+    is green, and the one-row `commit_verify` path is unchanged. The multi-row
+    sequential path itself is still unverified here: the store FTWs carry no
+    draft head, so it needs the decision-151 two-part overlay gate.

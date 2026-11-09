@@ -1,6 +1,17 @@
 # FerrumTorrens -- FreeToken MVP port to Rust: TODO
 
-Status (2026-11-08): **Vision tower is now streamed per block** (decision 157): the device tower no longer holds 1.7 GiB of weights; an image request no longer calls release_moe/rehydrate_moe, so the MoE cache and captured decode graphs survive it. **M9 (speculative decoding, section 6d) is complete through
+Status (2026-11-09): **The two FreeToken decode kernel ports are in and measured
+neutral** (R15 S9/S10, decision 158): split-K paged decode attention
+(`FERRUM_ATTN_SPLITK`) and the fused router top-k (`FERRUM_FUSED_ROUTER`) move
+captured decode 31.80 -> 32.11 tok/s (+1.0%, inside the run noise, 8 runs per
+arm). The remaining 1.45x to FreeToken is inside `moe_routed`'s unattributed
+"rest" (12-21 ms/token), which is the next decode slice (R15 S11); do not
+re-chase launch fusion. Verify graph capture is now gated on `[spec] mtp`
+(decision 159) -- it used to fail on every load and silently fall back to eager.
+**Vision tower is streamed per block** (decision 157): the device tower no
+longer holds 1.7 GiB of weights; an image request no longer calls
+release_moe/rehydrate_moe, so the MoE cache and captured decode graphs survive
+it. **M9 (speculative decoding, section 6d) is complete through
 M9.7, and M9.8a-e have landed.** Speculation runs end to end on both checkpoints,
 token-identical to greedy at the gated length, and remains a measured slowdown:
 0.44-0.53x at the new 2048-slot cache (a verify step's extra rows miss more than
@@ -785,7 +796,11 @@ Ordered slices, each its own gated change:
   (b) a captured verify (`rows = k + 1`) -- LANDED (M9.8b): `verify_cached`
   replays a captured graph when one is attached at load (one graph at
   `k + 1` rows, sequential GDN, hidden stashed for readback), falling back to
-  the eager tower otherwise. Slot validation in `commit_verify` now keys on
+  the eager tower otherwise. Since decision 159 the graph is captured only when
+  `[spec] mtp` is on, and a multi-row sequential replay no longer reshapes the
+  whole state batch to one row (that bug made every capture fail and fall back
+  to eager). The captured path itself still needs the decision-151 overlay gate:
+  the store FTWs have no draft head. Slot validation in `commit_verify` now keys on
   the live cache slot so a captured (slot-agnostic) verify still commits;
   (c) a fused GDN commit -- LANDED (M9.8c): the verify stashes each linear layer's
   evolved conv/rec state per row, and `commit_verify` scatters the accepted
@@ -1360,9 +1375,22 @@ Standing: 32.2-32.9 tok/s captured at 2048 slots against FreeToken's 47.0 at
   <1% and does not clear the 2% bar; no code change shipped. See
   `OPTIMIZATION.md` R15 S7. The f32 router gate (80 MB/step at ~40 GB/s) is the
   same shape of problem and the follow-up.
+- [x] **R15 S4 fused router -- landed, measured neutral (2026-11-09).**
+  `_fused_topk_softmax_kernel` replaces softmax/topk/sum/reciprocal/row_mul with
+  one launch, `FERRUM_FUSED_ROUTER=0` restores the chain. +2.5% at n = 4, +1.0%
+  combined at n = 8: inside the noise (decision 158, `OPTIMIZATION.md` R15
+  S9/S10).
+- [x] **R15 S9 split-K decode attention -- landed, measured neutral (2026-11-09).**
+  FreeToken's stage-1/stage-2 split-K merge, fixed 32-split scratch so the graph
+  captures it, `FERRUM_ATTN_SPLITK=0` restores the single-CTAs path. +0.5% at
+  517 tokens, +0.6% at ~1900 (decision 158).
+- [ ] **R15 S11 attribute `moe_routed`'s "rest".** The step is 24.7-33.6 ms/token
+  and only ~7 copy + ~3.4 marlin GEMV + ~1.9 LRU are named; 12-21 ms has never
+  been attributed. Split the per-route glue (id/weight d2d, output scatter, the
+  eight GEMV launches) before porting another kernel. **This is the top decode
+  item**: S1, S2, S4, S7, S8 and S9 all came back neutral, so the gap is here.
 - [ ] **R15 S3 pin a pre-collected hot expert set** (`locked_fetch` /
   profile-sized pool; online LFU was measured and rejected). Target 2-4 ms.
-- [ ] **R15 S4 fused router** (full-softmax arithmetic, iterative top-k), small.
 
 ### Decode speed plan (decision 82): status and next steps
 
