@@ -30,6 +30,7 @@ use crate::infrastructure::kernel_abi::{
     grid, grouped_down_args, grouped_gate_up_args, index_copy_args, lru_ensure_args,
     moe_csr_count_args, moe_csr_prefix_args, moe_csr_scatter_args, silu_mul_args, sum_reduce_args,
 };
+use crate::infrastructure::profile::{substep_begin, substep_end};
 use crate::infrastructure::torch::Device;
 
 /// The concrete buffer behind a port handle. The adapter is the one place
@@ -1968,23 +1969,31 @@ impl CudaMoE {
         }
         // The kernel rewrites this copy in place; a fresh buffer keeps the
         // router's own `[tokens, top_k]` ids untouched.
+        let sp = substep_begin(&self.rt);
         let slots = as_i32_ids(experts, routes, &self.rt)?;
-        let sp = crate::infrastructure::profile::begin("moe_lru");
+        substep_end(&self.rt, "moe_ids", sp);
+        let sp = substep_begin(&self.rt);
         self.ensure_experts(layer, &slots)?;
-        crate::infrastructure::profile::end("moe_lru", sp);
-        let sp = crate::infrastructure::profile::begin("moe_copy");
+        substep_end(&self.rt, "moe_lru", sp);
+        let sp = substep_begin(&self.rt);
         self.copy_missing(layer)?;
-        crate::infrastructure::profile::end("moe_copy", sp);
+        substep_end(&self.rt, "moe_copy", sp);
         self.probe_misses(layer);
 
         // A fresh pageable H2D here would be recorded with a host pointer that
         // dies before a captured graph replays, so reuse the device table.
+        let sp = substep_begin(&self.rt);
         let token_t = self.token_table_for(tokens, top_k)?;
-        let sp = crate::infrastructure::profile::begin("moe_gemm");
+        substep_end(&self.rt, "moe_ids", sp);
+        let sp = substep_begin(&self.rt);
         let g = self.group_with_slots(x, weights, slots, token_t, tokens, top_k)?;
+        substep_end(&self.rt, "moe_group", sp);
+        let sp = substep_begin(&self.rt);
         self.launch(&g)?;
+        substep_end(&self.rt, "moe_launch", sp);
+        let sp = substep_begin(&self.rt);
         let out = self.collect_dev(&g, out);
-        crate::infrastructure::profile::end("moe_gemm", sp);
+        substep_end(&self.rt, "moe_collect", sp);
         out
     }
 }

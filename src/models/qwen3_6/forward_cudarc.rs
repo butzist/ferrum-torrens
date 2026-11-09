@@ -524,6 +524,9 @@ impl CudarcQwen3_6 {
         cache: Arc<DeviceCache>,
     ) -> Result<Self> {
         let device = Device::Cuda(rt.context().ordinal());
+        if let Device::Cuda(ordinal) = device {
+            let _ = crate::infrastructure::profile::init(ordinal, rt.raw_stream());
+        }
         let gdn = Arc::new(GdnDecode::new(device, &params, rt.raw_stream())?);
         let attention = PagedAttention::new(device, &params, rt.raw_stream())?;
         let tower = Tower::load(params.clone(), rt.clone(), index.clone(), reader.clone())
@@ -1288,7 +1291,6 @@ impl CudarcQwen3_6 {
         let se = down_out.row_mul(&se_gate.reshape(&[t])?)?;
         substep_end(&self.rt, "moe_shared_epi", s);
 
-        let s = substep_begin(&self.rt);
         let routed = match port {
             Some(port) => {
                 let mut out = self.rt.zeros(&[t, p.hidden_size], TensorDType::Bf16)?;
@@ -1304,9 +1306,13 @@ impl CudarcQwen3_6 {
                 port.execute_device(&req, &mut out)?;
                 out
             }
-            None => self.routed_inline(bank_layer, x_post, &ids, &weights)?,
+            None => {
+                let s = substep_begin(&self.rt);
+                let out = self.routed_inline(bank_layer, x_post, &ids, &weights)?;
+                substep_end(&self.rt, "moe_routed_inline", s);
+                out
+            }
         };
-        substep_end(&self.rt, "moe_routed", s);
         se.add(&routed)
     }
 
@@ -1402,9 +1408,12 @@ impl CudarcQwen3_6 {
                     .head_gemv
                     .as_ref()
                     .ok_or_else(|| moe_bad("an NVFP4 head needs the dense gemv launcher"))?;
+                let s = substep_begin(&self.rt);
                 let out = self
                     .rt
                     .zeros(&[x.shape()[0], head.rows], TensorDType::F32)?;
+                substep_end(&self.rt, "head_alloc", s);
+                let s = substep_begin(&self.rt);
                 unsafe {
                     gemv.gemv(
                         &x.cast(TensorDType::Bf16)?,
@@ -1414,7 +1423,11 @@ impl CudarcQwen3_6 {
                         &out,
                     )
                 }?;
-                out.to_host_f32()
+                substep_end(&self.rt, "head_gemv", s);
+                let s = substep_begin(&self.rt);
+                let logits = out.to_host_f32();
+                substep_end(&self.rt, "head_d2h", s);
+                logits
             }
             HeadWeight::Bf16(d) => {
                 let DenseWeight::Bf16(w) = &d.w else {
@@ -1511,10 +1524,13 @@ impl CudarcQwen3_6 {
         access: &Access<'_>,
     ) -> Result<Tensor> {
         let p = &self.params;
+        let s = substep_begin(&self.rt);
         let mut x = self.embed_rows(idx)?;
+        substep_end(&self.rt, "embed", s);
         let mut residual: Option<Tensor> = None;
 
         for (li, layer) in self.tower.layers.iter().enumerate() {
+            let s = substep_begin(&self.rt);
             let (xsum, h1) = match residual.take() {
                 None => {
                     let h1 = rms_norm(&x, &layer.input_norm, p.rms_norm_eps)?;
@@ -1522,6 +1538,7 @@ impl CudarcQwen3_6 {
                 }
                 Some(r) => x.add_rms_norm(&r, &layer.input_norm, p.rms_norm_eps)?,
             };
+            substep_end(&self.rt, "res_norm", s);
             let mixer_out = if ablated("mixer") {
                 self.rt.zeros(&[t, p.hidden_size], TensorDType::Bf16)?
             } else {
@@ -1535,7 +1552,9 @@ impl CudarcQwen3_6 {
                     _ => self.rt.zeros(&[t, p.hidden_size], TensorDType::Bf16)?,
                 }
             };
+            let s = substep_begin(&self.rt);
             let (sum2, h2) = mixer_out.add_rms_norm(&xsum, &layer.post_norm, p.rms_norm_eps)?;
+            substep_end(&self.rt, "post_norm", s);
             x = if ablated("moe") {
                 h2.clone()
             } else {
@@ -1569,6 +1588,7 @@ impl CudarcQwen3_6 {
         if t == 0 {
             return Ok((Vec::new(), Vec::new()));
         }
+        let _step = crate::infrastructure::profile::step_scope(t as i64);
         let idx: Vec<i32> = ids.iter().map(|i| *i as i32).collect();
         let idx = self.rt.from_slice_i32(&idx, &[t])?;
         let stream = self.tower_stream(&idx, t, &positions, access)?;
@@ -1580,9 +1600,9 @@ impl CudarcQwen3_6 {
             hidden.extend(normed.cast(TensorDType::F32)?.to_host_f32()?);
             if ablated("head") {
                 out.extend(vec![0.0; p.vocab_size]);
-                continue;
+            } else {
+                out.extend(self.lm_head_logits(&normed)?);
             }
-            out.extend(self.lm_head_logits(&normed)?);
         }
         Ok((out, hidden))
     }
@@ -1894,6 +1914,7 @@ impl CudarcQwen3_6 {
     /// bit for bit -- which is what makes "captured == eager" a testable claim
     /// rather than a hope. `cache` has already been grown by this token.
     fn decode_one_cached(&self, input: &ForwardInput, cache: &SequenceCache) -> Result<Vec<f32>> {
+        let _step = crate::infrastructure::profile::step_scope(1);
         let id = input.input_ids[0] as i32;
         let position = input.positions[0] as i32;
         let out_loc = cache.tail(1)[0] as i32;
@@ -1912,10 +1933,11 @@ impl CudarcQwen3_6 {
         };
         let stream = self.tower_stream(&ids, 1, &Positions::Device(&positions), &access)?;
         let normed = rms_norm(&stream, &self.tower.final_norm, self.params.rms_norm_eps)?;
-        if ablated("head") {
-            return Ok(vec![0.0; self.params.vocab_size]);
-        }
-        let logits = self.lm_head_logits(&normed)?;
+        let logits = if ablated("head") {
+            vec![0.0; self.params.vocab_size]
+        } else {
+            self.lm_head_logits(&normed)?
+        };
         substep_report(1);
         Ok(logits)
     }

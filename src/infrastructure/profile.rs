@@ -67,17 +67,22 @@ pub fn enabled() -> bool {
     std::env::var("FT_PROFILE").is_ok_and(|v| !v.is_empty() && v != "0" && v != "false")
 }
 
-/// Host-clock sub-step timer for the eager prefill path.
+/// Sub-step timer for the uncaptured forward.
 ///
-/// Unlike the CUDA-event timer above, this one brackets each sub-step with a
-/// stream synchronize, so it attributes host plus device time inside one mixer
-/// on the uncaptured path. It is off unless `FT_PROFILE` is set.
+/// Each span records a CUDA-event pair on the model's stream, so the report is
+/// device time per stage with no host synchronize between the spans: the same
+/// shape the MoE labels use, and the only shape comparable to a captured step.
+/// `FT_PROFILE_SYNC=1` additionally brackets every span with a stream
+/// synchronize and prints host-plus-device sums. That is the older attribution,
+/// kept because it also prices host glue, but a synchronize drains the queue, so
+/// a span absorbs work still in flight from earlier ones (OPTIMIZATION.md R15).
 #[cfg(feature = "cudarc")]
 mod substep {
     use std::collections::BTreeMap;
     use std::sync::{Mutex, OnceLock};
     use std::time::Instant;
 
+    use crate::infrastructure::cuda_driver::OwnedEvent;
     use crate::infrastructure::cudarc::Runtime;
 
     fn on() -> bool {
@@ -85,23 +90,49 @@ mod substep {
         *ON.get_or_init(super::enabled)
     }
 
+    fn sync_clock() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var("FT_PROFILE_SYNC")
+                .is_ok_and(|v| !v.is_empty() && v != "0" && v != "false")
+        })
+    }
+
     fn acc() -> &'static Mutex<BTreeMap<&'static str, u64>> {
         static ACC: OnceLock<Mutex<BTreeMap<&'static str, u64>>> = OnceLock::new();
         ACC.get_or_init(|| Mutex::new(BTreeMap::new()))
     }
 
-    /// Synchronize, then start the clock. `None` when the timer is off.
-    pub fn begin(rt: &Runtime) -> Option<Instant> {
+    /// One open span: the event pair the report reads, plus the host clock when
+    /// `FT_PROFILE_SYNC` asked for it.
+    pub struct Span {
+        event: Option<OwnedEvent>,
+        host: Option<Instant>,
+    }
+
+    /// Open a span on the model's stream. `None` when the timer is off.
+    pub fn begin(rt: &Runtime) -> Option<Span> {
         if !on() {
             return None;
         }
-        let _ = rt.synchronize();
-        Some(Instant::now())
+        let host = if sync_clock() {
+            let _ = rt.synchronize();
+            Some(Instant::now())
+        } else {
+            None
+        };
+        let event = super::begin("");
+        Some(Span { event, host })
     }
 
-    /// Synchronize, then add the elapsed span under `name`.
-    pub fn end(rt: &Runtime, name: &'static str, start: Option<Instant>) {
-        let Some(start) = start else {
+    /// Close the span: record the event pair under `name`, and the host delta
+    /// when the synchronizing clock is on.
+    pub fn end(rt: &Runtime, name: &'static str, span: Option<Span>) {
+        let Some(span) = span else {
+            return;
+        };
+        super::end(name, span.event);
+        let Some(start) = span.host else {
             return;
         };
         let _ = rt.synchronize();
@@ -112,9 +143,9 @@ mod substep {
     }
 
     /// Print one line per sub-step plus their sum, then clear for the next
-    /// top-level forward.
+    /// top-level forward. Only the synchronizing clock has host sums to print.
     pub fn report(tokens: usize) {
-        if !on() {
+        if !on() || !sync_clock() {
             return;
         }
         let Ok(mut m) = acc().lock() else {
@@ -142,7 +173,7 @@ pub fn substep_report(_tokens: usize) {}
 /// Open the driver and install the timer. Idempotent; `false` when disabled or
 /// the driver/context cannot be set up, in which case every `begin` is a no-op.
 #[cfg(feature = "cudarc")]
-pub fn init(device: usize) -> bool {
+pub fn init(device: usize, stream: CUstream) -> bool {
     if !enabled() {
         return false;
     }
@@ -156,7 +187,6 @@ pub fn init(device: usize) -> bool {
     if driver.init().is_err() || driver.attach_primary_context(device as i32).is_err() {
         return false;
     }
-    let stream = std::ptr::null_mut();
     let inner = Inner {
         driver,
         device,
@@ -174,8 +204,8 @@ pub fn init(device: usize) -> bool {
 }
 
 #[cfg(feature = "cudarc")]
-fn current(_g: &Inner) -> CUstream {
-    std::ptr::null_mut()
+fn current(g: &Inner) -> CUstream {
+    g.stream
 }
 
 /// A fresh timing event recorded on the model's current stream. `None` when the
@@ -299,6 +329,27 @@ pub fn end_step() {
     if g.decoded_seen >= skip + steps {
         dump(&mut g);
     }
+}
+
+/// Opens one forward's step and closes it on drop, so an early return still
+/// lands the step and its events.
+#[cfg(feature = "cudarc")]
+pub struct StepScope(());
+
+#[cfg(feature = "cudarc")]
+impl Drop for StepScope {
+    fn drop(&mut self) {
+        end_step();
+    }
+}
+
+/// Open a profiled forward when `FT_PROFILE` is set; a no-op otherwise.
+#[cfg(feature = "cudarc")]
+pub fn step_scope(tokens: i64) -> StepScope {
+    if enabled() {
+        begin_step(tokens);
+    }
+    StepScope(())
 }
 
 #[cfg(feature = "cudarc")]
@@ -480,7 +531,7 @@ mod noop {
     /// Marker for a timer event on a build with no CUDA runtime.
     pub struct Event;
 
-    pub fn init(_device: usize) -> bool {
+    pub fn init(_device: usize, _stream: *mut std::ffi::c_void) -> bool {
         false
     }
 
