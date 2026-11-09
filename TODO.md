@@ -4,6 +4,41 @@ Status (2026-11-09): **A dropped engine now returns its device slot banks**
 (M8.1e, decision 163): the adapter's `Drop` freed them too late, so
 `Engine::retire` releases the cache before dropping the residency (3945 -> 7471
 MiB free after `drop(engine)`), which also unblocks in-process arm loops.
+
+**Queued next (recorded 2026-11-09, none started; evidence in `OPTIMIZATION.md`):**
+
+1. **Like-for-like FreeToken re-profile, identical payload.** Not a build problem:
+   `uv pip install "freetoken[accel]==0.2.1"` into a 3.12 venv (the wheel is on
+   PyPI and 0.2.1 is the version R14b measured), or their git head with
+   `CUDA_HOME=/nix/store/84x2n69n1gpq0cqm9rmaawwc59234g4b-cuda13.4-cuda_nvcc-13.4.92`
+   so nvcc 13.4 matches torch cu130 instead of tripping their mismatch gate.
+   The open risk is **FTW compatibility** (our converter's format against their
+   0.2.x reader); test it first. Payload staged, greedy, 128 decode tokens,
+   363-token prose prompt at `/tmp/opencode/bench/payload.jsonl`; their side is
+   `bench_decode_moe.py --backend offload --cache 0 --greedy --decode 128
+   --aime payload.jsonl`, ours is `FERRUM_SMOKE_PROMPT="$(cat prompt2.txt)"
+   FERRUM_SMOKE_TOKENS=128 FERRUM_SMOKE_GRAPH=1`. Compare pp/tg, then stages
+   (ours eager `FT_PROFILE`, theirs `FT_PROBE_OUT`).
+2. **Re-measure speculative decode on the current engine.** The R14b verdict
+   (0.62-0.70x) predates the 2048-slot cache, the captured verify that never
+   captured until decision 159, and the multi-row GDN replay fix, so both of its
+   inputs are stale. Needs the decision-151 two-part FTW overlay (store
+   checkpoints have no MTP head), then k=3 at 2048 slots against FT's 1.06x.
+   The two gaps to explain, in order: verify row cost (ours 4.0x a plain step
+   vs their 3.0x) and accept at depth 3 (0.53 vs 0.72, equal at depth 2).
+3. **CPU-side miss compute (the one reference mechanism we never built).**
+   FreeToken's hybrid mode computes a measured fraction of a step's misses on
+   CPU threads instead of moving them, `pcie/(pcie+cpu)` (and `p/(2p+c)` for
+   unpinned banks), from `ft bench bw` per layer kind. Our misses cost 0.125 ms
+   each over PCIe, so the split turns on whether a one-row NVFP4 expert GEMV
+   beats that on this CPU. `ft bench bw` (same venv as item 1) answers it.
+4. **Reconcile the decode miss count.** R14c records ~52 misses/step at 2048
+   slots; the current validator (probe + simulator, agreeing to 1-2 experts)
+   says ~100 on the default prompt. Nothing concluded from the old number
+   changes (the per-miss price and the link-rate ceiling both hold), but the
+   recorded figure should be corrected or explained.
+5. **Vision encode staging** (open since decision 157): 376 -> ~276 ms/encode by
+   dropping the per-tensor pageable copy and the full synchronize.
 **The decode step is attributed** (R15 S11, decision 160):
 29.2 ms/token, of which `moe_copy` -- the expert miss staging over PCIe -- is
 9.4 ms (32%); the routed GEMV and the lm_head are at roofline. R15 S12 landed

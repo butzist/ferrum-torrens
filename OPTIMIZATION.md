@@ -2621,3 +2621,35 @@ gather. Their expert cache is the same device-side LRU we ported. So the real
 difference in their hybrid mode is that they *compute* some misses on the CPU
 instead of moving them, chosen from measured bandwidths -- a lever we have never
 implemented, and the only one their tree has that ours does not.
+
+## R16 queued -- like-for-like FreeToken re-profile with an identical payload (2026-11-09)
+
+The reference numbers in this file are from FreeToken 0.2.1 on this box (R14b,
+decision 76). Re-measuring needs no build: 0.2.1 is on PyPI as a wheel, so
+`uv venv --python 3.12 && uv pip install "freetoken[accel]==0.2.1"` is enough;
+their git head also works if `CUDA_HOME` points at the store's CUDA 13.4 nvcc
+(`cuda13.4-cuda_nvcc-13.4.92`) so it matches torch 2.14.1+cu130 instead of
+tripping `kernel/_toolchain.py`'s major-mismatch gate. The first thing to test
+is whether their 0.2.x reader accepts the FTW our converter produces.
+
+Payload: one line of `{"problem": ...}` jsonl (their bench accepts a local
+`--aime` file) with the 363-token prose prompt, `--greedy --decode 128`, cache
+auto, text-only, `--max-running-requests 1`. Our arm is the same text through
+`FERRUM_SMOKE_PROMPT` with `FERRUM_SMOKE_TOKENS=128`. Compare pp and tg first,
+then the stage tables (ours `FT_PROFILE=1` eager, theirs `FT_PROBE_OUT`), which
+is where the remaining question lives: their per-stage table sums to 33.0 ms
+(30.3 tok/s) while their bench reports 47.0 tok/s, so those two cannot be the
+same configuration and only a fresh matched pair can say which stage we lose in.
+
+## R17 queued -- CPU-side miss compute (FreeToken's hybrid split), 2026-11-09
+
+Source reading (0.2.2) corrected our earlier claim that they pin a hot set: they
+do not. `moe/bench_profile.py` holds a per-layer-kind bandwidth row from
+`ft bench bw`, and `fetch_fraction = pcie/(pcie+cpu)` decides how much of a
+step's misses to fetch over PCIe so the fetch and the CPU compute finish
+together (`p/(2p+c)` for OS-locked banks that need a staging memcpy first).
+That is a second compute engine for misses, not cache policy, so it is the one
+reference lever R15 S13 did not test and the one our engine has no
+implementation of. Sizing input: a miss costs 0.125 ms over PCIe here, so the
+CPU side has to beat that per expert row to be worth a thread pool and a
+dispatch path. `ft bench bw` on the R16 venv measures it.
