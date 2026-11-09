@@ -46,6 +46,20 @@ fn vram(stage: &str) {
             m.total >> 20
         );
     }
+    // NVML reports pool-held blocks as used even after they are freed; the
+    // driver's own free count is what a second load can actually allocate.
+    #[cfg(feature = "cudarc")]
+    if let Ok(driver) = ferrum_torrens::infrastructure::cuda_driver::Driver::open()
+        && driver.init().is_ok()
+        && driver.attach_primary_context(0).is_ok()
+        && let Ok((free, total)) = driver.mem_info()
+    {
+        eprintln!(
+            "driver {stage}: {} MiB free / {} MiB total",
+            free >> 20,
+            total >> 20
+        );
+    }
 }
 
 /// GPU utilization sampling through NVML (dlopen, so the test does not link
@@ -348,10 +362,11 @@ fn single_request_throughput_smoke() {
 
 /// Load one engine, warm it, then time one request and print the numbers.
 ///
-/// One arm per process on purpose: dropping an `Engine` returns its 16.9 GiB of
-/// pinned host banks but leaves its device slot banks allocated (~1.8 MiB per
-/// cache slot), so a second load in the same process starts with that memory
-/// gone and eventually fails (TODO.md M8.1e).
+/// One arm per process by default: a load costs ~20 s and 16.9 GiB of pinned
+/// host banks, so a multi-arm loop wants `FERRUM_SMOKE_REPS` or the in-process
+/// arms an idle release makes possible -- dropping an `Engine` now returns its
+/// device slot banks too (M8.1e, decision 163), which this harness proves by
+/// printing the driver's free count before and after the drop.
 fn run_arm(graph: bool) {
     let engine = load_engine(&config(graph)).unwrap();
     eprintln!("captured decode graph: {}", engine.captured().is_some());
@@ -377,8 +392,14 @@ fn run_arm(graph: bool) {
         measure(&engine);
     }
     eprintln!("peak rss: {:.1} GiB", peak_rss_gib());
+    if env_usize("FERRUM_SMOKE_RELEASE_MOE").is_some() {
+        engine.release_moe().expect("release the expert banks");
+        vram("after release_moe");
+    }
     drop(engine);
     vram("after drop");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    vram("after drop, settled");
 }
 
 /// One timed request over a warm engine, printing the pp/tg pair.

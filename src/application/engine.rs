@@ -665,11 +665,7 @@ pub fn load_engine(config: &crate::config::Config) -> Result<Engine, LoadError> 
 
 impl Drop for Engine {
     fn drop(&mut self) {
-        if let Ok(mut slot) = self.residency.write() {
-            // Dropping the residency frees the device banks too: the MoE adapter
-            // owns them, and nothing else may keep it alive past the engine.
-            let _ = slot.take();
-        }
+        self.retire();
     }
 }
 
@@ -786,8 +782,26 @@ impl Engine {
     /// next request rebuilds them. Only call this while no forward is running
     /// (the dispatcher does it between batches).
     pub fn release_residency(&self) {
-        let mut slot = self.residency.write().expect("residency lock");
-        *slot = None;
+        self.retire();
+    }
+
+    /// Drop the residency and hand the memory it used back to the driver.
+    ///
+    /// The expert cache is released *before* the residency goes, through the MoE
+    /// port, because the adapter's own `Drop` is too late: measured on this card,
+    /// letting the adapter free its banks while it drops with the residency
+    /// leaves them resident (3945 of 7707 MiB free after `drop(engine)`), while
+    /// releasing the cache first returns everything (7471 of 7514). The adapter
+    /// is cloned so it outlives the residency long enough to be asked
+    /// (M8.1e, decision 163).
+    fn retire(&self) {
+        let moe = self.peek().and_then(|res| res.moe.clone());
+        if let Some(moe) = &moe {
+            let _ = moe.release_cache();
+        }
+        if let Ok(mut slot) = self.residency.write() {
+            let _ = slot.take();
+        }
     }
 
     /// Whether a device model is currently resident.
@@ -2184,5 +2198,65 @@ mod tests {
         room.store(true, std::sync::atomic::Ordering::Relaxed);
         assert!(engine.rehydrate().is_ok(), "the retry must succeed");
         assert!(engine.is_resident());
+    }
+
+    /// Releasing or dropping a residency must go through the MoE port, because
+    /// that is what trims the CUDA memory pool: cudarc frees through the pool,
+    /// so dropping the tensors alone leaves the VRAM allocated (M8.1e,
+    /// decision 163).
+    fn engine_with_moe(calls: Arc<std::sync::atomic::AtomicUsize>) -> Engine {
+        use crate::domain::expert_kernel::MockMoEExecutor;
+        let mut moe = MockMoEExecutor::new();
+        moe.expect_steps().returning(|| 0);
+        moe.expect_release_cache().times(1).returning(move || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        });
+        let (model, _rec) = fake::FakeModel::new();
+        let residency = Residency::new(
+            Arc::new(model),
+            VisionSource::Absent,
+            Some(Arc::new(moe)),
+            None,
+            None,
+            0,
+        );
+        Engine::with_residency(
+            residency,
+            None,
+            Arc::new(fake::FakeTokenizer),
+            vec![fake::FAKE_EOS],
+            fake::limits(),
+            Device::Cpu,
+        )
+    }
+
+    #[test]
+    fn an_idle_release_frees_the_expert_cache_once() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let engine = engine_with_moe(Arc::clone(&calls));
+        engine.release_residency();
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "an idle release must hand the expert banks back"
+        );
+        assert!(!engine.is_resident());
+        // Nothing is left to release, so the drop must not call it again (the
+        // mock's `times(1)` would catch a second call).
+        drop(engine);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn dropping_a_live_engine_frees_the_expert_cache() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let engine = engine_with_moe(Arc::clone(&calls));
+        drop(engine);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "a dropped engine must hand the expert banks back"
+        );
     }
 }
