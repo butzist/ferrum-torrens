@@ -140,40 +140,21 @@ pub struct Qwen3_6VisionCudarc {
 }
 
 struct DevWeights {
-    proj_w: Tensor,
-    proj_b: Tensor,
+    // Host-side widened f32 weights (the source for the device ring).
+    host: Arc<HostVisionWeights>,
+    // Double-buffered device ring that stages one weight tensor at a time.
+    ring: Tensor,
+    // Size (in f32 elements) of one ring slot; the ring holds two slots.
+    max_tensor: usize,
+    slot: std::sync::atomic::AtomicUsize,
     // [hidden, 1] f32 ones: the outer-product operand that broadcasts the
     // LayerNorm mean over the token width.
     ones: Tensor,
-    blocks: Vec<BlockW>,
-    merger: MergerW,
+    // Number of ViT blocks.
+    depth: usize,
     // Base position embedding table, widened to f32, for per-image grid
     // interpolation at encode time.
     pos_embed: Vec<f32>,
-}
-
-struct BlockW {
-    qkv_w: Tensor,
-    qkv_b: Tensor,
-    proj_w: Tensor,
-    proj_b: Tensor,
-    fc1_w: Tensor,
-    fc1_b: Tensor,
-    fc2_w: Tensor,
-    fc2_b: Tensor,
-    ln1_g: Tensor,
-    ln1_b: Tensor,
-    ln2_g: Tensor,
-    ln2_b: Tensor,
-}
-
-struct MergerW {
-    w1: Tensor,
-    b1: Tensor,
-    w2: Tensor,
-    b2: Tensor,
-    g: Tensor,
-    b: Tensor,
 }
 
 impl crate::domain::model::VisionTower for Qwen3_6VisionCudarc {
@@ -231,7 +212,7 @@ impl crate::domain::model::VisionTower for Qwen3_6VisionCudarc {
     }
 
     fn debug_xf(&self, pixels: &[f32], h: usize, w: usize) -> Option<Vec<f32>> {
-        self.probe_xn(pixels, h, w, self.dev.blocks.len()).ok()
+        self.probe_xn(pixels, h, w, self.dev.depth).ok()
     }
 
     fn debug_xn(&self, pixels: &[f32], h: usize, w: usize, n: usize) -> Option<Vec<f32>> {
@@ -244,46 +225,88 @@ impl crate::domain::model::VisionTower for Qwen3_6VisionCudarc {
 }
 
 impl Qwen3_6VisionCudarc {
+    /// Stage one weight tensor from the host cache into the device ring and
+    /// return a view over it. The ring is reused, so only one tensor (plus
+    /// its double-buffer slot) is device-resident at a time.
+    fn stage(&self, name: &str, shape: &[usize]) -> R<Tensor> {
+        let vals = self
+            .dev
+            .host
+            .get(name)
+            .ok_or_else(|| format!("missing {name}"))?;
+        let expected: usize = shape.iter().product();
+        if vals.len() != expected {
+            return Err(format!(
+                "expected {expected} f32 values for {name}, got {}",
+                vals.len()
+            ));
+        }
+        self.rt.synchronize().map_err(|e| e.to_string())?;
+        use std::sync::atomic::Ordering;
+        let slot = self.dev.slot.load(Ordering::Relaxed);
+        let offset_elems = slot * self.dev.max_tensor;
+        self.dev
+            .slot
+            .store(if slot == 0 { 1 } else { 0 }, Ordering::Relaxed);
+        let ptr = self.dev.ring.device_ptr() + (offset_elems * 4) as u64;
+        let bytes =
+            unsafe { std::slice::from_raw_parts(vals.as_ptr() as *const u8, vals.len() * 4) };
+        unsafe { self.rt.driver().copy_h2d(ptr, bytes) }.map_err(|e| e.to_string())?;
+        let view = self
+            .dev
+            .ring
+            .narrow(0, offset_elems, vals.len())
+            .map_err(|e| e.to_string())?;
+        view.reshape(shape).map_err(|e| e.to_string())
+    }
+
     fn probe_x0(&self, pixels: &[f32], h: usize, w: usize) -> R<Vec<f32>> {
         thost(&self.patch_pos(pixels, h, w)?)
     }
 
     fn probe_x1(&self, pixels: &[f32], h: usize, w: usize) -> R<Vec<f32>> {
         let x = self.patch_pos(pixels, h, w)?;
-        let bl = &self.dev.blocks[0];
-        thost(&self.block(&x, bl, self.config.num_heads)?)
+        thost(&self.block(&x, 0, self.config.num_heads)?)
     }
 
     fn probe_ln0(&self, pixels: &[f32], h: usize, w: usize) -> R<Vec<f32>> {
         let x = self.patch_pos(pixels, h, w)?;
-        let bl = &self.dev.blocks[0];
-        thost(&layer_norm(&x, &bl.ln1_g, &bl.ln1_b, &self.dev.ones)?)
+        let dim = x.shape()[1];
+        let ln1_g = self.stage("visual.blocks.0.norm1.weight", &[dim])?;
+        let ln1_b = self.stage("visual.blocks.0.norm1.bias", &[dim])?;
+        thost(&layer_norm(&x, &ln1_g, &ln1_b, &self.dev.ones)?)
     }
 
     fn probe_q0(&self, pixels: &[f32], h: usize, w: usize) -> R<Vec<f32>> {
         let x = self.patch_pos(pixels, h, w)?;
-        let bl = &self.dev.blocks[0];
         let dim = x.shape()[1];
-        let a = layer_norm(&x, &bl.ln1_g, &bl.ln1_b, &self.dev.ones)?;
+        let ln1_g = self.stage("visual.blocks.0.norm1.weight", &[dim])?;
+        let ln1_b = self.stage("visual.blocks.0.norm1.bias", &[dim])?;
+        let qkv_w = self.stage("visual.blocks.0.attn.qkv.weight", &[3 * dim, dim])?;
+        let qkv_b = self.stage("visual.blocks.0.attn.qkv.bias", &[3 * dim])?;
+        let a = layer_norm(&x, &ln1_g, &ln1_b, &self.dev.ones)?;
         let q = tcol_add(
-            &tmatf(&a, &io(bl.qkv_w.narrow(0, 0, dim))?)?,
-            &io(bl.qkv_b.narrow(0, 0, dim))?,
+            &tmatf(&a, &io(qkv_w.narrow(0, 0, dim))?)?,
+            &io(qkv_b.narrow(0, 0, dim))?,
         )?;
         thost(&q)
     }
 
     fn probe_kv0(&self, pixels: &[f32], h: usize, w: usize) -> R<Vec<f32>> {
         let x = self.patch_pos(pixels, h, w)?;
-        let bl = &self.dev.blocks[0];
         let dim = x.shape()[1];
-        let a = layer_norm(&x, &bl.ln1_g, &bl.ln1_b, &self.dev.ones)?;
+        let ln1_g = self.stage("visual.blocks.0.norm1.weight", &[dim])?;
+        let ln1_b = self.stage("visual.blocks.0.norm1.bias", &[dim])?;
+        let qkv_w = self.stage("visual.blocks.0.attn.qkv.weight", &[3 * dim, dim])?;
+        let qkv_b = self.stage("visual.blocks.0.attn.qkv.bias", &[3 * dim])?;
+        let a = layer_norm(&x, &ln1_g, &ln1_b, &self.dev.ones)?;
         let k = tcol_add(
-            &tmatf(&a, &io(bl.qkv_w.narrow(0, dim, dim))?)?,
-            &io(bl.qkv_b.narrow(0, dim, dim))?,
+            &tmatf(&a, &io(qkv_w.narrow(0, dim, dim))?)?,
+            &io(qkv_b.narrow(0, dim, dim))?,
         )?;
         let v = tcol_add(
-            &tmatf(&a, &io(bl.qkv_w.narrow(0, 2 * dim, dim))?)?,
-            &io(bl.qkv_b.narrow(0, 2 * dim, dim))?,
+            &tmatf(&a, &io(qkv_w.narrow(0, 2 * dim, dim))?)?,
+            &io(qkv_b.narrow(0, 2 * dim, dim))?,
         )?;
         let kh = thost(&k)?;
         let vh = thost(&v)?;
@@ -292,15 +315,18 @@ impl Qwen3_6VisionCudarc {
 
     fn probe_heads0(&self, pixels: &[f32], h: usize, w: usize) -> R<Vec<f32>> {
         let x = self.patch_pos(pixels, h, w)?;
-        let bl = &self.dev.blocks[0];
         let dim = x.shape()[1];
         let heads = self.config.num_heads;
         let hd = dim / heads;
         let seq = x.shape()[0];
-        let a = layer_norm(&x, &bl.ln1_g, &bl.ln1_b, &self.dev.ones)?;
+        let ln1_g = self.stage("visual.blocks.0.norm1.weight", &[dim])?;
+        let ln1_b = self.stage("visual.blocks.0.norm1.bias", &[dim])?;
+        let qkv_w = self.stage("visual.blocks.0.attn.qkv.weight", &[3 * dim, dim])?;
+        let qkv_b = self.stage("visual.blocks.0.attn.qkv.bias", &[3 * dim])?;
+        let a = layer_norm(&x, &ln1_g, &ln1_b, &self.dev.ones)?;
         let q = tcol_add(
-            &tmatf(&a, &io(bl.qkv_w.narrow(0, 0, dim))?)?,
-            &io(bl.qkv_b.narrow(0, 0, dim))?,
+            &tmatf(&a, &io(qkv_w.narrow(0, 0, dim))?)?,
+            &io(qkv_b.narrow(0, 0, dim))?,
         )?;
         let qf = heads3(&q, seq, heads, hd)?;
         thost(&qf)
@@ -310,31 +336,34 @@ impl Qwen3_6VisionCudarc {
     fn probe_xn(&self, pixels: &[f32], h: usize, w: usize, n: usize) -> R<Vec<f32>> {
         let mut x = self.patch_pos(pixels, h, w)?;
         let heads = self.config.num_heads;
-        for bl in self.dev.blocks.iter().take(n) {
-            x = self.block(&x, bl, heads)?;
+        for li in 0..n {
+            x = self.block(&x, li, heads)?;
         }
         thost(&x)
     }
 
     fn probe_ctx0(&self, pixels: &[f32], h: usize, w: usize) -> R<Vec<f32>> {
         let x = self.patch_pos(pixels, h, w)?;
-        let bl = &self.dev.blocks[0];
         let heads = self.config.num_heads;
         let dim = x.shape()[1];
         let hd = dim / heads;
         let seq = x.shape()[0];
-        let a = layer_norm(&x, &bl.ln1_g, &bl.ln1_b, &self.dev.ones)?;
+        let ln1_g = self.stage("visual.blocks.0.norm1.weight", &[dim])?;
+        let ln1_b = self.stage("visual.blocks.0.norm1.bias", &[dim])?;
+        let qkv_w = self.stage("visual.blocks.0.attn.qkv.weight", &[3 * dim, dim])?;
+        let qkv_b = self.stage("visual.blocks.0.attn.qkv.bias", &[3 * dim])?;
+        let a = layer_norm(&x, &ln1_g, &ln1_b, &self.dev.ones)?;
         let q = tcol_add(
-            &tmatf(&a, &io(bl.qkv_w.narrow(0, 0, dim))?)?,
-            &io(bl.qkv_b.narrow(0, 0, dim))?,
+            &tmatf(&a, &io(qkv_w.narrow(0, 0, dim))?)?,
+            &io(qkv_b.narrow(0, 0, dim))?,
         )?;
         let k = tcol_add(
-            &tmatf(&a, &io(bl.qkv_w.narrow(0, dim, dim))?)?,
-            &io(bl.qkv_b.narrow(0, dim, dim))?,
+            &tmatf(&a, &io(qkv_w.narrow(0, dim, dim))?)?,
+            &io(qkv_b.narrow(0, dim, dim))?,
         )?;
         let v = tcol_add(
-            &tmatf(&a, &io(bl.qkv_w.narrow(0, 2 * dim, dim))?)?,
-            &io(bl.qkv_b.narrow(0, 2 * dim, dim))?,
+            &tmatf(&a, &io(qkv_w.narrow(0, 2 * dim, dim))?)?,
+            &io(qkv_b.narrow(0, 2 * dim, dim))?,
         )?;
         let qf = heads3(&q, seq, heads, hd)?;
         let kf = heads3(&k, seq, heads, hd)?;
@@ -383,8 +412,10 @@ impl Qwen3_6VisionCudarc {
             .collect();
         let stretch: Vec<f32> = patch_rows.iter().flatten().copied().collect();
         let patch_t = upload_f32(&self.rt, &stretch, &[seq, time_dim])?;
-        let proj = tmatf(&patch_t, &self.dev.proj_w)?;
-        let x = tcol_add(&proj, &self.dev.proj_b)?;
+        let proj_w = self.stage("visual.patch_embed.proj.weight", &[hidden, time_dim])?;
+        let proj_b = self.stage("visual.patch_embed.proj.bias", &[hidden])?;
+        let proj = tmatf(&patch_t, &proj_w)?;
+        let x = tcol_add(&proj, &proj_b)?;
 
         // Pos embed: the square table interpolated to this image's grid, kept
         // on the host (the interpolation is a per-request host pass).
@@ -424,8 +455,9 @@ impl Qwen3_6VisionCudarc {
             return Err(format!("unsupported vision hidden_act {}", cfg.hidden_act));
         }
 
-        for bl in &self.dev.blocks {
-            x = self.block(&x, bl, self.config.num_heads)?;
+        let heads = self.config.num_heads;
+        for li in 0..self.dev.depth {
+            x = self.block(&x, li, heads)?;
         }
 
         // Merger: per-token LayerNorm, merge^2 consecutive tokens concatenated,
@@ -446,38 +478,59 @@ impl Qwen3_6VisionCudarc {
         }
         let idx_t = upload_i32(&self.rt, &merge_idx)?;
         let gathered = tgather(&x, &idx_t)?;
+        let in_dim = merge * merge * hidden;
+        let mid = self
+            .dev
+            .host
+            .get("visual.merger.linear_fc1.weight")
+            .ok_or_else(|| "missing visual.merger.linear_fc1.weight".to_string())?
+            .len()
+            / in_dim;
         // Per-token norm first (token width = hidden), then the merge concat.
-        let ln = layer_norm(
-            &gathered,
-            &self.dev.merger.g,
-            &self.dev.merger.b,
-            &self.dev.ones,
-        )?;
+        let m_g = self.stage("visual.merger.norm.weight", &[hidden])?;
+        let m_b = self.stage("visual.merger.norm.bias", &[hidden])?;
+        let ln = layer_norm(&gathered, &m_g, &m_b, &self.dev.ones)?;
         let joined = tresh(&ln, &[groups, merge * merge * hidden])?;
-        let mid = tmatf(&joined, &self.dev.merger.w1)?;
-        let mid = tcol_add(&mid, &self.dev.merger.b1)?;
-        let mid = gelu(&mid)?;
-        let out = tmatf(&mid, &self.dev.merger.w2)?;
-        let out = tcol_add(&out, &self.dev.merger.b2)?;
+
+        let m_w1 = self.stage("visual.merger.linear_fc1.weight", &[mid, in_dim])?;
+        let m_b1 = self.stage("visual.merger.linear_fc1.bias", &[mid])?;
+        let midt = tmatf(&joined, &m_w1)?;
+        let midt = tcol_add(&midt, &m_b1)?;
+        let midt = gelu(&midt)?;
+
+        let m_w2 = self.stage(
+            "visual.merger.linear_fc2.weight",
+            &[cfg.out_hidden_size, mid],
+        )?;
+        let m_b2 = self.stage("visual.merger.linear_fc2.bias", &[cfg.out_hidden_size])?;
+        let out = tmatf(&midt, &m_w2)?;
+        let out = tcol_add(&out, &m_b2)?;
         let flat = thost(&out)?;
-        let out_dim = self.dev.merger.w2.shape()[0];
+        let out_dim = m_w2.shape()[0];
         Ok(flat.chunks(out_dim).map(|r| r.to_vec()).collect())
     }
 
     /// One ViT block (pre-norm): LN -> full attention -> residual -> LN ->
     /// GELU MLP -> residual. Everything runs in f32; see the module header.
-    fn block(&self, x: &Tensor, bl: &BlockW, heads: usize) -> R<Tensor> {
+    fn block(&self, x: &Tensor, li: usize, heads: usize) -> R<Tensor> {
         let seq = x.shape()[0];
         let dim = x.shape()[1];
         let hd = dim / heads;
+        let pfx = format!("visual.blocks.{li}");
+        let inter = self.config.intermediate_size;
 
-        let a = layer_norm(x, &bl.ln1_g, &bl.ln1_b, &self.dev.ones)?;
-        let qw = tnarrow(&bl.qkv_w, 0, 0, dim)?;
-        let kw = tnarrow(&bl.qkv_w, 0, dim, dim)?;
-        let vw = tnarrow(&bl.qkv_w, 0, 2 * dim, dim)?;
-        let qb = tnarrow(&bl.qkv_b, 0, 0, dim)?;
-        let kb = tnarrow(&bl.qkv_b, 0, dim, dim)?;
-        let vb = tnarrow(&bl.qkv_b, 0, 2 * dim, dim)?;
+        let ln1_g = self.stage(&format!("{pfx}.norm1.weight"), &[dim])?;
+        let ln1_b = self.stage(&format!("{pfx}.norm1.bias"), &[dim])?;
+        let a = layer_norm(x, &ln1_g, &ln1_b, &self.dev.ones)?;
+
+        let qkv_w = self.stage(&format!("{pfx}.attn.qkv.weight"), &[3 * dim, dim])?;
+        let qkv_b = self.stage(&format!("{pfx}.attn.qkv.bias"), &[3 * dim])?;
+        let qw = tnarrow(&qkv_w, 0, 0, dim)?;
+        let kw = tnarrow(&qkv_w, 0, dim, dim)?;
+        let vw = tnarrow(&qkv_w, 0, 2 * dim, dim)?;
+        let qb = tnarrow(&qkv_b, 0, 0, dim)?;
+        let kb = tnarrow(&qkv_b, 0, dim, dim)?;
+        let vb = tnarrow(&qkv_b, 0, 2 * dim, dim)?;
         let q = tcol_add(&tmatf(&a, &qw)?, &qb)?;
         let k = tcol_add(&tmatf(&a, &kw)?, &kb)?;
         let v = tcol_add(&tmatf(&a, &vw)?, &vb)?;
@@ -493,13 +546,24 @@ impl Qwen3_6VisionCudarc {
         let probs3 = tresh(&tsoft(&tsc(&scores, scale)?)?, &[heads, seq, seq])?;
         let ctx = tbmm(&probs3, &vf)?;
         let ctx = tresh(&tcont(&tperm(&ctx, &[1, 0, 2])?)?, &[seq, dim])?;
-        let attn = tcol_add(&tmatf(&ctx, &bl.proj_w)?, &bl.proj_b)?;
+
+        let proj_w = self.stage(&format!("{pfx}.attn.proj.weight"), &[dim, dim])?;
+        let proj_b = self.stage(&format!("{pfx}.attn.proj.bias"), &[dim])?;
+        let attn = tcol_add(&tmatf(&ctx, &proj_w)?, &proj_b)?;
         let y = tadd(x, &attn)?;
 
-        let a2 = layer_norm(&y, &bl.ln2_g, &bl.ln2_b, &self.dev.ones)?;
-        let mid = tcol_add(&tmatf(&a2, &bl.fc1_w)?, &bl.fc1_b)?;
+        let ln2_g = self.stage(&format!("{pfx}.norm2.weight"), &[dim])?;
+        let ln2_b = self.stage(&format!("{pfx}.norm2.bias"), &[dim])?;
+        let a2 = layer_norm(&y, &ln2_g, &ln2_b, &self.dev.ones)?;
+
+        let fc1_w = self.stage(&format!("{pfx}.mlp.linear_fc1.weight"), &[inter, dim])?;
+        let fc1_b = self.stage(&format!("{pfx}.mlp.linear_fc1.bias"), &[inter])?;
+        let mid = tcol_add(&tmatf(&a2, &fc1_w)?, &fc1_b)?;
         let mid = gelu(&mid)?;
-        let out = tcol_add(&tmatf(&mid, &bl.fc2_w)?, &bl.fc2_b)?;
+
+        let fc2_w = self.stage(&format!("{pfx}.mlp.linear_fc2.weight"), &[dim, inter])?;
+        let fc2_b = self.stage(&format!("{pfx}.mlp.linear_fc2.bias"), &[dim])?;
+        let out = tcol_add(&tmatf(&mid, &fc2_w)?, &fc2_b)?;
         tadd(&y, &out)
     }
 }
@@ -563,69 +627,11 @@ pub fn build_device_vision(
     let cfg = &vcfg;
     let hidden = cfg.hidden_size;
     let in_dim = hidden * cfg.spatial_merge_size * cfg.spatial_merge_size;
-    let time_dim = cfg.in_channels * cfg.temporal_patch_size * cfg.patch_size * cfg.patch_size;
 
     // Host-side cache of the widened f32 weights: load + widen once per process.
     let host = host_vision_weights(index.clone(), reader.clone(), cache_key)?;
 
-    let proj_w = f32_cached(
-        &rt,
-        &host,
-        "visual.patch_embed.proj.weight",
-        hidden,
-        time_dim,
-    )?;
-    let proj_b = f32_cached_row(&rt, &host, "visual.patch_embed.proj.bias", hidden)?;
-    let ones = upload_f32(&rt, &vec![1.0f32; hidden], &[hidden, 1])?;
-
-    let mut blocks = Vec::with_capacity(cfg.depth);
-    for li in 0..cfg.depth {
-        let pfx = format!("visual.blocks.{li}");
-        blocks.push(BlockW {
-            qkv_w: f32_cached(
-                &rt,
-                &host,
-                &format!("{pfx}.attn.qkv.weight"),
-                3 * hidden,
-                hidden,
-            )?,
-            qkv_b: f32_cached_row(&rt, &host, &format!("{pfx}.attn.qkv.bias"), 3 * hidden)?,
-            proj_w: f32_cached(
-                &rt,
-                &host,
-                &format!("{pfx}.attn.proj.weight"),
-                hidden,
-                hidden,
-            )?,
-            proj_b: f32_cached_row(&rt, &host, &format!("{pfx}.attn.proj.bias"), hidden)?,
-            fc1_w: f32_cached(
-                &rt,
-                &host,
-                &format!("{pfx}.mlp.linear_fc1.weight"),
-                cfg.intermediate_size,
-                hidden,
-            )?,
-            fc1_b: f32_cached_row(
-                &rt,
-                &host,
-                &format!("{pfx}.mlp.linear_fc1.bias"),
-                cfg.intermediate_size,
-            )?,
-            fc2_w: f32_cached(
-                &rt,
-                &host,
-                &format!("{pfx}.mlp.linear_fc2.weight"),
-                hidden,
-                cfg.intermediate_size,
-            )?,
-            fc2_b: f32_cached_row(&rt, &host, &format!("{pfx}.mlp.linear_fc2.bias"), hidden)?,
-            ln1_g: f32_cached_row(&rt, &host, &format!("{pfx}.norm1.weight"), hidden)?,
-            ln1_b: f32_cached_row(&rt, &host, &format!("{pfx}.norm1.bias"), hidden)?,
-            ln2_g: f32_cached_row(&rt, &host, &format!("{pfx}.norm2.weight"), hidden)?,
-            ln2_b: f32_cached_row(&rt, &host, &format!("{pfx}.norm2.bias"), hidden)?,
-        });
-    }
-
+    // Validate the merger shapes against the host cache (cheap, no upload).
     let merger_w1 = host
         .get("visual.merger.linear_fc1.weight")
         .ok_or_else(|| "missing visual.merger.linear_fc1.weight".to_string())?;
@@ -663,14 +669,6 @@ pub fn build_device_vision(
     if merger_b.len() != hidden {
         return Err("merger norm bias does not match".into());
     }
-    let merger = MergerW {
-        w1: upload_f32(&rt, merger_w1, &[mid, in_dim])?,
-        b1: upload_f32(&rt, merger_b1, &[mid])?,
-        w2: upload_f32(&rt, merger_w2, &[cfg.out_hidden_size, mid])?,
-        b2: upload_f32(&rt, merger_b2, &[cfg.out_hidden_size])?,
-        g: upload_f32(&rt, merger_g, &[hidden])?,
-        b: upload_f32(&rt, merger_b, &[hidden])?,
-    };
 
     let pos_embed = host
         .get("visual.pos_embed.weight")
@@ -684,16 +682,37 @@ pub fn build_device_vision(
         ));
     }
 
+    // Size the device ring to the largest single weight tensor, doubled for a
+    // two-slot ring. Nothing else about the tower is device-resident.
+    let mut max_tensor: usize = 0;
+    for v in host.map.values() {
+        if v.len() > max_tensor {
+            max_tensor = v.len();
+        }
+    }
+    if max_tensor == 0 {
+        return Err("vision host cache is empty".into());
+    }
+    let ring_elems = max_tensor * 2;
+    let ring = rt
+        .zeros(
+            &[ring_elems],
+            crate::infrastructure::cudarc::TensorDType::F32,
+        )
+        .map_err(|e| e.to_string())?;
+    let ones = upload_f32(&rt, &vec![1.0f32; hidden], &[hidden, 1])?;
+
     Ok(Some(Arc::new(Qwen3_6VisionCudarc {
-        config: vcfg,
+        config: vcfg.clone(),
         rt,
         image_token_id: id,
         dev: DevWeights {
-            proj_w,
-            proj_b,
+            host,
+            ring,
+            max_tensor,
+            slot: std::sync::atomic::AtomicUsize::new(0),
             ones,
-            blocks,
-            merger,
+            depth: cfg.depth,
             pos_embed,
         },
     })))
@@ -745,33 +764,4 @@ fn host_vision_weights(
     let cached = Arc::new(HostVisionWeights { map });
     *guard = Some((cache_key.to_string(), cached.clone()));
     Ok(cached)
-}
-
-fn f32_cached(
-    rt: &Runtime,
-    host: &HostVisionWeights,
-    name: &str,
-    rows: usize,
-    cols: usize,
-) -> R<Tensor> {
-    let vals = host.get(name).ok_or_else(|| format!("missing {name}"))?;
-    if vals.len() != rows * cols {
-        return Err(format!(
-            "expected {} f32 values for {name} ({rows}x{cols}), got {}",
-            rows * cols,
-            vals.len()
-        ));
-    }
-    upload_f32(rt, vals, &[rows, cols])
-}
-
-fn f32_cached_row(rt: &Runtime, host: &HostVisionWeights, name: &str, cols: usize) -> R<Tensor> {
-    let vals = host.get(name).ok_or_else(|| format!("missing {name}"))?;
-    if vals.len() != cols {
-        return Err(format!(
-            "expected {cols} f32 values for {name}, got {}",
-            vals.len()
-        ));
-    }
-    upload_f32(rt, vals, &[cols])
 }

@@ -186,3 +186,70 @@ fn residency_contract_no_tower_between_requests() {
         "no resident tower after an image request"
     );
 }
+
+fn config_graph(max_output_tokens: u32) -> Config {
+    let dir = common::ftw_dir();
+    format!(
+        "[model]\npath = \"{dir}\"\nmax_seq_len = 1024\nmax_output_tokens = {max_output_tokens}\n\
+         max_prefill_length = 512\nmax_running_requests = 1\ncuda_graph = true\n\n\
+         [kernel]\ntriton = true\n\n\
+         [kv]\nnum_tokens = 512\ndtype = \"bf16\"\n\n[moe]\ncache_size_slots = 256\n"
+    )
+    .parse()
+    .unwrap()
+}
+
+#[test]
+#[ignore = "requires converted checkpoint in .model-cache"]
+#[serial]
+fn an_image_request_leaves_moe_cache_and_captured_decode_graphs_untouched() {
+    let engine = load_engine(&config_graph(8)).unwrap();
+    assert!(
+        engine.captured().is_some(),
+        "decode capture must be on for this contract"
+    );
+    assert!(engine.moe_resident(), "moe cache resident before the image");
+
+    let marker: &str = "<|vision_start|><|image_pad|><|vision_end|>";
+    let conversation = [
+        ChatMessage::new("system", "be brief"),
+        ChatMessage::new("user", &format!("{marker}\ndescribe this image")),
+    ];
+    let prompt = engine.render_chat(&conversation, &[]).unwrap();
+    let ids = engine.encode(&prompt).unwrap();
+    let pads = ids.iter().filter(|&&i| i == 248056).count();
+    assert_eq!(pads, 1, "the template would render exactly one image run");
+
+    let request = engine
+        .make_request_with_images(2, ids, vec![red_disk_png()], greedy(8), 0)
+        .unwrap();
+    let g = generation::generate(&engine, request).unwrap();
+    assert!(!g.text.trim().is_empty(), "the image request must answer");
+
+    // Contract: captured decode graph survives the image request.
+    assert!(
+        engine.captured().is_some(),
+        "captured decode graph must remain present after an image request"
+    );
+    // Contract: MoE expert cache stays resident across the image request.
+    assert!(
+        engine.moe_resident(),
+        "moe expert cache must stay resident across an image request"
+    );
+
+    // A text decode afterwards runs without a recapture and advances the MoE
+    // step counter.
+    let text_ids = engine.encode("The capital of France is").unwrap();
+    let text_req = generation::make_request(&engine, 99, text_ids, greedy(4), 0).unwrap();
+    let steps_before = engine.expert_steps();
+    let g2 = generation::generate(&engine, text_req).unwrap();
+    assert!(!g2.text.trim().is_empty(), "the text decode must answer");
+    assert!(
+        engine.expert_steps() > steps_before,
+        "the MoE step counter must advance on the post-image text decode"
+    );
+    assert!(
+        engine.captured().is_some(),
+        "captured decode graph must remain present after the post-image text decode"
+    );
+}

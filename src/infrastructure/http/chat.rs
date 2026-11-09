@@ -189,9 +189,10 @@ pub(crate) async fn chat_completions(
             let lease = worker.try_exclusive().ok_or(EngineError::Busy {
                 retry_after_ms: 1_000,
             })?;
-            worker.release_moe()?;
+            // The vision tower is streamed per block from the host cache, so an
+            // image request no longer frees or rebuilds the MoE expert cache;
+            // the captured decode graphs and the cache survive untouched.
             let result = worker.make_request_with_images(uid, ids, images, params, seed);
-            worker.rehydrate_moe()?;
             drop(lease);
             result
         })
