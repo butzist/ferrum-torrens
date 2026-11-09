@@ -5038,3 +5038,33 @@ subsection names are kept verbatim.
     ~1.7 GiB for the cached f32 weights. Partial MoE eviction is deliberately
     not implemented here; the encode keeps the existing full `release_moe()`
     borrow and is the planned follow-up (VMM-backed slot banks).
+
+157. **The vision tower is streamed per block; an image request leaves the MoE
+    cache and the captured decode graphs untouched** (R14c follow-up). The
+    device tower no longer uploads its 1.7 GiB of widened f32 weights: each
+    weight tensor is staged from the existing host cache into a small device
+    ring (two slots, 39.6 MiB) by a blocking pageable H2D immediately before
+    its GEMM, one synchronize() per stage, so the copies serialize with
+    compute and the device footprint is the ring plus the block's activations
+    instead of 1.7 GiB of weights. Measured: device encode is 376 ms for 49
+    tokens against ~200 ms when the tower was fully resident. f32 weight
+    values and GEMM order are
+    unchanged, so `tests/vision_cudarc_tower.rs` passes at the same bound
+    (mean ~1e-5). The tower still lives only for the duration of `encode`. An
+    image request no longer calls `Engine::release_moe`/`rehydrate_moe`: the
+    pair was removed from the image path in `src/infrastructure/http/chat.rs`
+    (the exclusive lease stays), because with a streamed tower there is nothing
+    to free; the captured decode graphs and the expert cache survive an image
+    request. `release_moe`/`rehydrate_moe` and the idle unload keep their
+    current semantics and remain used by the idle timer's first stage. The
+    parked VMM partial-eviction design (stash@{0}) was measured to break
+    decode-graph capture and stays parked. Host source is the existing pageable
+    f32 cache; peak RSS is ~18.6 GiB with one load and MemAvailable low-water
+    stays above 24 GiB, leaving ~14 GiB of margin against the host budget.
+    Measured: tower build 1.31 s (host cache load unchanged), device encode
+    376 ms for 49 tokens; vision_smoke end to end in ~0.5 s. Ring size is
+    2 * 19.8 MiB = 39.6 MiB; the largest single tensor is
+    `visual.blocks.*.mlp.linear_fc1.weight` at ~19.8 MiB (4304 x 1152 f32).
+    Open follow-up: real overlap (pinned staging + async copies + events) is
+    expected to save ~0.1 s on the encode; the current path is a blocking
+    pageable H2D per weight with one synchronize() per stage.

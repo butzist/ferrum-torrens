@@ -549,9 +549,12 @@ once the tower and KV pool are resident, reserving 512 MiB for the prefill
 scratch and transient activations (item 12, decisions 90, 127, `registry::resolve_cache_slots`).
 Two allocations are deliberately outside that device budget: the bf16 embedding
 table lives in pinned host RAM and a gather reads its rows over the bus
-(decision 153), and `model.text_only = true` skips the f32 vision tower. With
-both, auto resolves the kernel's `BLOCK_C = 2048` ceiling; with the vision tower
-resident it resolves ~1536. `CudaMoE::grouped_moe_staged` chunks a larger list by tokens
+(decision 153), and the f32 vision tower is no longer device-resident at all
+(decision 157): its weights are streamed per block through a small device
+ring (two slots, 39.6 MiB), staged by a blocking pageable H2D before each
+GEMM, so `model.text_only` is a capability switch rather than a
+load-time skip and auto resolves the kernel's `BLOCK_C = 2048` ceiling for every
+deployment. `CudaMoE::grouped_moe_staged` chunks a larger list by tokens
 (`staged_chunk_tokens`) and repeats the sequence per chunk, the device LRU and
 the pinned banks carrying across, so prefill uses the same device path as decode
 (decision 66). `CachedExperts` without device staging still takes the host plan

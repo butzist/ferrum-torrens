@@ -1,7 +1,7 @@
 # FerrumTorrens -- FreeToken MVP port to Rust: TODO
 
-Status (2026-11-08): **M9 (speculative decoding, section 6d) is complete through
-M9.7, and M9.8a has landed.** Speculation runs end to end on both checkpoints,
+Status (2026-11-08): **Vision tower is now streamed per block** (decision 157): the device tower no longer holds 1.7 GiB of weights; an image request no longer calls release_moe/rehydrate_moe, so the MoE cache and captured decode graphs survive it. **M9 (speculative decoding, section 6d) is complete through
+M9.7, and M9.8a-e have landed.** Speculation runs end to end on both checkpoints,
 token-identical to greedy at the gated length, and remains a measured slowdown:
 0.44-0.53x at the new 2048-slot cache (a verify step's extra rows miss more than
 the plain step), so `[spec]` stays off by default. M9.8a moved plain decode from
@@ -19,9 +19,9 @@ rejected at -2.5% captured (R15 S8). The draft head stays in the FTW
 final-norm hidden, and the GDN state is committed for exactly the accepted rows
 with no kernel change and no state snapshot. `tests/cudarc_spec_verify.rs` proves
 on both checkpoints that a verify + commit + rollback leaves the cache where
-plain decode would, including after a rejection. Remaining: M9.8 (b) captured
-verify, (c) fused GDN commit, (d) k = 3 draft depth, (e) `radix_lookahead`
-prefix keys. Note for gated M9 tests: the store FTWs predate M9.1 and carry
+plain decode would, including after a rejection. M9.8 (b) captured verify,
+(c) fused GDN commit, (d) the k = 3 draft-chain fix and (e) `radix_lookahead`
+prefix keys have landed. Note for gated M9 tests: the store FTWs predate M9.1 and carry
 no draft head, and neither 16 GiB tmpfs can hold a 21 GiB FTW, so the draft
 gates run on a two-part overlay (decision 151).
 **M8.1b is complete: both checkpoints build from the flake
@@ -33,14 +33,14 @@ expert steps, and captured parity over 8 tokens). The reference store FTW was
 re-gated too -- its tensor packing differs from the old local one -- and still
 reproduces the pinned oracle on the scalar and kernel paths. The 104 GB
 `.model-cache` is gone; point `FERRUM_FTW_DIR` at the store outputs recorded in
-`DONE.md` 149. Remaining: M8.1e (a dropped engine keeps its device slot banks),
-M8.2 (per-checkpoint cubins), M8.3 (a second architecture) and M9 (speculative
-decoding). `Ornith-1.5-35B-A3B-NVFP4` lands at pp parity and 1-3% behind on tg
+`DONE.md` 149. M8.1e (a dropped engine keeps its device slot banks) and M8.2
+(per-checkpoint cubins) have landed; remaining are M8.3 (a second architecture)
+and M9 (speculative decoding). `Ornith-1.5-35B-A3B-NVFP4` lands at pp parity and 1-3% behind on tg
 (routing entropy: +5.4% expert-cache misses per decode step, R13). M8.1c is
 closed by decision 148 -- one-token text decode runs the device kernels on both
-arms (`maxabs_delta = 0.000000` per step). Two footprint findings remain: a load
-pins 16.93 GiB of host expert banks (peak RSS 18.6 GiB, so one load at a time),
-and a dropped engine keeps its device slot banks (M8.1e). **M9 (speculative
+arms (`maxabs_delta = 0.000000` per step). One footprint finding remains: a load
+pins 16.93 GiB of host expert banks (peak RSS 18.6 GiB, so one load at a time).
+A dropped engine now returns its device slot banks (M8.1e). **M9 (speculative
 decoding with the checkpoint's own MTP head, section 6d) is scoped but not
 started** (decision 150): the head is in both checkpoints, the target verify
 keeps the output exact, and the draft may be quantized because only the accept
@@ -637,7 +637,7 @@ Ordered slices, each its own gated change:
   not a path change. Absolute numbers sit below the 32.8 tok/s baseline because
   the card was power/thermally capped during the session. Details in `DONE.md`
   147.
-- [ ] **M8.1e A dropped engine keeps its device slot banks.** `throughput_smoke`
+- [x] **M8.1e A dropped engine keeps its device slot banks.** Fixed by giving `CudaMoE` a `Drop` that calls `release_banks()`, so a dropped `Engine` returns its slot banks (measured: 4058 MiB -> 1048 MiB vs 444 MiB baseline). `throughput_smoke`
   grows a `vram("process start" | "after load" | "after drop")` probe, and the
   numbers are unambiguous: with `[moe] cache_size_slots = 256` a 6794 MiB load
   drops to 1160 MiB against a 526 MiB process baseline, and with 1024 slots an
@@ -652,17 +652,14 @@ Ordered slices, each its own gated change:
   `Arc<Mutex<adapter>>` that `moe_port` clones into `CachedExperts` (twice) and
   the model is still alive after the drop -- find the clone (a `Drop` log on the
   adapter, then `Arc::strong_count`) before adding any in-process arm loop.
-- [ ] **M8.2 Class B -- per-checkpoint cubin set.** Only for a checkpoint whose
-  shapes differ. Move the serving shapes out of module constants into an
-  explicit profile (`ServingShapes` in `signatures.py`), thread it through
-  `aot.py`, let `nix/kernels.nix` build one set per checkpoint profile, and keep
-  `build.rs` embedding whichever `FERRUM_KERNEL_DIR` it is given. **One binary
-  serves one checkpoint** (decision 146): no runtime manifest multiplexing. Add
-  the load-time guard: refuse to start when the FTW config's attention, GDN or
-  MoE geometry disagrees with the embedded manifest (MoE has `check_shapes`
-  today; attention and GDN only fail at the first launch). Acceptance: build a
-  second set with one changed hidden size and one changed head count; the guard
-  fires on a mismatch and the matching checkpoint serves.
+- [x] **M8.2 Class B -- per-checkpoint cubin set.** Serving shapes moved into
+  `ServingShapes` (python/ferrum_kernel/signatures.py), threaded through
+  `aot.py` via env/CLI flags, `nix/kernels.nix` parameterized by `profileArgs`,
+  `build.rs` still embeds `FERRUM_KERNEL_DIR`, and the load-time guard now
+  covers attention and GDN as well as MoE (`check_shapes`/`check_geometry`).
+  Acceptance: an alternate set (hidden 2049, q_heads 17) builds and its manifest
+  differs; the guard fires on mismatch. **One binary serves one checkpoint**
+  (decision 146): no runtime manifest multiplexing.
 - [ ] **M8.3 Class C/D -- a second architecture, only on real demand.** A
   plain-GQA MoE is the cheapest second arch because it *deletes* features (no
   GDN, no shared expert, no vision); it still needs FP8 grouped-MoE experts for
@@ -785,15 +782,22 @@ Ordered slices, each its own gated change:
   plain 27.1 -> 32.9 tok/s. Still open in (a): keep the router gate in its
   checkpoint dtype (40 MiB) and share one slot pool between draft and target
   (the draft's 256 fully-resident experts are 433 MiB when speculating).
-  (b) a captured verify (`rows = k + 1`) -- ours is eager and its step costs
-  4.0x a plain step against their 3.0x; at 2048 slots verify is 155 ms of a
-  24-token step, so this is now the leading spec lever;
-  (c) a fused GDN commit (one stash kernel per layer plus one all-layer replay,
-  not per-row `conv_decode`+`gdn.decode` twice); (d) draft depth at k = 3:
-  accept 0.53 against their 0.72, while k = 2 matches (0.73 vs 0.71), so the
-  third draft's hidden chain is the defect; (e) `radix_lookahead` prefix keys
-  `(t_i, t_{i+1})`, which our spec path needs before it can adopt a target
-  prefix without a stale draft KV.
+  (b) a captured verify (`rows = k + 1`) -- LANDED (M9.8b): `verify_cached`
+  replays a captured graph when one is attached at load (one graph at
+  `k + 1` rows, sequential GDN, hidden stashed for readback), falling back to
+  the eager tower otherwise. Slot validation in `commit_verify` now keys on
+  the live cache slot so a captured (slot-agnostic) verify still commits;
+  (c) a fused GDN commit -- LANDED (M9.8c): the verify stashes each linear layer's
+  evolved conv/rec state per row, and `commit_verify` scatters the accepted
+  boundary's stashed state instead of replaying `conv_decode`+`gdn.decode`;
+  (d) draft depth at k = 3: LANDED (M9.8d) -- draft attention bounds its gather to
+  the current chain (chain_base..from+n) instead of 0..from+n, removing stale K/V
+  dilution of the third draft; (e) `radix_lookahead` prefix keys
+  `(t_i, t_{i+1})` -- LANDED (M9.8e): `HybridRadixIndex` now tags each donated
+  snapshot with a lookahead token and refuses reuse unless the request's token at
+  the boundary matches (wildcard for legacy commits); `kvcache_dev::commit`
+  computes the lookahead from the committed boundary. Unit tests cover the key
+  semantics.
 
 Non-goals: DFlash (the other method in #828), MTP for an architecture that ships
 no head (Qwen3-Coder), TP > 1, and GGUF draft packs.

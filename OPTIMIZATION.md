@@ -2380,3 +2380,17 @@ slice.
 **Do not re-chase** (all measured): S1 host fetch, S2 GDN block fusion and the
 `ba` cast, S7's standalone small-N GEMV and simple shared-epilogue fusion, S8's
 gated-norm fusion, R9.2's fused q/k + gated norms, and online LFU admission.
+
+## R14c follow-up -- streamed vision tower (decision 157)
+
+The vision tower is no longer device-resident. Each weight tensor is staged
+from the host cache into a small device ring (two slots, 39.6 MiB) by a
+blocking pageable H2D immediately before its GEMM, one synchronize() per stage,
+so the copies serialize with compute. Device encode is 376 ms for 49 tokens
+against ~200 ms when the tower was fully resident; tower build is 1.31 s
+(host cache load unchanged). An image request no longer calls
+release_moe/rehydrate_moe, so the expert cache (2048 slots) and the captured
+decode graphs survive it. Host source remains the pageable f32 cache; peak RSS
+~18.6 GiB, MemAvailable low-water above 24 GiB. Open follow-up: real overlap
+(pinned staging + async copies + events) is expected to save ~0.1 s on the
+encode.
