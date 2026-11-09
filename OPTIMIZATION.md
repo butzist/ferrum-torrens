@@ -2052,13 +2052,12 @@ fused add_rmsnorm tolerance, and the state layout `[slot, NV, K, V]` f32 must
 match exactly. Cost: one Triton kernel, one AOT entry, a `--interp` selftest
 against `gdn_recurrence_step_batch`.
 
-**S3. Pin a pre-collected hot expert set (locked_fetch / profile-sized pools).**
-Online LFU was measured and rejected (3% on a real trace, 0% end to end;
-R14c). The alternative is offline: run a representative trace, collect the hot
-expert set, pin it resident at load, and let LRU manage only the cold tail.
-Misses/step would fall from ~52 toward the hot-set size, shrinking the PCIe
-copy. Expected ~2-4 ms/token. Risk: profile drift across prompts, and it needs
-a calibration step plus a pin/unpin API in `CudaMoE`.
+**S3. Pin a pre-collected hot expert set (locked_fetch / profile-sized pools).
+CLOSED as a measured no-go (R15 S13).** Online LFU was measured and rejected (3%
+on a real trace, 0% end to end; R14c). The offline version was then bounded with
+a route trace and a validated simulator: a hindsight pin is worth -19% to -47%
+misses, but a pin learned from a 16-32-step warmup is -11% to +6%, and LFU is
++38% worse on varied prose. The hot set cannot be known before the run.
 
 **S4. Fused Triton router (full-softmax arithmetic, iterative top-k).** Keep the
 f32 gate matmul; replace softmax + topk + renormalize with one kernel that keeps
@@ -2083,8 +2082,8 @@ independent compute kernel cannot co-schedule). Not viable on this 26-SM part
 without a dedicated copy stream that does not saturate the SMs. Parked.
 
 Not a decode lever (do not re-chase): capture (only +2% tg; eager == captured),
-growing the cache past 2048 (BLOCK_C is a hard power-of-two ceiling),
-paged-attention kernel changes (captured attention cost is ~0.1-0.25 ms; the
+growing the cache past 2048 (BLOCK_C is a hard power-of-two ceiling), any
+expert-cache policy change -- pinned hot set, LFU, random (R15 S13), paged-attention kernel changes (captured attention cost is ~0.1-0.25 ms; the
 2.4 ms is the FP8 projections at the read roofline), mmapping dense weights
 (the loader always dequant-transforms), and speculative decode (a separate
 milestone; its verify is 4.0x a plain step and loses at this cache size).
@@ -2532,3 +2531,77 @@ copy. A DMA copy would overlap more but needs the miss list on the host, which
 the device-side plan deliberately never produces (a per-layer D2H would cost
 more than it saves). The ~8.6 ms that remains is miss bytes: ~0.15 ms per missed
 expert, so R13's hot set is the only lever left for it.
+
+### R15 S13: the route-trace study -- the expert-cache policy half of R13 is CLOSED (2026-11-09)
+
+R13/S3 wanted a pre-collected hot expert set, on the theory that the decode miss
+copy (R15 S11: 9.4 ms of a 29.2 ms step) is bytes and the miss rate could be cut.
+The measurement that settles it needed two pieces that did not exist: a route
+*trace* (ids, not counts) and a policy simulator that provably matches the
+kernel. Both are now in the tree:
+
+- `FT_ROUTE_TRACE=<path>` (dev probe in `cuda_moe::ensure_experts`): eager
+  decode writes one line per (step, layer) of layer-local router ids. A D2H
+  cannot be captured, so it is a measurement probe like `FT_MISS_TRACE`; it
+  covers the overlapped decode path too, which `FT_MISS_TRACE` had silently
+  stopped seeing when the copy moved to `begin_staged` (fixed in the same
+  change).
+- `scripts/route-trace-sim.py TRACE...` replays that sequence against strict
+  LRU (the `_ensure_experts_kernel` contract exactly: one flat slot pool shared
+  by all layers, this call's hits pinned, misses take the coldest slot, free
+  slots first), LFU, a random victim, a bigger cache, and a static pin of the
+  top-P ids. Its per-step misses match `FT_MISS_TRACE` to within 1-2 experts,
+  so the model of the kernel is exact enough to size a change before writing
+  one.
+
+Two traces, 96 greedy decode tokens each, eager, auto 2048 slots, text-only
+(`/tmp/opencode/bench/routes{2,3}.txt`):
+
+| trace | prompt | LRU miss/step | decode tok/s |
+| --- | --- | ---: | ---: |
+| A | the harness default ("The quick brown fox..." x 12) | **106.4** | 29.8 |
+| B | 363 tokens of varied prose | **37.9** | 40.2 |
+
+The 68-miss difference is 8.5 ms/token, i.e. **0.125 ms per missed expert**,
+which confirms R15 S11's "the copy is miss bytes" thesis and prices a miss
+directly instead of by division.
+
+| policy | trace A vs LRU | trace B vs LRU |
+| --- | ---: | ---: |
+| LRU 2048 (committed) | 106.4 | 37.9 |
+| LRU 2304 (+256 slots, 454 MiB) | -39.0% | -2.3% |
+| LRU 3072 (+1024 slots, 1.8 GiB) | -51.7% | -6.7% |
+| LFU, no decay | -18.9% | **+38.1%** |
+| LFU, halving every 4096 calls | -18.9% | +38.1% |
+| random victim | +13.7% | +40.4% |
+| pin top-1792 (oracle, hindsight) | -47.1% | -45.6% |
+| pin top-1024 (oracle, hindsight) | -19.4% | -24.7% |
+| pin top-1024 from the first 16 steps | -5.8% | +6.0% |
+| pin top-1024 from the first 32 steps | -10.7% | +2.0% |
+
+**Verdict: the hot-set lever is closed, and so is every other policy change.**
+The oracle pin is large and stable (-19% to -47% on both traces), but the set
+that produces it needs hindsight; a set learned from a warmup window is worth
+-11% to +6%, and frequency *admission* (LFU, the adaptive equivalent) is -19% on
+the repetitive trace and **+38% worse** on varied prose, because it keeps stale
+hot ids when the local working set is what LRU is holding. That also explains
+R14c's earlier LFU result (3% on its trace, 0% end to end) instead of merely
+repeating it: the policy's sign depends on the prompt, so it cannot be enabled
+safely. Random eviction is worse on both, so this is not a cyclic-pattern
+pathology that an anti-LRU trick would fix.
+
+The one robust lever is **capacity**: +256 slots is -39% / -2.3%, +1024 is
+-52% / -6.7%. It is closed on this card for two independent reasons:
+
+1. `BLOCK_C` is a Triton `tl.arange` bound, so it must be a power of two. The
+   committed ceiling is 2048; the next value is 4096 slots = 7.1 GiB, which does
+   not fit an 8 GiB card next to the tower-free model (839 MiB are free after
+   load, and the planner already reserves 512 MiB of that for prefill scratch).
+2. Even a 2304-slot cache (+454 MiB) would need the victim search to run over
+   two blocks; and 2176 slots is what the auto planner would resolve at most,
+   i.e. +128 slots, measured at -32.4% on trace A but only -1.0% on trace B --
+   another workload-dependent term, against a cubin rebuild and a two-block
+   victim search.
+
+So the copy stays at ~100 misses/step on a repetitive prompt and ~40 on varied
+prose, and the remaining decode headroom is the workload, not the engine.

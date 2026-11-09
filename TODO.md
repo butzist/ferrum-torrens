@@ -3,8 +3,12 @@
 Status (2026-11-09): **The decode step is attributed** (R15 S11, decision 160):
 29.2 ms/token, of which `moe_copy` -- the expert miss staging over PCIe -- is
 9.4 ms (32%); the routed GEMV and the lm_head are at roofline. R15 S12 landed
-the copy/shared-expert overlap (+2.4%); the rest of the copy is miss bytes, so
-R13 (a hot expert set) is the next decode lever. **The two FreeToken decode
+the copy/shared-expert overlap (+2.4%). **The expert-cache policy lever is now
+closed** (R15 S13, decision 162): a route trace shows the miss rate is the
+workload (106/step on a repetitive prompt, 38 on varied prose; 0.125 ms per
+miss), no realizable policy beats strict LRU across both, and capacity -- the
+only robust lever -- is blocked by the power-of-two `BLOCK_C` and the 8 GiB
+card. Decode is workload-bound, not engine-bound. **The two FreeToken decode
 kernel ports are in and measured neutral** (R15 S9/S10, decision 158): split-K paged decode attention
 (`FERRUM_ATTN_SPLITK`) and the fused router top-k (`FERRUM_FUSED_ROUTER`) move
 captured decode 31.80 -> 32.11 tok/s (+1.0%, inside the run noise, 8 runs per
@@ -779,13 +783,14 @@ Ordered slices, each its own gated change:
   possible* cost/token is 1.24/rows-per-token and rows-per-token is 1.66 at
   `k=3`; the measured result is 0.70x on the reference and 0.92x on Ornith (0.91x
   at `k=2`). Expert staging, not the implementation, sets the ceiling.
-- [ ] **R13 shared work: a resident expert working set.** The one lever that
-  would make speculation pay: `c_row < c_plain / 1.24` needs the hot expert set
-  to stop crossing the host bus on every row. M9.8a lifted capacity from ~1024
-  to the 2048-slot ceiling (host embedding + text-only), which is FreeToken's
-  ballpark. The policy half is now measured and closed for online LFU (3% on a
-  real trace, 0% end to end, R14c); what remains is a *pre-collected* hot set
-  (profile-sized pinning, FreeToken's `locked_fetch` shape).
+- [x] **R13 shared work: a resident expert working set -- CLOSED (2026-11-09,
+  decision 162).** A route trace plus a validated policy simulator show no
+  realizable policy beats strict LRU across workloads: a hindsight pin is worth
+  -19% to -47% misses, a warmup-learned pin -11% to +6%, and LFU -19% on a
+  repetitive prompt but +38% worse on varied prose. Capacity is the only robust
+  lever (-39% / -2.3% for +256 slots) and is blocked by `BLOCK_C` being a
+  power-of-two `tl.arange` bound plus the 8 GiB card. A miss costs 0.125 ms.
+  `OPTIMIZATION.md` R15 S13.
 - [ ] **M9.8 close the FreeToken gap (measured in OPTIMIZATION.md R14b/R14c).**
   FreeToken's own MTP is 1.06-1.07x at the *same* cache and 1.7x faster in
   absolute decode; ours is 0.62-0.70x (worse at 2048 slots: 0.44-0.53x).
@@ -1401,9 +1406,18 @@ Standing: 32.2-32.9 tok/s captured at 2048 slots against FreeToken's 47.0 at
   Measured 31.85 -> 32.63 tok/s (+2.4%, 4/4 paired, capture green). The win is
   limited because `index_copy` is a kernel, not a DMA copy: it contends for the
   same SMs, so only the idle capacity of the small-N shared GEMVs is recovered.
-  The remaining ~8.6 ms of copy is miss bytes -> R13 is the next lever there.
-- [ ] **R15 S3 pin a pre-collected hot expert set** (`locked_fetch` /
-  profile-sized pool; online LFU was measured and rejected). Target 2-4 ms.
+  The remaining ~8.6 ms of copy is miss bytes; R15 S13 (below) shows that is
+  the workload, not a policy we can improve.
+- [x] **R15 S3 pin a pre-collected hot expert set -- CLOSED as a measured
+  no-go (2026-11-09, decision 162).** The hot set cannot be known before the
+  run: a pin chosen with hindsight is worth -19% to -47% misses, but a pin
+  learned from a 16-32-step warmup is -11% to +6% and LFU (its adaptive form) is
+  +38% *worse* on varied prose. Capacity would be the robust lever and is
+  blocked by the power-of-two `BLOCK_C` plus the 8 GiB card. Tooling kept:
+  `FT_ROUTE_TRACE` and `scripts/route-trace-sim.py`.
+- [x] **R15 S13 route-trace study -- done (2026-11-09, decision 162).** The
+  trace probe and the validated simulator; priced a miss at 0.125 ms and closed
+  the policy half of R13 with two workload traces. `OPTIMIZATION.md` R15 S13.
 
 ### Decode speed plan (decision 82): status and next steps
 

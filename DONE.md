@@ -5171,3 +5171,34 @@ subsection names are kept verbatim.
     Risk noted in the code: the handle carries a raw adapter pointer; it is
     finished synchronously inside `moe_parts` before the step returns, and the
     `CachedExperts` that owns the adapter outlives it.
+
+162. **The expert-cache hot-set lever is closed by a route trace, and the miss
+    copy is priced per miss** (2026-11-09, R15 S13, closing R13/S3).
+    Two missing tools came first. `FT_ROUTE_TRACE=<path>` is a dev probe in
+    `cuda_moe::ensure_experts` that writes one line per (step, layer) of the
+    router's layer-local ids; `scripts/route-trace-sim.py` replays that sequence
+    against the committed strict LRU and the alternatives (LFU, random, a bigger
+    cache, a static pin of the top-P ids). The simulator reproduces
+    `FT_MISS_TRACE` per step to within 1-2 experts, so it can size a cache
+    change without a kernel. Enabling it exposed a regression in the older
+    probe: `FT_MISS_TRACE` had stopped reporting decode misses when R15 S12
+    moved the copy into `begin_staged`, so it was only counting prefill chunks;
+    `begin_staged` calls `probe_misses` again.
+    Two 96-token greedy traces (default harness prompt, and 363 tokens of varied
+    prose): the committed LRU misses **106.4 experts/step** on the first and
+    **37.9** on the second, and decode runs 29.8 vs 40.2 tok/s -- 68 misses for
+    8.5 ms, i.e. **0.125 ms per missed expert**, which prices R15 S11's copy
+    directly. Results (details and the full table in `OPTIMIZATION.md` R15 S13):
+    a hindsight-chosen pin is worth -19% to -47% misses, a pin learned from a
+    16-32-step warmup is -11% to +6%, and LFU is -19% on the repetitive trace
+    but **+38% worse** on varied prose. So no realizable policy change is safe:
+    the oracle needs hindsight, and the adaptive approximation keeps stale hot
+    ids when the local working set is what matters. R13's policy half and R15 S3
+    are closed, and the earlier R14c LFU rejection now has a mechanism instead
+    of a single trace.
+    Capacity is the only robust lever (+256 slots: -39% / -2.3%; +128 slots, the
+    most the auto planner could resolve: -32% / -1.0%) and it is closed twice
+    over: `BLOCK_C` is a `tl.arange` bound and so must be a power of two (the
+    next step is 4096 slots = 7.1 GiB, which does not fit), and a two-block
+    victim search would be needed in between. Decode is therefore
+    workload-bound, not engine-bound, on this card.
