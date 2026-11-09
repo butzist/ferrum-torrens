@@ -1269,6 +1269,25 @@ impl CudarcQwen3_6 {
             topk_renorm(&probs, p.top_k)?
         };
         substep_end(&self.rt, "moe_gate", s);
+
+        // Start the routed step first, so its miss copy can overlap the shared
+        // expert below. The handle (if any) is finished after `se` is computed.
+        let pending = match port {
+            Some(port) => {
+                let req = MoEDeviceRequest {
+                    layer: bank_layer,
+                    hidden: p.hidden_size,
+                    inter: p.moe_intermediate_size,
+                    top_k: p.top_k,
+                    x: x_post,
+                    experts: &ids,
+                    weights: &weights,
+                };
+                port.begin_device(&req)?
+            }
+            None => None,
+        };
+
         let s = substep_begin(&self.rt);
         let se_gate = x_post
             .cast(TensorDType::F32)?
@@ -1303,7 +1322,11 @@ impl CudarcQwen3_6 {
                     experts: &ids,
                     weights: &weights,
                 };
-                port.execute_device(&req, &mut out)?;
+                if let Some(handle) = pending {
+                    handle.finish(&mut out)?;
+                } else {
+                    port.execute_device(&req, &mut out)?;
+                }
                 out
             }
             None => {

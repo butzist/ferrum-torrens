@@ -266,6 +266,20 @@ pub trait ExpertGemm: Send + Sync {
         out: &mut dyn MoETensor,
     ) -> Result<(), MoEError>;
 
+    /// Start a routed step that may finish later, so the shared expert can
+    /// compute on the main stream while the missed experts are copied. The
+    /// default returns `None`, meaning "no overlapped path: call
+    /// `grouped_moe_staged` as today". An adapter that can split the copy onto
+    /// a second stream returns `Some(handle)`; the caller computes the shared
+    /// expert and then calls `handle.finish(out)`.
+    fn begin_staged<'a>(
+        &self,
+        req: &MoEDeviceRequest<'a>,
+    ) -> Result<Option<Box<dyn PendingMoE>>, MoEError> {
+        let _ = req;
+        Ok(None)
+    }
+
     /// The largest `tokens * top_k` one `grouped_moe_staged` step can take, or
     /// zero when this adapter has no device staging. The committed `lru_ensure`
     /// bakes this bound, so the executor reports it and falls back to the host
@@ -337,6 +351,15 @@ pub struct MoEDeviceGroup<'a> {
     pub weights: &'a dyn MoETensor,
 }
 
+/// A routed step that has been started but not finished: the missed experts
+/// have been copied (possibly on a second stream) but the grouped GEMV has not
+/// run yet. The caller finishes it after the independent shared-expert work.
+/// Pure domain: no CUDA, no streams live in this type.
+#[cfg_attr(test, mockall::automock)]
+pub trait PendingMoE: Send {
+    fn finish(self: Box<Self>, out: &mut dyn MoETensor) -> Result<(), MoEError>;
+}
+
 /// The engine's MoE port: one call per routed layer per step. Arch-agnostic on
 /// purpose. The offload cache and the grouped GEMM are core engine obligations
 /// shared by every supported model, so an arch forward only hands over its
@@ -352,6 +375,17 @@ pub trait MoEExecutor: Send + Sync {
         req: &MoEDeviceRequest<'a>,
         out: &mut dyn MoETensor,
     ) -> Result<(), MoEError>;
+
+    /// Start a routed step that may overlap its miss copy with independent
+    /// work. The default returns `None`, so callers fall back to
+    /// `execute_device` exactly as before. Pure domain: no streams here.
+    fn begin_device<'a>(
+        &self,
+        req: &MoEDeviceRequest<'a>,
+    ) -> Result<Option<Box<dyn PendingMoE>>, MoEError> {
+        let _ = req;
+        Ok(None)
+    }
 
     /// How many steps this executor has run since it was built. A forward that
     /// widens routed experts on the host answers with the same logits as one

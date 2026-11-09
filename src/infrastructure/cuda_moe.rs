@@ -15,8 +15,8 @@ use half::bf16;
 
 use crate::domain::expert_kernel::{
     BANKS, ExpertGemm, ExpertShapes, ExpertSlabSource, ExpertSlotStore, MoEDeviceGroup,
-    MoEDeviceRequest, MoEError, MoEGroup, MoETensor, Part, PinnedBank, PinnedBankSource, Slab,
-    route_lists,
+    MoEDeviceRequest, MoEError, MoEGroup, MoETensor, Part, PendingMoE, PinnedBank,
+    PinnedBankSource, Slab, route_lists,
 };
 use crate::infrastructure::cuda_driver::{
     CUstream, CudaError, CudaKernels, Driver, OwnedEvent, OwnedStream, STREAM_NON_BLOCKING,
@@ -186,6 +186,8 @@ pub struct CudaMoE {
     prefill_enabled: bool,
     /// The live residency policy over the shared slot banks.
     residency: Residency,
+    /// Decode-time copy overlap, present when the device/context allowed it.
+    decode_overlap: Option<DecodeOverlap>,
 }
 
 // SAFETY: the driver handles are immutable after construction, and the tensor
@@ -195,6 +197,37 @@ pub struct CudaMoE {
 // behind a Mutex regardless.
 unsafe impl Send for CudaMoE {}
 unsafe impl Sync for CudaMoE {}
+
+/// Decode-time overlap machinery: a second non-blocking stream plus two
+/// timing-disabled events, created once at construction and reused every step.
+struct DecodeOverlap {
+    copy_stream: OwnedStream,
+    begin: OwnedEvent,
+    done: OwnedEvent,
+}
+
+struct CudaPendingMoE {
+    group: StagedGroup,
+    adapter: *mut Mutex<CudaMoE>,
+}
+
+// SAFETY: the handle is moved across threads only while the adapter it points at
+// is still alive (the CachedExperts that owns the adapter keeps it alive), and
+// all access goes through the mutex.
+unsafe impl Send for CudaPendingMoE {}
+unsafe impl Sync for CudaPendingMoE {}
+
+impl PendingMoE for CudaPendingMoE {
+    fn finish(self: Box<Self>, out: &mut dyn MoETensor) -> Result<(), MoEError> {
+        let adapter = unsafe { &*self.adapter };
+        let guard = adapter
+            .lock()
+            .map_err(|_| MoEError::Bad("cuda slot cache poisoned".into()))?;
+        guard.wait_decode_copy_done()?;
+        guard.launch(&self.group)?;
+        guard.collect_dev(&self.group, out)
+    }
+}
 
 impl Drop for CudaMoE {
     fn drop(&mut self) {
@@ -402,8 +435,20 @@ impl CudaMoE {
             stream
         };
         let kernels = CudaKernels::load(Arc::clone(&lib), abi.clone()).map_err(driver)?;
-        let staging = StagingKernels::load(lib, staging_abi.clone()).map_err(driver)?;
+        let staging =
+            StagingKernels::load(Arc::clone(&lib), staging_abi.clone()).map_err(driver)?;
         let lut = rt.from_slice_f32(&E2M1, &[E2M1.len()])?;
+        let decode_overlap: Option<DecodeOverlap> = (|| -> Result<DecodeOverlap, MoEError> {
+            let copy_stream = lib.owned_stream(STREAM_NON_BLOCKING).map_err(driver)?;
+            let begin = lib.owned_event().map_err(driver)?;
+            let done = lib.owned_event().map_err(driver)?;
+            Ok(DecodeOverlap {
+                copy_stream,
+                begin,
+                done,
+            })
+        })()
+        .ok();
         Ok(Self {
             rt,
             kernels,
@@ -425,11 +470,22 @@ impl CudaMoE {
             staging_dims: None,
             prefill_enabled: false,
             residency: Residency::Decode,
+            decode_overlap,
         })
     }
 
     pub fn stream(&self) -> CUstream {
         self.stream
+    }
+
+    /// Make the main stream wait for the decode copy stream's done event.
+    pub fn wait_decode_copy_done(&self) -> Result<(), MoEError> {
+        let ov = self
+            .decode_overlap
+            .as_ref()
+            .ok_or_else(|| MoEError::Bad("decode overlap is not available".into()))?;
+        // SAFETY: both handles belong to this adapter's context, which is current.
+        unsafe { ov.done.wait_on(self.stream) }.map_err(driver)
     }
 
     /// The runtime that owns this adapter's stream and buffers, so a caller
@@ -862,6 +918,13 @@ impl CudaMoE {
     /// banks into the device slot banks. Reads the plan `ensure_experts` wrote on
     /// the device, so it is data-independent.
     pub fn copy_missing(&mut self, layer: usize) -> Result<(), MoEError> {
+        self.copy_missing_on(layer, self.stream)
+    }
+
+    /// Same as `copy_missing`, but launched on `stream` (used by the decode
+    /// overlap, which runs the copy on a second stream).
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn copy_missing_on(&mut self, layer: usize, stream: CUstream) -> Result<(), MoEError> {
         let copy = self.staging_abi.kernel(INDEX_COPY).map_err(bad_abi)?;
         let st = self
             .device_staging
@@ -884,7 +947,7 @@ impl CudaMoE {
         let mut params = pack.kernel_params().map_err(bad_abi)?;
         // SAFETY: as `ensure_experts`: every pointer is a live allocation and
         // `params` matches this kernel's manifest entry.
-        unsafe { self.staging.launch(copy, &mut params, self.stream) }.map_err(driver)
+        unsafe { self.staging.launch(copy, &mut params, stream) }.map_err(driver)
     }
 
     /// Every check the launches need, before anything is allocated: the
@@ -2294,6 +2357,83 @@ impl ExpertGemm for Mutex<CudaMoE> {
         self.lock()
             .map_err(|_| MoEError::Bad("cuda slot cache poisoned".into()))?
             .grouped_moe_staged(req, out)
+    }
+
+    fn begin_staged<'a>(
+        &self,
+        req: &MoEDeviceRequest<'a>,
+    ) -> Result<Option<Box<dyn PendingMoE>>, MoEError> {
+        if std::env::var("FERRUM_MOE_OVERLAP").ok().as_deref() == Some("0") {
+            return Ok(None);
+        }
+        let mut guard = self
+            .lock()
+            .map_err(|_| MoEError::Bad("cuda slot cache poisoned".into()))?;
+        if guard.decode_overlap.is_none() {
+            return Ok(None);
+        }
+        let tokens = guard.check_batch(
+            req.top_k,
+            req.x.numel(),
+            req.experts.numel(),
+            req.weights.numel(),
+        )?;
+        let top_k = req.top_k;
+        let routes = tokens * top_k;
+        let block_k = guard.lru_block_k()?;
+        if routes > block_k {
+            return Ok(None);
+        }
+        if guard.is_prefill_step(routes)? {
+            return Ok(None);
+        }
+        let x = device_tensor(req.x, "the activations")?;
+        let experts = device_tensor(req.experts, "the expert ids")?;
+        let weights = device_tensor(req.weights, "the weights")?;
+
+        // First half on the main stream: slot plan + group assembly.
+        let slots = as_i32_ids(experts, routes, guard.runtime())?;
+        guard.ensure_experts(req.layer, &slots)?;
+        let token_t = guard.token_table_for(tokens, top_k)?;
+        let g = guard.group_with_slots(x, weights, slots, token_t, tokens, top_k)?;
+
+        // Order the copy stream behind the main stream's slot plan, then run
+        // the miss copy on the copy stream. The copy stream waits on this event
+        // so it never reads slot banks the main stream is still planning.
+        let copy_stream = guard.decode_overlap.as_ref().unwrap().copy_stream.raw();
+        unsafe {
+            guard
+                .decode_overlap
+                .as_ref()
+                .unwrap()
+                .begin
+                .record(guard.stream())
+        }
+        .map_err(driver)?;
+        unsafe {
+            guard
+                .decode_overlap
+                .as_ref()
+                .unwrap()
+                .begin
+                .wait_on(copy_stream)
+        }
+        .map_err(driver)?;
+        guard.copy_missing_on(req.layer, copy_stream)?;
+        unsafe {
+            guard
+                .decode_overlap
+                .as_ref()
+                .unwrap()
+                .done
+                .record(copy_stream)
+        }
+        .map_err(driver)?;
+
+        drop(guard);
+
+        let adapter: *mut Mutex<CudaMoE> = self as *const Mutex<CudaMoE> as *mut Mutex<CudaMoE>;
+        Ok(Some(Box::new(CudaPendingMoE { group: g, adapter })))
     }
 
     fn staged_route_cap(&self) -> usize {

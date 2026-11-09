@@ -10,7 +10,7 @@
 use crate::domain::expert_cache::ExpertCache;
 use crate::domain::expert_kernel::{
     ExpertGemm, ExpertSlotStore, MoEDeviceGroup, MoEDeviceRequest, MoEError, MoEExecutor, MoEGroup,
-    MoETensor,
+    MoETensor, PendingMoE,
 };
 use std::sync::{
     Arc, Mutex,
@@ -159,6 +159,33 @@ impl MoEExecutor for CachedExperts {
             req,
             out,
         )
+    }
+
+    fn begin_device<'a>(
+        &self,
+        req: &MoEDeviceRequest<'a>,
+    ) -> Result<Option<Box<dyn PendingMoE>>, MoEError> {
+        if !self.staged {
+            return Ok(None);
+        }
+        if std::env::var("FERRUM_MOE_OVERLAP").ok().as_deref() == Some("0") {
+            return Ok(None);
+        }
+        let tokens = check_device_step(req)?;
+        if req.x.numel() < tokens * req.hidden {
+            return Err(MoEError::Bad(format!(
+                "device expert step: {} outputs for {tokens} tokens x hidden {}",
+                req.x.numel(),
+                req.hidden
+            )));
+        }
+        match self.gemm.begin_staged(req)? {
+            Some(pending) => {
+                self.steps.fetch_add(1, Ordering::Relaxed);
+                Ok(Some(pending))
+            }
+            None => Ok(None),
+        }
     }
 }
 
@@ -310,7 +337,7 @@ fn stage_and_route(
 mod tests {
     use super::*;
     use crate::domain::expert_kernel::{
-        MoEDeviceRequest, MoETensor, MockExpertGemm, MockExpertSlotStore,
+        MoEDeviceRequest, MoETensor, MockExpertGemm, MockExpertSlotStore, MockPendingMoE,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -620,6 +647,51 @@ mod tests {
             Err(MoEError::Bad(_))
         ));
         assert_eq!(x.reads(), 0, "a rejected step reads nothing at all");
+    }
+
+    /// `begin_device` counts the step once when it actually starts an
+    /// overlapped step, and leaves the count alone when it declines (so the
+    /// later `execute_device` fallback is the one that counts).
+    #[test]
+    fn begin_device_counts_a_started_step_once() {
+        let store = strict_store(4);
+        let mut gemm = MockExpertGemm::new();
+        gemm.expect_begin_staged().returning(|_| {
+            let mut pending = MockPendingMoE::new();
+            pending.expect_finish().returning(|_| Ok(()));
+            Ok(Some(Box::new(pending)))
+        });
+        let exec = CachedExperts::with_device_staging(Arc::new(store), Arc::new(gemm), 4, 8, 4);
+        let (x, experts, weights, mut out) = step_buffers();
+        assert_eq!(exec.steps(), 0);
+        let handle = exec
+            .begin_device(&device_request(3, &x, &experts, &weights))
+            .unwrap();
+        assert!(handle.is_some());
+        assert_eq!(exec.steps(), 1);
+        handle.unwrap().finish(&mut out).unwrap();
+        assert_eq!(exec.steps(), 1);
+    }
+
+    #[test]
+    fn begin_device_declining_does_not_count_and_fallback_does() {
+        let store = strict_store(4);
+        let mut gemm = MockExpertGemm::new();
+        gemm.expect_begin_staged().returning(|_| Ok(None));
+        gemm.expect_grouped_moe_staged()
+            .times(1)
+            .returning(|_, out| out.set_host_f32(&vec![0.5f32; out.numel()]));
+        let exec = CachedExperts::with_device_staging(Arc::new(store), Arc::new(gemm), 4, 8, 4);
+        let (x, experts, weights, mut out) = step_buffers();
+        assert_eq!(exec.steps(), 0);
+        let handle = exec
+            .begin_device(&device_request(3, &x, &experts, &weights))
+            .unwrap();
+        assert!(handle.is_none());
+        assert_eq!(exec.steps(), 0);
+        exec.execute_device(&device_request(3, &x, &experts, &weights), &mut out)
+            .unwrap();
+        assert_eq!(exec.steps(), 1);
     }
 
     /// A store that answers exactly the calls the test expects and fails on
