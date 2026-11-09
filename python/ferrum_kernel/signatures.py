@@ -12,6 +12,8 @@ baked into the cubin rather than passed at launch.
 
 from __future__ import annotations
 
+import os
+
 from .conv import CONV_BLOCK_N, CONV_PREFILL_BLOCK
 from .elementwise import (
     COPY_BLOCK,
@@ -38,22 +40,90 @@ from .nvfp4_moe import GEMM_BLOCK_KW, GEMM_BLOCK_M, GEMM_BLOCK_N, GEMV_BLOCK_KW,
 from .moe_prefill import CSR_BLOCK
 from .offload import COPY_SEG_I32, USAGE_MAX, copy_splits
 
-# The serving attention geometry (Qwen3.6-35B-A3B): 16 query heads over 2 KV
-# heads at head_dim 256. All four are constexpr, so the committed cubin is
-# specialized to this checkpoint (DONE.md decision 36).
-SERVING_Q_HEADS = 16
-SERVING_KV_HEADS = 2
-SERVING_HEAD_DIM = 256
-# The paged decode tile over a row's keys.
-SERVING_ATTN_BLOCK_N = 64
+import dataclasses
 
-# One hidden size and one intermediate size in a serving checkpoint; both are
-# constexpr trip counts, so the committed cubins are shape-specialized and the
-# manifest records the shapes (DONE.md decision 36).
-SERVING_HIDDEN = 2048
-SERVING_INTER = 512
-SERVING_TOP_K = 8
-SERVING_DTYPE = "bf16"
+
+@dataclasses.dataclass(frozen=True)
+class ServingShapes:
+    q_heads: int = dataclasses.field(default_factory=lambda: int(os.getenv("FERRUM_SERVING_Q_HEADS", "16")))
+    kv_heads: int = dataclasses.field(default_factory=lambda: int(os.getenv("FERRUM_SERVING_KV_HEADS", "2")))
+    head_dim: int = dataclasses.field(default_factory=lambda: int(os.getenv("FERRUM_SERVING_HEAD_DIM", "256")))
+    attn_block_n: int = dataclasses.field(default_factory=lambda: int(os.getenv("FERRUM_SERVING_ATTN_BLOCK_N", "64")))
+    hidden: int = dataclasses.field(default_factory=lambda: int(os.getenv("FERRUM_SERVING_HIDDEN", "2048")))
+    inter: int = dataclasses.field(default_factory=lambda: int(os.getenv("FERRUM_SERVING_INTER", "512")))
+    top_k: int = dataclasses.field(default_factory=lambda: int(os.getenv("FERRUM_SERVING_TOP_K", "8")))
+    dtype: str = dataclasses.field(default_factory=lambda: os.getenv("FERRUM_SERVING_DTYPE", "bf16"))
+    gdn_k_heads: int = dataclasses.field(default_factory=lambda: int(os.getenv("FERRUM_SERVING_GDN_K_HEADS", "16")))
+    gdn_v_heads: int = dataclasses.field(default_factory=lambda: int(os.getenv("FERRUM_SERVING_GDN_V_HEADS", "32")))
+    gdn_k: int = dataclasses.field(default_factory=lambda: int(os.getenv("FERRUM_SERVING_GDN_K", "128")))
+    gdn_v: int = dataclasses.field(default_factory=lambda: int(os.getenv("FERRUM_SERVING_GDN_V", "128")))
+    conv_width: int = dataclasses.field(default_factory=lambda: int(os.getenv("FERRUM_SERVING_CONV_WIDTH", "4")))
+    block_k: int = dataclasses.field(default_factory=lambda: int(os.getenv("FERRUM_SERVING_BLOCK_K", "128")))
+    cache_slots: int = dataclasses.field(default_factory=lambda: int(os.getenv("FERRUM_SERVING_CACHE_SLOTS", "2048")))
+    block_c: int = dataclasses.field(default_factory=lambda: int(os.getenv("FERRUM_SERVING_BLOCK_C", "2048")))
+    num_banks: int = dataclasses.field(default_factory=lambda: int(os.getenv("FERRUM_SERVING_NUM_BANKS", "6")))
+    max_feat_bytes: int = dataclasses.field(default_factory=lambda: int(os.getenv("FERRUM_SERVING_MAX_FEAT_BYTES", str(1024 * 1024))))
+    conv_dim: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.conv_dim is None:
+            object.__setattr__(
+                self,
+                "conv_dim",
+                2 * self.gdn_k_heads * self.gdn_k + self.gdn_v_heads * self.gdn_v,
+            )
+
+
+SERVING = ServingShapes()
+SERVING_Q_HEADS = SERVING.q_heads
+SERVING_KV_HEADS = SERVING.kv_heads
+SERVING_HEAD_DIM = SERVING.head_dim
+SERVING_ATTN_BLOCK_N = SERVING.attn_block_n
+SERVING_HIDDEN = SERVING.hidden
+SERVING_INTER = SERVING.inter
+SERVING_TOP_K = SERVING.top_k
+SERVING_DTYPE = SERVING.dtype
+SERVING_GDN_K_HEADS = SERVING.gdn_k_heads
+SERVING_GDN_V_HEADS = SERVING.gdn_v_heads
+SERVING_GDN_K = SERVING.gdn_k
+SERVING_GDN_V = SERVING.gdn_v
+SERVING_CONV_DIM = SERVING.conv_dim
+SERVING_CONV_WIDTH = SERVING.conv_width
+SERVING_BLOCK_K = SERVING.block_k
+SERVING_CACHE_SLOTS = SERVING.cache_slots
+SERVING_BLOCK_C = SERVING.block_c
+SERVING_NUM_BANKS = SERVING.num_banks
+SERVING_MAX_FEAT_BYTES = SERVING.max_feat_bytes
+
+
+def set_serving(shapes: ServingShapes) -> None:
+    global SERVING
+    global SERVING_Q_HEADS, SERVING_KV_HEADS, SERVING_HEAD_DIM, SERVING_ATTN_BLOCK_N
+    global SERVING_HIDDEN, SERVING_INTER, SERVING_TOP_K, SERVING_DTYPE
+    global SERVING_GDN_K_HEADS, SERVING_GDN_V_HEADS, SERVING_GDN_K, SERVING_GDN_V
+    global SERVING_CONV_DIM, SERVING_CONV_WIDTH
+    global SERVING_BLOCK_K, SERVING_CACHE_SLOTS, SERVING_BLOCK_C
+    global SERVING_NUM_BANKS, SERVING_MAX_FEAT_BYTES
+    SERVING = shapes
+    SERVING_Q_HEADS = shapes.q_heads
+    SERVING_KV_HEADS = shapes.kv_heads
+    SERVING_HEAD_DIM = shapes.head_dim
+    SERVING_ATTN_BLOCK_N = shapes.attn_block_n
+    SERVING_HIDDEN = shapes.hidden
+    SERVING_INTER = shapes.inter
+    SERVING_TOP_K = shapes.top_k
+    SERVING_DTYPE = shapes.dtype
+    SERVING_GDN_K_HEADS = shapes.gdn_k_heads
+    SERVING_GDN_V_HEADS = shapes.gdn_v_heads
+    SERVING_GDN_K = shapes.gdn_k
+    SERVING_GDN_V = shapes.gdn_v
+    SERVING_CONV_DIM = shapes.conv_dim
+    SERVING_CONV_WIDTH = shapes.conv_width
+    SERVING_BLOCK_K = shapes.block_k
+    SERVING_CACHE_SLOTS = shapes.cache_slots
+    SERVING_BLOCK_C = shapes.block_c
+    SERVING_NUM_BANKS = shapes.num_banks
+    SERVING_MAX_FEAT_BYTES = shapes.max_feat_bytes
 
 
 def gemv(
@@ -365,6 +435,76 @@ def paged_attention_constexprs(
     }
 
 
+def paged_attention_splitk_stage1(dtype: str = SERVING_DTYPE, kv_dtype: str | None = None) -> dict:
+    kv = kv_dtype or dtype
+    return {
+        "q_ptr": f"*{dtype}",
+        "k_ptr": f"*{kv}",
+        "v_ptr": f"*{kv}",
+        "locs_ptr": "*i32",
+        "positions_ptr": "*i32",
+        "mid_o_ptr": f"*{dtype}",
+        "mid_lse_ptr": "*fp32",
+        "max_kv_splits": "i32",
+        "window": "i32",
+        "NUM_Q_HEADS": "constexpr",
+        "NUM_KV_HEADS": "constexpr",
+        "HEAD_DIM": "constexpr",
+        "BLOCK_N": "constexpr",
+        "MIN_BLOCK_KV": "constexpr",
+        "MIN_SPLIT_LEN": "constexpr",
+        "MIN_SPLITS": "constexpr",
+    }
+
+
+def paged_attention_splitk_stage1_constexprs(
+    q_heads: int = SERVING_Q_HEADS,
+    kv_heads: int = SERVING_KV_HEADS,
+    head_dim: int = SERVING_HEAD_DIM,
+    block_n: int = SERVING_ATTN_BLOCK_N,
+) -> dict:
+    return {
+        "NUM_Q_HEADS": q_heads,
+        "NUM_KV_HEADS": kv_heads,
+        "HEAD_DIM": head_dim,
+        "BLOCK_N": block_n,
+        "MIN_BLOCK_KV": 32,
+        "MIN_SPLIT_LEN": 128,
+        "MIN_SPLITS": 8,
+    }
+
+
+def paged_attention_splitk_stage2(dtype: str = SERVING_DTYPE) -> dict:
+    return {
+        "mid_o_ptr": f"*{dtype}",
+        "mid_lse_ptr": "*fp32",
+        "out_ptr": f"*{dtype}",
+        "positions_ptr": "*i32",
+        "max_kv_splits": "i32",
+        "window": "i32",
+        "NUM_Q_HEADS": "constexpr",
+        "HEAD_DIM": "constexpr",
+        "MIN_BLOCK_KV": "constexpr",
+        "MIN_SPLIT_LEN": "constexpr",
+        "MIN_SPLITS": "constexpr",
+        "SPLIT_TILE": "constexpr",
+    }
+
+
+def paged_attention_splitk_stage2_constexprs(
+    q_heads: int = SERVING_Q_HEADS,
+    head_dim: int = SERVING_HEAD_DIM,
+) -> dict:
+    return {
+        "NUM_Q_HEADS": q_heads,
+        "HEAD_DIM": head_dim,
+        "MIN_BLOCK_KV": 32,
+        "MIN_SPLIT_LEN": 128,
+        "MIN_SPLITS": 8,
+        "SPLIT_TILE": 8,
+    }
+
+
 # The GDN geometry of the serving checkpoint: 16 key heads of 128 dims feeding 32
 # value heads of 128. `BK` is `next_power_of_2(K)`, so one program covers all key
 # heads; all six are constexpr, so the committed cubin is specialized (DONE.md
@@ -540,6 +680,25 @@ def add_rmsnorm() -> dict:
 
 
 def add_rmsnorm_constexprs(hidden: int = SERVING_HIDDEN, block: int = NORM_BLOCK_H) -> dict:
+    return {"HIDDEN": hidden, "BLOCK": block}
+
+
+def rmsnorm_gated() -> dict:
+    """Fused gated RMSNorm: out = rmsnorm(x, w) * silu(z)."""
+    return {
+        "x_ptr": f"*{SERVING_DTYPE}",
+        "z_ptr": f"*{SERVING_DTYPE}",
+        "w_ptr": f"*{SERVING_DTYPE}",
+        "out_ptr": f"*{SERVING_DTYPE}",
+        "eps": "fp32",
+        "stride_x": "i32",
+        "stride_z": "i32",
+        "HIDDEN": "constexpr",
+        "BLOCK": "constexpr",
+    }
+
+
+def rmsnorm_gated_constexprs(hidden: int = SERVING_GDN_V, block: int = SERVING_GDN_V) -> dict:
     return {"HIDDEN": hidden, "BLOCK": block}
 
 
@@ -850,6 +1009,21 @@ def topk_last() -> dict:
 
 
 def topk_last_constexprs(block: int = SELECT_BLOCK) -> dict:
+    return {"BLOCK": block}
+
+
+def fused_topk_softmax() -> dict:
+    return {
+        "x_ptr": "*fp32",
+        "val_ptr": "*fp32",
+        "idx_ptr": "*i32",
+        "cols": "i32",
+        "k": "i32",
+        "BLOCK": "constexpr",
+    }
+
+
+def fused_topk_softmax_constexprs(block: int = SELECT_BLOCK) -> dict:
     return {"BLOCK": block}
 
 

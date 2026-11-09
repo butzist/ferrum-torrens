@@ -101,3 +101,68 @@ def add_rmsnorm_reference(
     var = sf.pow(2).mean(-1, keepdim=True)
     y = (sf * torch.rsqrt(var + eps)) * w.to(torch.float32)
     return s, y.to(torch.bfloat16)
+
+
+# ---------------------------------------------------------------------------
+# Fused gated RMSNorm: out = rmsnorm(x, weight) * silu(z)
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _rmsnorm_gated_kernel(
+    x_ptr,
+    z_ptr,
+    w_ptr,
+    out_ptr,
+    eps,
+    stride_x,
+    stride_z,
+    HIDDEN: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK)
+    mask = cols < HIDDEN
+    x = tl.load(x_ptr + row * stride_x + cols, mask=mask, other=0.0).to(tl.float32)
+    z = tl.load(z_ptr + row * stride_z + cols, mask=mask, other=0.0).to(tl.float32)
+    var = tl.sum(x * x, axis=0) / HIDDEN
+    recip = 1.0 / tl.sqrt(var + eps)
+    w = tl.load(w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    silu_z = z / (1.0 + tl.exp(-z))
+    y = (x * recip) * w * silu_z
+    tl.store(out_ptr + row * HIDDEN + cols, y.to(tl.bfloat16), mask=mask)
+
+
+def rmsnorm_gated(
+    x: torch.Tensor,
+    z: torch.Tensor,
+    w: torch.Tensor,
+    out: torch.Tensor,
+    eps: float,
+) -> None:
+    """Launch the fused gated RMSNorm over `rows` rows: out = rmsnorm(x) * silu(z)."""
+    rows, hidden = x.shape
+    grid = (rows,)
+    _rmsnorm_gated_kernel[grid](
+        x,
+        z,
+        w,
+        out,
+        eps,
+        x.stride(0),
+        z.stride(0),
+        HIDDEN=hidden,
+        BLOCK=triton.next_power_of_2(hidden),
+        num_warps=4,
+    )
+
+
+def rmsnorm_gated_reference(
+    x: torch.Tensor, z: torch.Tensor, w: torch.Tensor, eps: float
+) -> torch.Tensor:
+    """Plain-torch oracle for the same math."""
+    xf = x.to(torch.float32)
+    var = xf.pow(2).mean(-1, keepdim=True)
+    y = (xf * torch.rsqrt(var + eps)) * w.to(torch.float32)
+    silu_z = z.to(torch.float32) / (1.0 + torch.exp(-z.to(torch.float32)))
+    return (y * silu_z).to(torch.bfloat16)

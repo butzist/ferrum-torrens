@@ -2,6 +2,7 @@
   pkgs,
   lib,
   pythonEnv,
+  profileArgs ? "",
 }:
 #
 # The sm_120 cubins the engine launches, built from the Triton sources under
@@ -50,7 +51,7 @@ pkgs.stdenv.mkDerivation (finalAttrs: {
   installPhase = ''
     runHook preInstall
     mkdir -p "$out"
-    (cd python && ${pythonEnv}/bin/python3 -m ferrum_kernel.aot)
+    (cd python && ${pythonEnv}/bin/python3 -m ferrum_kernel.aot ${profileArgs})
     mv python/kernel "$out/kernel"
     runHook postInstall
   '';

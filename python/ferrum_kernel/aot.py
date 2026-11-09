@@ -48,6 +48,7 @@ from .elementwise import (
     _softmax_last_kernel,
     _sum_last_kernel,
     _topk_last_kernel,
+    _fused_topk_softmax_kernel,
     _rope_kernel,
     _causal_sdpa_kernel,
     _repeat_heads_kernel,
@@ -63,7 +64,7 @@ from .elementwise import (
 )
 from .gdn import _gdn_decode_kernel, _gdn_tri_solve_kernel
 from .mrope import _mrope_gather_kernel
-from .norm import _add_rmsnorm_kernel
+from .norm import _add_rmsnorm_kernel, _rmsnorm_gated_kernel
 from .fp8_linear import (
     GEMM_STAGES,
     GEMM_WARPS as FP8_GEMM_WARPS,
@@ -84,11 +85,37 @@ from .nvfp4_moe import (
 )
 from .moe_prefill import _moe_csr_count_kernel, _moe_csr_prefix_kernel, _moe_csr_scatter_kernel
 from .offload import _ensure_experts_kernel, _index_copy_multi_kernel
-from .attention import _paged_attention_decode_kernel
+from .attention import _paged_attention_decode_kernel, _paged_attention_decode_splitk_stage1_kernel, _paged_attention_decode_splitk_stage2_kernel
 
 # The silu kernel's tile is derived from the intermediate size at launch
 # (`min(next_power_of_2(inter), 256)`), so the AOT build pins the serving value.
 SILU_BLOCK_I = 256
+import os as _os
+import sys as _sys
+
+_FLAG_MAP = {
+    "--serving-hidden": "FERRUM_SERVING_HIDDEN",
+    "--serving-inter": "FERRUM_SERVING_INTER",
+    "--serving-top-k": "FERRUM_SERVING_TOP_K",
+    "--serving-q-heads": "FERRUM_SERVING_Q_HEADS",
+    "--serving-kv-heads": "FERRUM_SERVING_KV_HEADS",
+    "--serving-head-dim": "FERRUM_SERVING_HEAD_DIM",
+    "--serving-gdn-k-heads": "FERRUM_SERVING_GDN_K_HEADS",
+    "--serving-gdn-v-heads": "FERRUM_SERVING_GDN_V_HEADS",
+    "--serving-gdn-k": "FERRUM_SERVING_GDN_K",
+    "--serving-gdn-v": "FERRUM_SERVING_GDN_V",
+    "--serving-conv-width": "FERRUM_SERVING_CONV_WIDTH",
+    "--serving-dtype": "FERRUM_SERVING_DTYPE",
+}
+_i = 1
+while _i < len(_sys.argv):
+    _flag = _sys.argv[_i]
+    if _flag in _FLAG_MAP and _i + 1 < len(_sys.argv):
+        _os.environ[_FLAG_MAP[_flag]] = _sys.argv[_i + 1]
+        _i += 2
+        continue
+    _i += 1
+
 from .signatures import (
     SERVING_BLOCK_C,
     SERVING_COPY_SPLITS,
@@ -96,6 +123,16 @@ from .signatures import (
     SERVING_HIDDEN,
     SERVING_INTER,
     SERVING_NUM_BANKS,
+    SERVING_Q_HEADS,
+    SERVING_KV_HEADS,
+    SERVING_HEAD_DIM,
+    SERVING_ATTN_BLOCK_N,
+    SERVING_GDN_K_HEADS,
+    SERVING_GDN_V_HEADS,
+    SERVING_GDN_K,
+    SERVING_GDN_V,
+    SERVING_CONV_DIM,
+    SERVING_CONV_WIDTH,
     SERVING_TOP_K,
     conv_decode,
     conv_decode_constexprs,
@@ -119,6 +156,8 @@ from .signatures import (
     sum_last_constexprs,
     topk_last,
     topk_last_constexprs,
+    fused_topk_softmax,
+    fused_topk_softmax_constexprs,
     rope,
     rope_constexprs,
     mrope_gather,
@@ -152,6 +191,8 @@ from .signatures import (
     gdn_tri_solve_constexprs,
     add_rmsnorm,
     add_rmsnorm_constexprs,
+    rmsnorm_gated,
+    rmsnorm_gated_constexprs,
     gemv,
     grouped_down_constexprs,
     grouped_gate_up_constexprs,
@@ -174,6 +215,10 @@ from .signatures import (
     fp8_splitk_reduce_constexprs,
     paged_attention,
     paged_attention_constexprs,
+    paged_attention_splitk_stage1,
+    paged_attention_splitk_stage1_constexprs,
+    paged_attention_splitk_stage2,
+    paged_attention_splitk_stage2_constexprs,
     reduce,
     reduce_constexprs,
     silu,
@@ -297,6 +342,24 @@ ATTENTION_KERNELS: dict[str, dict] = {
         "constexprs": paged_attention_constexprs(),
         "num_warps": 8,
     },
+    "paged_attention_splitk_stage1": {
+        "fn": _paged_attention_decode_splitk_stage1_kernel,
+        "signature": paged_attention_splitk_stage1(kv_dtype="fp32"),
+        "constexprs": paged_attention_splitk_stage1_constexprs(),
+        "num_warps": 8,
+    },
+    "paged_attention_splitk_stage1_bf16": {
+        "fn": _paged_attention_decode_splitk_stage1_kernel,
+        "signature": paged_attention_splitk_stage1(kv_dtype=SERVING_DTYPE),
+        "constexprs": paged_attention_splitk_stage1_constexprs(),
+        "num_warps": 8,
+    },
+    "paged_attention_splitk_stage2": {
+        "fn": _paged_attention_decode_splitk_stage2_kernel,
+        "signature": paged_attention_splitk_stage2(),
+        "constexprs": paged_attention_splitk_stage2_constexprs(),
+        "num_warps": 4,
+    },
 }
 
 # The fused GDN decode step (TODO.md M5). Like attention it is one program per
@@ -382,6 +445,12 @@ LINEAR_KERNELS: dict[str, dict] = {
         "signature": add_rmsnorm(),
         "constexprs": add_rmsnorm_constexprs(),
         "num_warps": 8,
+    },
+    "rmsnorm_gated": {
+        "fn": _rmsnorm_gated_kernel,
+        "signature": rmsnorm_gated(),
+        "constexprs": rmsnorm_gated_constexprs(),
+        "num_warps": 4,
     },
     "add_bf16": {
         "fn": _binary_kernel,
@@ -549,6 +618,12 @@ LINEAR_KERNELS: dict[str, dict] = {
         "fn": _softmax_last_kernel,
         "signature": softmax_last(),
         "constexprs": softmax_last_constexprs(),
+        "num_warps": 4,
+    },
+    "fused_topk_softmax_f32": {
+        "fn": _fused_topk_softmax_kernel,
+        "signature": fused_topk_softmax(),
+        "constexprs": fused_topk_softmax_constexprs(),
         "num_warps": 4,
     },
     "copy_strided_bf16": {
@@ -846,6 +921,18 @@ def _emit() -> Artifacts:
             "inter": SERVING_INTER,
             "top_k": SERVING_TOP_K,
             "dtype": SERVING_DTYPE,
+            "attention": {
+                "q_heads": SERVING_Q_HEADS,
+                "kv_heads": SERVING_KV_HEADS,
+                "head_dim": SERVING_HEAD_DIM,
+            },
+            "gdn": {
+                "k_heads": SERVING_GDN_K_HEADS,
+                "v_heads": SERVING_GDN_V_HEADS,
+                "k": SERVING_GDN_K,
+                "v": SERVING_GDN_V,
+                "conv_width": SERVING_CONV_WIDTH,
+            },
         },
     }
     cubins: dict[str, bytes] = {}

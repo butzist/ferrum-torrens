@@ -16,3 +16,6 @@ __pycache__/
 
 # Per-project jailed-agent home
 .home/
+
+# A local `kernel-aot` run from python/ (the nix build writes to $out)
+/python/kernel/

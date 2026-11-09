@@ -31,11 +31,12 @@ use crate::infrastructure::kernel_abi::{
     ADD_BF16, ADD_F32, ADD_RMSNORM, AddRmsnormArgs, ArgPack, CAST_BF16_F32, CAST_F32_BF16,
     CAUSAL_SDPA_BF16, CAUSAL_SDPA_F32, COL_MUL_BF16, COL_MUL_F32, COPY_STRIDED_BF16,
     COPY_STRIDED_F32, COPY_STRIDED_I32, COPY_STRIDED_I64, COPY_STRIDED_U8, CUMSUM_DIM0_F32,
-    GATHER_ROWS_BF16, GATHER_ROWS_F32, GATHER_ROWS_I32, GDN_RATIO_MASKS_F32, INDEX_SELECT_BF16,
-    LinearAbi, MAX_ALL_F32, MROPE_GATHER, MUL_BF16, MUL_F32, MUL_MID_F32, REPEAT_HEADS_BF16,
-    ROPE_BF16, SCALAR_BF16, SCALAR_F32, SCALE_HEADS_F32, SCATTER_ROWS_BF16, SCATTER_ROWS_F32,
+    FUSED_TOPK_SOFTMAX_F32, GATHER_ROWS_BF16, GATHER_ROWS_F32, GATHER_ROWS_I32,
+    GDN_RATIO_MASKS_F32, INDEX_SELECT_BF16, LinearAbi, MAX_ALL_F32, MROPE_GATHER, MUL_BF16,
+    MUL_F32, MUL_MID_F32, REPEAT_HEADS_BF16, RMSNORM_GATED, ROPE_BF16, RmsnormGatedArgs,
+    SCALAR_BF16, SCALAR_F32, SCALE_HEADS_F32, SCATTER_ROWS_BF16, SCATTER_ROWS_F32,
     SOFTMAX_LAST_F32, SUM_ALL_F32, SUM_LAST_F32, TOPK_LAST_F32, UNARY_BF16, UNARY_F32,
-    add_rmsnorm_args, add_rmsnorm_grid,
+    add_rmsnorm_args, add_rmsnorm_grid, rmsnorm_gated_args, rmsnorm_gated_grid,
 };
 
 fn bad(e: impl std::fmt::Display) -> MoEError {
@@ -236,6 +237,30 @@ impl Runtime {
 
     pub fn synchronize(&self) -> Result<(), MoEError> {
         self.inner.stream.synchronize().map_err(bad)
+    }
+
+    /// Allocate a zeroed f32 device buffer of `n` elements, returned as a
+    /// shared handle so a ring can keep one allocation and hand out views.
+    pub fn alloc_f32_shared(&self, n: usize) -> Result<Arc<CudaSlice<f32>>, MoEError> {
+        let slice = self.inner.stream.alloc_zeros::<f32>(n).map_err(bad)?;
+        Ok(Arc::new(slice))
+    }
+
+    /// Wrap a shared f32 device buffer (at element offset `offset`) as a
+    /// tensor with the given shape. The buffer is shared, not copied.
+    pub fn tensor_from_device_f32(
+        &self,
+        buf: Arc<CudaSlice<f32>>,
+        offset: usize,
+        shape: &[usize],
+    ) -> Tensor {
+        Tensor {
+            rt: self.clone(),
+            buf: Buffer::F32(buf),
+            shape: shape.to_vec(),
+            strides: contiguous_strides(shape),
+            offset,
+        }
     }
 
     /// Gather rows of a bf16 table that lives in pinned host memory (the
@@ -1105,6 +1130,36 @@ impl Tensor {
         Ok((vals, idx))
     }
 
+    /// Fused softmax + descending top-k + renormalization over the last
+    /// dimension of a f32 `[rows, cols]`. Returns `(ids, weights)` where
+    /// `ids` is i32 `[rows, k]` and `weights` is f32 `[rows, k]` summing to
+    /// one per row.
+    pub fn fused_topk_softmax(&self, k: usize) -> Result<(Tensor, Tensor), MoEError> {
+        if self.dim() != 2 || self.dtype() != TensorDType::F32 {
+            return Err(bad("fused_topk_softmax wants a f32 [rows, cols]"));
+        }
+        let (rows, cols) = (self.shape[0], self.shape[1]);
+        if cols > 1024 || k == 0 || k > cols {
+            return Err(bad(format!("fused_topk_softmax k={k} on cols={cols}")));
+        }
+        let x = self.contiguous()?;
+        let vals = self.rt.zeros(&[rows, k], TensorDType::F32)?;
+        let idx = self.rt.zeros(&[rows, k], TensorDType::I32)?;
+        if rows == 0 {
+            return Ok((vals, idx));
+        }
+        self.rt.kernels().fused_topk_softmax(
+            self.rt.raw_stream(),
+            x.device_ptr(),
+            vals.device_ptr(),
+            idx.device_ptr(),
+            rows,
+            cols,
+            k,
+        )?;
+        Ok((vals, idx))
+    }
+
     pub fn add(&self, other: &Tensor) -> Result<Tensor, MoEError> {
         self.binary(other, 0)
     }
@@ -1590,6 +1645,48 @@ impl Tensor {
         Ok(out)
     }
 
+    /// Fused gated RMSNorm: `out = rmsnorm(self, w) * silu(z)`, bf16 in/out.
+    /// `self`/`z` are `[rows, hidden]` (hidden must match the cubin's baked
+    /// HIDDEN, i.e. the GDN value head dim), `w` is `[hidden]`.
+    pub fn rms_norm_gated(&self, z: &Tensor, w: &Tensor, eps: f32) -> Result<Tensor, MoEError> {
+        if self.dim() != 2 || z.dim() != 2 || w.dim() != 1 {
+            return Err(bad(
+                "rms_norm_gated wants [rows, hidden], [rows, hidden], [hidden]",
+            ));
+        }
+        if self.shape != z.shape || self.shape[1] != w.shape[0] {
+            return Err(bad(format!(
+                "rms_norm_gated shape mismatch {:?}, {:?}, {:?}",
+                self.shape, z.shape, w.shape
+            )));
+        }
+        let x = self.contiguous()?;
+        let z = z.contiguous()?;
+        let w = w.contiguous()?;
+        let (rows, hidden) = (x.shape[0], x.shape[1]);
+        let out = self.rt.zeros(&[rows, hidden], TensorDType::Bf16)?;
+        if rows == 0 || hidden == 0 {
+            return Ok(out);
+        }
+        // SAFETY: all inputs/outputs live in this runtime's context, contiguous,
+        // sized by the shape check above.
+        unsafe {
+            self.rt.kernels().rmsnorm_gated(
+                self.rt.raw_stream(),
+                x.device_ptr(),
+                z.device_ptr(),
+                w.device_ptr(),
+                out.device_ptr(),
+                eps,
+                rows,
+                hidden,
+                hidden as u32,
+                hidden as u32,
+            )
+        }?;
+        Ok(out)
+    }
+
     /// `(x + r, rms_norm(x + r) * w)` with `x`/`r` `[rows, hidden]` bf16 and
     /// `w` `[hidden]` bf16. Both outputs are new bf16 tensors.
     pub fn add_rms_norm(
@@ -1971,6 +2068,7 @@ impl LinearKernels {
     pub fn load(lib: Arc<Driver>) -> Result<Self, MoEError> {
         let abi = LinearAbi::committed()?;
         abi.kernel(ADD_RMSNORM)?;
+        abi.kernel(RMSNORM_GATED)?;
         let kernels = GdnKernels::load(lib, abi.clone()).map_err(driver)?;
         Ok(Self { abi, kernels })
     }
@@ -2473,6 +2571,33 @@ impl LinearKernels {
         self.launch(TOPK_LAST_F32, (rows as u32, 1, 1), &mut params, stream)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn fused_topk_softmax(
+        &self,
+        stream: CUstream,
+        x: u64,
+        vals: u64,
+        idx: u64,
+        rows: usize,
+        cols: usize,
+        k: usize,
+    ) -> Result<(), MoEError> {
+        let kernel = self.abi.kernel(FUSED_TOPK_SOFTMAX_F32)?;
+        let mut pack = ArgPack::for_linear(kernel);
+        pack.ptr(x)?;
+        pack.ptr(vals)?;
+        pack.ptr(idx)?;
+        pack.u32(cols as u32)?;
+        pack.u32(k as u32)?;
+        let mut params = pack.kernel_params()?;
+        self.launch(
+            FUSED_TOPK_SOFTMAX_F32,
+            (rows as u32, 1, 1),
+            &mut params,
+            stream,
+        )
+    }
+
     fn softmax_last(
         &self,
         stream: CUstream,
@@ -2533,6 +2658,45 @@ impl LinearKernels {
         let mut params = pack.kernel_params()?;
         let grid = add_rmsnorm_grid(rows);
         self.launch(ADD_RMSNORM, grid, &mut params, stream)
+    }
+
+    /// # Safety
+    /// Every pointer must be a live device allocation in `stream`'s context, with
+    /// `rows * hidden` bf16 elements, and `out` fully writable.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn rmsnorm_gated(
+        &self,
+        stream: CUstream,
+        x: u64,
+        z: u64,
+        w: u64,
+        out: u64,
+        eps: f32,
+        rows: usize,
+        hidden: usize,
+        stride_x: u32,
+        stride_z: u32,
+    ) -> Result<(), MoEError> {
+        let kernel = self.abi.kernel(RMSNORM_GATED)?;
+        let baked = kernel.constexpr("HIDDEN")? as usize;
+        if hidden != baked {
+            return Err(MoEError::Bad(format!(
+                "rmsnorm_gated was built for hidden {baked}, not {hidden}"
+            )));
+        }
+        let args = RmsnormGatedArgs {
+            x,
+            z,
+            w,
+            out,
+            eps,
+            stride_x,
+            stride_z,
+        };
+        let pack = rmsnorm_gated_args(&self.abi, &args)?;
+        let mut params = pack.kernel_params()?;
+        let grid = rmsnorm_gated_grid(rows);
+        self.launch(RMSNORM_GATED, grid, &mut params, stream)
     }
 
     pub fn hidden(&self) -> Result<usize, MoEError> {

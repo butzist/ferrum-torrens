@@ -1,5 +1,8 @@
 // Driver-API launcher for the paged GQA decode attention kernel (TODO.md M3).
 //
+// Split-K launch path ported from FreeToken's `decode_paged_attention` and
+// `_decode_attention_stage2` (FreeToken, Apache-2.0); see NOTICE.
+//
 // The dense device decode path gathered each row's fixed-length KV window into a
 // fresh `[rows, window, kv_heads, head_dim]` tensor and ran an SDPA over it. A
 // captured graph therefore baked that whole materialization into its node set,
@@ -20,8 +23,10 @@ use crate::domain::model::ModelParams;
 use crate::infrastructure::cuda_driver::{AttentionKernels, CUstream, CudaError, Driver};
 use crate::infrastructure::cudarc::{Runtime, Tensor};
 use crate::infrastructure::kernel_abi::{
-    AttentionAbi, AttentionArgs, PAGED_ATTENTION, PAGED_ATTENTION_BF16, attention_grid,
-    paged_attention_args,
+    AttentionAbi, AttentionArgs, AttentionSplitKStage1Args, AttentionSplitKStage2Args,
+    PAGED_ATTENTION, PAGED_ATTENTION_BF16, PAGED_ATTENTION_SPLITK_STAGE1,
+    PAGED_ATTENTION_SPLITK_STAGE1_BF16, PAGED_ATTENTION_SPLITK_STAGE2, attention_grid,
+    attention_splitk_stage1_args, attention_splitk_stage2_args, paged_attention_args,
 };
 use crate::infrastructure::torch::Device;
 
@@ -43,6 +48,12 @@ pub struct PagedAttention {
     kernels: AttentionKernels,
     abi: AttentionAbi,
     kv_heads: i64,
+    q_heads: usize,
+    head_dim: usize,
+    splitk_max_splits: usize,
+    mid_o: std::cell::RefCell<Option<Tensor>>,
+    mid_lse: std::cell::RefCell<Option<Tensor>>,
+    mid_rows: std::cell::RefCell<usize>,
     _rt: Runtime,
     stream: CUstream,
 }
@@ -76,6 +87,12 @@ impl PagedAttention {
             kernels,
             abi,
             kv_heads: params.num_kv_heads as i64,
+            q_heads: params.num_q_heads,
+            head_dim: params.head_dim,
+            splitk_max_splits: 32,
+            mid_o: std::cell::RefCell::new(None),
+            mid_lse: std::cell::RefCell::new(None),
+            mid_rows: std::cell::RefCell::new(0),
             _rt: rt,
             stream,
         })
@@ -153,22 +170,103 @@ impl PagedAttention {
             )));
         }
         let window = locs.shape()[1];
-        let args = AttentionArgs {
+        let splitk = std::env::var("FERRUM_ATTN_SPLITK")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        if !splitk {
+            let args = AttentionArgs {
+                q: q.device_ptr(),
+                k: k_ptr,
+                v: v_ptr,
+                locs: locs.device_ptr(),
+                positions: positions.device_ptr(),
+                out: out.device_ptr(),
+                window: window as u32,
+            };
+            let pack = paged_attention_args(&self.abi, name, &args).map_err(bad_abi)?;
+            let mut params = pack.kernel_params().map_err(bad_abi)?;
+            let grid = attention_grid(rows, kernel).map_err(bad_abi)?;
+            // SAFETY: as above.
+            return unsafe { self.kernels.launch(kernel, grid, &mut params, self.stream) }
+                .map_err(driver);
+        }
+        // Split-K path.
+        let stage1_name = if kv_bf16 {
+            PAGED_ATTENTION_SPLITK_STAGE1_BF16
+        } else {
+            PAGED_ATTENTION_SPLITK_STAGE1
+        };
+        let stage1_kernel = self.abi.kernel(stage1_name).map_err(bad_abi)?;
+        let stage2_kernel = self
+            .abi
+            .kernel(PAGED_ATTENTION_SPLITK_STAGE2)
+            .map_err(bad_abi)?;
+        // Ensure scratch buffers sized for this row count.
+        let need = *self.mid_rows.borrow() != rows || self.mid_o.borrow().is_none();
+        if need {
+            let mid_o = self
+                ._rt
+                .zeros(
+                    &[rows, self.q_heads, self.splitk_max_splits, self.head_dim],
+                    crate::infrastructure::cudarc::TensorDType::Bf16,
+                )
+                .map_err(|e| MoEError::Bad(format!("mid_o alloc: {e}")))?;
+            let mid_lse = self
+                ._rt
+                .zeros(
+                    &[rows, self.q_heads, self.splitk_max_splits],
+                    crate::infrastructure::cudarc::TensorDType::F32,
+                )
+                .map_err(|e| MoEError::Bad(format!("mid_lse alloc: {e}")))?;
+            *self.mid_o.borrow_mut() = Some(mid_o);
+            *self.mid_lse.borrow_mut() = Some(mid_lse);
+            *self.mid_rows.borrow_mut() = rows;
+        }
+        let mid_o_ref = self.mid_o.borrow();
+        let mid_lse_ref = self.mid_lse.borrow();
+        let mid_o = mid_o_ref.as_ref().unwrap();
+        let mid_lse = mid_lse_ref.as_ref().unwrap();
+        let max_splits = self.splitk_max_splits as u32;
+        let s1_args = AttentionSplitKStage1Args {
             q: q.device_ptr(),
             k: k_ptr,
             v: v_ptr,
             locs: locs.device_ptr(),
             positions: positions.device_ptr(),
-            out: out.device_ptr(),
+            mid_o: mid_o.device_ptr(),
+            mid_lse: mid_lse.device_ptr(),
+            max_kv_splits: max_splits,
             window: window as u32,
         };
-        let pack = paged_attention_args(&self.abi, name, &args).map_err(bad_abi)?;
-        let mut params = pack.kernel_params().map_err(bad_abi)?;
-        let grid = attention_grid(rows, kernel).map_err(bad_abi)?;
-        // SAFETY: the caller guarantees every address is live in this context;
-        // `params` was built from this kernel's manifest entry, and `self.stream`
-        // belongs to the context made current at construction.
-        unsafe { self.kernels.launch(kernel, grid, &mut params, self.stream) }.map_err(driver)
+        let pack1 =
+            attention_splitk_stage1_args(&self.abi, stage1_name, &s1_args).map_err(bad_abi)?;
+        let mut params1 = pack1.kernel_params().map_err(bad_abi)?;
+        let grid1 = (rows as u32, self.q_heads as u32, max_splits);
+        // SAFETY: as above.
+        unsafe {
+            self.kernels
+                .launch(stage1_kernel, grid1, &mut params1, self.stream)
+        }
+        .map_err(driver)?;
+        let s2_args = AttentionSplitKStage2Args {
+            mid_o: mid_o.device_ptr(),
+            mid_lse: mid_lse.device_ptr(),
+            out: out.device_ptr(),
+            positions: positions.device_ptr(),
+            max_kv_splits: max_splits,
+            window: window as u32,
+        };
+        let pack2 =
+            attention_splitk_stage2_args(&self.abi, PAGED_ATTENTION_SPLITK_STAGE2, &s2_args)
+                .map_err(bad_abi)?;
+        let mut params2 = pack2.kernel_params().map_err(bad_abi)?;
+        let grid2 = (rows as u32, self.q_heads as u32, 1);
+        // SAFETY: as above.
+        unsafe {
+            self.kernels
+                .launch(stage2_kernel, grid2, &mut params2, self.stream)
+        }
+        .map_err(driver)
     }
 }
 
@@ -176,8 +274,17 @@ impl PagedAttention {
 /// differs would launch a kernel walking the wrong strides. Fail at construction
 /// instead, the same way `CudaMoE` checks its `ExpertShapes`. Both pool-dtype
 /// variants are checked: a stream picks one per layer, so both must match.
+pub fn check_shapes(params: &ModelParams, abi: &AttentionAbi) -> Result<(), MoEError> {
+    check_geometry(params, abi)
+}
+
 fn check_geometry(params: &ModelParams, abi: &AttentionAbi) -> Result<(), MoEError> {
-    for name in [PAGED_ATTENTION, PAGED_ATTENTION_BF16] {
+    for name in [
+        PAGED_ATTENTION,
+        PAGED_ATTENTION_BF16,
+        PAGED_ATTENTION_SPLITK_STAGE1,
+        PAGED_ATTENTION_SPLITK_STAGE1_BF16,
+    ] {
         let kernel = abi.kernel(name).map_err(bad_abi)?;
         let c = |name_const: &str| kernel.constexpr(name_const).map_err(bad_abi);
         let want = [
@@ -193,6 +300,15 @@ fn check_geometry(params: &ModelParams, abi: &AttentionAbi) -> Result<(), MoEErr
                 )));
             }
         }
+    }
+    // Stage 2 only carries the head dimension.
+    let kernel = abi.kernel(PAGED_ATTENTION_SPLITK_STAGE2).map_err(bad_abi)?;
+    let built = kernel.constexpr("HEAD_DIM").map_err(bad_abi)?;
+    if built != params.head_dim as u64 {
+        return Err(MoEError::Bad(format!(
+            "the paged kernel {} was built with HEAD_DIM = {built}, but the model has {}",
+            PAGED_ATTENTION_SPLITK_STAGE2, params.head_dim
+        )));
     }
     Ok(())
 }

@@ -446,7 +446,19 @@ pub const PAGED_ATTENTION: &str = "paged_attention";
 /// The bf16-KV pool variant (TODO.md item 14): same body, bf16 K/V pointers.
 pub const PAGED_ATTENTION_BF16: &str = "paged_attention_bf16";
 
-const ATTENTION_NAMES: [&str; 2] = [PAGED_ATTENTION, PAGED_ATTENTION_BF16];
+/// Split-K paged decode attention (FreeToken port): stage 1 writes per-split
+/// partial softmax, stage 2 merges the splits.
+pub const PAGED_ATTENTION_SPLITK_STAGE1: &str = "paged_attention_splitk_stage1";
+pub const PAGED_ATTENTION_SPLITK_STAGE1_BF16: &str = "paged_attention_splitk_stage1_bf16";
+pub const PAGED_ATTENTION_SPLITK_STAGE2: &str = "paged_attention_splitk_stage2";
+
+const ATTENTION_NAMES: [&str; 5] = [
+    PAGED_ATTENTION,
+    PAGED_ATTENTION_BF16,
+    PAGED_ATTENTION_SPLITK_STAGE1,
+    PAGED_ATTENTION_SPLITK_STAGE1_BF16,
+    PAGED_ATTENTION_SPLITK_STAGE2,
+];
 
 #[derive(Debug, Deserialize)]
 struct AttentionEntry {
@@ -577,6 +589,18 @@ pub fn attention_cubin(name: &str) -> Result<&'static [u8], MoEError> {
             env!("OUT_DIR"),
             "/kernel/paged_attention_bf16.cubin"
         )),
+        PAGED_ATTENTION_SPLITK_STAGE1 => include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/kernel/paged_attention_splitk_stage1.cubin"
+        )),
+        PAGED_ATTENTION_SPLITK_STAGE1_BF16 => include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/kernel/paged_attention_splitk_stage1_bf16.cubin"
+        )),
+        PAGED_ATTENTION_SPLITK_STAGE2 => include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/kernel/paged_attention_splitk_stage2.cubin"
+        )),
         other => return Err(MoEError::Bad(format!("no committed cubin for {other}"))),
     })
 }
@@ -588,6 +612,24 @@ fn attention_ptx(name: &str) -> &'static str {
         PAGED_ATTENTION => include_str!(concat!(env!("OUT_DIR"), "/kernel/paged_attention.ptx")),
         PAGED_ATTENTION_BF16 => {
             include_str!(concat!(env!("OUT_DIR"), "/kernel/paged_attention_bf16.ptx"))
+        }
+        PAGED_ATTENTION_SPLITK_STAGE1 => {
+            include_str!(concat!(
+                env!("OUT_DIR"),
+                "/kernel/paged_attention_splitk_stage1.ptx"
+            ))
+        }
+        PAGED_ATTENTION_SPLITK_STAGE1_BF16 => {
+            include_str!(concat!(
+                env!("OUT_DIR"),
+                "/kernel/paged_attention_splitk_stage1_bf16.ptx"
+            ))
+        }
+        PAGED_ATTENTION_SPLITK_STAGE2 => {
+            include_str!(concat!(
+                env!("OUT_DIR"),
+                "/kernel/paged_attention_splitk_stage2.ptx"
+            ))
         }
         other => panic!("no committed ptx for {other}"),
     }
@@ -612,6 +654,9 @@ pub const CONV_PREFILL: &str = "conv_prefill";
 
 /// The fused residual-add + RMSNorm (OPTIMIZATION.md R6: the norm launch tax).
 pub const ADD_RMSNORM: &str = "add_rmsnorm";
+
+/// Fused gated RMSNorm: out = rmsnorm(x, w) * silu(z).
+pub const RMSNORM_GATED: &str = "rmsnorm_gated";
 
 /// The prefill chunk triangular solve (OPTIMIZATION.md R9.3).
 pub const GDN_TRI_SOLVE: &str = "gdn_tri_solve";
@@ -645,6 +690,7 @@ pub const MAX_ALL_F32: &str = "max_all_f32";
 pub const SUM_ALL_F32: &str = "sum_all_f32";
 pub const SOFTMAX_LAST_F32: &str = "softmax_last_f32";
 pub const TOPK_LAST_F32: &str = "topk_last_f32";
+pub const FUSED_TOPK_SOFTMAX_F32: &str = "fused_topk_softmax_f32";
 pub const ROPE_BF16: &str = "rope_bf16";
 pub const MROPE_GATHER: &str = "mrope_gather";
 pub const REPEAT_HEADS_BF16: &str = "repeat_heads_bf16";
@@ -655,11 +701,12 @@ pub const GDN_RATIO_MASKS_F32: &str = "gdn_ratio_masks_f32";
 pub const MUL_MID_F32: &str = "mul_mid_f32";
 pub const SCALE_HEADS_F32: &str = "scale_heads_f32";
 
-const LINEAR_NAMES: [&str; 46] = [
+const LINEAR_NAMES: [&str; 48] = [
     GDN_DECODE,
     CONV_DECODE,
     CONV_PREFILL,
     ADD_RMSNORM,
+    RMSNORM_GATED,
     GDN_TRI_SOLVE,
     NVFP4_DENSE_GEMV,
     FP8_GEMV,
@@ -693,6 +740,7 @@ const LINEAR_NAMES: [&str; 46] = [
     SUM_ALL_F32,
     SOFTMAX_LAST_F32,
     TOPK_LAST_F32,
+    FUSED_TOPK_SOFTMAX_F32,
     ROPE_BF16,
     MROPE_GATHER,
     REPEAT_HEADS_BF16,
@@ -829,6 +877,7 @@ pub fn linear_cubin(name: &str) -> Result<&'static [u8], MoEError> {
         CONV_DECODE => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/conv_decode.cubin")),
         CONV_PREFILL => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/conv_prefill.cubin")),
         ADD_RMSNORM => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/add_rmsnorm.cubin")),
+        RMSNORM_GATED => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/rmsnorm_gated.cubin")),
         GDN_TRI_SOLVE => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/gdn_tri_solve.cubin")),
         NVFP4_DENSE_GEMV => {
             include_bytes!(concat!(env!("OUT_DIR"), "/kernel/nvfp4_dense_gemv.cubin"))
@@ -890,6 +939,10 @@ pub fn linear_cubin(name: &str) -> Result<&'static [u8], MoEError> {
             include_bytes!(concat!(env!("OUT_DIR"), "/kernel/softmax_last_f32.cubin"))
         }
         TOPK_LAST_F32 => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/topk_last_f32.cubin")),
+        FUSED_TOPK_SOFTMAX_F32 => include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/kernel/fused_topk_softmax_f32.cubin"
+        )),
         ROPE_BF16 => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/rope_bf16.cubin")),
         MROPE_GATHER => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/mrope_gather.cubin")),
         REPEAT_HEADS_BF16 => {
@@ -926,6 +979,7 @@ fn linear_ptx(name: &str) -> &'static str {
         CONV_DECODE => include_str!(concat!(env!("OUT_DIR"), "/kernel/conv_decode.ptx")),
         CONV_PREFILL => include_str!(concat!(env!("OUT_DIR"), "/kernel/conv_prefill.ptx")),
         ADD_RMSNORM => include_str!(concat!(env!("OUT_DIR"), "/kernel/add_rmsnorm.ptx")),
+        RMSNORM_GATED => include_str!(concat!(env!("OUT_DIR"), "/kernel/rmsnorm_gated.ptx")),
         GDN_TRI_SOLVE => include_str!(concat!(env!("OUT_DIR"), "/kernel/gdn_tri_solve.ptx")),
         NVFP4_DENSE_GEMV => include_str!(concat!(env!("OUT_DIR"), "/kernel/nvfp4_dense_gemv.ptx")),
         FP8_GEMV => include_str!(concat!(env!("OUT_DIR"), "/kernel/fp8_gemv.ptx")),
@@ -985,6 +1039,10 @@ fn linear_ptx(name: &str) -> &'static str {
             include_str!(concat!(env!("OUT_DIR"), "/kernel/softmax_last_f32.ptx"))
         }
         TOPK_LAST_F32 => include_str!(concat!(env!("OUT_DIR"), "/kernel/topk_last_f32.ptx")),
+        FUSED_TOPK_SOFTMAX_F32 => include_str!(concat!(
+            env!("OUT_DIR"),
+            "/kernel/fused_topk_softmax_f32.ptx"
+        )),
         ROPE_BF16 => include_str!(concat!(env!("OUT_DIR"), "/kernel/rope_bf16.ptx")),
         MROPE_GATHER => include_str!(concat!(env!("OUT_DIR"), "/kernel/mrope_gather.ptx")),
         REPEAT_HEADS_BF16 => {
@@ -1573,6 +1631,66 @@ pub fn paged_attention_args(
     Ok(p)
 }
 
+/// Split-K stage 1 launch arguments.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AttentionSplitKStage1Args {
+    pub q: u64,
+    pub k: u64,
+    pub v: u64,
+    pub locs: u64,
+    pub positions: u64,
+    pub mid_o: u64,
+    pub mid_lse: u64,
+    pub max_kv_splits: u32,
+    pub window: u32,
+}
+
+pub fn attention_splitk_stage1_args(
+    abi: &AttentionAbi,
+    name: &str,
+    a: &AttentionSplitKStage1Args,
+) -> Result<ArgPack, MoEError> {
+    let kernel = abi.kernel(name)?;
+    let mut p = ArgPack::for_attention(kernel);
+    p.ptr(a.q)?;
+    p.ptr(a.k)?;
+    p.ptr(a.v)?;
+    p.ptr(a.locs)?;
+    p.ptr(a.positions)?;
+    p.ptr(a.mid_o)?;
+    p.ptr(a.mid_lse)?;
+    p.u32(a.max_kv_splits)?;
+    p.u32(a.window)?;
+    Ok(p)
+}
+
+/// Split-K stage 2 launch arguments.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AttentionSplitKStage2Args {
+    pub mid_o: u64,
+    pub mid_lse: u64,
+    pub out: u64,
+    pub positions: u64,
+    pub max_kv_splits: u32,
+    pub window: u32,
+}
+
+pub fn attention_splitk_stage2_args(
+    abi: &AttentionAbi,
+    name: &str,
+    a: &AttentionSplitKStage2Args,
+) -> Result<ArgPack, MoEError> {
+    let kernel = abi.kernel(name)?;
+    let mut p = ArgPack::for_attention(kernel);
+    p.ptr(a.mid_o)?;
+    p.ptr(a.mid_lse)?;
+    p.ptr(a.out)?;
+    p.ptr(a.positions)?;
+    p.u32(a.max_kv_splits)?;
+    p.u32(a.window)?;
+    Ok(p)
+}
+
 /// The attention launch grid: one program per (row, q_head). The y extent is the
 /// baked `NUM_Q_HEADS`; the x extent is the step's row count, which is why this
 /// cannot come from the cubin alone.
@@ -1753,6 +1871,37 @@ pub fn add_rmsnorm_args(abi: &LinearAbi, a: &AddRmsnormArgs) -> Result<ArgPack, 
 /// The fused add + RMSNorm launch grid: one program per row; the whole hidden
 /// row is one baked tile.
 pub fn add_rmsnorm_grid(rows: usize) -> (u32, u32, u32) {
+    (rows as u32, 1, 1)
+}
+
+/// Arguments for the fused gated RMSNorm: out = rmsnorm(x, w) * silu(z).
+#[derive(Debug, Clone, Copy)]
+pub struct RmsnormGatedArgs {
+    pub x: u64,
+    pub z: u64,
+    pub w: u64,
+    pub out: u64,
+    pub eps: f32,
+    pub stride_x: u32,
+    pub stride_z: u32,
+}
+
+/// The fused gated RMSNorm launch argument pack, in the cubin's declared order.
+pub fn rmsnorm_gated_args(abi: &LinearAbi, a: &RmsnormGatedArgs) -> Result<ArgPack, MoEError> {
+    let kernel = abi.kernel(RMSNORM_GATED)?;
+    let mut p = ArgPack::for_linear(kernel);
+    p.ptr(a.x)?;
+    p.ptr(a.z)?;
+    p.ptr(a.w)?;
+    p.ptr(a.out)?;
+    p.f32(a.eps)?;
+    p.u32(a.stride_x)?;
+    p.u32(a.stride_z)?;
+    Ok(p)
+}
+
+/// The fused gated RMSNorm launch grid: one program per row.
+pub fn rmsnorm_gated_grid(rows: usize) -> (u32, u32, u32) {
     (rows as u32, 1, 1)
 }
 

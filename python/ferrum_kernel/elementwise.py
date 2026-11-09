@@ -348,6 +348,47 @@ def launch_topk_last(x: torch.Tensor, vals: torch.Tensor, idx: torch.Tensor, k: 
 
 
 @triton.jit
+def _fused_topk_softmax_kernel(x_ptr, val_ptr, idx_ptr, cols, k, BLOCK: tl.constexpr):
+    """Fused router: softmax over the experts, then descending top-k with
+    renormalization, in one launch. Replaces the separate softmax + topk +
+    sum + reciprocal + row_mul chain. Ties take the lowest index, matching
+    `_topk_last_kernel`."""
+
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK)
+    mask = offs < cols
+    x = tl.load(x_ptr + row * cols + offs, mask=mask, other=float("-inf")).to(tl.float32)
+    x = tl.where(mask, x, float("-inf"))
+    peak = tl.max(x, 0)
+    exps = tl.where(mask, tl.exp(x - peak), 0.0)
+    total = tl.sum(exps, 0)
+    probs = exps / total
+
+    # Descending top-k over the softmax probabilities.
+    p = probs
+    topk_sum = 0.0
+    for j in tl.range(0, k):
+        v = tl.max(p, 0)
+        cand = tl.where(p == v, offs, BLOCK)
+        i = tl.min(cand, 0)
+        tl.store(val_ptr + row * k + j, v)
+        tl.store(idx_ptr + row * k + j, i)
+        topk_sum += v
+        p = tl.where(offs == i, float("-inf"), p)
+
+    # Renormalize the selected weights so they sum to one.
+    for j in tl.range(0, k):
+        v = tl.load(val_ptr + row * k + j).to(tl.float32)
+        tl.store(val_ptr + row * k + j, v / topk_sum)
+
+
+def launch_fused_topk_softmax(x: torch.Tensor, vals: torch.Tensor, idx: torch.Tensor, k: int) -> None:
+    rows, cols = x.shape
+    assert cols <= SELECT_BLOCK, f"fused_topk_softmax needs cols <= {SELECT_BLOCK}, got {cols}"
+    _fused_topk_softmax_kernel[(rows,)](x, vals, idx, cols, k, BLOCK=SELECT_BLOCK, num_warps=4)
+
+
+@triton.jit
 def _rope_kernel(
     x_ptr,
     cos_ptr,

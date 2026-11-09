@@ -388,6 +388,35 @@ def check_paged_attention(device: torch.device, tol: float) -> int:
     return failures
 
 
+def check_paged_attention_splitk(device: torch.device, tol: float) -> int:
+    """Split-K paged decode: the two-stage kernel against the plain-torch oracle."""
+    cases = [
+        ("small", {"rows": 3, "q_heads": 4, "kv_heads": 2, "head_dim": 64}, 16),
+        ("single", {"rows": 1, "q_heads": 4, "kv_heads": 2, "head_dim": 64}, 32),
+        ("multiblock", {"rows": 2, "q_heads": 4, "kv_heads": 2, "head_dim": 64, "lens": [40, 3]}, 16),
+        ("qwen-shape", {"rows": 2, "q_heads": 16, "kv_heads": 2, "head_dim": 256}, 64),
+    ]
+    failures = 0
+    for kv_dtype, bound in ((torch.float32, tol), (torch.bfloat16, 5e-2)):
+        for label, shape, block_n in cases:
+            for seed in range(2):
+                q, k, v, locs, positions = random_attention_case(str(device), seed=seed, **shape)
+                k = k.to(kv_dtype)
+                v = v.to(kv_dtype)
+                q = q.to(kv_dtype) if kv_dtype == torch.bfloat16 else q
+                want = attn.paged_attention_reference(q, k, v, locs, positions)
+                got = torch.empty_like(q)
+                mid_o = torch.empty((q.shape[0], q.shape[1], 32, q.shape[2]), dtype=q.dtype, device=q.device)
+                mid_lse = torch.empty((q.shape[0], q.shape[1], 32), dtype=torch.float32, device=q.device)
+                attn.paged_attention_decode_splitk(q, k, v, locs, positions, got, mid_o, mid_lse, max_kv_splits=32, block_n=block_n)
+                rel = (got - want).abs().max().item() / want.abs().max().clamp(min=1e-6).item()
+                print(f"attention-splitk {label} [{kv_dtype}] seed {seed}: rel {rel:.3e}")
+                if rel > bound:
+                    failures += 1
+                    print(f"attention-splitk {label} [{kv_dtype}] seed {seed}: FAIL", file=sys.stderr)
+    return failures
+
+
 def random_gdn_case(
     device: str,
     rows: int = 2,
@@ -645,6 +674,32 @@ def check_norm(device: torch.device, tol: float, full: bool) -> int:
     return failures
 
 
+def check_rmsnorm_gated(device: torch.device, tol: float, full: bool) -> int:
+    cases = [("small", {"rows": 2, "hidden": 32})]
+    if full:
+        cases.append(("qwen-shape", {"rows": 3, "hidden": 128}))
+    failures = 0
+    for label, shape in cases:
+        for seed in range(2):
+            rows, hidden = shape["rows"], shape["hidden"]
+            g = torch.Generator(device=device).manual_seed(seed)
+            x = (torch.randn((rows, hidden), generator=g, dtype=torch.float32) * 0.5).to(device).to(torch.bfloat16)
+            z = (torch.randn((rows, hidden), generator=g, dtype=torch.float32) * 0.5).to(device).to(torch.bfloat16)
+            w = (torch.rand((hidden,), generator=g, dtype=torch.float32) * 0.5 + 0.75).to(device).to(torch.bfloat16)
+            want = norm_mod.rmsnorm_gated_reference(x, z, w, 1e-6)
+            got = torch.empty((rows, hidden), dtype=torch.bfloat16, device=device)
+            norm_mod.rmsnorm_gated(x, z, w, got, 1e-6)
+            rel = (
+                (got.to(torch.float32) - want.to(torch.float32)).abs().max().item()
+                / want.to(torch.float32).abs().max().clamp(min=1e-6).item()
+            )
+            print(f"rmsnorm_gated {label} seed {seed}: rel {rel:.3e}")
+            if rel > tol:
+                failures += 1
+                print(f"rmsnorm_gated {label} seed {seed}: FAIL", file=sys.stderr)
+    return failures
+
+
 def random_dense_case(device: str, m: int = 2, n: int = 128, k: int = 256, seed: int = 0):
     """A dense NVFP4 GEMV case: `[n, k//2]` packed nibbles, `[n, k//16]` e4m3
     block scales, `[n]` f16 globals, and a bf16 activation row."""
@@ -843,6 +898,7 @@ def main(argv: list[str] | None = None) -> int:
         print("FAIL", file=sys.stderr)
         return 1
     attention_failures = check_paged_attention(torch.device(args.device), args.tol)
+    attention_failures += check_paged_attention_splitk(torch.device(args.device), args.tol)
     if offload_failures or attention_failures:
         print("FAIL", file=sys.stderr)
         return 1
@@ -874,6 +930,12 @@ def main(argv: list[str] | None = None) -> int:
         torch.device(args.device), args.tol, full=args.device != "cpu"
     )
     if norm_failures:
+        print("FAIL", file=sys.stderr)
+        return 1
+    gated_norm_failures = check_rmsnorm_gated(
+        torch.device(args.device), args.tol, full=args.device != "cpu"
+    )
+    if gated_norm_failures:
         print("FAIL", file=sys.stderr)
         return 1
     mrope_failures = check_mrope_gather(torch.device(args.device), 0.0)

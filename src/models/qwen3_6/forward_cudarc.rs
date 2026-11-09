@@ -161,6 +161,15 @@ pub fn topk_renorm(probs: &Tensor, k: usize) -> Result<(Tensor, Tensor)> {
     Ok((ids, vals.row_mul(&inv)?))
 }
 
+/// Fused softmax + top-k + renormalization over the router logits (f32
+/// `[rows, experts]`). Returns `(ids, weights)` matching `topk_renorm` over
+/// the softmaxed probabilities. Replaces the separate softmax/topk/sum/
+/// reciprocal/row_mul chain when `FERRUM_FUSED_ROUTER` is not `0`.
+pub fn fused_topk_softmax(logits: &Tensor, k: usize) -> Result<(Tensor, Tensor)> {
+    let (vals, ids) = logits.fused_topk_softmax(k)?;
+    Ok((ids, vals))
+}
+
 /// Partial-NeoX rope tables: `cos`/`sin` f32 `[max_len, rotary_dim / 2]`.
 ///
 /// The angle is `pos * base^(-2i/rotary_dim)` computed in f64 and rounded once
@@ -1246,8 +1255,13 @@ impl CudarcQwen3_6 {
                 .cast(TensorDType::F32)?
                 .matmul_nt_f32(&layer.gate.cast(TensorDType::F32)?)?
         };
-        let probs = logits.softmax_last()?;
-        let (ids, weights) = topk_renorm(&probs, p.top_k)?;
+        let fused = std::env::var("FERRUM_FUSED_ROUTER").ok().as_deref() != Some("0");
+        let (ids, weights) = if fused {
+            fused_topk_softmax(&logits, p.top_k)?
+        } else {
+            let probs = logits.softmax_last()?;
+            topk_renorm(&probs, p.top_k)?
+        };
         substep_end(&self.rt, "moe_gate", s);
         let s = substep_begin(&self.rt);
         let se_gate = x_post

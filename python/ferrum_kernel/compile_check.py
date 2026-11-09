@@ -36,7 +36,7 @@ from .nvfp4_moe import (
 )
 from .moe_prefill import _moe_csr_count_kernel, _moe_csr_prefix_kernel, _moe_csr_scatter_kernel
 from .offload import _ensure_experts_kernel, _index_copy_multi_kernel
-from .attention import _paged_attention_decode_kernel
+from .attention import _paged_attention_decode_kernel, _paged_attention_decode_splitk_stage1_kernel, _paged_attention_decode_splitk_stage2_kernel
 from .conv import _conv_decode_kernel, _conv_prefill_kernel
 from .elementwise import (
     _binary_kernel,
@@ -53,7 +53,7 @@ from .elementwise import (
 )
 from .gdn import _gdn_decode_kernel, _gdn_tri_solve_kernel
 from .mrope import _mrope_gather_kernel
-from .norm import _add_rmsnorm_kernel
+from .norm import _add_rmsnorm_kernel, _rmsnorm_gated_kernel
 from .fp8_linear import (
     _fp8_gemm_kernel,
     _fp8_gemv_splitk_kernel,
@@ -85,6 +85,8 @@ from .signatures import gdn_tri_solve as _gdn_tri_solve_sig
 from .signatures import gdn_tri_solve_constexprs
 from .signatures import add_rmsnorm as _add_rmsnorm_sig
 from .signatures import add_rmsnorm_constexprs
+from .signatures import rmsnorm_gated as _rmsnorm_gated_sig
+from .signatures import rmsnorm_gated_constexprs
 from .signatures import gemv as _gemv_sig
 from .signatures import grouped_gemm as _grouped_sig
 from .signatures import grouped_down_constexprs, grouped_gate_up_constexprs
@@ -101,6 +103,10 @@ from .signatures import nvfp4_dense_gemv as _nvfp4_dense_gemv_sig
 from .signatures import nvfp4_dense_gemv_constexprs
 from .signatures import paged_attention as _paged_attention_sig
 from .signatures import paged_attention_constexprs
+from .signatures import paged_attention_splitk_stage1 as _paged_attention_splitk_stage1_sig
+from .signatures import paged_attention_splitk_stage1_constexprs
+from .signatures import paged_attention_splitk_stage2 as _paged_attention_splitk_stage2_sig
+from .signatures import paged_attention_splitk_stage2_constexprs
 from .signatures import reduce as _reduce_sig
 from .signatures import silu as _silu_sig
 
@@ -215,6 +221,16 @@ def main() -> int:
     except Exception as e:  # noqa: BLE001
         failures += 1
         print(f"paged_attention_bf16 FAILED: {type(e).__name__}: {str(e)[:200]}")
+    for label, sig, consts, fn in [
+        ("paged_attention_splitk_stage1", _paged_attention_splitk_stage1_sig(kv_dtype="fp32"), paged_attention_splitk_stage1_constexprs(), _paged_attention_decode_splitk_stage1_kernel),
+        ("paged_attention_splitk_stage1_bf16", _paged_attention_splitk_stage1_sig(kv_dtype="bf16"), paged_attention_splitk_stage1_constexprs(), _paged_attention_decode_splitk_stage1_kernel),
+        ("paged_attention_splitk_stage2", _paged_attention_splitk_stage2_sig(), paged_attention_splitk_stage2_constexprs(), _paged_attention_decode_splitk_stage2_kernel),
+    ]:
+        try:
+            check(label, fn, sig, consts)
+        except Exception as e:  # noqa: BLE001
+            failures += 1
+            print(f"{label} FAILED: {type(e).__name__}: {str(e)[:200]}")
     # The fused GDN decode step (TODO.md M5), one warp like the FLA reference.
     try:
         check(
@@ -293,6 +309,17 @@ def main() -> int:
     except Exception as e:  # noqa: BLE001
         failures += 1
         print(f"add_rmsnorm FAILED: {type(e).__name__}: {str(e)[:200]}")
+    # Fused gated RMSNorm (out = rmsnorm(x, w) * silu(z)).
+    try:
+        check(
+            "rmsnorm_gated",
+            _rmsnorm_gated_kernel,
+            _rmsnorm_gated_sig(),
+            rmsnorm_gated_constexprs(),
+        )
+    except Exception as e:  # noqa: BLE001
+        failures += 1
+        print(f"rmsnorm_gated FAILED: {type(e).__name__}: {str(e)[:200]}")
     # The generic elementwise set the cudarc tensor adapter needs (M7.1).
     for label, fn, sig, consts in (
         ("add_bf16", _binary_kernel, _binary_sig("bf16"), binary_constexprs(0)),
