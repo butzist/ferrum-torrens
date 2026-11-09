@@ -2415,11 +2415,8 @@ and captured device decode still matches the host refeed at argmax
 
 **What this leaves.** The 1.45x decode gap (31-32 vs 47 tok/s) is not the
 attention kernel, the router launches, the shared expert (S7), the GDN tail
-(S8) or the recurrence (S2). It sits in `moe_routed`, whose "rest" bucket has
-never been attributed: 24.7-33.6 ms/token of which ~7 copy, ~3.4 marlin GEMV
-(decision 89) and ~1.9 LRU are named and **12-21 ms is not**. The next decode
-slice is to split that bucket (per-route glues: id/weight d2d, output scatter,
-the 8 GEMV launches) before porting anything else.
+(S8) or the recurrence (S2). S11 below attributed the rest of the step and
+found it is not a kernel at all: it is the expert **miss copy**.
 
 A second finding from the same runs: at the production 2048-slot cache a dropped
 engine still holds ~3776 MiB of device memory (4302 MiB after `drop(engine)`
@@ -2427,6 +2424,65 @@ against a 526 MiB process baseline), i.e. 2048 x 1.775 MiB plus ~140 MiB of
 context. That is the M8.1e residual already recorded in `TODO.md` (one bank row
 per slot outlives the `Engine` because a clone keeps the adapter alive), not a
 new regression; an in-process arm loop still needs that clone found first.
+
+### R15 S11: the decode step attributed -- the copy is a third of it (2026-11-09)
+
+The profiler was broken and the earlier per-stage tables said so in hindsight:
+`profile::current()` returned the legacy null stream while the model runs on its
+own cudarc stream, so every CUDA-event pair timed an empty stream. `total`
+survived (the step ends in a D2H that drains the real stream) but the stages did
+not: the same run reported `head` 6.6 ms (really 1.3), `moe_copy` 0.13 ms
+(really 9.4) and `moe_gemv` 3.4 ms. `profile::init` now takes the runtime's
+stream and records every event on it. The synchronizing host clock
+(`FT_PROFILE_SYNC=1`) is the cross-check and the two now agree.
+
+Decode, p50 over 16 steps (`FT_PROFILE=1`, eager, 517-token prompt + 40 tokens,
+text-only, auto 2048 slots, ms/token):
+
+| stage | ms | share | notes |
+| --- | ---: | ---: | --- |
+| `moe_copy` | **9.42** | **32%** | 40-115 misses/step (mean ~70) x 1.775 MiB = ~124 MB at ~13 GB/s = the pinned PCIe link |
+| `moe_launch` | 2.59 | 8.9% | the routed NVFP4 GEMV, ~503 MB of reads |
+| `gdn_qkvz` | 2.67 | 9.1% | 30 layers |
+| `moe_lru` | 1.76 | 6.0% | `lru_ensure` |
+| `attn_proj` | 1.62 | 5.5% | 10 layers |
+| `moe_shared_epi` | 1.29 | 4.4% | 120 calls |
+| `moe_shared_gemm` | 1.17 | 4.0% | |
+| `gdn_tail_proj` | 1.02 | 3.5% | |
+| `gdn_tail_norm` | 0.89 | 3.1% | |
+| `head_gemv` | 0.80 | 2.7% | 286 MB -> 0.8 ms = ~350 GB/s, at the roofline and at FreeToken's 0.82 |
+| `moe_gate` | 0.73 | 2.5% | |
+| `gdn_conv`, `attn_sdpa`, `moe_group`, `attn_out`, `gdn_ba`, `gdn_recur`, `head_d2h` | 0.36-0.53 each | | |
+| `gdn_tail_gate`, `res_norm`, `post_norm`, `moe_collect` | 0.14-0.27 each | | |
+| `moe_ids`, `embed`, `head_alloc` | <0.05 each | | |
+| unaccounted (host glue between launches) | 1.20 | 4.1% | |
+| **total** | **29.2** | | 34 tok/s, matching the captured smoke's 32-34 |
+
+Two things this settles. The lm_head is **not** slow: 0.80 ms GEMV + 0.48 ms
+readback, at the read roofline; the `FT_ABLATE=head` A/B that looked like +14
+tok/s was a confound (ablated logits decode a constant token, which makes
+routing trivially cacheable, so the copy disappears too). And the routed GEMV is
+at roofline as well (~503 MB in 2.6 ms, ~190 GB/s). Stage by stage the engine is
+at or ahead of FreeToken's instrumented AIME table (copy 15.7, gdn 9.0, attn
+3.0, gemm 4.2, shared 3.6, lru 1.6, router 1.6, norms 1.0, head 0.85 at 33.0 ms
+total): our copy is the only stage that can still be meaningfully attacked, and
+on this prompt it is already cheaper than theirs.
+
+**The remaining gap is miss bytes, not compute.** 9.4 ms of the 29.2 is PCIe
+traffic at the link limit. Two sound levers, in order:
+
+1. **Overlap the copy with the shared expert** (S12). The shared-expert block
+   (gate + 2 GEMVs + epilogue = ~3.2 ms of `moe_shared_*`, plus `moe_gate` 0.7)
+   does not depend on the routed experts, and today it runs *before* the copy.
+   Issuing the copy on a second stream after the router, computing the shared
+   expert on the main stream, then waiting for the copy before the GEMV hides
+   up to ~4 ms -- 12-14% of the step -- with no numerics change.
+2. **Cut the miss rate.** ~0.15 ms per missed expert, so 10 fewer misses/token
+   is 1.5 ms. R13 (a pre-collected hot set) is the planned shape; the LRU is
+   already at ~78% hit on a repetitive prompt.
+
+Do not chase the head, the routed GEMV, `moe_copy`'s kernel geometry (it is at
+the PCIe rate) or launch fusion: all four are measured.
 
 ## R14c follow-up -- streamed vision tower (decision 157)
 

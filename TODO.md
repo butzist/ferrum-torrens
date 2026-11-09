@@ -1,11 +1,14 @@
 # FerrumTorrens -- FreeToken MVP port to Rust: TODO
 
-Status (2026-11-09): **The two FreeToken decode kernel ports are in and measured
-neutral** (R15 S9/S10, decision 158): split-K paged decode attention
+Status (2026-11-09): **The decode step is attributed** (R15 S11, decision 160):
+29.2 ms/token, of which `moe_copy` -- the expert miss staging over PCIe -- is
+9.4 ms (32%); the routed GEMV and the lm_head are at roofline. Next is R15 S12,
+overlapping the copy with the shared expert (~4 ms). **The two FreeToken decode
+kernel ports are in and measured neutral** (R15 S9/S10, decision 158): split-K paged decode attention
 (`FERRUM_ATTN_SPLITK`) and the fused router top-k (`FERRUM_FUSED_ROUTER`) move
 captured decode 31.80 -> 32.11 tok/s (+1.0%, inside the run noise, 8 runs per
-arm). The remaining 1.45x to FreeToken is inside `moe_routed`'s unattributed
-"rest" (12-21 ms/token), which is the next decode slice (R15 S11); do not
+arm). That "rest" turned out to be the expert miss copy (R15 S11): 9.4 ms of a
+29.2 ms step, at the PCIe link rate; no compute stage is the gap, so do not
 re-chase launch fusion. Verify graph capture is now gated on `[spec] mtp`
 (decision 159) -- it used to fail on every load and silently fall back to eager.
 **Vision tower is streamed per block** (decision 157): the device tower no
@@ -1384,11 +1387,19 @@ Standing: 32.2-32.9 tok/s captured at 2048 slots against FreeToken's 47.0 at
   FreeToken's stage-1/stage-2 split-K merge, fixed 32-split scratch so the graph
   captures it, `FERRUM_ATTN_SPLITK=0` restores the single-CTAs path. +0.5% at
   517 tokens, +0.6% at ~1900 (decision 158).
-- [ ] **R15 S11 attribute `moe_routed`'s "rest".** The step is 24.7-33.6 ms/token
-  and only ~7 copy + ~3.4 marlin GEMV + ~1.9 LRU are named; 12-21 ms has never
-  been attributed. Split the per-route glue (id/weight d2d, output scatter, the
-  eight GEMV launches) before porting another kernel. **This is the top decode
-  item**: S1, S2, S4, S7, S8 and S9 all came back neutral, so the gap is here.
+- [x] **R15 S11 attribute the decode step -- done (2026-11-09, decision 160).**
+  The stage profiler was recording on the null stream; fixed, the step closes at
+  29.2 ms/token and its largest stage is `moe_copy` at **9.4 ms (32%)** -- ~70
+  missed experts x 1.775 MiB at the ~13 GB/s PCIe rate -- not any kernel. The
+  routed GEMV (2.6) and the lm_head (0.8 + 0.5 readback) are at roofline.
+  See `OPTIMIZATION.md` R15 S11.
+- [ ] **R15 S12 overlap the decode expert copy with the shared expert.** The
+  shared block (`moe_gate` 0.7 + `moe_shared_*` 2.5 = ~3.2 ms) does not depend
+  on the routed experts and today runs before the copy. Stage the copy on a
+  second stream after the router, compute the shared expert on the main stream,
+  wait before the routed GEMV: up to ~4 ms (12-14%) with no numerics change and
+  no capture regression (event-ordered cross-stream work is capturable; the
+  prefill harness already does it). **Top decode item.**
 - [ ] **R15 S3 pin a pre-collected hot expert set** (`locked_fetch` /
   profile-sized pool; online LFU was measured and rejected). Target 2-4 ms.
 

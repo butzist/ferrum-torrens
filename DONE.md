@@ -5112,3 +5112,33 @@ subsection names are kept verbatim.
     is green, and the one-row `commit_verify` path is unchanged. The multi-row
     sequential path itself is still unverified here: the store FTWs carry no
     draft head, so it needs the decision-151 two-part overlay gate.
+
+160. **The stage profiler recorded on the wrong stream; with that fixed the
+    decode step's largest stage is the expert miss copy** (2026-11-09, R15 S11).
+    `profile::current()` returned the legacy null stream while the model runs on
+    its own cudarc stream, so every CUDA-event pair timed an empty stream:
+    per-stage numbers were meaningless (the same run reported `head` 6.6 ms,
+    really 1.3, and `moe_copy` 0.13, really 9.4) while `total` survived because
+    a step ends in a D2H that drains the real stream. `profile::init` now takes
+    the runtime's `CUstream` and every event is recorded on it; the
+    synchronizing host clock (`FT_PROFILE_SYNC=1`) is the independent
+    cross-check and the two agree to ~1 ms per stage. The sub-step timer also
+    records an event pair per span now (host-clock syncs are opt-in) and the
+    decode path opens a step (`step_scope`, a drop guard) in
+    `decode_one_cached`, `run_tower_rows` and the verify.
+    Parent spans that also hold children double-counted in `labeled sum`, so
+    `moe_routed` and the outer `head` bracket are gone: the routed step reports
+    `moe_ids`/`moe_lru`/`moe_copy`/`moe_group`/`moe_launch`/`moe_collect` (the
+    inline host fallback keeps `moe_routed_inline`) and the head reports
+    `head_alloc`/`head_gemv`/`head_d2h`. `labeled sum` is now 28.7 against a
+    29.2 ms total (1.2 ms of host glue), so the table closes.
+    Attribution (p50, 16 steps, 517+40 tokens, text-only, auto 2048 slots):
+    `moe_copy` **9.4 ms (32%)** -- 40-115 misses/step, ~70 mean x 1.775 MiB =
+    ~124 MB at ~13 GB/s, i.e. the pinned PCIe link -- then `moe_launch` 2.6,
+    `gdn_qkvz` 2.7, `moe_lru` 1.8, `attn_proj` 1.6, shared expert 2.5,
+    `gdn_tail_*` 2.2, `head` 1.3 (0.80 GEMV + 0.48 readback, at the roofline and
+    at FreeToken's 0.82), and ~4 ms over a long tail of 0.1-0.7 ms stages. The
+    `FT_ABLATE=head` A/B that looked like +14 tok/s was a confound: ablated
+    logits decode a constant token, whose routing is trivially cacheable, so it
+    removed the copy as well. Verdict: no compute stage is the gap; the copy is,
+    and only the overlap (S12) and the miss rate (R13) can move it.
