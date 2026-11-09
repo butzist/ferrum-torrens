@@ -5142,3 +5142,32 @@ subsection names are kept verbatim.
     logits decode a constant token, whose routing is trivially cacheable, so it
     removed the copy as well. Verdict: no compute stage is the gap; the copy is,
     and only the overlap (S12) and the miss rate (R13) can move it.
+
+161. **The decode expert miss copy overlaps the shared expert on a second stream**
+    (2026-11-09, R15 S12). R15 S11 showed the copy is a third of the step, and
+    the shared-expert block (~3.2 ms) does not depend on the routed experts, so
+    it can hide part of it. Domain: `PendingMoE` (a started, unfinished routed
+    step, `finish(Box<Self>, out)`) plus defaulted
+    `MoEExecutor::begin_device` / `ExpertGemm::begin_staged` returning `None`
+    for "take the serial path". Application: `CachedExperts::begin_device`
+    validates the step and delegates, counting a step exactly once when a
+    handle comes back (the fallback `execute_device` counts its own).
+    Infrastructure: `CudaMoE` creates a non-blocking copy stream and two
+    timing-disabled events once at construction; `begin_staged` runs the slot
+    plan and group assembly on the main stream, records the begin event, makes
+    the copy stream wait on it, runs `copy_missing` there, records the done
+    event and returns the group; `finish` waits on the done event, then
+    `launch` + `collect_dev`. Model: `moe_parts` starts the routed step before
+    the shared expert and finishes it after. It declines (serial path) for
+    `FERRUM_MOE_OVERLAP=0`, a chunked route list, a prefill-shaped step, or a
+    driver without a second stream - so prefill, chunked decode and the inline
+    fallback are untouched.
+    Measured (4 runs/arm, order balanced, captured, auto 2048 slots, 517+128):
+    31.85 -> 32.63 tok/s, **+2.4%, all four paired comparisons positive,
+    capture still true in every run**, oracle and refeed gates green at
+    unchanged deltas. The win is smaller than the shared block because
+    `copy_missing` is the `index_copy` kernel, not a DMA copy: it contends for
+    the same SMs. The remaining ~8.6 ms of copy is miss bytes (R13).
+    Risk noted in the code: the handle carries a raw adapter pointer; it is
+    finished synchronously inside `moe_parts` before the step returns, and the
+    `CachedExperts` that owns the adapter outlives it.

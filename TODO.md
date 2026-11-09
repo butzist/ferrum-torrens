@@ -2,8 +2,9 @@
 
 Status (2026-11-09): **The decode step is attributed** (R15 S11, decision 160):
 29.2 ms/token, of which `moe_copy` -- the expert miss staging over PCIe -- is
-9.4 ms (32%); the routed GEMV and the lm_head are at roofline. Next is R15 S12,
-overlapping the copy with the shared expert (~4 ms). **The two FreeToken decode
+9.4 ms (32%); the routed GEMV and the lm_head are at roofline. R15 S12 landed
+the copy/shared-expert overlap (+2.4%); the rest of the copy is miss bytes, so
+R13 (a hot expert set) is the next decode lever. **The two FreeToken decode
 kernel ports are in and measured neutral** (R15 S9/S10, decision 158): split-K paged decode attention
 (`FERRUM_ATTN_SPLITK`) and the fused router top-k (`FERRUM_FUSED_ROUTER`) move
 captured decode 31.80 -> 32.11 tok/s (+1.0%, inside the run noise, 8 runs per
@@ -1393,13 +1394,14 @@ Standing: 32.2-32.9 tok/s captured at 2048 slots against FreeToken's 47.0 at
   missed experts x 1.775 MiB at the ~13 GB/s PCIe rate -- not any kernel. The
   routed GEMV (2.6) and the lm_head (0.8 + 0.5 readback) are at roofline.
   See `OPTIMIZATION.md` R15 S11.
-- [ ] **R15 S12 overlap the decode expert copy with the shared expert.** The
-  shared block (`moe_gate` 0.7 + `moe_shared_*` 2.5 = ~3.2 ms) does not depend
-  on the routed experts and today runs before the copy. Stage the copy on a
-  second stream after the router, compute the shared expert on the main stream,
-  wait before the routed GEMV: up to ~4 ms (12-14%) with no numerics change and
-  no capture regression (event-ordered cross-stream work is capturable; the
-  prefill harness already does it). **Top decode item.**
+- [x] **R15 S12 overlap the decode copy with the shared expert -- LANDED
+  (2026-11-09, decision 161).** `begin_device`/`PendingMoE::finish` stage the
+  slot plan and start the miss copy on a second stream before the shared
+  expert, then wait before the routed GEMV (`FERRUM_MOE_OVERLAP`, default on).
+  Measured 31.85 -> 32.63 tok/s (+2.4%, 4/4 paired, capture green). The win is
+  limited because `index_copy` is a kernel, not a DMA copy: it contends for the
+  same SMs, so only the idle capacity of the small-N shared GEMVs is recovered.
+  The remaining ~8.6 ms of copy is miss bytes -> R13 is the next lever there.
 - [ ] **R15 S3 pin a pre-collected hot expert set** (`locked_fetch` /
   profile-sized pool; online LFU was measured and rejected). Target 2-4 ms.
 

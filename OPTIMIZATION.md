@@ -2497,3 +2497,38 @@ decode graphs survive it. Host source remains the pageable f32 cache; peak RSS
 ~18.6 GiB, MemAvailable low-water above 24 GiB. Open follow-up: real overlap
 (pinned staging + async copies + events) is expected to save ~0.1 s on the
 encode.
+
+### R15 S12: overlap the decode miss copy with the shared expert -- LANDED (2026-11-09)
+
+The one sound overlap S11 left: the shared-expert block does not depend on the
+routed experts, so the miss copy can run on a second stream while the main
+stream computes it, with the main stream waiting only before the routed GEMV.
+Landed behind `FERRUM_MOE_OVERLAP` (default on, `=0` forces the serial path).
+A dedicated non-blocking copy stream and two timing-disabled events are created
+once at adapter construction; `begin_staged` runs `as_i32_ids` +
+`ensure_experts` + `token_table_for` + `group_with_slots` on the main stream,
+records the begin event, makes the copy stream wait on it, runs `copy_missing`
+on the copy stream, records the done event, and returns a handle;
+`finish` waits on the done event, then launches the GEMV and collects.
+
+A/B, captured decode, text-only, auto 2048 slots, 517-token prompt, 128 decoded
+tokens, one load per run, 4 runs per arm order-balanced
+(`/tmp/opencode/bench/overlap/`):
+
+| arm | tg samples (tok/s) | mean | sd |
+| --- | --- | ---: | ---: |
+| overlap (`FERRUM_MOE_OVERLAP=1`) | 32.8 32.0 32.8 32.9 | **32.63** | 0.40 |
+| serial (`=0`) | 32.1 31.6 31.6 32.1 | **31.85** | 0.27 |
+
+**+0.78 tok/s (+2.4%), all four paired comparisons positive**, `pp` unchanged,
+capture still succeeds in every run, and the " Paris" oracle and the
+captured-vs-refeed gate both pass at the same logit deltas as before.
+
+Why only 2.4% and not the ~3.2 ms the shared expert would hide: `copy_missing`
+is the `index_copy` **kernel** reading the pinned host banks over PCIe, not a
+DMA engine copy, so it competes with the shared expert for the same 26 SMs. The
+overlap recovers the idle-SM capacity of the small-N shared GEMVs, not the whole
+copy. A DMA copy would overlap more but needs the miss list on the host, which
+the device-side plan deliberately never produces (a per-layer D2H would cost
+more than it saves). The ~8.6 ms that remains is miss bytes: ~0.15 ms per missed
+expert, so R13's hot set is the only lever left for it.
