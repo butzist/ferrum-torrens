@@ -1,6 +1,17 @@
 # FerrumTorrens -- FreeToken MVP port to Rust: TODO
 
-Status (2026-11-10): **R16 and R17 measured and recorded.** Like-for-like
+Status (2026-11-10): **Shared expert off the critical path: 36.6 -> 47.6 tok/s.**
+`FERRUM_SHARED_BF16=1` moves the shared expert's two GEMVs to bf16 cuBLAS
+(+15%), and a new fused Triton kernel (gate_up+silu*up+se_gate, then down+gating)
+takes it to 47.6 tok/s captured, above FreeToken's 43.4 on the same payload.
+Caveat: the prompt used for R16 (`/tmp/opencode/bench/prompt2.txt`) has a shell
+artifact appended (`EOF\nwc -w ...`), so both engines saw a trailing shell
+command; re-test on a clean prompt before quoting multi-token output. Also open:
+the bf16/fused paths change greedy trajectories (degenerate continuations on the
+truncated prompt) -- near-tie flips from accumulation order, same class as
+decision 164, not yet bounded against the 0.2 contract.
+
+**R16 and R17 measured and recorded.** Like-for-like
 re-profile (identical 379-token payload, 50 W cap): FreeToken captured 43.4 +/-
 0.5 tok/s vs ours 36.6-37.1 (1.17-1.19x), pp ours 292-293 vs FT 274.8; the
 captured-vs-eager 20% gap is confounded (eager generates a degenerate
@@ -33,6 +44,28 @@ R16/R17); items 2, 4, 5 remain open.
    2048 slots; the ~52 figure was from a different slot count/prompt.*
 5. **Vision encode staging** (open since decision 157): 376 -> ~276 ms/encode by
    dropping the per-tensor pageable copy and the full synchronize.
+6. **Autotuned Triton kernels, and revisit the bf16-cuBLAS shared-expert choice.**
+   Every custom kernel's tile is a hand-picked constant (`BLOCK_N=32`,
+   `BLOCK_KW=16`, `DENSE_WARPS=4` in `linear.py`; `BLOCK_H=256`/`BLOCK_SI=128` in
+   the new `shared_expert.py`), never measured per shape. Triton's
+   `@triton.autotune` sweeps `BLOCK_M/N/K`, `num_warps` and `num_stages` and
+   caches the winner
+   (<https://triton-lang.org/main/getting-started/tutorials/03-matrix-multiplication.html>);
+   the same tutorial set covers fused attention, grouped GEMM and block-scaled
+   (NVFP4) matmul, which are exactly our kernel families. Two things to settle:
+   (a) **AOT, not runtime.** There is no runtime JIT (decision 113) and a capture
+   bakes tile stride into the graph, so autotune must run **at build time**: sweep
+   the configs in `aot.py`/the kernel toolchain per shape, then bake the winner's
+   constexprs into the cubin (or emit one cubin per winning config and select by
+   shape at load). A runtime `@triton.autotune` is not an option.
+   (b) **NVFP4xNVFP4 vs bf16.** The docs report NVFP4 tensor-core GEMM beating
+   bf16 on Blackwell-class parts, which challenges the step-1 choice of bf16
+   cuBLAS for the shared expert (36.6 -> 42.4 tok/s) and the fused kernel (2b,
+   -> 47.6 tok/s): both run bf16 now. Re-benchmark the shared expert with an
+   autotuned NVFP4 dense GEMV (the marlin-style `nvfp4_dense_gemv` is the
+   starting point) and revert to NVFP4 if it wins. The same sweep applies to the
+   routed grouped GEMM (`moe_gemm` at 4.2 ms/token, R1/R2 fixed it but never
+   autotuned it) and the paged-attention decode kernel.
 **The decode step is attributed** (R15 S11, decision 160):
 29.2 ms/token, of which `moe_copy` -- the expert miss staging over PCIe -- is
 9.4 ms (32%); the routed GEMV and the lm_head are at roofline. R15 S12 landed
