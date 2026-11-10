@@ -9,7 +9,12 @@ appended (`EOF\nwc -w ...`), which made every arm degenerate; on the clean promp
 all four continuations are coherent but diverge at token 2 (near-tie flips from
 the bf16 weights and the fused kernel's chunked reduction, same class as
 decision 164), so the tg comparison is still trajectory-confounded. Open: a
-like-for-like decode A/B needs both arms on one trajectory.
+like-for-like decode A/B needs both arms on one trajectory. **Prefill->decode
+is sound**: appending "The capital of France is" after the 363-token prompt
+answers " Paris" in both the NVFP4 and bf16 paths, so the quality difference is
+numeric, not a boundary bug. The captured NVFP4 path did crash intermittently at
+~370-token prompts (`CUDA_ERROR_ILLEGAL_ADDRESS`); fixed by not loading the
+fused cubins into every launcher (queued item 7).
 
 **R16 and R17 measured and recorded.** Like-for-like
 re-profile (identical 379-token payload, 50 W cap): FreeToken captured 43.4 +/-
@@ -66,6 +71,22 @@ R16/R17); items 2, 4, 5 remain open.
    starting point) and revert to NVFP4 if it wins. The same sweep applies to the
    routed grouped GEMM (`moe_gemm` at 4.2 ms/token, R1/R2 fixed it but never
    autotuned it) and the paged-attention decode kernel.
+7. **Captured-step buffer stability (mitigated, root cause open).** A captured
+   decode graph bakes every per-step cudarc allocation (router ids/weights,
+   attention/GDN temporaries, the shared-expert GEMV's `a`/`out`), and those
+   slices are freed after capture. It has been dormant, but at ~370-token
+   prompts the NVFP4 captured path intermittently died with
+   `CUDA_ERROR_ILLEGAL_ADDRESS` once the two fused shared-expert cubins were
+   added to *every* `GdnKernels` consumer (more loaded modules shifted the
+   device layout). Mitigation landed: `LINEAR_LOAD_NAMES` excludes the fused
+   pair from the default load set, `SharedExpertFused` loads only its own two
+   (`GdnKernels::load_named`), and the port exists only with
+   `FERRUM_SHARED_BF16=1` (0/5 crashes after; eager was always 0/5, the parent
+   commit 0/7). The real fix is to make the captured step allocation-free with
+   stable scratch buffers (or prove cudarc's capture pool owns the slices for
+   the graph's lifetime). Until then: **a new launcher must not add cubins to
+   the default load set**, and re-run a long-prompt captured A/B after any
+   kernel-set change.
 **The decode step is attributed** (R15 S11, decision 160):
 29.2 ms/token, of which `moe_copy` -- the expert miss staging over PCIe -- is
 9.4 ms (32%); the routed GEMV and the lm_head are at roofline. R15 S12 landed
