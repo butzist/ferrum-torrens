@@ -891,10 +891,16 @@ pub fn linear_cubin(name: &str) -> Result<&'static [u8], MoEError> {
             include_bytes!(concat!(env!("OUT_DIR"), "/kernel/nvfp4_dense_gemv.cubin"))
         }
         SHARED_EXPERT_PHASE1 => {
-            include_bytes!(concat!(env!("OUT_DIR"), "/kernel/shared_expert_phase1.cubin"))
+            include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/kernel/shared_expert_phase1.cubin"
+            ))
         }
         SHARED_EXPERT_PHASE2 => {
-            include_bytes!(concat!(env!("OUT_DIR"), "/kernel/shared_expert_phase2.cubin"))
+            include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/kernel/shared_expert_phase2.cubin"
+            ))
         }
         FP8_GEMV => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/fp8_gemv.cubin")),
         FP8_SPLITK_REDUCE => {
@@ -996,8 +1002,12 @@ fn linear_ptx(name: &str) -> &'static str {
         RMSNORM_GATED => include_str!(concat!(env!("OUT_DIR"), "/kernel/rmsnorm_gated.ptx")),
         GDN_TRI_SOLVE => include_str!(concat!(env!("OUT_DIR"), "/kernel/gdn_tri_solve.ptx")),
         NVFP4_DENSE_GEMV => include_str!(concat!(env!("OUT_DIR"), "/kernel/nvfp4_dense_gemv.ptx")),
-        SHARED_EXPERT_PHASE1 => include_str!(concat!(env!("OUT_DIR"), "/kernel/shared_expert_phase1.ptx")),
-        SHARED_EXPERT_PHASE2 => include_str!(concat!(env!("OUT_DIR"), "/kernel/shared_expert_phase2.ptx")),
+        SHARED_EXPERT_PHASE1 => {
+            include_str!(concat!(env!("OUT_DIR"), "/kernel/shared_expert_phase1.ptx"))
+        }
+        SHARED_EXPERT_PHASE2 => {
+            include_str!(concat!(env!("OUT_DIR"), "/kernel/shared_expert_phase2.ptx"))
+        }
         FP8_GEMV => include_str!(concat!(env!("OUT_DIR"), "/kernel/fp8_gemv.ptx")),
         FP8_SPLITK_REDUCE => {
             include_str!(concat!(env!("OUT_DIR"), "/kernel/fp8_splitk_reduce.ptx"))
@@ -2063,9 +2073,7 @@ pub fn shared_expert_phase1_args(
 }
 
 /// The phase-1 grid: one program per output element of ic2 (SI programs).
-pub fn shared_expert_phase1_grid(
-    si: usize,
-) -> (u32, u32, u32) {
+pub fn shared_expert_phase1_grid(si: usize) -> (u32, u32, u32) {
     (si as u32, 1, 1)
 }
 
@@ -2101,9 +2109,7 @@ pub fn shared_expert_phase2_args(
 }
 
 /// The phase-2 grid: one program per output element of out (H programs).
-pub fn shared_expert_phase2_grid(
-    h: usize,
-) -> (u32, u32, u32) {
+pub fn shared_expert_phase2_grid(h: usize) -> (u32, u32, u32) {
     (h as u32, 1, 1)
 }
 

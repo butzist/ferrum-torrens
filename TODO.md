@@ -1,15 +1,15 @@
 # FerrumTorrens -- FreeToken MVP port to Rust: TODO
 
-Status (2026-11-10): **Shared expert off the critical path: 36.6 -> 47.6 tok/s.**
-`FERRUM_SHARED_BF16=1` moves the shared expert's two GEMVs to bf16 cuBLAS
-(+15%), and a new fused Triton kernel (gate_up+silu*up+se_gate, then down+gating)
-takes it to 47.6 tok/s captured, above FreeToken's 43.4 on the same payload.
-Caveat: the prompt used for R16 (`/tmp/opencode/bench/prompt2.txt`) has a shell
-artifact appended (`EOF\nwc -w ...`), so both engines saw a trailing shell
-command; re-test on a clean prompt before quoting multi-token output. Also open:
-the bf16/fused paths change greedy trajectories (degenerate continuations on the
-truncated prompt) -- near-tie flips from accumulation order, same class as
-decision 164, not yet bounded against the 0.2 contract.
+Status (2026-11-10): **Shared expert off the critical path; clean-prompt re-run
+done.** `FERRUM_SHARED_BF16=1` moves the shared expert's two GEMVs to bf16
+cuBLAS (+15%), and a new fused Triton kernel (gate_up+silu*up+se_gate, then
+down+gating) takes captured decode to 40.7 tok/s on the clean 363-token prompt
+vs FreeToken's 36.3 (1.12x), both pp ahead. The R16 payload had a shell artifact
+appended (`EOF\nwc -w ...`), which made every arm degenerate; on the clean prompt
+all four continuations are coherent but diverge at token 2 (near-tie flips from
+the bf16 weights and the fused kernel's chunked reduction, same class as
+decision 164), so the tg comparison is still trajectory-confounded. Open: a
+like-for-like decode A/B needs both arms on one trajectory.
 
 **R16 and R17 measured and recorded.** Like-for-like
 re-profile (identical 379-token payload, 50 W cap): FreeToken captured 43.4 +/-

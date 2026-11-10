@@ -432,6 +432,9 @@ fn measure(engine: &Engine) {
     eprintln!("pp: {pp_tokens} prompt tokens in {prefill_s:.2}s = {pp:.1} tok/s");
     eprintln!("tg: {tg_tokens} tokens, {decoded} decoded in {decode_s:.2}s = {tg:.1} tok/s");
     eprintln!("generated ids: {tokens:?}");
+    if let Ok(text) = engine.decode(&tokens) {
+        eprintln!("decoded text: {text:?}");
+    }
     // Steady per-token cost means a fixed per-step cost (staging/graph); a
     // growing cost means decode is re-reading prefix state.
     let (min, max) = (

@@ -2768,6 +2768,38 @@ fp16 is a legitimate space saving) is open; no change made.
 numbers above are not directly comparable to R14b's 47.0 tok/s (FT) / 32.9
 (ours) absolute, only to each other within this session.
 
+**Clean-prompt re-run (2026-11-10).** The R16 payload file
+(`/tmp/opencode/bench/prompt2.txt`) has a shell artifact appended
+(`\nEOF\nwc -w /tmp/opencode/bench/prompt2.txt`), i.e. both engines saw a
+trailing shell command, and on that prompt every arm produced a degenerate
+continuation (FT picked `<|im_end|>` then a thinking trace; ours picked digits).
+Re-ran on the clean 363-token prose (`/tmp/scratchpad/prompt-clean.txt`, the
+same text with the artifact cut), 128 greedy tokens, captured, one process per
+arm:
+
+| arm | pp tok/s | tg tok/s | first 128 decoded tokens |
+|---|---:|---:|---|
+| FreeToken 0.2.1 | 259 (ttft 1.40 s) | 36.3 | continues the prose ("The history of the printing press begins ... Printers experimented constantly ...") |
+| ours NVFP4 | 277.0 | 30.9 | continues the prose (with a stray `pUqmSj7Azl` prefix), same paragraph |
+| ours bf16 cuBLAS | 273.1 | 33.5 | writes a multiple-choice quiz with four identical options, then a `<think>` analysis |
+| ours bf16 + fused kernel | 276.8 | 40.7 | numbered list ("1. 2. 3. ... 26.") |
+
+So on a clean prompt the bf16+fused arm is **1.12x FT's decode** (40.7 vs 36.3)
+and ahead on pp, but the comparison is **still confounded by the trajectory**:
+the fused arm emits a numbered list (low routing diversity, few misses) while FT
+continues the prose (more diverse routing, more misses). The four trajectories
+diverge from token 2 (all agree on the first `\n\n`), which is the same
+near-tie/accumulation-order effect as decision 164: bf16-vs-NVFP4 weights and
+the fused kernel's chunked reduction each change the reduction order, and a
+near-tie at the end of this prompt (the model wants to re-emit the paragraph or
+start a thinking trace) flips the argmax and cascades. NVFP4 stays closest to
+FT's trajectory. None of these is "garbage" (no NaN, no out-of-vocab, no
+repeated single token) -- the earlier "0000"/"1111" runs were the tainted
+prompt's fault, not the kernels'. What remains open is a bounded claim: the
+per-step logits are inside the 0.2 contract, but greedy trajectories over 128
+tokens are not comparable, so a like-for-like throughput number needs both arms
+on one trajectory (feed one arm's ids to the other) and a non-degenerate prompt.
+
 ## R17 -- CPU-side miss compute (FreeToken's hybrid split) (measured 2026-11-10)
 
 `ft bench bw` on the R16 venv, RTX 5060 Laptop, AMD Ryzen 7 8745HX (16 cores),

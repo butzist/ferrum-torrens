@@ -376,44 +376,43 @@ fn load_layer(
         if let DenseWeight::Bf16(w) = &mut gate_up.w
             && let Some(scale) = gate_up.row_scale.take()
         {
-                let rows = w.shape()[0];
-                let cols = w.shape()[1];
-                let vals: Vec<f32> = w.to_host_f32().unwrap_or_default();
-                let globals: Vec<f32> = scale.to_host_f32().unwrap_or_default();
-                let mut out = Vec::with_capacity(rows * cols);
-                for r in 0..rows {
-                    let g = globals[r];
-                    for c in 0..cols {
-                        out.push(vals[r * cols + c] * g);
-                    }
+            let rows = w.shape()[0];
+            let cols = w.shape()[1];
+            let vals: Vec<f32> = w.to_host_f32().unwrap_or_default();
+            let globals: Vec<f32> = scale.to_host_f32().unwrap_or_default();
+            let mut out = Vec::with_capacity(rows * cols);
+            for r in 0..rows {
+                let g = globals[r];
+                for c in 0..cols {
+                    out.push(vals[r * cols + c] * g);
                 }
-                let new_t = ld.tensor(Loader::from_f32(&out), &[rows, cols])
-                    .unwrap_or_else(|_| (**w).clone());
-                *w = Box::new(new_t);
             }
+            let new_t = ld
+                .tensor(Loader::from_f32(&out), &[rows, cols])
+                .unwrap_or_else(|_| (**w).clone());
+            *w = Box::new(new_t);
+        }
         if let DenseWeight::Bf16(w) = &mut down.w
             && let Some(scale) = down.row_scale.take()
         {
-                let rows = w.shape()[0];
-                let cols = w.shape()[1];
-                let vals: Vec<f32> = w.to_host_f32().unwrap_or_default();
-                let globals: Vec<f32> = scale.to_host_f32().unwrap_or_default();
-                let mut out = Vec::with_capacity(rows * cols);
-                for r in 0..rows {
-                    let g = globals[r];
-                    for c in 0..cols {
-                        out.push(vals[r * cols + c] * g);
-                    }
+            let rows = w.shape()[0];
+            let cols = w.shape()[1];
+            let vals: Vec<f32> = w.to_host_f32().unwrap_or_default();
+            let globals: Vec<f32> = scale.to_host_f32().unwrap_or_default();
+            let mut out = Vec::with_capacity(rows * cols);
+            for r in 0..rows {
+                let g = globals[r];
+                for c in 0..cols {
+                    out.push(vals[r * cols + c] * g);
                 }
-                let new_t = ld.tensor(Loader::from_f32(&out), &[rows, cols])
-                    .unwrap_or_else(|_| (**w).clone());
-                *w = Box::new(new_t);
             }
+            let new_t = ld
+                .tensor(Loader::from_f32(&out), &[rows, cols])
+                .unwrap_or_else(|_| (**w).clone());
+            *w = Box::new(new_t);
+        }
     }
-    let shared = Shared {
-        gate_up,
-        down,
-    };
+    let shared = Shared { gate_up, down };
     Ok(Layer {
         input_norm,
         post_norm,
