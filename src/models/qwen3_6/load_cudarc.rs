@@ -358,9 +358,20 @@ fn load_layer(
         &[params.num_experts, h],
     )?;
     let shared_gate = ld.bf16_shape(&format!("{p}.mlp.shared_expert_gate.weight"), h, &[1, h])?;
+    // `FERRUM_SHARED_BF16=1` keeps the shared expert's NVFP4 banks out of the
+    // Dense, so `apply_dense` takes the bf16 cuBLAS path instead of the
+    // NVFP4 dense GEMV. Experiment lever: the NVFP4 dense GEMV is launch-bound
+    // on these small shapes (R15 S7), and cuBLAS tensor cores may be faster.
+    let shared_bf16 = std::env::var("FERRUM_SHARED_BF16").ok().as_deref() == Some("1");
+    let mut gate_up = ld.dense(&format!("{p}.mlp.shared_expert.gate_up_proj.weight"))?;
+    let mut down = ld.dense(&format!("{p}.mlp.shared_expert.down_proj.weight"))?;
+    if shared_bf16 {
+        gate_up.nvfp4 = None;
+        down.nvfp4 = None;
+    }
     let shared = Shared {
-        gate_up: ld.dense(&format!("{p}.mlp.shared_expert.gate_up_proj.weight"))?,
-        down: ld.dense(&format!("{p}.mlp.shared_expert.down_proj.weight"))?,
+        gate_up,
+        down,
     };
     Ok(Layer {
         input_norm,
