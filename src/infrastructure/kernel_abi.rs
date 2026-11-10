@@ -2555,13 +2555,14 @@ mod tests {
         let abi = abi();
         let gate_up = abi.kernel(GEMV_GATE_UP).unwrap();
         let routes = 3 * abi.top_k;
-        // The routed GEMV tiles 16 output columns per program (OPTIMIZATION.md
-        // R1): gate_up N=1024, down N=2048. The silu tile is 256, the reduce 128.
-        assert_eq!(gate_up.block, 16);
-        assert_eq!(grid(routes, gate_up), (routes as u32, 64, 1));
+        // The routed GEMV tiles 8 output columns per program (the 2026-11-10
+        // autotune: BLOCK_N=8, BLOCK_KW=64, warps=2): gate_up N=1024, down
+        // N=2048. The silu tile is 256, the reduce 128.
+        assert_eq!(gate_up.block, 8);
+        assert_eq!(grid(routes, gate_up), (routes as u32, 128, 1));
         assert_eq!(
             grid(routes, abi.kernel(GEMV_DOWN).unwrap()),
-            (routes as u32, 128, 1)
+            (routes as u32, 256, 1)
         );
         assert_eq!(
             grid(routes, abi.kernel(SILU_MUL).unwrap()),
@@ -2730,7 +2731,9 @@ mod tests {
         assert_eq!(kernel.constexpr("NUM_Q_HEADS").unwrap(), 16);
         assert_eq!(kernel.constexpr("NUM_KV_HEADS").unwrap(), 2);
         assert_eq!(kernel.constexpr("HEAD_DIM").unwrap(), 256);
-        assert_eq!(kernel.constexpr("BLOCK_N").unwrap(), 64);
+        // The 2026-11-10 autotune measured BLOCK_N=128 at 8 warps (+42% at both
+        // 362 and 1024 tokens) over the old 64.
+        assert_eq!(kernel.constexpr("BLOCK_N").unwrap(), 128);
     }
 
     #[test]

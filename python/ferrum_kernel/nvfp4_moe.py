@@ -53,9 +53,9 @@ _E2M1_VALUES = (
 # a narrow N block and a deferred [BLOCK_KW, BLOCK_N] partial. These came from
 # upstream's offline sweep (BLOCK_N=16, BLOCK_KW=16 == 128 k-values/iter) and are
 # fixed rather than autotuned, because decode runs inside a CUDA graph.
-GEMV_BLOCK_N = 16
-GEMV_BLOCK_KW = 16
-GEMV_WARPS = 4
+GEMV_BLOCK_N = 8
+GEMV_BLOCK_KW = 64
+GEMV_WARPS = 2
 
 # The top_k collapse at the end of a layer reads one row per route and is not
 # bandwidth bound, so it keeps the wide tile.

@@ -30,7 +30,7 @@ import triton.language as tl
 
 # The key tile. A constexpr, so it is baked into the cubin and recorded in the
 # manifest (signatures.SERVING_ATTN_BLOCK_N).
-DECODE_BLOCK_N = 64
+DECODE_BLOCK_N = 128
 
 # Split-K constants (FreeToken decode_paged_attention).
 MIN_BLOCK_KV = 32

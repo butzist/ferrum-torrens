@@ -94,6 +94,19 @@ R16/R17); items 2, 4, 5 remain open.
    tiled (BLOCK_N=16/KW=64), so the right fix there is to fuse the epilogue, not
    to change dtype. On an arch with much higher bandwidth per ALU the fp16
    crossover could move; re-run this comparison per arch before deciding.
+   **Routed GEMV and attention swept and baked (2026-11-10).** Routed decode
+   GEMV (`_nvfp4_gemv_kernel`, one launch per layer per part): current
+   BLOCK_N=16/KW=16/warps=4 is 80.7 us gate_up + 34.3 us down; the one shared
+   config **BLOCK_N=8/KW=64/warps=2** is 50.1 + 22.3 us, ~1.7 ms/token saved
+   across 40 layers (both shapes want the same config, so one cubin still
+   serves both; `aot.py` now records `num_warps`). Paged decode attention:
+   **BLOCK_N=128 at 8 warps** beats 64 at 8 by 42% at both `pos=362`
+   (35.1 -> 20.3 us) and `pos=1024` (83.7 -> 48.6 us), ~0.15-0.35 ms/token
+   (eager `attn_sdpa` is the dense path, so only captured decode shows it).
+   End-to-end NVFP4 clean prompt: 30.3 -> 31.9-32.0 tok/s (+5%), consistent
+   with the ~1.7 ms/token kernel win though still trajectory-confounded. The
+   prefill grouped GEMM was already swept in R10.8 (N=64 at 4 warps), so it was
+   not re-swept.
 7. **Captured-step buffer stability (mitigated, root cause open).** A captured
    decode graph bakes every per-step cudarc allocation (router ids/weights,
    attention/GDN temporaries, the shared-expert GEMV's `a`/`out`), and those

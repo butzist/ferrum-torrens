@@ -29,8 +29,16 @@ import sys
 import torch
 import triton
 
+from .attention import _paged_attention_decode_kernel
 from .linear import DENSE_BLOCK_KW, DENSE_BLOCK_N, DENSE_WARPS, _nvfp4_dense_gemv_kernel
-from .nvfp4_moe import _E2M1_VALUES
+from .nvfp4_moe import (
+    GEMV_BLOCK_KW,
+    GEMV_BLOCK_N,
+    GEMV_WARPS,
+    _E2M1_VALUES,
+    _e2m1_lut,
+    _nvfp4_gemv_kernel,
+)
 
 
 # The serving geometry (the checkpoint's hidden/inter/vocab).
@@ -163,6 +171,164 @@ def bench_dequant(shape, device) -> float:
     return start.elapsed_time(end)
 
 
+# The routed decode GEMV, per layer (one launch per layer per part). `routes`
+# is `tokens * top_k` at bs=1; the real step runs 40 of these.
+GROUPED_SHAPES = {
+    # name: (routes, m, n, k, mul_weight, a_row_is_route)
+    "routed_gate_up": (8, 1, 2 * INTER, HIDDEN, False, False),
+    "routed_down": (8, 1, HIDDEN, INTER, True, True),
+}
+GROUPED_SLOTS = 256  # the config floor; timing depends on the routes read, not S
+
+
+def make_grouped_case(routes, m, n, k, slots, device, seed=0):
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    s = slots
+    # Slot banks: [S, N, K // 2] u8 viewed as [S, N, K // 8] int32, plus
+    # [S, N, K // 16] e4m3 scales and [S, N] f16 globals.
+    packed_u8 = torch.randint(0, 256, (s, n, k // 2), generator=g, dtype=torch.uint8).to(device)
+    packed = packed_u8.view(torch.int32)
+    block = torch.rand((s, n, k // 16), generator=g) * 2.0 + 0.25
+    scale = block.to(torch.float8_e4m3fn).to(device)
+    glob = (torch.rand((s, n), generator=g) * 1.5 + 0.5).to(torch.float16).to(device)
+    rows = max(m, routes)
+    a = (torch.rand((rows, k), generator=g) * 2.0 - 1.0).to(device).to(torch.bfloat16)
+    c = torch.empty((routes, n), dtype=torch.bfloat16, device=device)
+    route_token = torch.randint(0, m, (routes,), generator=g, dtype=torch.int32).to(device)
+    route_slot = torch.randint(0, s, (routes,), generator=g, dtype=torch.int32).to(device)
+    route_weight = torch.rand((routes,), generator=g).to(torch.float32).to(device)
+    return a, packed, scale, glob, c, route_token, route_slot, route_weight
+
+
+def launch_grouped(
+    a, packed, scale, glob, c, route_token, route_slot, route_weight,
+    mul_weight, a_row_is_route, block_n, block_kw, warps,
+):
+    m, k = a.shape
+    _, n, _ = packed.shape
+    grid = (route_slot.numel(), triton.cdiv(n, block_n))
+    _nvfp4_gemv_kernel[grid](
+        a, packed, scale, glob, c, route_token, route_slot, route_weight,
+        _e2m1_lut(a.device),
+        m, n,
+        a.stride(0), a.stride(1),
+        packed.stride(0), packed.stride(1), packed.stride(2),
+        scale.stride(0), scale.stride(1), scale.stride(2),
+        glob.stride(0), glob.stride(1),
+        c.stride(0), c.stride(1),
+        K_WORDS=k // 8,
+        BLOCK_N=block_n,
+        BLOCK_KW=block_kw,
+        MUL_WEIGHT=mul_weight,
+        A_ROW_IS_ROUTE=a_row_is_route,
+        num_warps=warps,
+    )
+
+
+def bench_grouped(shape, block_n, block_kw, warps, slots, device) -> float:
+    routes, m, n, k, mul_weight, a_row = shape
+    case = make_grouped_case(routes, m, n, k, slots, device)
+    try:
+        fn = lambda: launch_grouped(
+            *case, mul_weight, a_row, block_n, block_kw, warps
+        )
+        fn()
+        torch.cuda.synchronize()
+        return triton.testing.do_bench(fn, warmup=25, rep=100)
+    except Exception as e:  # noqa: BLE001
+        print(f"    skip BLOCK_N={block_n} BLOCK_KW={block_kw} warps={warps}: {e}", file=sys.stderr)
+        return float("inf")
+
+
+# The paged decode attention: one program per (row, q_head), looping the KV
+# window in BLOCK_N tiles. The serving geometry is 16 q heads / 2 kv heads at
+# 256 dims; the window is max_seq_len (4096) and `pos` is the token position.
+ATTN_QH = 16
+ATTN_KVH = 2
+ATTN_DIM = 256
+ATTN_WINDOW = 4096
+
+
+def bench_attn(pos: int, block_n: int, warps: int, device) -> float:
+    rows = 1
+    q = torch.randn((rows, ATTN_QH, ATTN_DIM), device=device).to(torch.bfloat16)
+    k = torch.randn((ATTN_WINDOW, ATTN_KVH, ATTN_DIM), device=device).to(torch.bfloat16)
+    v = torch.randn((ATTN_WINDOW, ATTN_KVH, ATTN_DIM), device=device).to(torch.bfloat16)
+    locs = torch.arange(ATTN_WINDOW, device=device, dtype=torch.int32).reshape(1, ATTN_WINDOW).contiguous()
+    positions = torch.tensor([pos], device=device, dtype=torch.int32)
+    out = torch.empty((rows, ATTN_QH, ATTN_DIM), device=device).to(torch.bfloat16)
+
+    def fn():
+        _paged_attention_decode_kernel[(rows, ATTN_QH)](
+            q, k, v, locs, positions, out,
+            ATTN_WINDOW,
+            NUM_Q_HEADS=ATTN_QH,
+            NUM_KV_HEADS=ATTN_KVH,
+            HEAD_DIM=ATTN_DIM,
+            BLOCK_N=block_n,
+            num_warps=warps,
+        )
+
+    fn()
+    torch.cuda.synchronize()
+    return triton.testing.do_bench(fn, warmup=25, rep=100)
+
+
+def run_attn(args, device) -> int:
+    positions = [362, 1024]
+    blocks_n = [16, 32, 64, 128]
+    warps = [1, 2, 4, 8]
+    for pos in positions:
+        base = bench_attn(pos, 64, 8, device)  # DECODE_BLOCK_N, 8 warps (R6)
+        best = (base, (64, 8))
+        print(f"\npaged decode attention pos={pos} (q_heads={ATTN_QH} kv_heads={ATTN_KVH} "
+              f"dim={ATTN_DIM} window={ATTN_WINDOW}): current BLOCK_N=64 warps=8 = {base * 1e3:.3f} us")
+        for bn, w in itertools.product(blocks_n, warps):
+            if (bn, w) == (64, 8):
+                continue
+            us = bench_attn(pos, bn, w, device)
+            if us < best[0]:
+                best = (us, (bn, w))
+            print(f"  BLOCK_N={bn:3} warps={w}: {us * 1e3:8.3f} us")
+        us, (bn, w) = best
+        gain = (base - us) / base * 100.0
+        print(f"  BEST pos={pos}: BLOCK_N={bn} warps={w} = {us * 1e3:.3f} us "
+              f"({gain:+.1f}% vs current, x10 attn layers = {(base - us) * 10:.3f} ms/token saved)")
+    return 0
+
+
+def run_grouped(args, device) -> int:
+    names = [n for n in GROUPED_SHAPES if args.only_grouped_shape in (None, n)]
+    blocks_n = [8, 16, 32, 64]
+    blocks_kw = [8, 16, 32, 64]
+    warps = [1, 2, 4, 8]
+    for name in names:
+        shape = GROUPED_SHAPES[name]
+        routes, m, n, k, mul_weight, a_row = shape
+        base = bench_grouped(shape, GEMV_BLOCK_N, GEMV_BLOCK_KW, GEMV_WARPS, args.slots, device)
+        best = (base, (GEMV_BLOCK_N, GEMV_BLOCK_KW, GEMV_WARPS))
+        print(
+            f"\n{name} (routes={routes} N={n} K={k}, mul_weight={mul_weight}, "
+            f"a_row_is_route={a_row}): current BLOCK_N={GEMV_BLOCK_N} "
+            f"BLOCK_KW={GEMV_BLOCK_KW} warps={GEMV_WARPS} = {base * 1e3:.3f} us "
+            f"(x40 layers = {base * 40:.3f} ms/token)"
+        )
+        for bn, bkw, w in itertools.product(blocks_n, blocks_kw, warps):
+            if (bn, bkw, w) == (GEMV_BLOCK_N, GEMV_BLOCK_KW, GEMV_WARPS):
+                continue
+            ms = bench_grouped(shape, bn, bkw, w, args.slots, device)
+            if ms < best[0]:
+                best = (ms, (bn, bkw, w))
+            print(f"  BLOCK_N={bn:3} BLOCK_KW={bkw:3} warps={w}: {ms * 1e3:8.3f} us")
+        ms, (bn, bkw, w) = best
+        gain = (base - ms) / base * 100.0
+        print(
+            f"  BEST {name}: BLOCK_N={bn} BLOCK_KW={bkw} warps={w} = {ms * 1e3:.3f} us "
+            f"({gain:+.1f}% vs current, x40 = {(base - ms) * 40:.3f} ms/token saved)"
+        )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--no-lm", action="store_true", help="skip the 1 GiB lm_head shape")
@@ -173,12 +339,29 @@ def main(argv: list[str] | None = None) -> int:
         help="compare these weight dtypes: nvfp4 (on-the-fly dequant) and fp16 "
         "(convert once, then a cuBLAS fp16 matmul)",
     )
+    p.add_argument(
+        "--kernel",
+        default="dense",
+        choices=["dense", "grouped", "attention"],
+        help="dense: the lm_head/shared nvfp4 GEMV; grouped: the routed decode GEMV",
+    )
+    p.add_argument(
+        "--only-grouped-shape", default=None, help="bench only this routed shape"
+    )
+    p.add_argument(
+        "--slots", type=int, default=GROUPED_SLOTS, help="slot banks for the grouped bench"
+    )
     p.add_argument("--device", default="cuda")
     args = p.parse_args(argv)
     if not torch.cuda.is_available():
         print("autotune needs a CUDA device", file=sys.stderr)
         return 2
     device = torch.device(args.device)
+
+    if args.kernel == "grouped":
+        return run_grouped(args, device)
+    if args.kernel == "attention":
+        return run_attn(args, device)
 
     names = [n for n in SHAPES if not (args.no_lm and n == "lm_head")]
     if args.only is not None:

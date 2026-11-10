@@ -78,6 +78,7 @@ from .nvfp4_moe import (
     GEMM_BLOCK_N,
     GEMM_WARPS,
     GEMV_BLOCK_N,
+    GEMV_WARPS,
     REDUCE_BLOCK_N,
     _nvfp4_gemv_kernel,
     _nvfp4_grouped_gemm_kernel,
@@ -245,6 +246,7 @@ KERNELS: dict[str, dict] = {
         "constexprs": gate_up_constexprs(),
         "n": SERVING_INTER * 2,
         "block": GEMV_BLOCK_N,
+        "num_warps": GEMV_WARPS,
     },
     "gemv_down": {
         "fn": _nvfp4_gemv_kernel,
@@ -252,6 +254,7 @@ KERNELS: dict[str, dict] = {
         "constexprs": down_constexprs(),
         "n": SERVING_HIDDEN,
         "block": GEMV_BLOCK_N,
+        "num_warps": GEMV_WARPS,
     },
     "grouped_gate_up": {
         "fn": _nvfp4_grouped_gemm_kernel,

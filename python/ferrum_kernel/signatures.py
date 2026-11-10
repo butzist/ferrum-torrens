@@ -48,7 +48,7 @@ class ServingShapes:
     q_heads: int = dataclasses.field(default_factory=lambda: int(os.getenv("FERRUM_SERVING_Q_HEADS", "16")))
     kv_heads: int = dataclasses.field(default_factory=lambda: int(os.getenv("FERRUM_SERVING_KV_HEADS", "2")))
     head_dim: int = dataclasses.field(default_factory=lambda: int(os.getenv("FERRUM_SERVING_HEAD_DIM", "256")))
-    attn_block_n: int = dataclasses.field(default_factory=lambda: int(os.getenv("FERRUM_SERVING_ATTN_BLOCK_N", "64")))
+    attn_block_n: int = dataclasses.field(default_factory=lambda: int(os.getenv("FERRUM_SERVING_ATTN_BLOCK_N", "128")))
     hidden: int = dataclasses.field(default_factory=lambda: int(os.getenv("FERRUM_SERVING_HIDDEN", "2048")))
     inter: int = dataclasses.field(default_factory=lambda: int(os.getenv("FERRUM_SERVING_INTER", "512")))
     top_k: int = dataclasses.field(default_factory=lambda: int(os.getenv("FERRUM_SERVING_TOP_K", "8")))
