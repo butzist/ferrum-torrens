@@ -211,7 +211,9 @@ fn tower() -> CudarcQwen3_6 {
     let text_config = config_json.get("text_config").expect("text_config").clone();
     let params = config::parse_text_config(&text_config).expect("parse text_config");
     let device = Device::Cuda(0);
-    let cache = Arc::new(DeviceCache::new(&params, 160, 1, KvDType::F32, device));
+    // 512 pages so the long-prefix handoff gate can hold a 363-token prefill
+    // plus its decode page; the f32 pool is ~1.25 MiB a token.
+    let cache = Arc::new(DeviceCache::new(&params, 512, 1, KvDType::F32, device));
     let rt = cache.runtime().clone();
     let head_gemv = Arc::new(DenseGemv::new(device, rt.raw_stream()).expect("dense gemv"));
     let fp8 = Arc::new(Fp8Linear::new(device, rt.raw_stream()).expect("fp8 linear"));
@@ -323,4 +325,81 @@ fn the_chunked_gdn_prefill_matches_the_per_token_path() {
         argmax(&stateless_four),
         "cached decode argmax differs from the stateless run"
     );
+}
+
+/// The first decode step inherits the prefill's KV pages, its GDN state slot and
+/// the rope position. A wrong handoff (a dropped tail token, an off-by-one
+/// position, a scrambled recurrent state) shows up here as a step whose logits
+/// disagree with a full refeed of the same prefix, even though the prefill's own
+/// logits are fine. That is the "garbage right after a long prompt" shape: the
+/// first sampled token looks sane because prefill computed it, and the very next
+/// token is off.
+///
+/// Lengths straddle the 64-token GDN prefill chunk and the 128-token chunked
+/// floor, and 363 is five full chunks plus a 43-token partial one (the clean
+/// prose prompt this was reported on).
+#[test]
+#[ignore = "needs a CUDA device and the FTW checkpoint"]
+#[serial]
+fn a_long_prefill_hands_decode_the_same_state_as_a_refeed() {
+    use ferrum_torrens::domain::tokenizer::Tokenizer;
+
+    let model = tower();
+    let tokenizer = ferrum_torrens::infrastructure::tokenizers_hf::HfTokenizer::from_file(
+        &std::path::Path::new(FTW_DIR)
+            .join("tokenizer.json")
+            .to_string_lossy(),
+    )
+    .expect("load the tokenizer");
+    let text = std::env::var("FERRUM_PROBE_PROMPT")
+        .unwrap_or_else(|_| "The quick brown fox jumps over the lazy dog. ".repeat(40));
+    let all = tokenizer.encode(&text).expect("encode");
+    eprintln!("handoff gate: prompt {} tokens", all.len());
+    let kv = model
+        .cache()
+        .expect("the cudarc forward carries a kv cache");
+
+    for len in [7usize, 63, 64, 65, 127, 128, 129, 363] {
+        if all.len() < len {
+            eprintln!("len {len}: prompt too short, skipped");
+            continue;
+        }
+        let ids = &all[..len];
+
+        let mut seq = kv.begin();
+        kv.reserve(&mut seq, len)
+            .expect("reserve the prefill pages");
+        let prefill = model.forward_cached(&input(ids, 0), &mut seq).unwrap();
+        let next = argmax(&prefill) as u32;
+        kv.reserve(&mut seq, 1).expect("reserve the decode page");
+        let decoded = model
+            .forward_cached(&input(&[next], len), &mut seq)
+            .unwrap();
+        kv.end(&mut seq);
+
+        let mut refed_ids = ids.to_vec();
+        refed_ids.push(next);
+        let refed = model.forward(&input(&refed_ids, 0));
+
+        let (a, b) = (argmax(&decoded), argmax(&refed));
+        let scale = refed.iter().fold(0.0f32, |acc, v| acc.max(v.abs()));
+        let max_d = decoded
+            .iter()
+            .zip(&refed)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        eprintln!(
+            "len {len:>3}: prefill next {next} {:?}; decode argmax {a} {:?} vs refeed {b} {:?}, \
+             top|d| {:.3e}, max|d|/scale {:.3e}",
+            tokenizer.decode(&[next]).unwrap_or_default(),
+            tokenizer.decode(&[a as u32]).unwrap_or_default(),
+            tokenizer.decode(&[b as u32]).unwrap_or_default(),
+            (decoded[a] - refed[b]).abs(),
+            max_d / scale,
+        );
+        assert_eq!(
+            a, b,
+            "len {len}: the cached decode step and a full refeed disagree on the argmax"
+        );
+    }
 }

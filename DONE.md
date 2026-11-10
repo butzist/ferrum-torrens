@@ -5279,3 +5279,69 @@ subsection names are kept verbatim.
     (decision 164) is therefore closed at the capture-pollution level; a residual
     difference between the host and device LRU implementations, if any, would only
     surface on a prompt where the two would have diverged even with clean state.
+
+165. **The prefill double buffer corrupted the next decode: the overlap decode
+    never left `Prefill` (2026-11-10).** Symptom: the throughput smoke decoded
+    `"\n\n\nThe\nA\nB\nC..."` on the clean 363-token prose prompt, while the
+    FreeToken reference continues `"\nThe history of the printing press..."`.
+    The first sampled token was right in every arm (prefill produced it), and
+    only the first few decode tokens were garbage, which pointed at the
+    prefill->decode handoff.
+    Three new gates first proved the handoff itself is sound:
+    `cudarc_model::a_long_prefill_hands_decode_the_same_state_as_a_refeed`
+    (tower only, zero-routed MoE, lengths 7/63/64/65/127/128/129/363 -- on both
+    sides of the 64-token GDN prefill chunk and the 128-token chunked floor; the
+    cached decode step and a stateless refeed agree on the argmax everywhere and
+    to max|d|/scale <= 1.4e-2); `tests/long_prefill_decode.rs` (the real serving
+    path: device-staged MoE over pinned host banks; the device step and the
+    host-addressed step are bit-identical, and both are within 3.7e-2 of a full
+    refeed; the only argmax flips are genuine near ties, e.g. "," vs "." on a
+    0.058 logit margin at 256 tokens); and
+    `engine_real_generate::first_tokens_of_a_prose_prompt_without_a_warmup`
+    (since folded into the regression below), which showed a fresh engine
+    predicts `[198, 760, ...]` = `"\nThe history of"` at 363 tokens -- the
+    reference continuation.
+    Root cause: the expert-slot state machine, not the handoff.
+    `grouped_moe_staged` enters `Residency::Prefill` for the whole-layer prefill
+    and leaves it on the first non-prefill step, but the serving decode goes
+    through the overlap entry point `begin_staged`, which never called
+    `leave_prefill`. With the adapter still flagged `Prefill`, the next
+    request's prefill skipped `enter_prefill`/`select_buffer_slots` -- the step
+    that carves the double buffer's contiguous slot window out of the shared
+    decode LRU -- and overwrote slots the LRU still advertised as resident. The
+    following decode then read a prefetched layer's experts instead of the
+    routed expert. It needs a warm cache to show (the smoke's warmup; 2048
+    slots; `prefill_overlap` on, which needs slots >= 2 * 256), has nothing to do
+    with CUDA graphs (eager is equally wrong), and does not depend on prompt
+    length alignment.
+    Fix (two lines in `infrastructure/cuda_moe.rs`): `begin_staged` calls
+    `leave_prefill` before it plans, and a prefill step at layer 0 re-enters
+    `enter_prefill` even when the flag still says `Prefill`, so every request
+    re-selects its buffer window. `FERRUM_PF_DEBUG=1` prints the window start,
+    the retained-expert count and each layer-0 residency, which is how this was
+    found.
+    Regression: `engine_real_generate::a_warmup_request_does_not_corrupt_the_next_decode`
+    runs the prompt, the smoke's exact warmup (the same prompt with a nonce
+    first token), then the prompt again, and requires the first and last runs to
+    match. It failed `[198, 760, 3712, 314]` vs `[198, 271, 16, 220]` before the
+    fix and passes after.
+    Measured after the fix (clean 363-token prompt, captured, 50 W cap, three
+    interleaved reps, one process per arm): NVFP4 shared 30.7 +/- 0.2 tok/s,
+    bf16 shared + fused 31.6 +/- 0.0, bf16 shared + cuBLAS (unfused) 30.1. All
+    three now continue the prose, and the 48-token bf16+fused output is a
+    character-exact prefix of the FreeToken reference's 128-token greedy
+    continuation on the same prompt. On the R16 tainted payload: 35.5-36.0
+    (bf16) and 34.3-36.0 (NVFP4).
+    Consequences: (a) the earlier 47 tok/s, "bf16 is +15%", "40.7 tok/s" and the
+    R16 clean-prompt table were all measured with this bug on top of degenerate
+    trajectories; none is a baseline. (b) The premise that bf16 cuBLAS is the
+    fast path is wrong: the unfused bf16 arm is the slowest of the three,
+    matching the isolated benchmark that the NVFP4 GEMV beats cuBLAS bf16. The
+    win was fusing the shared-expert epilogue (decision 164's follow-up), not the
+    dtype. (c) The divergence at decode token 2 that TODO recorded as a near tie
+    was this bug, not numerics.
+    Open: (i) `CachedExperts::release_cache` resets the host plan but not the
+    device LRU, so a `release_moe`/`rehydrate_moe` pair can leave the device
+    tables pointing at freed slots -- same class of seam, not exercised by
+    text-only serving; (ii) re-baseline the decode rate against a like-for-like
+    FreeToken run on the corrected trajectory (TODO queued item 8).

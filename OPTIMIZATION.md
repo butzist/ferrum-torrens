@@ -2800,6 +2800,34 @@ per-step logits are inside the 0.2 contract, but greedy trajectories over 128
 tokens are not comparable, so a like-for-like throughput number needs both arms
 on one trajectory (feed one arm's ids to the other) and a non-degenerate prompt.
 
+### Corrected after the prefill-overlap fix (2026-11-10, decision 165)
+
+Every decode number above was measured while the whole-layer prefill's slot
+window was overwriting slots the decode LRU still mapped (DONE.md decision
+165). They are therefore invalid, not merely trajectory-confounded: the model
+was reading prefetched layers instead of its routed experts, so the
+continuations and their routing (hence the copy/miss cost) were artifacts.
+
+After the fix (clean 363-token prompt, captured, 50 W cap, three interleaved
+reps, one process per arm):
+
+| arm | tg tok/s | decoded |
+|---|---:|---|
+| NVFP4 shared | 30.7 +/- 0.2 | 127 |
+| bf16 shared + fused kernel | 31.6 +/- 0.0 | 127 |
+| bf16 shared + cuBLAS (unfused) | 30.1 | 127 |
+
+All three now continue the prose, and bf16+fused's 48-token output is a
+character-exact prefix of the FreeToken reference's 128-token greedy
+continuation on the same prompt. Two corrections to the earlier reading:
+(1) bf16 cuBLAS is *not* the fast path -- the unfused bf16 arm is the slowest,
+and the NVFP4 GEMV beats it, exactly as the isolated kernel sweep said; the win
+was fusing the shared-expert epilogue. (2) The 47 tok/s figure and the 1.12x
+"faster than FT" claim came from a degenerate trajectory plus the bug, so the
+honest gap has to be re-measured against FT on the corrected trajectory (TODO
+queued item 8). On the tainted R16 payload the corrected rate is 35.5-36.0
+(bf16) and 34.3-36.0 (NVFP4), against FT's 43.4 on the same payload.
+
 ## R17 -- CPU-side miss compute (FreeToken's hybrid split) (measured 2026-11-10)
 
 `ft bench bw` on the R16 venv, RTX 5060 Laptop, AMD Ryzen 7 8745HX (16 cores),

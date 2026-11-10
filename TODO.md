@@ -1,20 +1,23 @@
 # FerrumTorrens -- FreeToken MVP port to Rust: TODO
 
-Status (2026-11-10): **Shared expert off the critical path; clean-prompt re-run
-done.** `FERRUM_SHARED_BF16=1` moves the shared expert's two GEMVs to bf16
-cuBLAS (+15%), and a new fused Triton kernel (gate_up+silu*up+se_gate, then
-down+gating) takes captured decode to 40.7 tok/s on the clean 363-token prompt
-vs FreeToken's 36.3 (1.12x), both pp ahead. The R16 payload had a shell artifact
-appended (`EOF\nwc -w ...`), which made every arm degenerate; on the clean prompt
-all four continuations are coherent but diverge at token 2 (near-tie flips from
-the bf16 weights and the fused kernel's chunked reduction, same class as
-decision 164), so the tg comparison is still trajectory-confounded. Open: a
-like-for-like decode A/B needs both arms on one trajectory. **Prefill->decode
-is sound**: appending "The capital of France is" after the 363-token prompt
-answers " Paris" in both the NVFP4 and bf16 paths, so the quality difference is
-numeric, not a boundary bug. The captured NVFP4 path did crash intermittently at
-~370-token prompts (`CUDA_ERROR_ILLEGAL_ADDRESS`); fixed by not loading the
-fused cubins into every launcher (queued item 7).
+Status (2026-11-10): **Correctness fixed; the decode rate needs a clean
+baseline.** The garbage at the start of decode after a long prompt was the
+prefill double buffer's residency never leaving `Prefill` on the overlap decode
+path: the next request's prefill then skipped the buffer-window selection and
+overwrote slots the decode LRU still mapped (DONE.md decision 165). With the
+two-line fix, both shared-expert arms continue the clean 363-token prompt
+exactly like FreeToken (the 48-token output is a character-exact prefix of the
+reference's greedy continuation), and captured decode at the 50 W cap is
+30.7 +/- 0.2 tok/s (NVFP4), 31.6 (bf16 shared + fused) and 30.1 (bf16 shared +
+cuBLAS), three interleaved reps each. The old 47 tok/s and the "bf16 cuBLAS is
++15%" result were measured with this bug on degenerate trajectories and are not
+baselines; the corrected numbers also show the NVFP4 GEMV beating cuBLAS bf16,
+with the fused epilogue (not the dtype) supplying the win. **Next: queued item
+8**, attribute the remaining ~1.2x to a like-for-like FreeToken run on the
+corrected trajectory, starting from a stage profile and a miss-rate A/B.
+**Prefill->decode is sound**: 7/63/64/65/127/128/129/256/363-token refeed gates
+agree (decision 165). The captured NVFP4 crash at ~370-token prompts stays
+fixed (no fused cubins in the default load set; queued item 7).
 
 **R16 and R17 measured and recorded.** Like-for-like
 re-profile (identical 379-token payload, 50 W cap): FreeToken captured 43.4 +/-
@@ -104,7 +107,8 @@ R16/R17); items 2, 4, 5 remain open.
    (35.1 -> 20.3 us) and `pos=1024` (83.7 -> 48.6 us), ~0.15-0.35 ms/token
    (eager `attn_sdpa` is the dense path, so only captured decode shows it).
    End-to-end NVFP4 clean prompt: 30.3 -> 31.9-32.0 tok/s (+5%), consistent
-   with the ~1.7 ms/token kernel win though still trajectory-confounded. The
+   with the ~1.7 ms/token kernel win though still trajectory-confounded.
+   (Pre-decision-165 numbers on a corrupt trajectory; see queued item 8.) The
    prefill grouped GEMM was already swept in R10.8 (N=64 at 4 warps), so it was
    not re-swept.
    **Torch dependency of the autotune (checked 2026-11-10).** The measurement
@@ -135,7 +139,41 @@ R16/R17); items 2, 4, 5 remain open.
    stable scratch buffers (or prove cudarc's capture pool owns the slices for
    the graph's lifetime). Until then: **a new launcher must not add cubins to
    the default load set**, and re-run a long-prompt captured A/B after any
-   kernel-set change.
+   kernel-set change. The same seam class exists in
+   `CachedExperts::release_cache`: it resets the host plan but not the device
+   LRU, so a `release_moe`/`rehydrate_moe` pair can leave the device tables
+   pointing at freed slots (decision 165 open item; text-only serving never
+   calls it, so it is not gated).
+8. **Re-baseline the decode rate on the corrected trajectory** (decision 165).
+   The prefill-overlap bug made every prior decode number (the 47 tok/s, R16's
+   43.4 vs 36.6-37.1, the clean-prompt 40.7/33.5/30.9 table) invalid, so the
+   "where did the speed go" question is really "what does the honest gap look
+   like". Do it in this order, one process at a time under
+   `prlimit --as=68719476736`:
+   (a) stage profile of the corrected run:
+   `FT_PROFILE=1 FERRUM_SMOKE_GRAPH=0 FERRUM_SMOKE_TOKENS=48` on
+   `/tmp/scratchpad/prompt-clean.txt`, both `FERRUM_SHARED_BF16=1` and unset;
+   the pre-fix profile recorded `total 28.1 ms/token`, `moe_copy` 9.4,
+   `moe_shared_epi` 9.4, `moe_shared_gemm` 1.35 (`moe_shared_fused` replaces
+   the last two under bf16). Re-run R15 S11's attribution on the new trajectory
+   rather than trusting that split.
+   (b) miss-rate A/B: `FT_MISS_TRACE=1` (eager) on the clean prompt at 128
+   tokens, same two arms. A degenerate/repetitive trajectory routes more
+   coherently and can have a different miss count; R15 S13 recorded 106
+   misses/step on a repetitive prompt and 38 on varied prose at 0.125 ms/miss,
+   so a 30.7 vs 36 tok/s split is ~20-40 misses/step and needs the real number.
+   (c) like-for-like FreeToken: restart the reference server on
+   `.model-cache/bench/ftw-ref-14119b8` and ask for the same clean prompt with
+   `temperature=0, top_k=1, top_p=1, max_tokens=128` (the server defaults to
+   the model's temp 1.0 / top_k 20, so pass them explicitly; `/v1/completions`
+   on port 1926 is the recipe used on 2026-11-10). Its R16 43.4 was on the
+   tainted payload and its own converter, so the clean-prompt number must be
+   measured, not carried over.
+   (d) only then choose a lever: if the corrected profile is still copy-bound,
+   the options are cache capacity or a better prefetch; if the shared-expert
+   epilogue is now the largest stage, the NVFP4 fused-epilogue kernel
+   (`shared_expert.py` currently bf16-only) is the one that lets NVFP4 keep its
+   faster GEMV *and* drop the epilogue.
 **The decode step is attributed** (R15 S11, decision 160):
 29.2 ms/token, of which `moe_copy` -- the expert miss staging over PCIe -- is
 9.4 ms (32%); the routed GEMV and the lm_head are at roofline. R15 S12 landed

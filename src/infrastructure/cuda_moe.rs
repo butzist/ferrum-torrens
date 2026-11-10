@@ -1555,8 +1555,22 @@ impl CudaMoE {
         // layer and one GEMV pass, no per-chunk `lru_ensure`. Anything smaller
         // stays on the flat LRU. Entering the prefill frees only the buffer
         // slots; the rest of the decode LRU survives (TODO.md item 24).
-        if self.is_prefill_step(tokens * top_k)? {
-            if self.residency != Residency::Prefill {
+        let pf_step = self.is_prefill_step(tokens * top_k)?;
+        if req.layer == 0 && std::env::var_os("FERRUM_PF_DEBUG").is_some() {
+            eprintln!(
+                "[pfdbg] step layer=0 tokens={tokens} routes={} prefill_step={pf_step} residency={:?}",
+                tokens * top_k,
+                self.residency
+            );
+        }
+        if pf_step {
+            // A prefill sequence starts at layer 0, and a fresh sequence must
+            // re-select its buffer window even when the adapter is still flagged
+            // `Prefill`: the window selection is what frees those slots from the
+            // decode LRU, so skipping it lets this prefill overwrite slots the
+            // LRU still advertises as resident and the following decode reads a
+            // prefetched layer instead of the routed expert.
+            if req.layer == 0 || self.residency != Residency::Prefill {
                 self.enter_prefill()?;
             }
             return self.prefill_layer(req.layer, x, experts, weights, out_t, top_k);
@@ -1727,6 +1741,14 @@ impl CudaMoE {
             let mut id_of_slot = st.id_of_slot.to_host_i32()?;
             let mut slot_for_id = st.slot_for_id.to_host_i32()?;
             let mut usage = st.usage.to_host_i64()?;
+            if std::env::var_os("FERRUM_PF_DEBUG").is_some() {
+                let retained = id_of_slot.iter().filter(|id| **id >= 0).count();
+                let warm = usage.iter().filter(|u| **u > 0).count();
+                eprintln!(
+                    "[pfdbg] select window_start={start} buffer={buffer} slots={} retained={retained} warm_usage={warm}",
+                    st.id_of_slot.numel()
+                );
+            }
             for &victim in &victims {
                 let slot = victim as usize;
                 let id = id_of_slot[slot];
@@ -2078,6 +2100,29 @@ impl CudaMoE {
         self.copy_missing(layer)?;
         substep_end(&self.rt, "moe_copy", sp);
         self.probe_misses(layer);
+        if layer == 0 && std::env::var_os("FERRUM_PF_DEBUG").is_some() {
+            let slots_host = slots.to_host_i32()?;
+            let misses = self
+                .device_staging
+                .as_ref()
+                .and_then(|st| st.num.to_host_i64().ok())
+                .and_then(|v| v.first().copied())
+                .unwrap_or(-1);
+            let window = self
+                .prefill
+                .as_ref()
+                .map(|pf| {
+                    (
+                        pf.window_start,
+                        2 * self.device_staging.as_ref().map_or(0, |s| s.experts),
+                    )
+                })
+                .unwrap_or((0, 0));
+            eprintln!(
+                "[pfdbg] decode layer 0 window={window:?} misses={misses} slots={:?}",
+                &slots_host[..slots_host.len().min(8)]
+            );
+        }
 
         // A fresh pageable H2D here would be recorded with a host pointer that
         // dies before a captured graph replays, so reuse the device table.
@@ -2427,6 +2472,13 @@ impl ExpertGemm for Mutex<CudaMoE> {
         let experts = device_tensor(req.experts, "the expert ids")?;
         let weights = device_tensor(req.weights, "the weights")?;
 
+        // A decode step always ends the prefill residency, even when it runs
+        // through this overlap entry point rather than `grouped_moe_staged`.
+        // Leaving it flagged `Prefill` across a decode is what used to hide the
+        // next request's missing buffer-window re-selection.
+        if guard.residency == Residency::Prefill {
+            guard.leave_prefill()?;
+        }
         // First half on the main stream: slot plan + group assembly.
         let slots = as_i32_ids(experts, routes, guard.runtime())?;
         guard.ensure_experts(req.layer, &slots)?;

@@ -249,6 +249,57 @@ fn logit_lens_locates_the_first_bad_layer() {
     }
 }
 
+/// Top-5 logits at the first two decode steps of a prose prompt, so a greedy
+/// trajectory that diverges from the FreeToken reference can be told apart from
+/// a genuine numerics bug: a near tie (the reference's token inside a few
+/// hundredths of the argmax) is the reduction-order effect decision 164 already
+/// records, while a large margin on a template token would be a real defect.
+///
+///   FERRUM_PROBE_PROMPT="$(cat /tmp/scratchpad/prompt-clean.txt)" \
+///     cargo test --release --features cudarc --test engine_real_generate -- \
+///     first_decode_steps_margin --ignored --nocapture
+#[test]
+#[ignore = "diagnostic: needs the checkpoint and a CUDA device"]
+#[serial]
+fn first_decode_steps_margin() {
+    let prompt = std::env::var("FERRUM_PROBE_PROMPT").unwrap_or_else(|_| PROMPT.to_string());
+    let engine = load_engine(&config(8)).unwrap();
+    let mut ids = engine.encode(&prompt).unwrap();
+    eprintln!("prompt {} tokens", ids.len());
+    let greedy = greedy(8);
+    let mut rng = Rng::new(0);
+    for step in 0..2 {
+        let input = ferrum_torrens::domain::model::ForwardInput {
+            positions: (0..ids.len() as u32).collect(),
+            mrope_positions: None,
+            input_ids: ids.clone(),
+            answers: vec![],
+            image_embeddings: None,
+            image_positions: None,
+        };
+        let (logits, _) = engine.probe_layers(&input, usize::MAX);
+        let mut ranked: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+        eprintln!("step {step}: prefix {} tokens", ids.len());
+        for (rank, (id, logit)) in ranked.iter().take(5).enumerate() {
+            let text = engine.decode(&[*id as u32]).unwrap_or_default();
+            eprintln!("  {rank} id {id:>6} logit {logit:>9.3}  {text:?}");
+        }
+        let row = || BatchRow {
+            uid: 1,
+            ids: &ids,
+            params: &greedy,
+            images: None,
+        };
+        let next = engine.run_forward(&[row()], &mut rng).unwrap()[0].1;
+        eprintln!(
+            "  argmax {next} {:?}",
+            engine.decode(&[next]).unwrap_or_default()
+        );
+        ids.push(next);
+    }
+}
+
 /// Per-step cost against prefix length, so the fixed per-forward cost (weight
 /// streaming plus per-layer expert dequant) separates from the marginal cost of
 /// one more token. The reference path re-feeds the whole sequence every step,
@@ -280,4 +331,52 @@ fn per_step_cost_scales_with_prefix_length() {
         );
         ids.push(token);
     }
+}
+
+/// The throughput smoke warms the expert cache with one request before it
+/// measures the next, and a warmup must not change what the next request
+/// generates. The serving cache (2048 slots, `prefill_overlap`) runs prefills
+/// through the whole-layer double buffer, which owns a contiguous slot window
+/// carved out of the shared decode LRU; a request boundary that does not reset
+/// that state lets the next prefill overwrite slots the LRU still advertises as
+/// resident, and the following decode reads the prefetched layer instead of the
+/// routed expert. That is the "newlines right after a long prompt" report.
+#[test]
+#[ignore = "needs the checkpoint and a CUDA device; ~17 GiB of pinned host banks"]
+#[serial]
+fn a_warmup_request_does_not_corrupt_the_next_decode() {
+    let prompt = std::env::var("FERRUM_PROBE_PROMPT").unwrap_or_else(|_| PROMPT.to_string());
+    let dir = common::ftw_dir();
+    // The serving shape: the automatic slot count (2048 here), prefill overlap
+    // on, a context above the prefill budget.
+    let cfg: Config = format!(
+        "[model]\npath = \"{dir}\"\ndevice = \"cuda\"\nmax_seq_len = 8192\n\
+         max_output_tokens = 8\nmax_prefill_length = 8192\n\
+         max_running_requests = 1\ncuda_graph = false\ntext_only = true\n\n\
+         [kv]\nnum_tokens = 4096\ndtype = \"f32\"\n\n\
+         [moe]\ncache_size_slots = \"auto\"\nprefill_overlap = true\n\n\
+         [kernel]\ntriton = true\n"
+    )
+    .parse()
+    .unwrap();
+    let engine = load_engine(&cfg).unwrap();
+    let ids = engine.encode(&prompt).unwrap();
+    eprintln!("prompt {} tokens", ids.len());
+
+    let run = |ids: Vec<u32>, n: u32| {
+        let request = make_request(&engine, 1, ids, greedy(n), 0).unwrap();
+        let g = generation::generate(&engine, request).unwrap();
+        (g.tokens, g.text)
+    };
+
+    let (base, base_text) = run(ids.clone(), 4);
+    // Exactly the smoke's warmup: the same prompt with a nonce first token, the
+    // nonce keeping it out of the radix prefix the measured run could adopt.
+    let mut warm = ids.clone();
+    warm.insert(0, 12345);
+    let _ = run(warm, 8);
+    let (after, after_text) = run(ids, 4);
+    eprintln!("first: {base:?} {base_text:?}");
+    eprintln!("after a warmup: {after:?} {after_text:?}");
+    assert_eq!(after, base, "a warmup request changed the next decode");
 }
