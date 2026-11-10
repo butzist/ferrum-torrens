@@ -873,7 +873,6 @@ def _install_patches() -> bool:
         import freetoken.layers.moe as moe_layer
         import freetoken.layers.norm as norm
         import freetoken.models.qwen3_5_moe.attention as attn_mod
-        import freetoken.models.qwen3_5_moe.gdn as gdn_mod
         import freetoken.models.qwen3_5_moe.model as model_mod
         import freetoken.models.qwen3_5_moe.moe as qwen_moe
         import freetoken.moe.offload_cache as offload
@@ -882,6 +881,17 @@ def _install_patches() -> bool:
         _log(f"[ft-probe] import failed: {exc!r}")
         return False
 
+    # 0.2.1 kept the GDN layer under the model package; 14119b8 (the commit
+    # R14b measured) moved it to layers/linear_attn and renamed the class.
+    try:
+        import freetoken.models.qwen3_5_moe.gdn as gdn_mod
+
+        gdn_cls = gdn_mod.Qwen3_5GatedDeltaNet
+    except ImportError:
+        import freetoken.layers.linear_attn.gdn as gdn_mod
+
+        gdn_cls = gdn_mod.GatedDeltaNet
+
     eng.Engine.__init__ = _engine_init(eng.Engine.__init__)
     eng.Engine.forward_batch = _forward_batch(eng.Engine.forward_batch)
 
@@ -889,7 +899,7 @@ def _install_patches() -> bool:
         (model_mod.Qwen3_5Model, "forward", "MODEL"),
         (model_mod.Qwen3_5DecoderLayer, "forward", "LAYER"),
         (attn_mod.Qwen3_5Attention, "forward", "ATTN"),
-        (gdn_mod.Qwen3_5GatedDeltaNet, "forward", "GDN"),
+        (gdn_cls, "forward", "GDN"),
         (qwen_moe.Qwen3_5MoE, "forward", "MOE"),
         (qwen_moe._SharedExpert, "forward", "SHARED"),
         (moe_layer.OffloadMoELayer, "_decode_routed", "ROUTED_DEC"),

@@ -2622,34 +2622,160 @@ difference in their hybrid mode is that they *compute* some misses on the CPU
 instead of moving them, chosen from measured bandwidths -- a lever we have never
 implemented, and the only one their tree has that ours does not.
 
-## R16 queued -- like-for-like FreeToken re-profile with an identical payload (2026-11-09)
+## R16 -- like-for-like FreeToken re-profile, identical payload (measured 2026-11-10)
 
-The reference numbers in this file are from FreeToken 0.2.1 on this box (R14b,
-decision 76). Re-measuring needs no build: 0.2.1 is on PyPI as a wheel, so
-`uv venv --python 3.12 && uv pip install "freetoken[accel]==0.2.1"` is enough;
-their git head also works if `CUDA_HOME` points at the store's CUDA 13.4 nvcc
-(`cuda13.4-cuda_nvcc-13.4.92`) so it matches torch 2.14.1+cu130 instead of
-tripping `kernel/_toolchain.py`'s major-mismatch gate. The first thing to test
-is whether their 0.2.x reader accepts the FTW our converter produces.
+**Setup.** FreeToken 0.2.1 (`14119b8`) in a 3.12 venv, their own `ft
+checkpoint`-converted FTW (`.model-cache/bench/ftw-ref-14119b8`, 20.35 GiB):
+their 0.2.x reader refuses our converter's output because it stores NVFP4
+global scales as fp16 where FreeToken reads them as fp32 (`lm_head.weight_global`
+etc., 161 tensors). Our store FTW: 21,785,153,536 bytes, fingerprint
+`25d1aa4972c0f4b6`; theirs: 21,848,727,552 bytes, fingerprint
+`043faf84396b4957`. Both arms ran the identical 379-token prose prompt
+(`/tmp/opencode/bench/prompt2.txt`), greedy, 128 decoded tokens, single request,
+auto cache, at the 50 W power cap (40 W unreachable from the jail; both arms at
+50 W so the pair is internally consistent vs R14b's 40 W). FT's custom driver
+(`scripts/freetoken_probe/r16_reprofile.py`) spawns `ft serve` with the exact
+R14b flag set under `prlimit --as=137438953472` (128 GiB; their
+`cuMemAddressReserve` wants more VA than our 64 GiB engine cap); the stage
+table came from `FT_PROBE_OUT` (eager, because their `forward_logits` graph
+replay bypasses the probe-wrapped per-layer methods). Our arm used
+`FERRUM_SMOKE_GRAPH=0` for the eager profile (`FT_PROFILE=1`) and
+`FERRUM_SMOKE_GRAPH=1` for the captured throughput run; the smoke's warmup
+got a nonce first token so the measured pp is a cold prefill.
 
-Payload: one line of `{"problem": ...}` jsonl (their bench accepts a local
-`--aime` file) with the 363-token prose prompt, `--greedy --decode 128`, cache
-auto, text-only, `--max-running-requests 1`. Our arm is the same text through
-`FERRUM_SMOKE_PROMPT` with `FERRUM_SMOKE_TOKENS=128`. Compare pp and tg first,
-then the stage tables (ours `FT_PROFILE=1` eager, theirs `FT_PROBE_OUT`), which
-is where the remaining question lives: their per-stage table sums to 33.0 ms
-(30.3 tok/s) while their bench reports 47.0 tok/s, so those two cannot be the
-same configuration and only a fresh matched pair can say which stage we lose in.
+**Head to head (identical payload, both at the 50 W cap).**
 
-## R17 queued -- CPU-side miss compute (FreeToken's hybrid split), 2026-11-09
+| metric | FreeToken 0.2.1 (captured bench) | ours (captured) | ours (eager profile) |
+|---|---|---|---|
+| tg tok/s | 43.4 +/- 0.5 (n=5) | 36.6-37.1 | 44.2 (degenerate trajectory) |
+| tg ms/token | 23.0 | 27.3 | 22.6 |
+| pp tok/s (cold) | 274.8 +/- 17.8 | 292-293 | 296.0 |
+| VRAM | 6.60 GiB (7088 MiB) | 7.31 GiB | 7.18 GiB |
+| slots | 1981 | 2048 | 2048 |
+| power | mean 42.5 / max 50.1 W | 50 W cap | 50 W cap |
 
-Source reading (0.2.2) corrected our earlier claim that they pin a hot set: they
-do not. `moe/bench_profile.py` holds a per-layer-kind bandwidth row from
-`ft bench bw`, and `fetch_fraction = pcie/(pcie+cpu)` decides how much of a
-step's misses to fetch over PCIe so the fetch and the CPU compute finish
-together (`p/(2p+c)` for OS-locked banks that need a staging memcpy first).
-That is a second compute engine for misses, not cache policy, so it is the one
-reference lever R15 S13 did not test and the one our engine has no
-implementation of. Sizing input: a miss costs 0.125 ms over PCIe here, so the
-CPU side has to beat that per expert row to be worth a thread pool and a
-dispatch path. `ft bench bw` on the R16 venv measures it.
+**FreeToken stage table (eager, `FT_PROBE_OUT`, 32 steps, 44.61 ms/token gpu).**
+
+| stage | ms/token |
+|---|---|
+| STAGING (PCIe miss copy) | 12.578 (97.7 missing experts/token, 166 MiB/token, 13.84 GB/s) |
+| GDN | 8.227 |
+| SHARED | 4.538 |
+| MOE (routed GEMM) | 4.288 |
+| ATTN | 3.195 |
+| EXPERT_GEMM | 2.356 |
+| ROUTER | 1.871 |
+| ENSURE (lru_ensure) | 1.486 |
+| GDN_NORM | 1.363 |
+| ROUTED_DEC | 1.114 |
+| HEAD | 0.818 |
+| EMBED | 0.018 |
+| SUM (excl. gaps) | 41.862 of 44.614 (gap 0.075) |
+
+byte model: 1.70 MiB/slot, 1981 slots, 1.69 GiB dense/token, 174 MiB staged/token.
+
+**Our stage table (eager, `FT_PROFILE=1`, 24 steps, 26.467 ms/token).**
+
+| stage | ms/token | calls/step |
+|---|---|---|
+| moe_shared_epi | 7.954 | 120 |
+| gdn_qkvz | 2.716 | 30 |
+| attn_proj | 1.707 | 10 |
+| moe_shared_gemm | 1.222 | 80 |
+| gdn_tail_proj | 1.018 | 30 |
+| gdn_tail_norm | 0.960 | 30 |
+| head_gemv | 0.807 | 1 |
+| moe_gate | 0.720 | 40 |
+| gdn_conv | 0.523 | 30 |
+| attn_out | 0.427 | 10 |
+| head_d2h | 0.423 | 1 |
+| gdn_ba | 0.398 | 30 |
+| attn_sdpa | 0.387 | 10 |
+| gdn_recur | 0.371 | 30 |
+| gdn_tail_gate | 0.272 | 30 |
+| res_norm | 0.250 | 40 |
+| post_norm | 0.239 | 40 |
+| embed | 0.016 | 1 |
+| head_alloc | 0.004 | 1 |
+| labeled sum | 20.415 | (unaccounted/launch gaps 6.052) |
+
+No `moe_copy` label appears: the staged PCIe copy is not separately scoped in the
+current profile (R15 S11 had it at 9.4 ms on the old 512-slot config); the
+6.052 ms unaccounted gap plus the launch overhead is where it lives now. Prefill
+profile (2 steps: 380 + 379 tokens) is in `ours-profile.txt`.
+
+**The two profiles are not the same configuration, and never were.** FreeToken's
+probe table (44.61 ms/token, eager) and its bench (43.4 tok/s = 23.0 ms/token,
+captured) differ by ~2x; the probe wraps per-layer methods with timing hooks that
+break the fusion/overlap the captured `forward_logits` graph keeps, so the probe
+is an upper bound, not a peer of the bench. Our eager profile (26.467 ms/token)
+is much closer to our captured bench (27.3 ms/token), so our capture is roughly
+neutral (+/- launch overhead) rather than a 2x win. The fair comparison is
+therefore the two *captured* numbers: 43.4 (FT) vs 36.6-37.1 (ours), a 1.17-1.19x
+gap, not the 1.7x the stale R14b numbers implied.
+
+**New finding: the two arms no longer agree on tokens.** On this prompt the eager
+arm generates `[271, 15, 15, 15, ...]` (degenerate, 5440 expert steps) while the
+captured arm generates coherent prose `[271, 248068, 271, 2523, ...]` (320
+warmup steps), reproducibly across processes. The first token agrees (271), so
+prefill agrees; the split happens on decode step 1. `decode_graph_capture`
+still reports max|d| = 0.000e0 on the oracle prompt, so the capture machinery is
+intact -- the drift is a *trajectory* effect: the host-side `ExpertCache` (eager)
+and the device-side LRU (`lru_ensure`, captured) assign different slot indices
+to the same expert, so the grouped GEMM's reduction order differs and a
+near-tie flips, after which the two arms route differently for the rest of the
+sequence. Consequences:
+
+  * the "captured is 20% slower than eager" headline (44.5 vs 36.6 tok/s) is
+    confounded: the eager arm is faster because its degenerate trajectory hits
+    the LRU harder (fewer misses), not because capture regressed. The captured
+    arm's 36.6 tok/s on real prose is the honest number.
+  * a clean captured-vs-eager A/B needs both arms on the *same* token trajectory.
+    Options: (a) force the eager arm to replay the captured arm's ids (feed them
+    back), (b) compare per-step logits on a fixed prefix, or (c) make the two
+    LRU implementations agree on slot assignment. Until one of those lands, treat
+    the 1.17-1.19x gap as the real remaining deficit, not the 1.7x.
+  * this also qualifies decision 148's "captured == eager" claim: it is
+    bit-exact per step on a fixed prefix, but greedy *trajectories* can diverge
+    over many steps once a near-tie flips. The gate in
+    `tests/decode_graph_capture.rs` (max|d| = 0) still holds and should keep
+    holding; the new failure mode is only visible in long-run greedy smoke.
+
+**FTW divergence (measured, the queued risk).** Our store FTW fails FreeToken's
+reader with `WeightLoadError: ... stores NVFP4 global scales as fp16 (e.g.
+'lm_head.weight_global') but FreeToken reads them as fp32`. Reconvert with
+`ft checkpoint` (their converter writes fp32 globals). Our converter writes fp16
+(g16) globals to save 161 * 2048 * 2 bytes; that is the one format difference
+between the two FTWs. Whether their reader's fp32 assumption is required (or our
+fp16 is a legitimate space saving) is open; no change made.
+
+**50 W caveat.** Both arms hit the 50 W cap; R14b was measured at 40 W. The
+numbers above are not directly comparable to R14b's 47.0 tok/s (FT) / 32.9
+(ours) absolute, only to each other within this session.
+
+## R17 -- CPU-side miss compute (FreeToken's hybrid split) (measured 2026-11-10)
+
+`ft bench bw` on the R16 venv, RTX 5060 Laptop, AMD Ryzen 7 8745HX (16 cores),
+the FTW's nvfp4 layer kind (H=2048, I=512, top_k=8, 1.70 MiB/slot):
+
+| metric | value |
+|---|---|
+| CPU STREAM read (16 threads) | 48.6 GB/s |
+| PCIe linear H2D / D2H | 14.35 / 14.28 GB/s |
+| CPU-MoE (15 threads, avx512bf16+avx512vnni) | 22.5 GB/s |
+| PCIe gather (fast_index_copy) | 13.2 GB/s |
+| CPU/PCIe ratio | 1.70x (threshold 2.0x) |
+| recommended backend | offload |
+| overlapped: CPU-MoE + PCIe | 16.0 + 13.2 GB/s -> hybrid fetches 45.2% of misses |
+
+**Verdict: not worth implementing.** A miss costs 0.125 ms over PCIe (R15 S13);
+the CPU kernel does beat that per expert (1.70 MiB / 22.5 GB/s = 0.076 ms vs
+1.70 MiB / 13.2 GB/s = 0.129 ms), but only by 1.70x, below the 2.0x bar, and
+under contention (the overlapped run, which is what hybrid actually does) the CPU
+drops to 16.0 GB/s = 1.21x PCIe. A hybrid fetch would move ~45% of misses onto
+CPU threads for a marginal gain that the contention mostly eats, plus a thread
+pool, a dispatch path and a second compute engine in the MoE block -- against a
+lever (R15 S13) that already closed the expert-cache policy space as
+workload-bound. Recommendation stands: stay on `offload`. This closes TODO item 3
+as measured; do not re-chase without a CPU whose MoE kernel clears 2x PCIe under
+contention.

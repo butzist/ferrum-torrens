@@ -5235,3 +5235,35 @@ subsection names are kept verbatim.
     from a free one) plus an optional `FERRUM_SMOKE_RELEASE_MOE=1` stage that
     measures the intermediate release. A dropped engine no longer costs the next
     in-process load its banks, so a multi-arm comparison can run in one process.
+
+164. **R16 found that eager and captured decode no longer agree on tokens for the
+    long prose prompt (2026-11-10).** On `/tmp/opencode/bench/prompt2.txt`
+    (379 tokens, greedy, 128 decoded) the eager arm (`FERRUM_SMOKE_GRAPH=0`)
+    generates `[271, 15, 15, 15, ...]` (degenerate, 5440 expert steps) while
+    the captured arm (`FERRUM_SMOKE_GRAPH=1`) generates coherent prose
+    `[271, 248068, 271, 2523, ...]` (320 warmup steps). The first token agrees
+    (271), so prefill agrees; the split is on decode step 1. This is not a
+    correctness regression in either path: `tests/decode_graph_capture.rs` still
+    reports max|d| = 0.000e0 on the oracle prompt, so the capture machinery
+    replays bit-exactly on a fixed prefix. The drift is a *trajectory* effect of
+    reduction order: the host-side `ExpertCache` (eager, `run_experts_device`)
+    and the device-side LRU (`lru_ensure` in `grouped_moe_staged`) assign
+    different slot indices to the same expert, so the grouped MoE GEMM
+    accumulates in a different order and a near-tie flips, after which the two
+    arms route differently for the rest of the sequence. Consequences recorded in
+    `OPTIMIZATION.md` R16: (a) the "captured is 20% slower than eager" headline
+    (44.5 vs 36.6 tok/s) is confounded -- the eager arm is faster because its
+    degenerate trajectory hits the LRU harder (fewer misses), not because capture
+    regressed; the captured arm's 36.6 tok/s on real prose is the honest number;
+    (b) the fair captured-vs-captured comparison is 43.4 (FreeToken) vs
+    36.6-37.1 (ours) = 1.17-1.19x, not the 1.7x the stale R14b numbers
+    implied; (c) decision 148's "captured == eager" claim holds per step on a
+    fixed prefix but not for greedy trajectories over long sequences -- the
+    `decode_graph_capture` gate (max|d| = 0) must keep holding, and a clean
+    A/B now needs both arms on one trajectory (feed captured ids back, compare
+    per-step logits on a fixed prefix, or reconcile slot assignment). The
+    underlying cause -- two LRU implementations with different slot assignment
+    -- is the same seam R15 S13 closed as "no realizable policy beats strict
+    LRU": the device LRU is not LRU-identical to the host one. Reconciling them
+    (or forcing one implementation) is the open follow-up before the next
+    captured-vs-eager claim.

@@ -209,8 +209,8 @@ impl Sampler {
     }
 }
 
-/// Whether `FERRUM_SMOKE_GRAPH=1` asked for the captured arm. `FERRUM_SMOKE_ARMS`
-/// (`eager`, `captured`, or `all`) overrides it.
+/// Whether `FERRUM_SMOKE_GRAPH=1` asked for the captured arm. There is no
+/// multi-arm selector here: one arm per process, driven by `FERRUM_SMOKE_GRAPH`.
 fn graph_from_env() -> bool {
     std::env::var("FERRUM_SMOKE_GRAPH").as_deref() == Ok("1")
 }
@@ -373,8 +373,14 @@ fn run_arm(graph: bool) {
     vram("after load");
 
     // Warm up: capture the decode graph and populate the expert slot cache so
-    // neither lands in the measured run.
-    let _ = time_request(&engine, prompt_of(&engine, 64), 8);
+    // neither lands in the measured run. A nonce first token keeps the
+    // warmup from committing a radix prefix the measured run would adopt: pp
+    // must be a cold prefill, the way the FreeToken baselines nonce-prefix
+    // their prompts. Without it the warmup's ~66 tokens are adopted, so pp
+    // overstates the prefill rate by the adopted fraction (~12% at 517).
+    let mut warm = prompt_of(&engine, 64);
+    warm.insert(0, 12345);
+    let _ = time_request(&engine, warm, 8);
     let moe_ablated = std::env::var("FT_ABLATE").is_ok_and(|v| v.split(',').any(|p| p == "moe"));
     assert!(
         moe_ablated || engine.expert_steps() > 0,
