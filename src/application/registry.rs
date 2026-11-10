@@ -170,6 +170,7 @@ pub fn build(
                     reader.clone(),
                     None,
                     head_gemv,
+                    shared_expert_fused_port(device, stream).ok().flatten(),
                     fp8_linear,
                     cache.clone(),
                 )
@@ -709,6 +710,20 @@ fn head_port(
     match device {
         Device::Cuda(_) => Ok(Some(Arc::new(
             DenseGemv::new(device, stream).map_err(RegistryError::build)?,
+        ))),
+        _ => Ok(None),
+    }
+}
+
+#[cfg(feature = "cudarc")]
+fn shared_expert_fused_port(
+    device: Device,
+    stream: crate::infrastructure::cuda_driver::CUstream,
+) -> Result<Option<Arc<crate::infrastructure::cuda_linear::SharedExpertFused>>, RegistryError> {
+    use crate::infrastructure::cuda_linear::SharedExpertFused;
+    match device {
+        Device::Cuda(_) => Ok(Some(Arc::new(
+            SharedExpertFused::new(device, stream).map_err(RegistryError::build)?,
         ))),
         _ => Ok(None),
     }

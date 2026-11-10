@@ -477,6 +477,7 @@ pub struct CudarcQwen3_6 {
     reader: Arc<dyn WeightsReader>,
     moe: Option<Arc<dyn MoEExecutor>>,
     head_gemv: Option<Arc<DenseGemv>>,
+    shared_expert_fused: Option<Arc<crate::infrastructure::cuda_linear::SharedExpertFused>>,
     fp8: Option<Arc<Fp8Linear>>,
     gdn: Arc<GdnDecode>,
     attention: PagedAttention,
@@ -520,6 +521,7 @@ impl CudarcQwen3_6 {
         reader: Arc<dyn WeightsReader>,
         moe: Option<Arc<dyn MoEExecutor>>,
         head_gemv: Option<Arc<DenseGemv>>,
+        shared_expert_fused: Option<Arc<crate::infrastructure::cuda_linear::SharedExpertFused>>,
         fp8: Option<Arc<Fp8Linear>>,
         cache: Arc<DeviceCache>,
     ) -> Result<Self> {
@@ -549,6 +551,7 @@ impl CudarcQwen3_6 {
             reader,
             moe,
             head_gemv,
+            shared_expert_fused,
             fp8,
             gdn,
             attention,
@@ -1288,27 +1291,67 @@ impl CudarcQwen3_6 {
             None => None,
         };
 
-        let s = substep_begin(&self.rt);
-        let se_gate = x_post
-            .cast(TensorDType::F32)?
-            .matmul_nt_f32(&layer.shared_gate.cast(TensorDType::F32)?)?
-            .sigmoid()?;
-        substep_end(&self.rt, "moe_shared_epi", s);
-        let s = substep_begin(&self.rt);
-        let gate_up = self.apply_dense(&layer.shared.gate_up, x_post)?;
-        substep_end(&self.rt, "moe_shared_gemm", s);
-        let s = substep_begin(&self.rt);
         let si = p.shared_expert_intermediate_size;
-        let gate_part = gate_up.narrow(1, 0, si)?.contiguous()?;
-        let up_part = gate_up.narrow(1, si, si)?.contiguous()?;
-        let ic2 = gate_part.silu()?.mul(&up_part)?;
-        substep_end(&self.rt, "moe_shared_epi", s);
-        let s = substep_begin(&self.rt);
-        let down_out = self.apply_dense(&layer.shared.down, &ic2)?;
-        substep_end(&self.rt, "moe_shared_gemm", s);
-        let s = substep_begin(&self.rt);
-        let se = down_out.row_mul(&se_gate.reshape(&[t])?)?;
-        substep_end(&self.rt, "moe_shared_epi", s);
+        let h = p.hidden_size;
+        // Fused path (step 2b): only for single-token decode with the launcher.
+        let fused_out = if t == 1 {
+            if let Some(fused) = &self.shared_expert_fused {
+                if layer.shared.gate_up.row_scale.is_some() {
+                    None
+                } else {
+                    let x_flat = x_post.reshape(&[h])?;
+                    let ic2 = self.rt.zeros(&[si], TensorDType::Bf16)?;
+                    let se_gate = self.rt.zeros(&[1], TensorDType::F32)?;
+                    let out = self.rt.zeros(&[h], TensorDType::Bf16)?;
+                    let gate_up_t = match &layer.shared.gate_up.w {
+                        DenseWeight::Bf16(w) => w.as_ref().clone(),
+                        _ => return Err(moe_bad("fused shared expert needs bf16 weights")),
+                    };
+                    let down_t = match &layer.shared.down.w {
+                        DenseWeight::Bf16(w) => w.as_ref().clone(),
+                        _ => return Err(moe_bad("fused shared expert needs bf16 weights")),
+                    };
+                    let shared_gate_t = layer.shared_gate.reshape(&[h])?;
+                    let s = substep_begin(&self.rt);
+                    // SAFETY: all tensors are live device allocations.
+                    unsafe {
+                        fused.phase1(&x_flat, &gate_up_t, &shared_gate_t, &ic2, &se_gate, h, si)?;
+                        fused.phase2(&ic2, &down_t, &se_gate, &out, h, si)?;
+                    }
+                    substep_end(&self.rt, "moe_shared_fused", s);
+                    Some(out.reshape(&[1, h])?)
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let se = if let Some(out) = fused_out {
+            out
+        } else {
+            let s = substep_begin(&self.rt);
+            let se_gate = x_post
+                .cast(TensorDType::F32)?
+                .matmul_nt_f32(&layer.shared_gate.cast(TensorDType::F32)?)?
+                .sigmoid()?;
+            substep_end(&self.rt, "moe_shared_epi", s);
+            let s = substep_begin(&self.rt);
+            let gate_up = self.apply_dense(&layer.shared.gate_up, x_post)?;
+            substep_end(&self.rt, "moe_shared_gemm", s);
+            let s = substep_begin(&self.rt);
+            let gate_part = gate_up.narrow(1, 0, si)?.contiguous()?;
+            let up_part = gate_up.narrow(1, si, si)?.contiguous()?;
+            let ic2 = gate_part.silu()?.mul(&up_part)?;
+            substep_end(&self.rt, "moe_shared_epi", s);
+            let s = substep_begin(&self.rt);
+            let down_out = self.apply_dense(&layer.shared.down, &ic2)?;
+            substep_end(&self.rt, "moe_shared_gemm", s);
+            let s = substep_begin(&self.rt);
+            let se = down_out.row_mul(&se_gate.reshape(&[t])?)?;
+            substep_end(&self.rt, "moe_shared_epi", s);
+            se
+        };
 
         let routed = match port {
             Some(port) => {

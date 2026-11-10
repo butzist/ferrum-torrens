@@ -20,9 +20,11 @@ use crate::infrastructure::cuda_driver::{CUstream, CudaError, Driver, GdnKernels
 use crate::infrastructure::cudarc::{Runtime, Tensor, TensorDType};
 use crate::infrastructure::kernel_abi::{
     DenseGemvArgs, FP8_GEMM, FP8_GEMV, FP8_SPLITK_REDUCE, Fp8GemmArgs, Fp8GemvArgs, Fp8ReduceArgs,
-    LinearAbi, NVFP4_DENSE_GEMV, fp8_gemm_args, fp8_gemm_grid, fp8_gemv_args, fp8_gemv_grid,
-    fp8_reduce_grid, fp8_split_k, fp8_splitk_reduce_args, nvfp4_dense_gemv_args,
-    nvfp4_dense_gemv_grid,
+    LinearAbi, NVFP4_DENSE_GEMV, SHARED_EXPERT_PHASE1, SHARED_EXPERT_PHASE2, fp8_gemm_args,
+    fp8_gemm_grid, fp8_gemv_args, fp8_gemv_grid, fp8_reduce_grid, fp8_split_k, fp8_splitk_reduce_args,
+    nvfp4_dense_gemv_args, nvfp4_dense_gemv_grid, shared_expert_phase1_args,
+    shared_expert_phase1_grid, shared_expert_phase2_args, shared_expert_phase2_grid,
+    SharedExpertPhase1Args, SharedExpertPhase2Args,
 };
 use crate::infrastructure::torch::Device;
 
@@ -329,6 +331,105 @@ impl Fp8Linear {
         let mut params = pack.kernel_params().map_err(bad_abi)?;
         let grid = fp8_gemm_grid(m, n, kernel).map_err(bad_abi)?;
         // SAFETY: as `gemv`.
+        unsafe { self.kernels.launch(kernel, grid, &mut params, self.stream) }.map_err(driver)
+    }
+}
+
+/// Fused shared-expert launcher (bf16): phase1 computes ic2 + se_gate,
+/// phase2 computes down_out * se_gate. Two kernel launches per call.
+pub struct SharedExpertFused {
+    kernels: GdnKernels,
+    abi: LinearAbi,
+    _rt: Runtime,
+    stream: CUstream,
+}
+
+unsafe impl Send for SharedExpertFused {}
+unsafe impl Sync for SharedExpertFused {}
+
+impl SharedExpertFused {
+    pub fn new(device: Device, stream: CUstream) -> Result<Self, MoEError> {
+        let Device::Cuda(ordinal) = device else {
+            return Err(MoEError::Bad(
+                "the shared-expert fused launcher needs a CUDA device".into(),
+            ));
+        };
+        let lib = Arc::new(Driver::open().map_err(driver)?);
+        let rt = if stream.is_null() {
+            Runtime::open_with(Arc::clone(&lib), ordinal)?
+        } else {
+            unsafe { Runtime::open_with_stream(Arc::clone(&lib), ordinal, stream)? }
+        };
+        let abi = LinearAbi::committed().map_err(bad_abi)?;
+        abi.kernel(SHARED_EXPERT_PHASE1).map_err(bad_abi)?;
+        abi.kernel(SHARED_EXPERT_PHASE2).map_err(bad_abi)?;
+        let kernels = GdnKernels::load(lib, abi.clone()).map_err(driver)?;
+        Ok(Self {
+            kernels,
+            abi,
+            _rt: rt,
+            stream,
+        })
+    }
+
+    pub fn stream(&self) -> CUstream {
+        self.stream
+    }
+
+    /// Phase 1: ic2 = silu(x @ gate_up[:si]) * (x @ gate_up[si:]), se_gate = sigmoid(x @ shared_gate).
+    /// x: [H] bf16, gate_up: [2*SI, H] bf16, shared_gate: [H] bf16, ic2: [SI] bf16, se_gate: [1] f32.
+    pub unsafe fn phase1(
+        &self,
+        x: &Tensor,
+        gate_up: &Tensor,
+        shared_gate: &Tensor,
+        ic2: &Tensor,
+        se_gate: &Tensor,
+        h: usize,
+        si: usize,
+    ) -> Result<(), MoEError> {
+        let kernel = self.abi.kernel(SHARED_EXPERT_PHASE1).map_err(bad_abi)?;
+        let args = SharedExpertPhase1Args {
+            x: x.device_ptr(),
+            gate_up: gate_up.device_ptr(),
+            shared_gate: shared_gate.device_ptr(),
+            ic2: ic2.device_ptr(),
+            se_gate: se_gate.device_ptr(),
+            h: h as u32,
+            si: si as u32,
+            stride_gu_row: h as u32,
+            stride_sg: 1,
+        };
+        let pack = shared_expert_phase1_args(&self.abi, &args).map_err(bad_abi)?;
+        let mut params = pack.kernel_params().map_err(bad_abi)?;
+        let grid = shared_expert_phase1_grid(si);
+        unsafe { self.kernels.launch(kernel, grid, &mut params, self.stream) }.map_err(driver)
+    }
+
+    /// Phase 2: out[n] = (sum_k ic2[k] * down[n,k]) * se_gate[0].
+    /// ic2: [SI] bf16, down: [H, SI] bf16, se_gate: [1] f32, out: [H] bf16.
+    pub unsafe fn phase2(
+        &self,
+        ic2: &Tensor,
+        down: &Tensor,
+        se_gate: &Tensor,
+        out: &Tensor,
+        h: usize,
+        si: usize,
+    ) -> Result<(), MoEError> {
+        let kernel = self.abi.kernel(SHARED_EXPERT_PHASE2).map_err(bad_abi)?;
+        let args = SharedExpertPhase2Args {
+            ic2: ic2.device_ptr(),
+            down: down.device_ptr(),
+            se_gate: se_gate.device_ptr(),
+            out: out.device_ptr(),
+            h: h as u32,
+            si: si as u32,
+            stride_down_row: si as u32,
+        };
+        let pack = shared_expert_phase2_args(&self.abi, &args).map_err(bad_abi)?;
+        let mut params = pack.kernel_params().map_err(bad_abi)?;
+        let grid = shared_expert_phase2_grid(h);
         unsafe { self.kernels.launch(kernel, grid, &mut params, self.stream) }.map_err(driver)
     }
 }

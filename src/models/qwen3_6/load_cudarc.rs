@@ -368,6 +368,46 @@ fn load_layer(
     if shared_bf16 {
         gate_up.nvfp4 = None;
         down.nvfp4 = None;
+        // Bake the per-row NVFP4 global into the bf16 weight so row_scale can
+        // be None. This lets the fused shared-expert kernel (which has no scale
+        // parameter) produce the same result as the cuBLAS path. Load-time
+        // only, so the CPU round-trip is fine.
+        if let DenseWeight::Bf16(w) = &mut gate_up.w {
+            if let Some(scale) = gate_up.row_scale.take() {
+                let rows = w.shape()[0];
+                let cols = w.shape()[1];
+                let vals: Vec<f32> = w.to_host_f32().unwrap_or_default();
+                let globals: Vec<f32> = scale.to_host_f32().unwrap_or_default();
+                let mut out = Vec::with_capacity(rows * cols);
+                for r in 0..rows {
+                    let g = globals[r];
+                    for c in 0..cols {
+                        out.push(vals[r * cols + c] * g);
+                    }
+                }
+                let new_t = ld.tensor(Loader::from_f32(&out), &[rows, cols])
+                    .unwrap_or_else(|_| (**w).clone());
+                *w = Box::new(new_t);
+            }
+        }
+        if let DenseWeight::Bf16(w) = &mut down.w {
+            if let Some(scale) = down.row_scale.take() {
+                let rows = w.shape()[0];
+                let cols = w.shape()[1];
+                let vals: Vec<f32> = w.to_host_f32().unwrap_or_default();
+                let globals: Vec<f32> = scale.to_host_f32().unwrap_or_default();
+                let mut out = Vec::with_capacity(rows * cols);
+                for r in 0..rows {
+                    let g = globals[r];
+                    for c in 0..cols {
+                        out.push(vals[r * cols + c] * g);
+                    }
+                }
+                let new_t = ld.tensor(Loader::from_f32(&out), &[rows, cols])
+                    .unwrap_or_else(|_| (**w).clone());
+                *w = Box::new(new_t);
+            }
+        }
     }
     let shared = Shared {
         gate_up,
