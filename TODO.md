@@ -83,6 +83,17 @@ R16/R17); items 2, 4, 5 remain open.
    returns to NVFP4 (it is bf16 now). **Next autotune candidates are the routed
    grouped GEMV (4.2 ms/token, the biggest single stage) and paged attention;
    run the same sweep there before trusting any tile change.**
+   **Dtype dimension (`--dtypes nvfp4,fp16`, 2026-11-10):** the sweep now also
+   times a converted fp16 weight through cuBLAS, and NVFP4 wins every shape on
+   this GPU: lm_head 1007 us nvfp4 vs 2905 us fp16 (2.9x), shared gate_up 14.7 vs
+   24.4 (1.7x), shared down 9.0 vs 18.5 (2.1x). The conversion is load-time only
+   (0.36-247 ms) but costs 4x VRAM (fp16 head = 1 GiB vs 254 MiB), so it is not a
+   trade worth making here. This also explains the earlier bf16 shared-expert
+   win: it came from the epilogue (`se_gate` matmul + silu/mul/gating through
+   cuBLAS), not the GEMV -- the NVFP4 GEMV itself is the faster kernel once
+   tiled (BLOCK_N=16/KW=64), so the right fix there is to fuse the epilogue, not
+   to change dtype. On an arch with much higher bandwidth per ALU the fp16
+   crossover could move; re-run this comparison per arch before deciding.
 7. **Captured-step buffer stability (mitigated, root cause open).** A captured
    decode graph bakes every per-step cudarc allocation (router ids/weights,
    attention/GDN temporaries, the shared-expert GEMV's `a`/`out`), and those
