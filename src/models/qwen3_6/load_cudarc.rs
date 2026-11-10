@@ -302,6 +302,7 @@ fn load_embedding(ld: &Loader<'_>, rt: &Runtime) -> Result<Embedding> {
 /// One decoder layer at `prefix`, which is either `model.layers.N` or the MTP
 /// draft's `draft.layers.0`. The draft layer is full attention with the same
 /// geometry, so only the prefix and the layer kind differ.
+#[allow(clippy::replace_box)]
 fn load_layer(
     ld: &Loader<'_>,
     prefix: &str,
@@ -372,8 +373,9 @@ fn load_layer(
         // be None. This lets the fused shared-expert kernel (which has no scale
         // parameter) produce the same result as the cuBLAS path. Load-time
         // only, so the CPU round-trip is fine.
-        if let DenseWeight::Bf16(w) = &mut gate_up.w {
-            if let Some(scale) = gate_up.row_scale.take() {
+        if let DenseWeight::Bf16(w) = &mut gate_up.w
+            && let Some(scale) = gate_up.row_scale.take()
+        {
                 let rows = w.shape()[0];
                 let cols = w.shape()[1];
                 let vals: Vec<f32> = w.to_host_f32().unwrap_or_default();
@@ -389,9 +391,9 @@ fn load_layer(
                     .unwrap_or_else(|_| (**w).clone());
                 *w = Box::new(new_t);
             }
-        }
-        if let DenseWeight::Bf16(w) = &mut down.w {
-            if let Some(scale) = down.row_scale.take() {
+        if let DenseWeight::Bf16(w) = &mut down.w
+            && let Some(scale) = down.row_scale.take()
+        {
                 let rows = w.shape()[0];
                 let cols = w.shape()[1];
                 let vals: Vec<f32> = w.to_host_f32().unwrap_or_default();
@@ -407,7 +409,6 @@ fn load_layer(
                     .unwrap_or_else(|_| (**w).clone());
                 *w = Box::new(new_t);
             }
-        }
     }
     let shared = Shared {
         gate_up,

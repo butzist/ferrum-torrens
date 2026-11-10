@@ -348,6 +348,8 @@ unsafe impl Send for SharedExpertFused {}
 unsafe impl Sync for SharedExpertFused {}
 
 impl SharedExpertFused {
+    // The stream is an opaque driver handle, not a pointer this code derefs.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn new(device: Device, stream: CUstream) -> Result<Self, MoEError> {
         let Device::Cuda(ordinal) = device else {
             return Err(MoEError::Bad(
@@ -378,6 +380,10 @@ impl SharedExpertFused {
 
     /// Phase 1: ic2 = silu(x @ gate_up[:si]) * (x @ gate_up[si:]), se_gate = sigmoid(x @ shared_gate).
     /// x: [H] bf16, gate_up: [2*SI, H] bf16, shared_gate: [H] bf16, ic2: [SI] bf16, se_gate: [1] f32.
+    ///
+    /// # Safety
+    /// All tensors must be live device allocations in this launcher's context.
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn phase1(
         &self,
         x: &Tensor,
@@ -408,6 +414,9 @@ impl SharedExpertFused {
 
     /// Phase 2: out[n] = (sum_k ic2[k] * down[n,k]) * se_gate[0].
     /// ic2: [SI] bf16, down: [H, SI] bf16, se_gate: [1] f32, out: [H] bf16.
+    ///
+    /// # Safety
+    /// All tensors must be live device allocations in this launcher's context.
     pub unsafe fn phase2(
         &self,
         ic2: &Tensor,

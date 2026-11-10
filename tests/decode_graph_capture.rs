@@ -119,6 +119,7 @@ fn build(num_pages: usize, num_slots: usize) -> Built {
         reader,
         Some(port),
         Some(head_gemv),
+        None,
         Some(fp8_linear),
         cache.clone(),
     )
