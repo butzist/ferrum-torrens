@@ -373,7 +373,9 @@ fn load_layer(
         // be None. This lets the fused shared-expert kernel (which has no scale
         // parameter) produce the same result as the cuBLAS path. Load-time
         // only, so the CPU round-trip is fine.
-        if let DenseWeight::Bf16(w) = &mut gate_up.w
+        let bake = std::env::var("FERRUM_SHARED_BAKE").ok().as_deref() != Some("0");
+        if bake
+            && let DenseWeight::Bf16(w) = &mut gate_up.w
             && let Some(scale) = gate_up.row_scale.take()
         {
             let rows = w.shape()[0];
@@ -392,7 +394,8 @@ fn load_layer(
                 .unwrap_or_else(|_| (**w).clone());
             *w = Box::new(new_t);
         }
-        if let DenseWeight::Bf16(w) = &mut down.w
+        if bake
+            && let DenseWeight::Bf16(w) = &mut down.w
             && let Some(scale) = down.row_scale.take()
         {
             let rows = w.shape()[0];

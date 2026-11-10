@@ -381,6 +381,7 @@ fn run_arm(graph: bool) {
     let mut warm = prompt_of(&engine, 64);
     warm.insert(0, 12345);
     let _ = time_request(&engine, warm, 8);
+    eprintln!("warmup done");
     let moe_ablated = std::env::var("FT_ABLATE").is_ok_and(|v| v.split(',').any(|p| p == "moe"));
     assert!(
         moe_ablated || engine.expert_steps() > 0,
