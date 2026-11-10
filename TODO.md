@@ -71,6 +71,18 @@ R16/R17); items 2, 4, 5 remain open.
    starting point) and revert to NVFP4 if it wins. The same sweep applies to the
    routed grouped GEMM (`moe_gemm` at 4.2 ms/token, R1/R2 fixed it but never
    autotuned it) and the paged-attention decode kernel.
+   **Dense GEMV swept (2026-11-10):** `kernel-autotune` / `python -m
+   ferrum_kernel.autotune` (needs a CUDA torch, not the devshell's CPU one)
+   swept `BLOCK_N x BLOCK_KW x warps` on the real K-major layout: lm_head
+   `[1,248320,2048]` current 1094 us -> best 1007 us (+8%, BLOCK_N=32/KW=32),
+   shared gate_up `[1,1024,2048]` 22.6 -> 14.7 us (+35%, N=16/KW=64/warps=8),
+   shared down `[1,2048,512]` 11.1 -> 9.0 us (+19%, N=16/KW=32/warps=8). Baked
+   and re-profiled: the real `head_gemv` stayed 0.818 ms (was 0.807) -- the head
+   is bandwidth-bound at ~250 MB per step, so the tile win does not transfer and
+   the change was reverted. The small-N wins only matter if the shared expert
+   returns to NVFP4 (it is bf16 now). **Next autotune candidates are the routed
+   grouped GEMV (4.2 ms/token, the biggest single stage) and paged attention;
+   run the same sweep there before trusting any tile change.**
 7. **Captured-step buffer stability (mitigated, root cause open).** A captured
    decode graph bakes every per-step cudarc allocation (router ids/weights,
    attention/GDN temporaries, the shared-expert GEMV's `a`/`out`), and those
