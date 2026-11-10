@@ -1227,8 +1227,19 @@ unsafe impl Sync for GdnKernels {}
 impl GdnKernels {
     /// Load every linear-attention kernel in `abi` from the committed cubins.
     pub fn load(driver: Arc<Driver>, abi: LinearAbi) -> Result<Self, CudaError> {
+        Self::load_named(driver, abi, LinearAbi::kernel_names())
+    }
+
+    /// Load only the named linear kernels. A launcher that needs one or two
+    /// cubins (the fused shared expert) must not pull the whole set: every extra
+    /// loaded module is device memory and a capture-visible layout change.
+    pub fn load_named(
+        driver: Arc<Driver>,
+        abi: LinearAbi,
+        names: &'static [&'static str],
+    ) -> Result<Self, CudaError> {
         let mut loaded = Vec::new();
-        for name in LinearAbi::kernel_names() {
+        for name in names {
             let image = crate::infrastructure::kernel_abi::linear_cubin(name)
                 .map_err(|e| CudaError::Driver(format!("cubin: {e}")))?;
             let module = driver.load_module(image)?;

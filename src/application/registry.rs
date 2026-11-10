@@ -721,6 +721,13 @@ fn shared_expert_fused_port(
     stream: crate::infrastructure::cuda_driver::CUstream,
 ) -> Result<Option<Arc<crate::infrastructure::cuda_linear::SharedExpertFused>>, RegistryError> {
     use crate::infrastructure::cuda_linear::SharedExpertFused;
+    // The fused path only runs when the shared expert is bf16 (the global is
+    // baked into the weight); otherwise its cubins would be loaded for nothing,
+    // and every extra loaded module shifts the device layout (which exposed a
+    // latent capture bug at long prompts).
+    if std::env::var("FERRUM_SHARED_BF16").ok().as_deref() != Some("1") {
+        return Ok(None);
+    }
     match device {
         Device::Cuda(_) => Ok(Some(Arc::new(
             SharedExpertFused::new(device, stream).map_err(RegistryError::build)?,

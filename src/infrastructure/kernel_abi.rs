@@ -760,6 +760,60 @@ const LINEAR_NAMES: [&str; 50] = [
     SCALE_HEADS_F32,
 ];
 
+/// The kernels every `GdnKernels` consumer loads by default: [`LINEAR_NAMES`]
+/// minus the fused shared-expert pair, which only its own launcher loads. Every
+/// extra loaded module is device memory and a capture-visible layout change.
+const LINEAR_LOAD_NAMES: [&str; 48] = [
+    GDN_DECODE,
+    CONV_DECODE,
+    CONV_PREFILL,
+    ADD_RMSNORM,
+    RMSNORM_GATED,
+    GDN_TRI_SOLVE,
+    NVFP4_DENSE_GEMV,
+    FP8_GEMV,
+    FP8_SPLITK_REDUCE,
+    FP8_GEMM,
+    ADD_BF16,
+    MUL_BF16,
+    ADD_F32,
+    MUL_F32,
+    CAST_BF16_F32,
+    CAST_F32_BF16,
+    INDEX_SELECT_BF16,
+    GATHER_ROWS_BF16,
+    GATHER_ROWS_F32,
+    GATHER_ROWS_I32,
+    SCATTER_ROWS_BF16,
+    SCATTER_ROWS_F32,
+    COPY_STRIDED_BF16,
+    COPY_STRIDED_F32,
+    COPY_STRIDED_I32,
+    COPY_STRIDED_I64,
+    COPY_STRIDED_U8,
+    UNARY_BF16,
+    UNARY_F32,
+    SCALAR_BF16,
+    SCALAR_F32,
+    COL_MUL_BF16,
+    COL_MUL_F32,
+    SUM_LAST_F32,
+    MAX_ALL_F32,
+    SUM_ALL_F32,
+    SOFTMAX_LAST_F32,
+    TOPK_LAST_F32,
+    FUSED_TOPK_SOFTMAX_F32,
+    ROPE_BF16,
+    MROPE_GATHER,
+    REPEAT_HEADS_BF16,
+    CAUSAL_SDPA_BF16,
+    CAUSAL_SDPA_F32,
+    CUMSUM_DIM0_F32,
+    GDN_RATIO_MASKS_F32,
+    MUL_MID_F32,
+    SCALE_HEADS_F32,
+];
+
 #[derive(Debug, Deserialize)]
 struct LinearEntry {
     entry: String,
@@ -868,7 +922,7 @@ impl LinearAbi {
 
     /// The linear kernel names, in launch order.
     pub fn kernel_names() -> &'static [&'static str] {
-        &LINEAR_NAMES
+        &LINEAR_LOAD_NAMES
     }
 
     pub fn kernel(&self, name: &str) -> Result<&LinearKernel, MoEError> {

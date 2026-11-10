@@ -362,10 +362,11 @@ impl SharedExpertFused {
         } else {
             unsafe { Runtime::open_with_stream(Arc::clone(&lib), ordinal, stream)? }
         };
+        const FUSED_KERNELS: &[&str] = &[SHARED_EXPERT_PHASE1, SHARED_EXPERT_PHASE2];
         let abi = LinearAbi::committed().map_err(bad_abi)?;
         abi.kernel(SHARED_EXPERT_PHASE1).map_err(bad_abi)?;
         abi.kernel(SHARED_EXPERT_PHASE2).map_err(bad_abi)?;
-        let kernels = GdnKernels::load(lib, abi.clone()).map_err(driver)?;
+        let kernels = GdnKernels::load_named(lib, abi.clone(), FUSED_KERNELS).map_err(driver)?;
         Ok(Self {
             kernels,
             abi,
