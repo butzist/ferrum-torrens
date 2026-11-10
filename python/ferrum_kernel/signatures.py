@@ -742,6 +742,44 @@ def nvfp4_dense_gemv_constexprs() -> dict:
     }
 
 
+def shared_expert_phase1() -> dict:
+    return {
+        "x_ptr": "*bf16",
+        "gate_up_ptr": "*bf16",
+        "shared_gate_ptr": "*bf16",
+        "ic2_ptr": "*bf16",
+        "se_gate_ptr": "*fp32",
+        "H": "i32",
+        "SI": "i32",
+        "stride_gu_row": "i32",
+        "stride_sg": "i32",
+        "BLOCK_H": "constexpr",
+    }
+
+
+def shared_expert_phase1_constexprs() -> dict:
+    from .shared_expert import BLOCK_H
+    return {"BLOCK_H": BLOCK_H}
+
+
+def shared_expert_phase2() -> dict:
+    return {
+        "ic2_ptr": "*bf16",
+        "down_ptr": "*bf16",
+        "se_gate_ptr": "*fp32",
+        "out_ptr": "*bf16",
+        "H": "i32",
+        "SI": "i32",
+        "stride_down_row": "i32",
+        "BLOCK_SI": "constexpr",
+    }
+
+
+def shared_expert_phase2_constexprs() -> dict:
+    from .shared_expert import BLOCK_SI
+    return {"BLOCK_SI": BLOCK_SI}
+
+
 def fp8_gemv() -> dict:
     """The W8A16 split-K GEMV (M == 1) vendored from FreeToken."""
     return {
