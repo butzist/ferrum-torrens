@@ -107,6 +107,19 @@ R16/R17); items 2, 4, 5 remain open.
    with the ~1.7 ms/token kernel win though still trajectory-confounded. The
    prefill grouped GEMM was already swept in R10.8 (N=64 at 4 warps), so it was
    not re-swept.
+   **Torch dependency of the autotune (checked 2026-11-10).** The measurement
+   path does not need torch: `autotune_min.py` allocates with `cuMemAlloc`, fills
+   with `cuMemcpyHtoD`, times with `cuEvent`, and launches Triton through a
+   `DevPtr` shim (`.data_ptr()` + a `tl.dtype`), timing the dense GEMV at
+   1062 us vs the 1007-1094 us torch `do_bench` reports -- same GPU, same answer.
+   Torch is only still needed because (a) every kernel wrapper module does
+   `import torch` for type hints / `Tensor.view(torch.int32)` /
+   `require_native_e4m3`, and (b) the fp16 dtype arm uses `torch.matmul`. A fully
+   torch-free autotune needs the Triton kernels split out of the torch wrappers,
+   a Triton fp16 GEMV for the dtype arm, and `tl` type constants; the alternative
+   is a Rust harness over the committed cubins. Neither is done; the devshell's
+   `pythonEnv` torch is CPU-only, so the harness currently runs under the
+   FreeToken venv.
 7. **Captured-step buffer stability (mitigated, root cause open).** A captured
    decode graph bakes every per-step cudarc allocation (router ids/weights,
    attention/GDN temporaries, the shared-expert GEMV's `a`/`out`), and those
