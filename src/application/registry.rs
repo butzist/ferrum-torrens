@@ -252,6 +252,14 @@ pub fn build(
                         ),
                     }
                 }
+                // The padding row ran `lru_ensure` during capture and polluted the
+                // device LRU tables (step counter + usage). Reset them so the
+                // first real replay starts from a cold cache, matching the eager
+                // path's slot assignment (decision 164). Only when capture ran:
+                // otherwise the eager path's live cache must survive.
+                if capture && let Some(moe) = &moe {
+                    let _ = moe.reset_staging();
+                }
                 let recapture = if capture {
                     let weak_model = std::sync::Arc::downgrade(&model);
                     let weak_cache = std::sync::Arc::downgrade(&cache);

@@ -187,6 +187,10 @@ impl MoEExecutor for CachedExperts {
             None => Ok(None),
         }
     }
+
+    fn reset_staging(&self) -> Result<(), MoEError> {
+        self.gemm.reset_staging()
+    }
 }
 
 /// One layer's routed expert step. `experts` is dense over `tokens * top_k`,

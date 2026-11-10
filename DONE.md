@@ -5267,3 +5267,15 @@ subsection names are kept verbatim.
     LRU": the device LRU is not LRU-identical to the host one. Reconciling them
     (or forcing one implementation) is the open follow-up before the next
     captured-vs-eager claim.
+
+    Resolution (2026-11-10): root cause confirmed as capture pollution. The padding
+    row ran `lru_ensure` during `capture_decode`/`capture_verify`, incrementing the
+    device step counter and marking padding experts as recently used, desynchronising
+    the device LRU from the host LRU the eager path uses. Fix: `MoEExecutor::reset_staging`
+    (default no-op; `CachedExperts` delegates to `CudaMoE::reset_staging`) called in
+    `registry::build` after capture, so the first real replay starts from a cold
+    cache. After the fix both arms generate `[271, 15, 15, ...]` on this prompt --
+    the trajectories now agree, validating the hypothesis. The slot-assignment seam
+    (decision 164) is therefore closed at the capture-pollution level; a residual
+    difference between the host and device LRU implementations, if any, would only
+    surface on a prompt where the two would have diverged even with clean state.

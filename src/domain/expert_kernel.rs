@@ -411,6 +411,16 @@ pub trait MoEExecutor: Send + Sync {
     fn cache_resident(&self) -> bool {
         true
     }
+
+    /// Drop the device LRU's residency tables (slot_for_id, id_of_slot, usage,
+    /// step counter) without freeing the device banks. Used after a CUDA-graph
+    /// capture, whose padding row ran `lru_ensure` and polluted the tables; the
+    /// first real replay must start from a cold cache so its slot assignment
+    /// matches the eager path (decision 164). A no-op when device staging is
+    /// off or the executor has no device LRU.
+    fn reset_staging(&self) -> Result<(), MoEError> {
+        Ok(())
+    }
 }
 
 /// Slot-major banks for the reference path: `packed [slots, rows, cols/2]`, the

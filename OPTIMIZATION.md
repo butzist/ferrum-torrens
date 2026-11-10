@@ -2714,7 +2714,7 @@ neutral (+/- launch overhead) rather than a 2x win. The fair comparison is
 therefore the two *captured* numbers: 43.4 (FT) vs 36.6-37.1 (ours), a 1.17-1.19x
 gap, not the 1.7x the stale R14b numbers implied.
 
-**New finding: the two arms no longer agree on tokens.** On this prompt the eager
+**New finding (now resolved, 2026-11-10): the two arms no longer agreed on tokens.** On this prompt the eager
 arm generates `[271, 15, 15, 15, ...]` (degenerate, 5440 expert steps) while the
 captured arm generates coherent prose `[271, 248068, 271, 2523, ...]` (320
 warmup steps), reproducibly across processes. The first token agrees (271), so
@@ -2740,6 +2740,21 @@ sequence. Consequences:
     over many steps once a near-tie flips. The gate in
     `tests/decode_graph_capture.rs` (max|d| = 0) still holds and should keep
     holding; the new failure mode is only visible in long-run greedy smoke.
+
+**Resolution (2026-11-10).** Root cause confirmed as capture pollution: the padding row
+ran `lru_ensure` during `capture_decode`/`capture_verify`, incrementing the device
+step counter and marking padding experts as recently used, desynchronising the
+device LRU from the host LRU that the eager path uses. Fix: `MoEExecutor::reset_staging`
+(default no-op; `CachedExperts` delegates to `CudaMoE::reset_staging`) called in
+`registry::build` after capture, so the first real replay starts from a cold cache.
+After the fix both arms generate `[271, 15, 15, ...]` on this prompt -- the
+trajectories agree, validating the hypothesis. The degenerate output itself is
+the model's greedy on this prompt (both paths now agree it is `[15, 15, ...]`);
+whether that is the "correct" greedy vs FreeToken's output is unverified (FT's
+probe did not save text), but the engine's two paths are now bit-identical in
+trajectory, not just per step. The fair captured-vs-captured comparison remains
+43.4 (FT) vs 36.6-37.1 (ours) = 1.17-1.19x.
+
 
 **FTW divergence (measured, the queued risk).** Our store FTW fails FreeToken's
 reader with `WeightLoadError: ... stores NVFP4 global scales as fp16 (e.g.
