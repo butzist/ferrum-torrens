@@ -195,19 +195,29 @@ R16/R17); item 4 is done (decision 166); items 2 and 5 remain open, and item 9
    hide it by issuing the H2D on the copy stream far enough ahead that the
    router and shared expert run underneath it. Cache capacity is a measured
    no-go (OPTIMIZATION.md R18).
-9. **Hide the expert miss copy (the top decode lever, decision 166).** The step
-   is 30 ms with ~15 ms of PCIe H2D for ~120 misses/step (0.125 ms each), and
-   the wait is charged to the head of the *following* layer -- which is why it
-   lands inside the shared-expert span and why that span measures 11 ms while
-   the kernels in it are free. Issue the H2D on the copy stream far enough ahead
-   (two layers, or a whole-layer prefetch like the prefill harness) that the
-   router and the shared expert run underneath it, and gate it with a
-   `cudaStreamWaitEvent` at the routed GEMV rather than at the layer head.
-   Acceptance: captured tg on the clean prompt, interleaved reps against the
-   current default; correctness is the existing oracle plus the long-prompt
-   gates (a new launcher must not add cubins to the default load set, item 7).
-   Do not spend the budget on cache capacity instead: R18 measured it at under
-   1 ms with prefill-scratch risk.
+9. ~~**Hide the expert miss copy**~~ -- CLOSED as a measured no-go (2026-11-11,
+   OPTIMIZATION.md R19). The copy is ~12.8 ms/token (102 misses x 0.125 ms) and
+   it is neither predictable nor hideable at bs=1: a one-layer-lookahead
+   prefetch installs **nothing** (temporal route overlap is 29.5% and every
+   predicted expert is already resident), per-layer partitioning is 0.2-1.4%
+   worse, and the only same-layer work independent of the routed experts is the
+   shared expert (~0.1 ms against a 0.32 ms/layer copy). Both runtimes pay the
+   same copy, so the remaining 1.13x to FreeToken is ~2 ms of **compute**
+   (ours ~15.5 ms against FT's ~13.6 on a 28.6 ms step). Pricing that needs a
+   real profiler on the captured path: CUDA events recorded inside a stream
+   capture read back as capture-time host deltas (labeled sum 160 ms against a
+   27.8 ms total), so a CUPTI activity harness is the prerequisite, not more
+   env-gated timers (`nsys`' qdstrm importer aborts in this nix build and `ncu`
+   has no GPU performance-counter permission). Do not re-chase prefetch,
+   partitioning, LFU, pins or capacity: all measured no-gos. The space is
+   *bounded*, not just exhausted: Belady MIN with perfect future knowledge at
+   2048 slots is 80.8 misses/step against LRU's 98.0 (-17.5%, 2.1 ms), and no
+   online policy (SLRU, 2-hit admission, TinyLFU, per-layer hot sets) found 1%
+   on the clean-prompt trace. The per-miss price is now measured, not inferred:
+   512 slots costs 14.54 ms/token against 33.0 tok/s, and the simulator puts the
+   two points at 220.3 vs 98.0 misses, i.e. **119 us/miss** (1.695 MiB at 14.2
+   GB/s, the PCIe Gen4 x8 link). Copy 11.7 ms + compute ~17 ms against
+   FreeToken's ~11.7 + ~14.1.
 **The decode step is attributed** (R15 S11, decision 160):
 29.2 ms/token, of which `moe_copy` -- the expert miss staging over PCIe -- is
 9.4 ms (32%); the routed GEMV and the lm_head are at roofline. R15 S12 landed

@@ -2922,3 +2922,111 @@ the copy stream far enough ahead that the router and the shared expert run
 underneath it. Raising `BLOCK_C` is recorded as a measured no-go (under 1 ms,
 prefill-scratch risk). Logs: `/tmp/opencode/ab_cur_*`, `/tmp/opencode/ab_twice_*`,
 `/tmp/opencode/sweep_*`, `/tmp/opencode/miss_clean.log`.
+
+## R19 -- The expert-miss copy cannot be hidden or reduced; the gap is compute (2026-11-11)
+
+R18 left one lever open: hide the ~12.8 ms/token of PCIe H2D instead of shrinking
+it. This slice measured the three ways to do that on the real route sequence and
+closed all of them, plus the attribution tool the next slice would have wanted.
+
+**The step, both runtimes, like-for-like** (50 W cap, clean 442-token prompt,
+greedy, captured graph, 24-step window):
+
+| | copy | compute | total |
+| --- | ---: | ---: | ---: |
+| FerrumTorrens | 12.8 ms (102 misses x 0.125) | ~15.5 ms | 28.6 ms (34.3-35.7 tok/s) |
+| FreeToken 0.2.1 | 12.2 ms (97.7 misses) | ~13.6 ms | 25.8 ms (38.7 tok/s) |
+
+The miss counts are measured, not inferred: `FT_ROUTE_TRACE` on the clean prompt
+(54 steps x 40 layers) plus `scripts/route-trace-sim.py` gives **97.9-102.1
+misses/step** at 2048 slots, matching the `FT_MISS_TRACE` probe (mean ~102, range
+80-180). R15 S13's 37.9 figure for "363 tokens of varied prose" does not
+reproduce on the current prompt and engine; quote ~100 for the clean prompt.
+
+**Lever 1: one-layer-lookahead prefetch (temporal prediction). REJECTED.** The
+idea was to issue layer L's fetches after layer L-1's router, where a full layer
+of compute (~0.7 ms) hides a 0.32 ms copy. Simulated on the trace (strict LRU,
+one flat pool, prefetch evicts only the coldest):
+
+| predictor | exposed misses/step | prefetch installs |
+| --- | ---: | ---: |
+| none (committed LRU) | 97.94 | - |
+| previous step, same layer | 97.94 | **0.00** |
+| previous step, layers L and L+1 | 97.94 | 0.00 |
+
+Temporal overlap of the top-8 route with the previous token is only **29.5%**,
+and every one of those experts is *already resident* (it was used one step ago),
+so the predictor installs nothing and hides nothing. The misses are precisely
+the experts that were not recently used, which is why R13's warmup-learned pins
+also failed. There is no cheap predictor for the miss set.
+
+**Lever 2: per-layer cache partitioning. REJECTED.** A layer only ever touches
+its own 256 experts, so partitioning the flat pool was the obvious structural
+alternative: 2048 slots -> 51/layer is **+1.4%** worse, 3072 -> 76/layer is
++0.2% worse. The global LRU already approximates the partition because a step
+touches 320 experts of 2048 slots.
+
+**Lever 3: attribution of the captured step. NEGATIVE (tool).** `FT_PROFILE`
+reports per-stage CUDA-event times, but a captured graph records those event
+pairs once at capture, and the elapsed values are **capture-time host deltas**:
+with the capture path instrumented, the labeled sum read 160 ms against a 27.8
+ms total (gdn_ba 106 ms for 30 tiny kernels). Recording events inside a stream
+capture is not a way to time a graph. The eager event profile stays
+self-consistent (24.75 labeled vs 30.07 total) but every stage in it also carries
+host submission time, so it cannot be used to price a captured stage either --
+which is exactly what R18's duplicate-pair experiment caught. The capture-path
+instrumentation was reverted.
+
+**What is left.** Copy (12.8 ms) is the link at ~90% of PCIe Gen4 x8 and is
+neither predictable nor hideable with bs=1, because the only same-layer work
+independent of the routed experts is the shared expert (~0.1 ms against a 0.32
+ms/layer copy). Both runtimes pay the same copy, so the remaining 1.13x is the
+~2 ms of compute difference, and pricing that needs a real profiler on the
+captured path (CUPTI activity API, since `nsys`' qdstrm importer aborts in this
+nix build and `ncu` has no permission for GPU performance counters). Do not
+re-chase prefetch, partitioning, LFU, pins or capacity: all are measured no-gos.
+Logs: `/tmp/opencode/routes_clean.txt`, `/tmp/opencode/prefetch_sim.py`,
+`/tmp/opencode/prof_eager.log`, `/tmp/opencode/prof_graph5.log`.
+
+### R19 addendum -- the policy space re-evaluated on the clean prompt, and bounded
+
+R15 S13 closed the cache policy on the broken prompt (`routes2.txt` was the
+"quick brown fox" repetition and `routes3.txt` the `/tmp/opencode/bench/prompt2.txt`
+artifact, whose degenerate trajectory routes nothing like serving). Re-ran the
+whole space on the clean-prompt trace (`/tmp/opencode/routes_clean.txt`, 54 steps
+x 40 layers, 320 fetches/step) with `/tmp/opencode/policy_study.py`, which also
+adds the scan-resistant policies that study never tried and an offline bound:
+
+| policy (2048 slots) | miss/step | vs LRU |
+| --- | ---: | ---: |
+| LRU (committed) | 97.96 | - |
+| SLRU protected=0.5 / 0.8 / 0.95 | 98.08 / 128.53 / 320.00 | +0.1% / +31% / +227% |
+| 2-hit admission | 135.40 | +38.2% |
+| frequency admission (TinyLFU rule) | 97.96 | +0.0% |
+| per-layer hot 8 / 16 / 32 + shared LRU | 97.96 / 97.70 / 98.70 | +0.0% / -0.3% / +0.8% |
+| LRU 2304 (+256 slots) | 93.23 | -4.8% |
+| LRU 3072 (+1024 slots) | 83.23 | -15.0% |
+| **Belady MIN (offline, perfect future)** | **80.81** | **-17.5%** |
+
+So the space is not merely exhausted, it is *bounded*: perfect future knowledge
+at this capacity buys 17 misses/step, and no online policy found even 1%. The
+result is robust to the broken prompt -- what changes with a real trajectory is
+the absolute miss count (98, not 38), which makes the copy *more* important, not
+the ranking. Capacity remains the only real lever and stays blocked: 3072 slots
+is 5.1 GiB against 4.4 GiB free, and auto already resolves to 2292 (the planner's
+VRAM answer) rather than to the `BLOCK_C` ceiling.
+
+**The per-miss price, measured instead of inferred.** The old 0.125 ms came from
+differencing two broken-prompt traces. Pinning the cache to 512 slots on the
+clean prompt costs 14.54 ms/token (22.3 against 33.0 tok/s captured), and the
+simulator puts 512 at 220.34 misses/step against 97.96 at 2048, i.e. **119 us
+per miss** -- 1.695 MiB at 14.2 GB/s, PCIe Gen4 x8. The copy is 11.7 ms/token
+and the simulator reproduces both measured points, so the cache model and the
+copy price now agree on the clean prompt.
+
+Consequence: the step is 11.7 ms copy + ~17 ms compute against FreeToken's
+~11.7 + ~14.1. The remaining 1.13x is compute, and it is diffuse by the eager
+attribution (gdn_qkvz 2.8, attn_proj 1.8, attn_sdpa 1.3, gdn_tail_proj 1.2,
+gdn_tail_norm 1.0, head 0.8, router 0.8, routed GEMV ~2.2), which is why the
+next step is a captured-path attribution (duplicate-op marginal cost in the
+graph, which needs no profiler), not another policy.
