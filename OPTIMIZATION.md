@@ -3159,7 +3159,12 @@ The pair is not a lever either way, but the *copy's interference* is, and no
 event-based timer could see it (R19's capture-time event deltas were the same
 blind spot from the other side).
 
-**Next levers, in order of cost:**
+**Correction (R22): both levers below were implemented and measured, and both
+are no-wins. The starved compute was the shared expert, which was already hidden
+under the copy window and therefore never on the critical path. Read R22 for the
+corrected step budget (copy 16.3 + serial compute 11.0 + a 5.0 ms host gap).**
+
+**Next levers, in order of cost (superseded by R22):**
 1. Give the copy stream the **lowest priority** (`cuStreamCreateWithPriority`)
    and the model stream the highest. Pending blocks of the copy yield to compute
    as SMs free, and a few dozen CTAs already saturate PCIe. One driver helper.
@@ -3173,3 +3178,71 @@ blind spot from the other side).
 device work is the logits D2H (one `memcpy`, 74 us/step = 0.25% of the step).
 The `FT_PROFILE` sub-step calls are no-ops when the timer is off and do not
 appear in the trace. Logs: `/tmp/opencode/cupti/`.
+
+## R22 -- Copy/compute interference is not on the critical path; the step budget is copy + serial compute + a 5 ms host gap (2026-11-11)
+
+R21 concluded that the miss copy starves the compute stream and that removing the
+starvation was the largest remaining win. Both halves of that were tested and
+**both are measured no-wins**; the R21 reading of the trace was wrong, and this
+slice corrects it.
+
+**Lever 1, lowest-priority copy stream. REJECTED, and it is a true no-op.** The
+driver reports the priority range `(0, -5)` and a default stream is already 0, so
+"lowest priority copy" only means anything if the model stream is raised to the
+greatest priority; done both ways, the trace is bit-identical (span p50 32.22 vs
+32.34 ms, copy window 16.27 vs 16.40, `_index_copy_multi` p50 406.8 vs 410.1
+us/call). Stream priority only reorders *pending* block dispatch, and the copy's
+384 CTAs are all resident before any compute block is pending, so there is
+nothing to reorder.
+
+**Lever 2, bounded copy grid. REJECTED.** `_index_copy_multi`'s grid was cut from
+`(6, 64)` = 384 CTAs to `(6, 8)` = 48 with an internal segment loop. It changed
+the mechanism exactly as designed -- the shared expert went from 339.9 to 87.6
+us/call at p50 (697.6 -> 128.0 at max) and the compute stream's busy time from
+26.5 to 16.3 ms -- **and the step did not get shorter**: span p50 32.22 -> 31.92
+ms (inside noise) and the worst step got worse (58.95 -> 64.37 ms), because 48
+CTAs cover PCIe latency less well than 384 and the copy is on the critical path.
+Rate over the three interleaved arms (3 rounds each): control 34.47, priority
+34.90, bounded grid 34.90 tok/s, all inside the ~2 tok/s within-arm spread.
+
+**Why the starvation was free.** The compute that runs inside the copy window is
+the shared expert and nothing else (overlap p50 15.52 ms against p1+p2 = 12.69 +
+small). Its starved time is coextensive with the copy window, so it was already
+hidden under the copy; the extra busy time R21 saw was that hidden work inflating,
+not critical work being delayed. The rest of the compute cannot overlap the copy
+at all: the routed GEMV reads the slots the copy writes, and the MoE closes each
+layer. So the reachable step is `copy + non-overlappable compute + gap`, not
+`max(copy, compute)`.
+
+**The corrected step budget** (p50 of 17 decode steps, 10-token run, clean prompt,
+captured):
+
+| component | p50 | share |
+| --- | ---: | ---: |
+| miss copy window | 16.27 ms | 51% |
+| compute outside the copy window | 10.97 ms | 34% |
+| gap between the head/D2H and the next step's kernels | **4.98 ms** | **16%** |
+| step span | 32.22 ms | |
+
+The gap is **identical in all three arms (4.98 / 4.94 / 4.59 ms) and is still
+5.15 ms in the warmest 18.3 ms step**, so it is not GPU work at all: it is the
+host between one step's head and the next step's first kernel (sampling, the
+logits D2H, engine bookkeeping, graph launch). R21's "instrumentation is 0.25%"
+was the *device* D2H only; the host half was never in any measurement.
+
+**What is left, sized from this trace:**
+1. The copy itself: 16.3 ms at p50, running ~12.8 GB/s against a ~14.4 GB/s
+   pinned peak, so at most ~11% (~1.6 ms) from copy efficiency.
+2. **The ~5 ms/step host gap: 16% of the step, and untouched by any GPU work.**
+   This is the next slice: instrument the host side of the step (sampling, the
+   logits D2H, `stage_and_launch`, graph launch) with a host clock and price each
+   piece, then attack whichever dominates. A server pays this per token, so it is
+   a serving cost, not a harness artifact -- but the harness's own share has to
+   be separated from the engine's first.
+3. The ~11 ms of serial compute (R20: `gdn_proj` 4.1, routed 2.4, attn 3.3, head
+   1.2, norms 1.2), which R20 already showed is diffuse.
+
+Prefill is unaffected by both levers: the normal prefill path uses
+`cuMemcpyBatchAsync_v2`, not `index_copy_multi`, and pp was 340.8 / 332.0 / 332.4
+tok/s across the arms. Logs: `/tmp/opencode/prio_*`, traces
+`/tmp/opencode/prio/trace_{control,prio,b}.*`.
