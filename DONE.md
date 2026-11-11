@@ -5404,3 +5404,61 @@ subsection names are kept verbatim.
     canonical `bench/prompt-clean.txt` the test header always told you to pass.
     The fallback is now that same file, so the gate is green without an env var;
     the threshold was not touched.
+
+167. **The decode step's residual "host gap" is the driver blocked in
+    `cuGraphLaunch`, not host work: a measured no-win (2026-11-11).** R22's
+    CUPTI budget booked 4.98 ms of a 32.2 ms captured step (16%) to host time
+    between the head GEMV/logits D2H and the next step's first kernel, and R23
+    planned to price it piece by piece before optimizing. Both sides were
+    measured and the premise does not survive: the step has 0.27 ms of host work
+    in it, and the 4.98 ms is the launch call itself, which the driver blocks in
+    while the graph is already running.
+    Instrument (landed): `src/infrastructure/host_profile.rs`, `FT_PROFILE_HOST=1`.
+    One `Instant` bracket each for the scheduler, the row build, the graph mutex,
+    the buffer staging, `cuGraphLaunch`, `cuStreamSynchronize`, the logits
+    readback (its redundant synchronize and the pageable D2H split out), the
+    sampler and the emit loop; brackets accumulate into a per-decode-step map and
+    the report is a p50 over steps (`/tmp/ft_profile_host.txt`). A prefill step is
+    discarded (different shape). Off, a bracket is one relaxed atomic load; four
+    unit tests pin the accumulation, the prefill filter, the percentiles and
+    `host = step - sync`. Brackets sit in `decode_graph.rs`
+    (stage/launch/sync/readback), `cudarc.rs` (the D2H) and `generation.rs`
+    (schedule/rows/sample/emit).
+    Measurement (captured, clean 442-token prompt, 50 W cap, greedy, 48 tokens,
+    one process per run, two control runs interleaved with four profiled ones):
+    control tg 34.2 / 34.6 tok/s against profiled 34.2 / 36.1 / 35.9 / 34.8, so
+    the timer does not perturb the step. Per-run p50, as a range over the four
+    profiled runs: `step` 27.4-28.9 ms = `sync` 15.2-16.2 + `launch` 11.3-11.8
+    + `readback` 0.13-0.17 + `sample` 0.10-0.11 + `stage` 0.03-0.06 + `emit`
+    0.004-0.010 + row build/schedule/lock 0.004. The whole 1 MB pageable logits
+    readback is ~0.15 ms (~6.5 GB/s) and the harness's full-vocab argmax 0.10 ms,
+    so moving sampling to the device (R23's first candidate) is worth ~0.25 ms
+    = 0.9%, below the 2% bar; a pinned readback and a pinned staging buffer are
+    0.03 ms and 0.15 ms at most.
+    Cross-check (CUPTI, `scripts/cupti-trace/`, same arm, 144 064 records, 56
+    readbacks): the GPU span is 99% of the step wall (p50 34.19 vs 34.92 ms, min
+    ratio 0.957), the first device record after a logits D2H lands 0.95 ms later
+    (p90 1.73), and the largest host-side hole inside a decode step is 0.07 ms p50
+    / 1.12 p90. Summed per-stream busy time is 45.2 ms per 34.9 ms step, i.e.
+    ~10 ms of the expert copy runs under compute (the R15 S12 overlap). So
+    `cuGraphLaunch` submits a ~1800-node graph, the GPU starts on the submitted
+    prefix, and the call returns about 11 ms later with roughly half the graph
+    still to run -- host blocking that overlaps device work, not idle GPU.
+    Correction recorded in OPTIMIZATION.md R23: a one-stream gap computed from the
+    head kernel to the next step's first kernel measures the launch call, not
+    idleness. The step budget stands as copy ~16 ms (at 12.8 of the 14.4 GB/s
+    pinned peak) plus ~11 ms of serial compute, and every lever in either term is
+    an existing measured no-go (R18/R19/R20/R22).
+    The one host-side design still possible -- a device argmax writing the next
+    input id so the host can enqueue step N+1 and lag the readback by a step --
+    has a measured ceiling of the same 0.95 ms/step (3.4%, 34.5 -> ~35.7 tok/s)
+    and would have to rework stop rules, non-greedy sampling and the MTP draft.
+    Not taken; the number is recorded so it is not re-derived.
+    Environment note for the next session: the devshell's exported
+    `FERRUM_KERNEL_DIR` here pointed at a kernel artifact set that predates
+    `rmsnorm_gated`, the split-K attention pair and the fused shared expert, which
+    fails ~30 manifest unit tests. Building with `FERRUM_KERNEL_DIR=$PWD` against
+    the tree's gitignored `kernel/` (the `kernel-aot` output) is green; re-run
+    `nix build .#kernels` and re-enter the shell for the deployment artifact.
+    Logs: `/tmp/opencode/r23/{step0,r2,r3,c1,c2}.log`, `host_*.txt`, trace
+    `trace.37121`.

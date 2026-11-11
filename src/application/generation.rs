@@ -24,6 +24,7 @@ use crate::domain::sampling::{Rng, SamplingParams, sample};
 use crate::domain::scheduler::{
     Budget, FinishReason, Phase, Req, check_stop, match_stop_str, schedule_next_batch,
 };
+use crate::infrastructure::host_profile;
 
 /// A stop string can straddle a token boundary, so a bounded window of the
 /// generated tail is re-decoded each step. Window is generous rather than exact:
@@ -331,6 +332,7 @@ fn run_batch(
     let mut finished: Vec<u64> = Vec::new();
 
     while !pending.is_empty() || !decoding.is_empty() {
+        let _host_step = host_profile::begin_step();
         // An image request's embedding rows belong to it alone, so the batch
         // that runs one is always a single row: one forward, one sequence.
         let images_only = sessions.values().any(|s| s.images.is_some());
@@ -342,11 +344,18 @@ fn run_batch(
         } else {
             budget
         };
-        let batch = schedule_next_batch(&mut pending, &mut decoding, &budget);
+        let batch = {
+            let _f = host_profile::span("schedule");
+            schedule_next_batch(&mut pending, &mut decoding, &budget)
+        };
         let Some(phase) = batch.phase else {
             break;
         };
         debug_assert!(!batch.reqs.is_empty());
+        // The host-clock report only keeps decode steps, and only the captured
+        // path is a single graph launch; everything else is a different shape.
+        let captured_step = phase == Phase::Decode && engine.captured().is_some() && !images_only;
+        host_profile::mark_decode(captured_step);
 
         // Prefill requests the scheduler chunked: they advance their cache this
         // step but complete later, so they are not sampled and go back to pending.
@@ -442,7 +451,7 @@ fn run_batch(
                         phase,
                     )?
                 }
-            } else if phase == Phase::Decode && engine.captured().is_some() && !images_only {
+            } else if captured_step {
                 // The engine owns a captured decode service, so a whole decode
                 // step replays on one graph instead of one cached forward per
                 // request. Prefill stays on the per-request path (see below),
@@ -477,6 +486,7 @@ fn run_batch(
         };
 
         for (uid, token) in sampled {
+            let _emit = host_profile::span("emit");
             let s = sessions.get_mut(&uid).expect("sampled row has a session");
             s.ids.push(token);
             s.generated.push(token);
@@ -673,6 +683,7 @@ fn captured_decode_step(
 ) -> Result<Vec<(u64, u32)>, EngineError> {
     let mut rows = Vec::with_capacity(reqs.len());
     let mut windows: Vec<Vec<u32>> = Vec::with_capacity(reqs.len());
+    let build = host_profile::span("rows");
     for req in reqs {
         let s = sessions
             .get_mut(&req.uid)
@@ -704,6 +715,7 @@ fn captured_decode_step(
         windows.push(cache.filled().to_vec());
     }
     let refs: Vec<&[u32]> = windows.iter().map(Vec::as_slice).collect();
+    drop(build);
     let logits = engine.run_captured(&rows, &refs)?;
     if logits.len() != reqs.len() {
         return Err(EngineError::BadLogits {
@@ -727,7 +739,10 @@ fn captured_decode_step(
             let s = sessions
                 .get_mut(&req.uid)
                 .expect("sampled row has a session");
-            let token = sample(&logits[i], &req.sampling, &mut s.rng);
+            let token = {
+                let _f = host_profile::span("sample");
+                sample(&logits[i], &req.sampling, &mut s.rng)
+            };
             (req.uid, token)
         })
         .collect())

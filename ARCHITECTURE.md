@@ -150,6 +150,7 @@ stays pure: `Tensor` and CUDA handles never cross it (section 4).
 | CUDA-graph capture/replay | Device | `infrastructure/decode_graph.rs` + `decode_buffers.rs`; one graph per batch size, opted in with `cuda_graph = true` (decision 134) |
 | Decode stage profile (dev only, `FT_PROFILE=1`) | Device timing events | `infrastructure/profile.rs`; reference probe in `scripts/freetoken_probe/` |
 | Captured-step marginal cost (dev only, `FERRUM_DUP=<group>`) | Duplicate launches inside the graph | `infrastructure/dup.rs` + hooks in `forward_cudarc.rs` / `cuda_moe.rs`; OPTIMIZATION.md R20 |
+| Host side of one decode step (dev only, `FT_PROFILE_HOST=1`) | Host clocks (`Instant`) | `infrastructure/host_profile.rs` + brackets in `decode_graph.rs`, `cudarc.rs` and `application/generation.rs`; OPTIMIZATION.md R23 |
 
 Crossings per step: token ids H2D, streamed expert rows H2D (misses only), logits
 D2H (for host sampling). The pinned expert banks and the dense weights are set up
@@ -172,6 +173,14 @@ unchanged and turns the step-time delta into that group's cost. The set is parse
 once at load into `infrastructure/dup.rs`'s `Dup` bitset and the unset case is a
 bit test per stage. `gdn_conv` and `gdn_recur` belong to no group because they
 advance recurrent state.
+
+`FT_PROFILE_HOST=1` prices the other half of a captured step: the host. One
+`Instant` bracket each for the scheduler, the row build, the graph lock, the
+buffer staging, `cuGraphLaunch`, the stream synchronize, the logits readback, the
+sampler and the emit loop, accumulated per decode step and reported as a p50 over
+steps (`/tmp/ft_profile_host.txt`). The brackets are in `decode_graph.rs`
+(stage/launch/sync/readback), `cudarc.rs` (the D2H) and `generation.rs`
+(schedule/rows/sample/emit); off, a bracket is one relaxed atomic load.
 
 ---
 

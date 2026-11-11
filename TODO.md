@@ -16,10 +16,16 @@ shortened the step, R22). A CUPTI activity profiler (`scripts/cupti-trace/`,
 R21 -- `ncu` is admin-blocked and `nsys`' importer aborts on this driver) gives
 the first real captured-step budget: **copy window 16.3 ms (51%) + serial compute
 11.0 ms (34%) + a 4.98 ms host gap (16%)** of a 32.2 ms p50 step, with step spans
-ranging 18.1 ms (55 tok/s, warm cache) to 58.7 ms. **Next: the host gap** (R23) --
-4.98 ms between the head/logits D2H and the next step's first kernel, identical
-in every arm, so it is host time (staging, graph launch, the 1 MB pageable logits
-readback, sampling), worth up to ~4 ms = 34.5 -> ~39-40 tok/s with no GPU change.
+ranging 18.1 ms (55 tok/s, warm cache) to 58.7 ms. **The host gap is closed as a
+measured no-win** (R23): a host clock on every piece of the step prices the whole
+logits readback at 0.133 ms, the harness argmax at 0.103, the per-step staging at
+0.026 and the emit loop at 0.004; the 4.98 ms was `cuGraphLaunch` itself, blocked
+while the graph executes (GPU span 34.19 of a 34.92 ms step = 99% busy, and the
+next step's first kernel lands 0.95 ms p50 after the logits D2H). Device sampling
+would recover 0.23 ms (0.8%); the only host design left, a step-spanning
+pipeline, has a 0.95 ms = 3.4% ceiling. **The step is GPU-bound on the copy plus
+serial compute, and every lever there is a measured no-go.** Instrument:
+`FT_PROFILE_HOST=1`.
 
 The garbage at the start of decode after a long prompt was the
 prefill double buffer's residency never leaving `Prefill` on the overlap decode
@@ -221,18 +227,22 @@ R16/R17); item 4 is done (decision 166); items 2 and 5 remain open, and item 9
    two points at 220.3 vs 98.0 misses, i.e. **119 us/miss** (1.695 MiB at 14.2
    GB/s, the PCIe Gen4 x8 link). Copy 11.7 ms + compute ~17 ms against
    FreeToken's ~11.7 + ~14.1.
-10. **Close the ~5 ms/token host gap (the top decode lever, R22/R23).** A CUPTI
-   trace of the captured step puts 4.98 ms of a 32.2 ms step p50 between the
-   head/logits D2H and the next step's first kernel -- identical in every arm
-   and still 5.15 ms in the warmest 18.3 ms step, so it is host time, not GPU
-   work. `OPTIMIZATION.md` R23 has the plan: price the pieces first
-   (`stage_and_launch`, the graph launch, the synchronize, the 1 MB pageable
-   logits readback, the harness's argmax -- one `FT_PROFILE_HOST` bracket each,
-   cross-checked against the CUPTI inter-step gap), then keep sampling on the
-   device (the top-k/max/sum kernels already exist) and/or read back through a
-   persistent pinned buffer. Ceiling ~4 ms = 34.5 -> ~39-40 tok/s with no GPU
-   change, i.e. FreeToken's rate. If step 0 shows the gap is the harness's
-   argmax and printing rather than the engine, record that and stop.
+10. ~~**Close the ~5 ms/token host gap**~~ -- CLOSED as a measured no-win
+   (2026-11-11, OPTIMIZATION.md R23). `FT_PROFILE_HOST=1` prices every host piece
+   of a captured step: logits readback 0.133 ms (the 1 MB pageable D2H) + sampler
+   0.103 + staging 0.026 + emit 0.004 = 0.27 ms of a 27.65 ms step, so there is
+   no host gap to close. The 4.98 ms R22 measured between the head/D2H and the
+   next step's first kernel is the driver blocked inside `cuGraphLaunch`
+   (11.33 ms/step p50) *while the graph executes*: a CUPTI trace of the same arm
+   puts the GPU span at 34.19 of a 34.92 ms step (99% busy) and the next step's
+   first kernel 0.95 ms p50 after the logits D2H. Device sampling plus a pinned
+   readback would recover 0.23 ms (0.8%, below the bar); a step-spanning pipeline
+   (a device argmax writing the next id, the readback lagging a step) has a
+   0.95 ms = 3.4% ceiling for a large change, so it is not taken. Three
+   `FT_PROFILE_HOST` runs (34.2 / 36.1 / 35.9 tok/s) against two control runs
+   (34.2 / 34.6) show the timer does not perturb the step. Do not re-open the
+   host: the step is the copy plus serial compute, each a measured no-go.
+   Logs `/tmp/opencode/r23/`.
 **The decode step is attributed** (R15 S11, decision 160):
 29.2 ms/token, of which `moe_copy` -- the expert miss staging over PCIe -- is
 9.4 ms (32%); the routed GEMV and the lm_head are at roofline. R15 S12 landed

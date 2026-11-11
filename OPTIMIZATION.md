@@ -3247,100 +3247,106 @@ Prefill is unaffected by both levers: the normal prefill path uses
 tok/s across the arms. Logs: `/tmp/opencode/prio_*`, traces
 `/tmp/opencode/prio/trace_{control,prio,b}.*`.
 
-## R23 -- The host gap: 5 ms/token that no GPU work touches (plan, 2026-11-11)
+## R23 -- The "host gap" is the driver blocked in `cuGraphLaunch` while the GPU runs (measured, 2026-11-11)
 
-R22's corrected budget leaves one term that is not GPU work and has never been
-measured: **4.98 ms/step p50 between the head GEMV/logits D2H and the next
-step's first kernel**, 16% of a 32.2 ms step, identical in all three arms of that
-slice (4.98 / 4.94 / 4.59) and still 5.15 ms in the warmest 18.3 ms step. The
-copy (16.3 ms) is at the link rate with ~1.6 ms of headroom and the serial
-compute (11.0 ms) is diffuse (R20), so this is the largest single unattacked
-term. A server pays it per token, so it is a serving cost, not a harness
-artifact -- but the harness's own share has to be separated from the engine's
-before anything is optimized.
+R22 left one term unattacked: **4.98 ms/step p50 between the head GEMV / logits
+D2H and the next step's first kernel**, 16% of a 32.2 ms step, identical in all
+three arms of that slice (4.98 / 4.94 / 4.59) and still 5.15 ms in the warmest
+18.3 ms step. It read as pure host time, and the plan was to price its pieces
+before touching anything. That was done, from both sides: a host clock on every
+piece of the step, and a CUPTI activity trace of the same arm as the device-side
+cross-check.
 
-### Step 0 -- price the pieces, do not guess
+**Result: no host gap. The step is device-bound at 99%, and the 4.98 ms is the
+driver blocked inside `cuGraphLaunch`, which overlaps the graph's execution.**
+The engine has no lever here; device sampling and a pinned readback together
+would recover 0.23 ms/step (0.8%), and the only remaining host-side design (a
+step-spanning pipeline) has a measured ceiling of 0.95 ms (3.4%).
 
-Instrument the host side of one decode step with a host clock (`Instant`), behind
-one env var (`FT_PROFILE_HOST=1`, off by default, no allocation when off), and
-report p50 over the measured steps. The pieces, in the order they run:
+### The instrument
 
-1. **`stage_and_launch`** (`decode_graph.rs`): the row/window staging into the
-   fixed buffers -- `from_slice_i32` of the KV window (up to 4096 i32 per step)
-   and the `DecodeRow` fields, i.e. one or more small pageable H2D.
-2. **`cuGraphLaunch`** plus the `service.inner.lock()`.
-3. **the stream synchronize** after the launch (`run_step` does it explicitly).
-4. **the logits readback**: `logits_rows(rows)` then `to_host_f32` of a
-   `[vocab]` row = 1 MB per step. CUPTI already prices the *device* side of this
-   at 74 us (one `memcpy` record), so whatever the host clock shows above that is
-   the host half: a pageable D2H is ~2-3 GB/s, i.e. ~0.4 ms, and the allocation
-   and copy of the `Vec<f32>` adds more.
-5. **sampling** (harness): greedy `argmax` over 248320 floats. Must be measured
-   separately -- it is the harness's, not the engine's.
-6. **tokenizer decode + printing** (harness, dev only): exclude from the engine
-   number, and do not "optimize" it.
+`FT_PROFILE_HOST=1` (`src/infrastructure/host_profile.rs`) puts one `Instant`
+bracket each on the scheduler, the row build, the graph lock, the buffer staging,
+`cuGraphLaunch`, the stream synchronize, the logits readback (split into its
+redundant sync and the pageable D2H), the sampler and the emit loop (tokenizer +
+sink). Brackets accumulate into a per-decode-step map and the report is a p50
+over steps, not over calls; a prefill step is discarded because it has a
+different shape. Off, a bracket is one relaxed atomic load and the guard holds
+nothing. Unit tests pin the accumulation, the prefill filter, the percentile and
+the `host = step - sync` arithmetic.
 
-Cross-check with the CUPTI trace already in the tree: the gap between the last
-kernel of step N and the first kernel of step N+1 is the whole host gap, so the
-sum of the pieces must reconcile with it. If it does not, the missing piece is
-outside these brackets (engine bookkeeping between `step()` calls, the
-scheduler, or the smoke's own per-token loop).
+### Step 0 (captured, clean 442-token prompt, 50 W cap, greedy, 48 tokens, one process per run)
 
-Also split the engine from the harness: run one arm with sampling replaced by a
-fixed token id (no argmax, no readback beyond what the API requires) and one with
-the full path, so the two shares are known before any fix.
+Three profiled runs and two control runs, interleaved, same binary:
 
-### Step 1 -- fix whichever piece dominates
+| run | tg (tok/s) |
+| --- | ---: |
+| control | 34.2 / 34.6 |
+| `FT_PROFILE_HOST=1` | 34.2 / 36.1 / 35.9 / 34.8 |
 
-Ordered by expected size, to be confirmed by step 0:
+The timer is inside the run-to-run spread, so profiling does not perturb the
+step. p50 of each span per run, as a range over the four profiled runs:
 
-1. **Keep sampling on the device.** The full-vocab readback exists because the
-   host samples. For greedy (and for the top-k/top-p paths the engine already
-   has device kernels for: `fused_topk_softmax_f32`, `topk_last_f32`,
-   `max_all_f32`, `sum_all_f32`) the host only needs the chosen id (4 bytes) plus
-   the sampler's parameters. Moving the reduce to the device removes the 1 MB
-   pageable D2H from the step. This is the largest candidate if step 0 shows the
-   readback dominating, and it also helps the server's per-token latency.
-2. **Pinned readback.** If the full vector must come back (a caller needs the
-   logits), stage it through a persistent pinned buffer (`cuMemcpyDtoHAsync` into
-   host-pinned memory + one event) instead of a pageable copy that allocates per
-   step. The embedding already uses the same pinned-host pattern.
-3. **Staging without per-step allocations.** The window/rows H2D should write
-   into a persistent pinned staging buffer; a per-step `Vec` + pageable copy pays
-   a driver-side bounce buffer every token.
-4. **The synchronize.** It cannot disappear while the API returns logits, but a
-   server can overlap it with the next request's tokenization; measure whether
-   the harness's own sync (rather than the engine's) is part of the gap.
-5. Only if 1-4 leave most of the gap: a capture that spans the step boundary (the
-   graph launch itself), which is a different design and needs its own slice.
+| span | ms/step p50 | share of step |
+| --- | ---: | ---: |
+| step (whole loop iteration) | 27.4-28.9 | |
+| `sync` (`cuStreamSynchronize`) | 15.2-16.2 | 55% |
+| `launch` (`cuGraphLaunch`) | 11.3-11.8 | 41% |
+| `readback` (1 MB pageable D2H) | 0.13-0.17 | 0.5% |
+| `sample` (harness argmax) | 0.10-0.11 | 0.4% |
+| `stage` (4 i32 + the KV window H2D) | 0.03-0.06 | 0.1% |
+| `emit` (tokenizer + sink) | 0.004-0.010 | 0.03% |
+| `host` = `step - sync` | 11.1-12.1 | 45% |
 
-### Acceptance and protocol
+R23's candidates are priced at the bottom of that table: the whole readback is
+0.13 ms (1 MB at ~7.5 GB/s through a pageable copy), the harness argmax over
+248320 floats 0.10 ms, the per-step staging 0.026 ms. Moving sampling to the
+device and keeping the logits on the card is 0.23 ms of a 27.65 ms step, i.e. 0.8%
+-- below the 2% bar and not worth a sampler port. The 4.98 ms is not in any of
+these brackets; it is inside `launch`.
 
-- Measure on the clean prompt (`bench/prompt-clean.txt`), captured, 50 W cap,
-  48 tokens, one process per arm, **interleaved 3 rounds minimum**; the control
-  must land in the known 34-36 tok/s band and single runs vary ~5%, so quote
-  per-round numbers and the mean. Never use `/tmp/opencode/bench/prompt2.txt`.
-- Report the host-gap p50 before/after from both the host clock and the CUPTI
-  trace (they must agree), plus the tok/s delta.
-- Gates: `cargo fmt --check`, both clippy passes, `cargo test`, the oracle
-  (`one_token_through_the_kernel_matches_the_oracle` -> " Paris"), and the
-  long-prefill gate. A sampler change additionally needs the greedy-token gates
-  to stay exact (`device_decode_matches_refeed`, `engine_real_generate`).
-- Resource limits as always: one model-loading process at a time under
-  `prlimit --as=68719476736`, `MemAvailable` >= ~23.4 GiB before a load.
+### Why `launch` is not a host cost: the CUPTI cross-check
 
-### Expected
+The trace (`/tmp/opencode/r23/trace.37121`, 144 064 records, 56 decode steps;
+`scripts/cupti-trace/`) says the graph is executing while that call is still
+submitting:
 
-If the engine's share of the gap is most of it and item 1 or 2 lands, the step
-drops by up to ~4 ms, i.e. 32.2 -> ~28 ms and 34.5 -> ~39-40 tok/s, which is
-FreeToken's 38.7 (R19) without touching the GPU at all. If step 0 instead shows
-the gap is mostly the harness's argmax and printing, the engine has no lever
-here: record that and stop, because the server would not pay the same cost.
+- GPU span vs step wall, per step (readback to readback): **p50 34.19 ms against
+  34.92 ms = 99% busy**, min ratio 0.957. The device is covered end to end.
+- The first device record after a logits D2H lands **p50 0.95 ms later** (p90
+  1.73, max 2.17) -- not 11 ms. The next step's kernels are running long before
+  `cuGraphLaunch` returns.
+- The largest host-side hole inside a decode step is **p50 0.07 ms (p90 1.12)**,
+  and what remains of it is the staging H2D + `copy_strided` pair, which is device
+  work in the same trace.
+- The compute stream's busiest-step holes in R21 (~1 ms) are the copy stream's
+  `index_copy_multi` occupying the SMs; they are covered by the copy, which is why
+  R22's own levers measured no-wins.
+- Summed per-stream busy time is 45.2 ms per 34.9 ms step: ~10 ms of the copy runs
+  under compute, which is the R15 S12 overlap doing its job.
 
-### Do not re-chase
+So the R22 reading (and the pass that grew out of it) was a measurement artifact:
+a gap computed on one stream, with the head as the last device record, measures
+the host's *blocking* time, not the GPU's idleness. The step budget stands as
+copy 16.3 + serial compute 11.0, and the ~5 ms attributed to the host is the
+launch call, paid while the GPU works.
 
-Copy/compute interference, copy-stream priority, the copy grid (R22, all
-measured no-wins); the cache policy in any form (R19, bounded at -17.5% by
-Belady); capacity (R18/R19, VRAM-bound); the shared expert (R18); the routed
-GEMV and lm_head (R20, both at the byte roofline); `nsys`/`ncu` (R21: importer
-aborts on this driver, counters are admin-only -- use `scripts/cupti-trace/`).
+### Verdict and what is left on the host
+
+- Do not move sampling to the device for rate (0.23 ms/step, 0.8%), and do not
+  build a pinned readback: both are inside the run-to-run spread.
+- The one host-side design left is a step-spanning pipeline: a device argmax that
+  writes the next input id into the graph's buffer, so the host can enqueue step
+  N+1 before reading anything back and lag the readback by a step. Its ceiling is
+  the measured readback-to-first-kernel window, **0.95 ms/step = 3.4%** (34.5 ->
+  ~35.7 tok/s), and it has to rework stop rules, non-greedy sampling and the MTP
+  draft. At the noise floor for a large change, so it is not taken; the number is
+  recorded so it is not re-derived.
+- The step is GPU-throughput-bound: the expert-miss copy (~16 ms at 12.8 of the
+  14.4 GB/s pinned peak) plus ~11 ms of serial compute. Every lever there is a
+  measured no-go (R18 capacity, R19 policy/prefetch, R20 kernels, R22
+  interference), so decode stays at 34-36 tok/s on this box until a structural
+  change (a bigger cache or a faster link) appears.
+
+Logs: `/tmp/opencode/r23/{step0,r2,r3,c1,c2}.log`,
+`/tmp/opencode/r23/host_*.txt`, trace `/tmp/opencode/r23/trace.37121`.

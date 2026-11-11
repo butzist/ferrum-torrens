@@ -243,16 +243,22 @@ impl<E: DecodeExec> DecodeGraphSet<E> {
         let exec = &self.entries[&bs];
         let bufs = exec.buffers();
 
-        bufs.stage_padded_with(rows, bs, self.padding)?;
-        for (i, w) in windows.iter().enumerate() {
-            bufs.stage_window(i, w)?;
+        {
+            let _stage = crate::infrastructure::host_profile::span("stage");
+            bufs.stage_padded_with(rows, bs, self.padding)?;
+            for (i, w) in windows.iter().enumerate() {
+                bufs.stage_window(i, w)?;
+            }
+            // A padded row keeps no window from an earlier, longer step: its mask
+            // drops every key but the padding must still be a defined buffer.
+            for i in rows.len()..bs {
+                bufs.stage_window(i, &[])?;
+            }
         }
-        // A padded row keeps no window from an earlier, longer step: its mask
-        // drops every key but the padding must still be a defined buffer.
-        for i in rows.len()..bs {
-            bufs.stage_window(i, &[])?;
+        {
+            let _launch = crate::infrastructure::host_profile::span("launch");
+            exec.launch()?;
         }
-        exec.launch()?;
         Ok(bs)
     }
 }
@@ -353,18 +359,24 @@ impl<E: DecodeExec> EngineDecodeGraphs<E> {
                 windows: windows.len(),
             });
         }
-        let service = self
-            .inner
-            .lock()
-            .map_err(|e| DecodeError::Step(e.to_string()))?;
+        let service = {
+            let _lock = crate::infrastructure::host_profile::span("lock");
+            self.inner
+                .lock()
+                .map_err(|e| DecodeError::Step(e.to_string()))?
+        };
         let bs = service
             .set
             .stage_and_launch(rows, windows)
             .map_err(graph_error)?;
-        if let Some(rt) = &service.rt {
-            rt.synchronize()
-                .map_err(|e| DecodeError::Step(e.to_string()))?;
+        {
+            let _sync = crate::infrastructure::host_profile::span("sync");
+            if let Some(rt) = &service.rt {
+                rt.synchronize()
+                    .map_err(|e| DecodeError::Step(e.to_string()))?;
+            }
         }
+        let _readback = crate::infrastructure::host_profile::span("readback");
         let bufs = service
             .set
             .get(bs)

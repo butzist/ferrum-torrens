@@ -669,7 +669,11 @@ impl Tensor {
 
     pub fn to_host_f32(&self) -> Result<Vec<f32>, MoEError> {
         let src = self.contiguous()?;
-        self.rt.synchronize()?;
+        {
+            let _s = crate::infrastructure::host_profile::span("d2h_sync");
+            self.rt.synchronize()?;
+        }
+        let _c = crate::infrastructure::host_profile::span("d2h");
         let start = src.offset;
         let len = src.numel();
         match &src.buf {
