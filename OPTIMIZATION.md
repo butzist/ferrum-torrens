@@ -3030,3 +3030,146 @@ attribution (gdn_qkvz 2.8, attn_proj 1.8, attn_sdpa 1.3, gdn_tail_proj 1.2,
 gdn_tail_norm 1.0, head 0.8, router 0.8, routed GEMV ~2.2), which is why the
 next step is a captured-path attribution (duplicate-op marginal cost in the
 graph, which needs no profiler), not another policy.
+
+## R20 -- Captured-step attribution by duplicate launch: compute is diffuse (2026-11-11)
+
+R19 left the captured step unattributed: events recorded inside a stream capture
+read back as capture-time host deltas, `nsys`' qdstrm importer aborts in this
+nix build and `ncu` has no GPU-counter permission. The one attribution that
+needs no profiler is marginal cost, the method R18 used on the shared expert:
+relaunch a stage a second time with identical inputs and output buffers, and the
+step-time delta is that stage's cost. This slice built it as a dev hook and used
+it to price the ~17 ms of compute.
+
+**What was built.** `FERRUM_DUP=<group>[,<group>...]`, parsed once at load into
+`infrastructure/dup.rs`'s `Dup` bitset (never a `std::env::var` per call or per
+layer; unset is a bit test per stage). A duplicate relaunches the same kernels
+over the same buffers, so the numerics are unchanged -- with all eight groups
+duplicated the oracle test still answers " Paris". Groups: `norms` (res_norm,
+post_norm, gdn_tail_norm), `attn_proj`, `attn_sdpa`, `attn_out`, `gdn_proj`
+(gdn_qkvz, gdn_ba, gdn_tail_gate, gdn_tail_proj), `head`, `router`, `routed`
+(the grouped expert GEMV pair + silu + reduce; the miss copy is never
+duplicated, a second `index_copy` is a no-op hit). `gdn_conv` and `gdn_recur`
+are in no group because they advance recurrent state.
+
+**Marginal cost of one extra pass, captured, 50 W, clean 442-token prompt,
+greedy, 48 tokens, one process per arm** (control and the eight groups
+interleaved, three forward rounds, plus one reversed round so the control is
+also measured last; the control is order-insensitive at 35.6/35.9/36.0/35.7):
+
+| group | tg tok/s (3 fwd rounds) | rev | mean | delta ms/token |
+| --- | --- | ---: | ---: | ---: |
+| control | 35.6 / 35.9 / 36.0 | 35.7 | 35.80 | - |
+| `gdn_proj` | 30.5 / 32.0 / 30.6 | 31.9 | 31.25 | **+4.07** |
+| `routed` | 33.4 / 33.1 / 32.0 | 33.5 | 33.00 | **+2.37** |
+| `attn_proj` | 33.3 / 34.2 / 34.3 | 32.3 | 33.53 | +1.90 |
+| `attn_sdpa` | 34.5 / 34.4 / 32.9 | 34.5 | 34.08 | +1.41 |
+| `head` | 34.7 / 34.7 / 33.4 | 34.4 | 34.30 | +1.22 |
+| `norms` | 34.7 / 34.9 / 33.0 | 34.7 | 34.33 | +1.20 |
+| `attn_out` | 34.4 / 34.0 / 35.5 | 35.6 | 34.88 | +0.74 |
+| `router` | 35.4 / 35.3 / 35.3 | 33.5 | 34.88 | +0.74 |
+
+Per-arm spread is 0.6-0.9 tok/s (sd, n=4), i.e. ~0.4 ms on a mean, so the
+ranking is solid but every delta below ~1.2 ms is within two standard errors of
+its neighbour. The eight groups sum to **13.7 ms**, against a control step of
+27.9 ms and R19's 11.7 ms of miss copy, i.e. they cover ~85% of the ~16 ms of
+compute; the rest is embed, the final norm, `gdn_conv`/`gdn_recur` and the
+shared expert.
+
+**Reading the table.** These are marginal costs, so they are lower bounds on a
+stage's cost: the duplicate re-reads data the original just touched (L2-warm)
+and the smaller groups are partly graph-node dispatch (110 extra nodes for
+`norms`, 120 for `gdn_proj`, 160 for `routed`). The two giants are also the two
+biggest byte reads of the step, and their implied bandwidth matches the already
+tuned lm_head:
+
+| group | extra weight bytes per step | implied GB/s |
+| --- | ---: | ---: |
+| `head` | 254 MB (248320 x 2048 NVFP4) | ~210 |
+| `routed` | 568 MB (320 expert banks x 1.69 MiB) | ~240 |
+| `gdn_proj` | 512 MB (30 x 12.6 MB qkvz + 4.2 MB o) | ~125 |
+
+So `gdn_proj` is not a slow kernel, it is 30 layers of a 12288x2048 projection
+plus its output projection. `attn_proj` (94 MB, ~55 GB/s) and `attn_out` (42 MB,
+~60 GB/s) are latency-bound: 10 layers each, several launches per layer.
+
+**Verdict: diffuse, no single lever.** No stage is more than 25% of the compute
+and the top three (`gdn_proj` 4.07, `routed` 2.37, `attn_proj` 1.90) are 8.3 of
+the 13.7 ms, so a ~3 ms gap against FreeToken cannot be one hot kernel here
+unless that kernel is 1.8x off, and nothing in this data says so. Worth
+attacking, in order: (1) `gdn_proj`, the only group with a bandwidth-shaped cost
+and real weight bytes -- but the bytes are the required math, so the only lever
+would be reading them as packed 4-bit (already does) or reusing them across
+layers (they are per-layer); (2) `routed`, likewise byte-bound, and already
+faster than `head`'s GB/s; (3) the launch count of `norms` (110 nodes) if a
+fusion is free. Not worth attacking: `head` (254 MB at 210 GB/s is the tuned
+roofline), `attn_sdpa`, `attn_out`, `router` -- all under 1.5 ms and none
+bandwidth-shaped. The honest conclusion is that FerrumTorrens' compute is
+already spread evenly over the required bytes, so the remaining 1.13x is not
+hiding in one stage and the next slice should not be another kernel hunt: it is
+either a real profiler (CUPTI activity API) to price the 2.5 ms this method
+cannot see, or accepting the rate.
+Logs: `/tmp/opencode/dup_{control,<group>}_r{1,2,3}.log`,
+`/tmp/opencode/dup_<group>_r4rev.log`, grid `/tmp/opencode/dup_grid.log`.
+
+## R21 -- A working CUPTI profiler, and the copy is starving the compute stream (2026-11-11)
+
+R18/R19/R20 had no attribution tool: `ncu` cannot read performance counters here
+(`RmProfilingAdminOnly: 1`) and `nsys` collects but its bundled qdstrm importer
+aborts on every report (driver 595.112 / CUDA 13.2 against the CUDA 12.9 build in
+the store; no newer nsight-systems is available). CUPTI *activity* tracing needs
+neither permission, so `scripts/cupti-trace/` is a ~120-line preload tracer that
+writes per-kernel start/end/stream to CSV, plus `decode-steps.py` to split the
+trace into decode steps. It works on the captured graph.
+
+**It overturns the R20 reading of the step.** The decode step is not a fixed
+27.9 ms; it ranges from **18.1 to 58.7 ms** across steps of one run, and the
+spread is entirely the expert-miss copy. Per step, on the compute stream (1974
+kernels) and the copy stream (101-161 kernels):
+
+| per step | fastest | median | slowest |
+| --- | ---: | ---: | ---: |
+| step span | 18.1 ms | 31.9 ms | 58.7 ms |
+| `_index_copy_multi` (40 calls) | 1.3 ms | 15.2 ms | 42.8 ms |
+| `shared_expert_nvfp4_phase1` (40 calls) | 1.7 ms (43 us/call) | - | 27.7 ms (694 us/call) |
+| `shared_expert_nvfp4_phase2` (40 calls) | 0.19 ms (4.7 us/call) | - | 12.3 ms (308 us/call) |
+| compute stream busy | 13.2 ms | 26.6 ms | 51.0 ms |
+
+So the copy does not merely add its own 12.8 ms: while it is in flight, every
+compute kernel on the other stream runs **4x slower** (the shared-expert pair
+16-65x slower per call), and the whole compute stream goes from 13.2 to 51.0 ms.
+The fastest step -- 18.1 ms, i.e. **55 tok/s** -- is the floor with a warm cache;
+the 48-token benchmark's 34-36 tok/s is the average over steps whose miss count
+drifts up as the continuation moves into new text.
+
+**Why.** `index_copy_multi` is a grid-stride *kernel* that reads the layer's
+pinned host rows straight into the slots (not a copy-engine DMA), launched as
+`(banks, splits)` = about **420 CTAs** of PCIe-latency-bound work. That is enough
+to occupy every SM while it waits, which is exactly what the prefill path's own
+comment says ("`6 * experts` `index_copy` CTAs that would occupy the SMs and
+stall the compute stream on PCIe") -- and why prefill uses
+`cuMemcpyBatchAsync_v2` instead. Decode cannot use the batch API inside a
+captured graph (it needs the miss list on the host, and a D2H is not capturable),
+so it keeps the kernel and pays the occupancy cost.
+
+**This also explains the earlier contradictions.** R20's duplicate-op experiment
+said the shared-expert pair is free: it is, in the average step, because it hides
+under the copy -- and in a miss-heavy step it is not free at all, it is starved.
+The pair is not a lever either way, but the *copy's interference* is, and no
+event-based timer could see it (R19's capture-time event deltas were the same
+blind spot from the other side).
+
+**Next levers, in order of cost:**
+1. Give the copy stream the **lowest priority** (`cuStreamCreateWithPriority`)
+   and the model stream the highest. Pending blocks of the copy yield to compute
+   as SMs free, and a few dozen CTAs already saturate PCIe. One driver helper.
+2. Bound `index_copy_multi`'s grid (one or two CTAs per SM with an internal
+   loop) so the copy cannot occupy the machine while it waits on the link.
+3. Re-measure the miss-copy price after either: R19's 119 us/miss was derived
+   from step *averages*, so it prices the interference as if it were copy time.
+
+**Instrumentation cost, measured while answering that question:** the graph is
+1974 compute kernels + 101 copy kernels per step, and the only harness-side
+device work is the logits D2H (one `memcpy`, 74 us/step = 0.25% of the step).
+The `FT_PROFILE` sub-step calls are no-ops when the timer is off and do not
+appear in the trace. Logs: `/tmp/opencode/cupti/`.
