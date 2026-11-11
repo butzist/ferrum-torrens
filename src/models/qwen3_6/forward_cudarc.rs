@@ -478,6 +478,9 @@ pub struct CudarcQwen3_6 {
     moe: Option<Arc<dyn MoEExecutor>>,
     head_gemv: Option<Arc<DenseGemv>>,
     shared_expert_fused: Option<Arc<crate::infrastructure::cuda_linear::SharedExpertFused>>,
+    shared_ic2: Option<Tensor>,
+    shared_se_gate: Option<Tensor>,
+    shared_out: Option<Tensor>,
     fp8: Option<Arc<Fp8Linear>>,
     gdn: Arc<GdnDecode>,
     attention: PagedAttention,
@@ -542,6 +545,17 @@ impl CudarcQwen3_6 {
         let axis = super::mrope::mrope_axis_map(&section, params.rotary_dim / 2, interleaved);
         let axis: Vec<i32> = axis.iter().map(|&a| a as i32).collect();
         let mrope_axis = rt.from_slice_i32(&axis, &[axis.len()])?;
+        let (shared_ic2, shared_se_gate, shared_out) = if shared_expert_fused.is_some() {
+            let si = params.shared_expert_intermediate_size;
+            let h = params.hidden_size;
+            (
+                Some(rt.zeros(&[si], TensorDType::Bf16)?),
+                Some(rt.zeros(&[1], TensorDType::F32)?),
+                Some(rt.zeros(&[h], TensorDType::Bf16)?),
+            )
+        } else {
+            (None, None, None)
+        };
         Ok(Self {
             rt,
             params,
@@ -552,6 +566,9 @@ impl CudarcQwen3_6 {
             moe,
             head_gemv,
             shared_expert_fused,
+            shared_ic2,
+            shared_se_gate,
+            shared_out,
             fp8,
             gdn,
             attention,
@@ -1300,9 +1317,13 @@ impl CudarcQwen3_6 {
                     None
                 } else {
                     let x_flat = x_post.reshape(&[h])?;
-                    let ic2 = self.rt.zeros(&[si], TensorDType::Bf16)?;
-                    let se_gate = self.rt.zeros(&[1], TensorDType::F32)?;
-                    let out = self.rt.zeros(&[h], TensorDType::Bf16)?;
+                    let ic2 = self.shared_ic2.as_ref().expect("shared scratch").clone();
+                    let se_gate = self
+                        .shared_se_gate
+                        .as_ref()
+                        .expect("shared scratch")
+                        .clone();
+                    let out = self.shared_out.as_ref().expect("shared scratch").clone();
                     let gate_up_t = match &layer.shared.gate_up.w {
                         DenseWeight::Bf16(w) => w.as_ref().clone(),
                         _ => return Err(moe_bad("fused shared expert needs bf16 weights")),

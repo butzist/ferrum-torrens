@@ -17,9 +17,9 @@ import triton
 import triton.language as tl
 
 
-BLOCK_H = 256
-BLOCK_SI = 128
-WARPS = 4
+BLOCK_H = 512
+BLOCK_SI = 256
+WARPS = 8
 
 
 @triton.jit

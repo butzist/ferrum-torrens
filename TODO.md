@@ -4,7 +4,8 @@ Status (2026-11-11): **Re-baselined on the corrected trajectory (clean prompt).*
 Both shared-expert arms now continue the prose with identical generated ids, so
 the comparison is no longer trajectory-confounded. Captured (50 W cap, 442-token
 clean prompt, greedy): FerrumTorrens NVFP4 pp 336.1 / tg 33.2 tok/s, bf16
-shared + fused pp 343.8 / tg 33.4; FreeToken 0.2.1 (triton attention backend,
+shared + fused pp 344.8 / tg 34.9 (after scratch pre-alloc + tile autotune 512/256/8);
+FreeToken 0.2.1 (triton attention backend,
 cuda-graph max bs 1) pp 131.2 / tg 38.7. Eager: NVFP4 tg 30.1, bf16+fused 32.1.
 Miss-rate A/B and the FreeToken like-for-like on the *corrected* trajectory are
 recorded; the remaining gap to FT decode is 1.16x (38.7 vs 33.2) and is the
@@ -155,7 +156,7 @@ R16/R17); items 2, 4, 5 remain open.
    calls it, so it is not gated).
 8. ~~**Re-baseline the decode rate on the corrected trajectory**~~ -- DONE
    (2026-11-11, decision 165). Captured (50 W, 442-token clean prompt, greedy):
-   FerrumTorrens NVFP4 pp 336.1 / tg 33.2; bf16 shared + fused pp 343.8 / tg 33.4;
+   FerrumTorrens NVFP4 pp 336.1 / tg 33.2; bf16 shared + fused pp 344.8 / tg 34.9;
    FreeToken 0.2.1 (triton attention, cuda-graph max bs 1) pp 131.2 / tg 38.7.
    Eager tg: NVFP4 30.1, bf16+fused 32.1. Both arms continue the prose with
    identical generated ids, so the comparison is no longer trajectory-confounded.
