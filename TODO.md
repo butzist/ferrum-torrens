@@ -1,15 +1,21 @@
 # FerrumTorrens -- FreeToken MVP port to Rust: TODO
 
-Status (2026-11-11): **Re-baselined on the corrected trajectory (clean prompt).**
-Both shared-expert arms now continue the prose with identical generated ids, so
-the comparison is no longer trajectory-confounded. Captured (50 W cap, 442-token
-clean prompt, greedy): FerrumTorrens NVFP4 pp 336.1 / tg 33.2 tok/s, bf16
-shared + fused pp 344.8 / tg 34.9 (after scratch pre-alloc + tile autotune 512/256/8);
-FreeToken 0.2.1 (triton attention backend,
-cuda-graph max bs 1) pp 131.2 / tg 38.7. Eager: NVFP4 tg 30.1, bf16+fused 32.1.
-Miss-rate A/B and the FreeToken like-for-like on the *corrected* trajectory are
-recorded; the remaining gap to FT decode is 1.16x (38.7 vs 33.2) and is the
-expert miss copy + shared-expert epilogue, not launch fusion.
+Status (2026-11-11): **The shared-expert stage is closed; the step is miss-bound.**
+Captured (50 W cap, 442-token clean prompt, greedy, 48 tokens, three interleaved
+rounds): fused NVFP4 shared expert (default) tg 34.1/35.5/33.3 = mean 34.30,
+bf16 shared + fused (FERRUM_SHARED_BF16=1) 33.7/32.6/34.7 = mean 33.67; pp ~336-344.
+FreeToken 0.2.1 (triton attention backend, cuda-graph max bs 1) pp 131.2 / tg 38.7.
+The gap to FT decode is 1.13x and it is the **expert miss copy**, not the shared
+expert and not launch fusion: running the fused shared-expert kernel pair twice
+per layer costs nothing (<0.1 ms/token marginal), so the 11 ms/token the eager
+substep profile attributes to it is stream wait (DONE.md decision 166). Measured
+this session on the clean prompt: ~120 expert misses per decode step of 320
+fetches (37%, `FT_MISS_TRACE=1`) at 0.125 ms/miss = ~15 ms of PCIe copy against a
+30 ms step; `FERRUM_SMOKE_CACHE=512` costs 16.6 ms/token; `auto` resolves to 2048
+slots because that is the `lru_ensure` `BLOCK_C` ceiling, not because VRAM runs
+out. **Next: hide the copy** (issue the H2D on the copy stream far enough ahead
+that the router and shared expert run underneath it) -- capacity is a measured
+no-go, see OPTIMIZATION.md R18.
 
 The garbage at the start of decode after a long prompt was the
 prefill double buffer's residency never leaving `Prefill` on the overlap decode
@@ -36,7 +42,8 @@ captured-vs-eager 20% gap is confounded (eager generates a degenerate
 trajectory, see DONE.md decision 164). `ft bench bw`: CPU-MoE 22.5 GB/s vs PCIe
 gather 13.2 GB/s = 1.70x, below the 2.0x bar, recommended offload; CPU miss
 compute is not worth implementing. Queued items 1 and 3 are done (OPTIMIZATION.md
-R16/R17); items 2, 4, 5 remain open.
+R16/R17); item 4 is done (decision 166); items 2 and 5 remain open, and item 9
+(hide the expert miss copy) is the new top decode lever.
 
 **Queued next (recorded 2026-11-09, items 1 and 3 done 2026-11-10; evidence in `OPTIMIZATION.md`):**
 
@@ -53,13 +60,10 @@ R16/R17); items 2, 4, 5 remain open.
    vs their 3.0x) and accept at depth 3 (0.53 vs 0.72, equal at depth 2).
 3. ~~**CPU-side miss compute**~~ -- DONE (OPTIMIZATION.md R17): 1.70x below the
    2.0x bar, recommended offload; not worth implementing.
-4. **Reconcile the decode miss count.** R14c records ~52 misses/step at 2048
-   slots; the current validator (probe + simulator, agreeing to 1-2 experts)
-   says ~100 on the default prompt. Nothing concluded from the old number
-   changes (the per-miss price and the link-rate ceiling both hold), but the
-   recorded figure should be corrected or explained. *Partially informed by R16:
-   FT's probe at ~1981 slots reports 97.7 misses/token, consistent with ~100 at
-   2048 slots; the ~52 figure was from a different slot count/prompt.*
+4. ~~**Reconcile the decode miss count**~~ -- DONE (2026-11-11, decision 166):
+   `FT_MISS_TRACE=1` on the clean 442-token prompt records 80-180 misses/step,
+   mean ~120 of 320 fetches (37%). That agrees with the validator's ~100 and
+   FT's 97.7 at ~1981 slots; R14c's ~52 was a different prompt/slot count.
 5. **Vision encode staging** (open since decision 157): 376 -> ~276 ms/encode by
    dropping the per-tensor pageable copy and the full synchronize.
 6. **Autotuned Triton kernels, and revisit the bf16-cuBLAS shared-expert choice.**
@@ -174,11 +178,9 @@ R16/R17); items 2, 4, 5 remain open.
    `moe_shared_epi` 9.4, `moe_shared_gemm` 1.35 (`moe_shared_fused` replaces
    the last two under bf16). Re-run R15 S11's attribution on the new trajectory
    rather than trusting that split.
-   (b) miss-rate A/B: `FT_MISS_TRACE=1` (eager) on the clean prompt at 128
-   tokens, same two arms. A degenerate/repetitive trajectory routes more
-   coherently and can have a different miss count; R15 S13 recorded 106
-   misses/step on a repetitive prompt and 38 on varied prose at 0.125 ms/miss,
-   so a 30.7 vs 36 tok/s split is ~20-40 misses/step and needs the real number.
+   (b) ~~miss-rate A/B~~ -- DONE (2026-11-11, decision 166): `FT_MISS_TRACE=1`
+   (eager) on the clean prompt records 80-180 misses/step, mean ~120 of 320
+   fetches (37%), i.e. ~15 ms/token of PCIe copy at 0.125 ms/miss.
    (c) like-for-like FreeToken: restart the reference server on
    `.model-cache/bench/ftw-ref-14119b8` and ask for the same clean prompt with
    `temperature=0, top_k=1, top_p=1, max_tokens=128` (the server defaults to
@@ -186,11 +188,26 @@ R16/R17); items 2, 4, 5 remain open.
    on port 1926 is the recipe used on 2026-11-10). Its R16 43.4 was on the
    tainted payload and its own converter, so the clean-prompt number must be
    measured, not carried over.
-   (d) only then choose a lever: if the corrected profile is still copy-bound,
-   the options are cache capacity or a better prefetch; if the shared-expert
-   epilogue is now the largest stage, the NVFP4 fused-epilogue kernel
-   (`shared_expert.py` currently bf16-only) is the one that lets NVFP4 keep its
-   faster GEMV *and* drop the epilogue.
+   (d) ~~choose a lever~~ -- DONE (2026-11-11, decision 166): the NVFP4
+   fused-epilogue kernel was built (`shared_expert_nvfp4.py`, two launches) and
+   is now the default, but it is measurably free (<0.1 ms/token marginal), so
+   the shared expert is retired as a lever. The lever is the expert miss copy:
+   hide it by issuing the H2D on the copy stream far enough ahead that the
+   router and shared expert run underneath it. Cache capacity is a measured
+   no-go (OPTIMIZATION.md R18).
+9. **Hide the expert miss copy (the top decode lever, decision 166).** The step
+   is 30 ms with ~15 ms of PCIe H2D for ~120 misses/step (0.125 ms each), and
+   the wait is charged to the head of the *following* layer -- which is why it
+   lands inside the shared-expert span and why that span measures 11 ms while
+   the kernels in it are free. Issue the H2D on the copy stream far enough ahead
+   (two layers, or a whole-layer prefetch like the prefill harness) that the
+   router and the shared expert run underneath it, and gate it with a
+   `cudaStreamWaitEvent` at the routed GEMV rather than at the layer head.
+   Acceptance: captured tg on the clean prompt, interleaved reps against the
+   current default; correctness is the existing oracle plus the long-prompt
+   gates (a new launcher must not add cubins to the default load set, item 7).
+   Do not spend the budget on cache capacity instead: R18 measured it at under
+   1 ms with prefill-scratch risk.
 **The decode step is attributed** (R15 S11, decision 160):
 29.2 ms/token, of which `moe_copy` -- the expert miss staging over PCIe -- is
 9.4 ms (32%); the routed GEMV and the lm_head are at roofline. R15 S12 landed

@@ -478,6 +478,7 @@ pub struct CudarcQwen3_6 {
     moe: Option<Arc<dyn MoEExecutor>>,
     head_gemv: Option<Arc<DenseGemv>>,
     shared_expert_fused: Option<Arc<crate::infrastructure::cuda_linear::SharedExpertFused>>,
+    shared_expert_nvfp4: Option<Arc<crate::infrastructure::cuda_linear::SharedExpertNvfp4>>,
     shared_ic2: Option<Tensor>,
     shared_se_gate: Option<Tensor>,
     shared_out: Option<Tensor>,
@@ -525,6 +526,7 @@ impl CudarcQwen3_6 {
         moe: Option<Arc<dyn MoEExecutor>>,
         head_gemv: Option<Arc<DenseGemv>>,
         shared_expert_fused: Option<Arc<crate::infrastructure::cuda_linear::SharedExpertFused>>,
+        shared_expert_nvfp4: Option<Arc<crate::infrastructure::cuda_linear::SharedExpertNvfp4>>,
         fp8: Option<Arc<Fp8Linear>>,
         cache: Arc<DeviceCache>,
     ) -> Result<Self> {
@@ -545,17 +547,18 @@ impl CudarcQwen3_6 {
         let axis = super::mrope::mrope_axis_map(&section, params.rotary_dim / 2, interleaved);
         let axis: Vec<i32> = axis.iter().map(|&a| a as i32).collect();
         let mrope_axis = rt.from_slice_i32(&axis, &[axis.len()])?;
-        let (shared_ic2, shared_se_gate, shared_out) = if shared_expert_fused.is_some() {
-            let si = params.shared_expert_intermediate_size;
-            let h = params.hidden_size;
-            (
-                Some(rt.zeros(&[si], TensorDType::Bf16)?),
-                Some(rt.zeros(&[1], TensorDType::F32)?),
-                Some(rt.zeros(&[h], TensorDType::Bf16)?),
-            )
-        } else {
-            (None, None, None)
-        };
+        let (shared_ic2, shared_se_gate, shared_out) =
+            if shared_expert_fused.is_some() || shared_expert_nvfp4.is_some() {
+                let si = params.shared_expert_intermediate_size;
+                let h = params.hidden_size;
+                (
+                    Some(rt.zeros(&[si], TensorDType::Bf16)?),
+                    Some(rt.zeros(&[1], TensorDType::F32)?),
+                    Some(rt.zeros(&[h], TensorDType::Bf16)?),
+                )
+            } else {
+                (None, None, None)
+            };
         Ok(Self {
             rt,
             params,
@@ -566,6 +569,7 @@ impl CudarcQwen3_6 {
             moe,
             head_gemv,
             shared_expert_fused,
+            shared_expert_nvfp4,
             shared_ic2,
             shared_se_gate,
             shared_out,
@@ -1341,6 +1345,49 @@ impl CudarcQwen3_6 {
                     }
                     substep_end(&self.rt, "moe_shared_fused", s);
                     Some(out.reshape(&[1, h])?)
+                }
+            } else if let Some(fused) = &self.shared_expert_nvfp4 {
+                if let (Some(gu_banks), Some(down_banks)) =
+                    (&layer.shared.gate_up.nvfp4, &layer.shared.down.nvfp4)
+                {
+                    let x_flat = x_post.reshape(&[h])?;
+                    let ic2 = self.shared_ic2.as_ref().expect("shared scratch").clone();
+                    let se_gate = self
+                        .shared_se_gate
+                        .as_ref()
+                        .expect("shared scratch")
+                        .clone();
+                    let out = self.shared_out.as_ref().expect("shared scratch").clone();
+                    let shared_gate_t = layer.shared_gate.reshape(&[h])?;
+                    let s = substep_begin(&self.rt);
+                    // SAFETY: all tensors are live device allocations.
+                    unsafe {
+                        fused.phase1(
+                            &x_flat,
+                            &gu_banks.packed,
+                            &gu_banks.scale,
+                            &gu_banks.global,
+                            &shared_gate_t,
+                            &ic2,
+                            &se_gate,
+                            h,
+                            si,
+                        )?;
+                        fused.phase2(
+                            &ic2,
+                            &down_banks.packed,
+                            &down_banks.scale,
+                            &down_banks.global,
+                            &se_gate,
+                            &out,
+                            h,
+                            si,
+                        )?;
+                    }
+                    substep_end(&self.rt, "moe_shared_fused_nvfp4", s);
+                    Some(out.reshape(&[1, h])?)
+                } else {
+                    None
                 }
             } else {
                 None

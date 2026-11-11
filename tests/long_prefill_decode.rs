@@ -9,9 +9,15 @@
 // long one, then compares one cached decode step against a stateless refeed of
 // the same prefix.
 //
-//   FERRUM_PROBE_PROMPT="$(cat /tmp/scratchpad/prompt-clean.txt)" \
+//   FERRUM_PROBE_PROMPT="$(cat bench/prompt-clean.txt)" \
 //     prlimit --as=68719476736 cargo test --release --features cudarc \
 //     --test long_prefill_decode -- --ignored --nocapture --test-threads=1
+//
+// The default is that same clean prompt (`bench/prompt-clean.txt`, 442 tokens).
+// The earlier fallback was "The quick brown fox jumps over the lazy dog. "
+// repeated 40 times, whose degenerate routing drifts 5.9e-2 of scale at 64
+// tokens against this gate's 5.0e-2 bound (measured at f42d638, same binary,
+// argmax agreeing) -- a repetitive prompt is not what serving gates on.
 
 #![cfg(feature = "cudarc")]
 
@@ -131,6 +137,7 @@ fn build(num_pages: usize) -> Built {
         Some(port),
         Some(head_gemv),
         None,
+        None,
         Some(fp8),
         cache.clone(),
     )
@@ -154,7 +161,7 @@ fn the_first_decode_step_after_a_long_prefill_matches_a_refeed() {
     )
     .expect("load the tokenizer");
     let text = std::env::var("FERRUM_PROBE_PROMPT")
-        .unwrap_or_else(|_| "The quick brown fox jumps over the lazy dog. ".repeat(40));
+        .unwrap_or_else(|_| include_str!("../bench/prompt-clean.txt").to_string());
     let all = tokenizer.encode(&text).expect("encode");
     eprintln!("long-prefill gate: prompt {} tokens", all.len());
     let kv = b

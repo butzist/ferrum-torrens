@@ -20,11 +20,14 @@ use crate::infrastructure::cuda_driver::{CUstream, CudaError, Driver, GdnKernels
 use crate::infrastructure::cudarc::{Runtime, Tensor, TensorDType};
 use crate::infrastructure::kernel_abi::{
     DenseGemvArgs, FP8_GEMM, FP8_GEMV, FP8_SPLITK_REDUCE, Fp8GemmArgs, Fp8GemvArgs, Fp8ReduceArgs,
-    LinearAbi, NVFP4_DENSE_GEMV, SHARED_EXPERT_PHASE1, SHARED_EXPERT_PHASE2,
-    SharedExpertPhase1Args, SharedExpertPhase2Args, fp8_gemm_args, fp8_gemm_grid, fp8_gemv_args,
-    fp8_gemv_grid, fp8_reduce_grid, fp8_split_k, fp8_splitk_reduce_args, nvfp4_dense_gemv_args,
-    nvfp4_dense_gemv_grid, shared_expert_phase1_args, shared_expert_phase1_grid,
-    shared_expert_phase2_args, shared_expert_phase2_grid,
+    LinearAbi, NVFP4_DENSE_GEMV, SHARED_EXPERT_NVFP4_PHASE1, SHARED_EXPERT_NVFP4_PHASE2,
+    SHARED_EXPERT_PHASE1, SHARED_EXPERT_PHASE2, SharedExpertNvfp4Phase1Args,
+    SharedExpertNvfp4Phase2Args, SharedExpertPhase1Args, SharedExpertPhase2Args, fp8_gemm_args,
+    fp8_gemm_grid, fp8_gemv_args, fp8_gemv_grid, fp8_reduce_grid, fp8_split_k,
+    fp8_splitk_reduce_args, nvfp4_dense_gemv_args, nvfp4_dense_gemv_grid,
+    shared_expert_nvfp4_phase1_args, shared_expert_nvfp4_phase1_grid,
+    shared_expert_nvfp4_phase2_args, shared_expert_nvfp4_phase2_grid, shared_expert_phase1_args,
+    shared_expert_phase1_grid, shared_expert_phase2_args, shared_expert_phase2_grid,
 };
 use crate::infrastructure::torch::Device;
 
@@ -440,6 +443,130 @@ impl SharedExpertFused {
         let pack = shared_expert_phase2_args(&self.abi, &args).map_err(bad_abi)?;
         let mut params = pack.kernel_params().map_err(bad_abi)?;
         let grid = shared_expert_phase2_grid(h);
+        unsafe { self.kernels.launch(kernel, grid, &mut params, self.stream) }.map_err(driver)
+    }
+}
+
+/// Fused shared-expert launcher (NVFP4): phase1 computes ic2 + se_gate,
+/// phase2 computes down_out * se_gate. Two kernel launches per call.
+pub struct SharedExpertNvfp4 {
+    kernels: GdnKernels,
+    abi: LinearAbi,
+    _rt: Runtime,
+    stream: CUstream,
+}
+
+unsafe impl Send for SharedExpertNvfp4 {}
+unsafe impl Sync for SharedExpertNvfp4 {}
+
+impl SharedExpertNvfp4 {
+    // The stream is an opaque driver handle, not a pointer this code derefs.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn new(device: Device, stream: CUstream) -> Result<Self, MoEError> {
+        let Device::Cuda(ordinal) = device else {
+            return Err(MoEError::Bad(
+                "the shared-expert nvfp4 fused launcher needs a CUDA device".into(),
+            ));
+        };
+        let lib = Arc::new(Driver::open().map_err(driver)?);
+        let rt = if stream.is_null() {
+            Runtime::open_with(Arc::clone(&lib), ordinal)?
+        } else {
+            unsafe { Runtime::open_with_stream(Arc::clone(&lib), ordinal, stream)? }
+        };
+        const FUSED_KERNELS: &[&str] = &[SHARED_EXPERT_NVFP4_PHASE1, SHARED_EXPERT_NVFP4_PHASE2];
+        let abi = LinearAbi::committed().map_err(bad_abi)?;
+        abi.kernel(SHARED_EXPERT_NVFP4_PHASE1).map_err(bad_abi)?;
+        abi.kernel(SHARED_EXPERT_NVFP4_PHASE2).map_err(bad_abi)?;
+        let kernels = GdnKernels::load_named(lib, abi.clone(), FUSED_KERNELS).map_err(driver)?;
+        Ok(Self {
+            kernels,
+            abi,
+            _rt: rt,
+            stream,
+        })
+    }
+
+    pub fn stream(&self) -> CUstream {
+        self.stream
+    }
+
+    /// Phase 1: ic2 = silu(x @ gate) * (x @ up), se_gate = sigmoid(x @ shared_gate).
+    ///
+    /// # Safety
+    /// All tensors must be live device allocations in this launcher's context.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn phase1(
+        &self,
+        x: &Tensor,
+        gate_up_packed: &Tensor,
+        gate_up_scale: &Tensor,
+        gate_up_global: &Tensor,
+        shared_gate: &Tensor,
+        ic2: &Tensor,
+        se_gate: &Tensor,
+        h: usize,
+        si: usize,
+    ) -> Result<(), MoEError> {
+        let kernel = self
+            .abi
+            .kernel(SHARED_EXPERT_NVFP4_PHASE1)
+            .map_err(bad_abi)?;
+        let args = SharedExpertNvfp4Phase1Args {
+            x: x.device_ptr(),
+            gate_up_packed: gate_up_packed.device_ptr(),
+            gate_up_scale: gate_up_scale.device_ptr(),
+            gate_up_global: gate_up_global.device_ptr(),
+            shared_gate: shared_gate.device_ptr(),
+            ic2: ic2.device_ptr(),
+            se_gate: se_gate.device_ptr(),
+            h: h as u32,
+            si: si as u32,
+            stride_gu_packed_k: gate_up_packed.strides()[0] as u32,
+            stride_gu_scale_k: gate_up_scale.strides()[0] as u32,
+            stride_sg: 1,
+        };
+        let pack = shared_expert_nvfp4_phase1_args(&self.abi, &args).map_err(bad_abi)?;
+        let mut params = pack.kernel_params().map_err(bad_abi)?;
+        let grid = shared_expert_nvfp4_phase1_grid(si);
+        unsafe { self.kernels.launch(kernel, grid, &mut params, self.stream) }.map_err(driver)
+    }
+
+    /// Phase 2: out[n] = (sum_k ic2[k] * down[n,k]) * se_gate[0].
+    ///
+    /// # Safety
+    /// All tensors must be live device allocations in this launcher's context.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn phase2(
+        &self,
+        ic2: &Tensor,
+        down_packed: &Tensor,
+        down_scale: &Tensor,
+        down_global: &Tensor,
+        se_gate: &Tensor,
+        out: &Tensor,
+        h: usize,
+        si: usize,
+    ) -> Result<(), MoEError> {
+        let kernel = self
+            .abi
+            .kernel(SHARED_EXPERT_NVFP4_PHASE2)
+            .map_err(bad_abi)?;
+        let args = SharedExpertNvfp4Phase2Args {
+            ic2: ic2.device_ptr(),
+            down_packed: down_packed.device_ptr(),
+            down_scale: down_scale.device_ptr(),
+            down_global: down_global.device_ptr(),
+            se_gate: se_gate.device_ptr(),
+            out: out.device_ptr(),
+            h: h as u32,
+            si: si as u32,
+            stride_down_packed_k: down_packed.strides()[0] as u32,
+            stride_down_scale_k: down_scale.strides()[0] as u32,
+        };
+        let pack = shared_expert_nvfp4_phase2_args(&self.abi, &args).map_err(bad_abi)?;
+        let mut params = pack.kernel_params().map_err(bad_abi)?;
+        let grid = shared_expert_nvfp4_phase2_grid(h);
         unsafe { self.kernels.launch(kernel, grid, &mut params, self.stream) }.map_err(driver)
     }
 }

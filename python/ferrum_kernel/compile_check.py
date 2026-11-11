@@ -62,6 +62,7 @@ from .fp8_linear import (
 from .linear import _nvfp4_dense_gemv_kernel
 from .shared_expert import _shared_expert_phase1_kernel, _shared_expert_phase2_kernel
 from .shared_expert import _shared_expert_phase1_kernel, _shared_expert_phase2_kernel
+from .shared_expert_nvfp4 import _shared_expert_nvfp4_phase1_kernel, _shared_expert_nvfp4_phase2_kernel
 from .signatures import binary as _binary_sig
 from .signatures import binary_constexprs
 from .signatures import cast as _cast_sig, cast_constexprs
@@ -412,6 +413,10 @@ def main() -> int:
     from .signatures import shared_expert_phase1_constexprs as _se_p1_consts
     from .signatures import shared_expert_phase2 as _se_p2_sig
     from .signatures import shared_expert_phase2_constexprs as _se_p2_consts
+    from .signatures import shared_expert_nvfp4_phase1 as _se_nvfp4_p1_sig
+    from .signatures import shared_expert_nvfp4_phase1_constexprs as _se_nvfp4_p1_consts
+    from .signatures import shared_expert_nvfp4_phase2 as _se_nvfp4_p2_sig
+    from .signatures import shared_expert_nvfp4_phase2_constexprs as _se_nvfp4_p2_consts
     try:
         check(
             "shared_expert_phase1",
@@ -432,6 +437,26 @@ def main() -> int:
     except Exception as e:  # noqa: BLE001
         failures += 1
         print(f"shared_expert_phase2 FAILED: {type(e).__name__}: {str(e)[:200]}")
+    try:
+        check(
+            "shared_expert_nvfp4_phase1",
+            _shared_expert_nvfp4_phase1_kernel,
+            _se_nvfp4_p1_sig(),
+            _se_nvfp4_p1_consts(),
+        )
+    except Exception as e:  # noqa: BLE001
+        failures += 1
+        print(f"shared_expert_nvfp4_phase1 FAILED: {type(e).__name__}: {str(e)[:200]}")
+    try:
+        check(
+            "shared_expert_nvfp4_phase2",
+            _shared_expert_nvfp4_phase2_kernel,
+            _se_nvfp4_p2_sig(),
+            _se_nvfp4_p2_consts(),
+        )
+    except Exception as e:  # noqa: BLE001
+        failures += 1
+        print(f"shared_expert_nvfp4_phase2 FAILED: {type(e).__name__}: {str(e)[:200]}")
     # The vendored W8A16 FP8 projections (TODO.md item 17, decision 82 slice 2).
     for label, fn, sig, consts in (
         ("fp8_gemv", _fp8_gemv_splitk_kernel, _fp8_gemv_sig(), fp8_gemv_constexprs()),

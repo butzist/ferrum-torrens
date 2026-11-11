@@ -2854,3 +2854,71 @@ lever (R15 S13) that already closed the expert-cache policy space as
 workload-bound. Recommendation stands: stay on `offload`. This closes TODO item 3
 as measured; do not re-chase without a CPU whose MoE kernel clears 2x PCIe under
 contention.
+
+## R18 -- The fused NVFP4 shared expert is free; the step is miss-bound (2026-11-11)
+
+R15 S7 priced the shared expert at 3.8 ms/token from the eager substep profile
+and closed it as "no safe win". That price was never kernel time. This slice
+built the deeper fusion R15 S7 declined (a fused NVFP4 kernel pair) and then
+measured the stage directly, which retires the stage as a lever.
+
+**What was built.** `python/ferrum_kernel/shared_expert_nvfp4.py`: phase 1 is
+the gate_up GEMV + `silu(gate)*up` + the `shared_gate` dot + sigmoid; phase 2 is
+the down GEMV + `global * se_gate`. Both read the K-major banks the Rust side
+already holds (`packed [K//8, N]` i32, `scale [K//16, N]` e4m3, `global [N]`
+f16), so the shared expert never has to be widened to bf16 for decode. Four
+launches (two `apply_dense` GEMVs + the elementwise epilogue) become two, and
+the per-layer weight read drops from 6 MiB (bf16) to 1.7 MiB (NVFP4).
+
+A one-row-per-program first cut measured 14.8 ms/token: it read
+`packed[widx * N + n]` with the warp strided by N, one 32-byte sector per
+element. Tiling to `BLOCK_N` contiguous output rows (32) with a deferred
+`[BLOCK_KW, BLOCK_N]` partial, the same shape `nvfp4_dense_gemv` uses, brought
+it to the numbers below.
+
+**Captured A/B** (50 W cap, clean 442-token prompt, greedy, 48 tokens, three
+interleaved rounds, one process per arm):
+
+| arm | tg tok/s (3 rounds) | mean |
+| --- | --- | ---: |
+| fused NVFP4 shared expert (default) | 34.1 / 35.5 / 33.3 | 34.30 |
+| bf16 shared + fused kernel (`FERRUM_SHARED_BF16=1`) | 33.7 / 32.6 / 34.7 | 33.67 |
+
+The delta is inside the ~5% single-run spread. Keep the NVFP4 path for its
+smaller read and lower launch count; do not claim a rate win from it.
+
+**The measurement that matters.** Running phase 1 + phase 2 *twice* per layer,
+on the same inputs so the numerics are unchanged, costs nothing: 32.9 / 34.5
+tok/s with the duplicate pair, 33.8 / 33.0 without. The pair is under 0.1
+ms/token marginal, so the eager profile's `moe_shared_fused_nvfp4` 11.0
+ms/token (40 calls) is stream wait charged to that span, not kernel time. This
+is the same trap R15 S8 named for the GDN tail, now measured directly.
+
+**Where the 30 ms step actually goes** (all measured this session):
+
+| probe | result |
+| --- | --- |
+| `FT_MISS_TRACE=1`, clean prompt, eager | 80-180 misses/step, mean ~120 of 320 fetches (37%) |
+| miss cost (R15 S13) | 0.125 ms/miss -> ~15 ms/token of PCIe copy |
+| `FERRUM_SMOKE_CACHE=512` (graph) | 22.3 tok/s vs 33.0-35.5 at auto |
+| auto cache resolution | 2048 slots = the `lru_ensure` `BLOCK_C` ceiling |
+| free VRAM at planner time | 4396 MiB, slot_bytes 1.695 MiB, 512 MiB reserve -> ~2292 |
+| shared-expert residual zeroed (diagnostic only) | 34.9 -> 48.6 tok/s via routing alone |
+
+So the cache is capped by the kernel's `BLOCK_C` constexpr, not by VRAM, and
+only ~250 slots (~12%) of headroom is unclaimed there -- worth under 1 ms by the
+512-slot slope, against the risk of eating the prefill scratch reserve (which is
+already why the reserve is 512 MiB at a 4096-token prefill chunk). Capacity is
+not the lever.
+
+**Verdict: closed.** The shared expert is free and the expert-miss copy is the
+step. Tile autotuning of the new pair is closed too: `BLOCK_N=32 BLOCK_KW=32
+WARPS=8` measured ~23.6 us for both launches in the torch-free cold-L2 sweep
+against the committed `32/16/4`, and the duplicate-pair experiment above already
+shows tens of microseconds is unmeasurable in the step, so the tiles stay.
+The next slice is to *hide* the copy rather than grow the cache: the wait
+currently lands at the head of the following layer, so the H2D must be issued on
+the copy stream far enough ahead that the router and the shared expert run
+underneath it. Raising `BLOCK_C` is recorded as a measured no-go (under 1 ms,
+prefill-scratch risk). Logs: `/tmp/opencode/ab_cur_*`, `/tmp/opencode/ab_twice_*`,
+`/tmp/opencode/sweep_*`, `/tmp/opencode/miss_clean.log`.

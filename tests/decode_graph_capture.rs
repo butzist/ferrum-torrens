@@ -120,6 +120,7 @@ fn build(num_pages: usize, num_slots: usize) -> Built {
         Some(port),
         Some(head_gemv),
         None,
+        None,
         Some(fp8_linear),
         cache.clone(),
     )

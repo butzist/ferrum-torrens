@@ -171,6 +171,7 @@ pub fn build(
                     None,
                     head_gemv,
                     shared_expert_fused_port(device, stream).ok().flatten(),
+                    shared_expert_nvfp4_port(device, stream).ok().flatten(),
                     fp8_linear,
                     cache.clone(),
                 )
@@ -731,6 +732,25 @@ fn shared_expert_fused_port(
     match device {
         Device::Cuda(_) => Ok(Some(Arc::new(
             SharedExpertFused::new(device, stream).map_err(RegistryError::build)?,
+        ))),
+        _ => Ok(None),
+    }
+}
+
+#[cfg(feature = "cudarc")]
+fn shared_expert_nvfp4_port(
+    device: Device,
+    stream: crate::infrastructure::cuda_driver::CUstream,
+) -> Result<Option<Arc<crate::infrastructure::cuda_linear::SharedExpertNvfp4>>, RegistryError> {
+    use crate::infrastructure::cuda_linear::SharedExpertNvfp4;
+    // The NVFP4 fused path runs in the default (NVFP4) mode, where the shared
+    // expert stays packed; in bf16 mode (FERRUM_SHARED_BF16=1) it is unused.
+    if std::env::var("FERRUM_SHARED_BF16").ok().as_deref() == Some("1") {
+        return Ok(None);
+    }
+    match device {
+        Device::Cuda(_) => Ok(Some(Arc::new(
+            SharedExpertNvfp4::new(device, stream).map_err(RegistryError::build)?,
         ))),
         _ => Ok(None),
     }

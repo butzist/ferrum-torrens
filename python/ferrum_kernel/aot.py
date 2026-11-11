@@ -74,6 +74,7 @@ from .fp8_linear import (
 )
 from .linear import DENSE_WARPS, _nvfp4_dense_gemv_kernel
 from .shared_expert import BLOCK_H, BLOCK_SI, WARPS as SE_WARPS, _shared_expert_phase1_kernel, _shared_expert_phase2_kernel
+from .shared_expert_nvfp4 import WARPS as SE_NVFP4_WARPS, _shared_expert_nvfp4_phase1_kernel, _shared_expert_nvfp4_phase2_kernel
 from .nvfp4_moe import (
     GEMM_BLOCK_N,
     GEMM_WARPS,
@@ -213,6 +214,10 @@ from .signatures import (
     shared_expert_phase1_constexprs,
     shared_expert_phase2,
     shared_expert_phase2_constexprs,
+    shared_expert_nvfp4_phase1,
+    shared_expert_nvfp4_phase1_constexprs,
+    shared_expert_nvfp4_phase2,
+    shared_expert_nvfp4_phase2_constexprs,
     fp8_gemm,
     fp8_gemm_constexprs,
     fp8_gemv,
@@ -440,6 +445,18 @@ LINEAR_KERNELS: dict[str, dict] = {
         "signature": shared_expert_phase2(),
         "constexprs": shared_expert_phase2_constexprs(),
         "num_warps": SE_WARPS,
+    },
+    "shared_expert_nvfp4_phase1": {
+        "fn": _shared_expert_nvfp4_phase1_kernel,
+        "signature": shared_expert_nvfp4_phase1(),
+        "constexprs": shared_expert_nvfp4_phase1_constexprs(),
+        "num_warps": SE_NVFP4_WARPS,
+    },
+    "shared_expert_nvfp4_phase2": {
+        "fn": _shared_expert_nvfp4_phase2_kernel,
+        "signature": shared_expert_nvfp4_phase2(),
+        "constexprs": shared_expert_nvfp4_phase2_constexprs(),
+        "num_warps": SE_NVFP4_WARPS,
     },
     "fp8_gemv": {
         "fn": _fp8_gemv_splitk_kernel,

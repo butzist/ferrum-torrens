@@ -647,6 +647,16 @@ pub const SHARED_EXPERT_PHASE1: &str = "shared_expert_phase1";
 /// The fused shared-expert kernel, phase 2 (bf16): down GEMV + gating.
 pub const SHARED_EXPERT_PHASE2: &str = "shared_expert_phase2";
 
+/// The fused shared-expert kernel, phase 1 (NVFP4): gate_up GEMV + silu*up + se_gate.
+pub const SHARED_EXPERT_NVFP4_PHASE1: &str = "shared_expert_nvfp4_phase1";
+
+/// The fused shared-expert kernel, phase 2 (NVFP4): down GEMV + gating.
+pub const SHARED_EXPERT_NVFP4_PHASE2: &str = "shared_expert_nvfp4_phase2";
+
+/// Output rows one NVFP4 shared-expert program covers; the grid is a `div_ceil`
+/// by this. Mirrors `BLOCK_N` in `python/ferrum_kernel/shared_expert_nvfp4.py`.
+pub const SHARED_EXPERT_NVFP4_BLOCK_N: usize = 32;
+
 /// The vendored W8A16 FP8 projection kernels (TODO.md item 17).
 pub const FP8_GEMV: &str = "fp8_gemv";
 pub const FP8_SPLITK_REDUCE: &str = "fp8_splitk_reduce";
@@ -707,7 +717,7 @@ pub const GDN_RATIO_MASKS_F32: &str = "gdn_ratio_masks_f32";
 pub const MUL_MID_F32: &str = "mul_mid_f32";
 pub const SCALE_HEADS_F32: &str = "scale_heads_f32";
 
-const LINEAR_NAMES: [&str; 50] = [
+const LINEAR_NAMES: [&str; 52] = [
     GDN_DECODE,
     CONV_DECODE,
     CONV_PREFILL,
@@ -717,6 +727,8 @@ const LINEAR_NAMES: [&str; 50] = [
     NVFP4_DENSE_GEMV,
     SHARED_EXPERT_PHASE1,
     SHARED_EXPERT_PHASE2,
+    SHARED_EXPERT_NVFP4_PHASE1,
+    SHARED_EXPERT_NVFP4_PHASE2,
     FP8_GEMV,
     FP8_SPLITK_REDUCE,
     FP8_GEMM,
@@ -956,6 +968,18 @@ pub fn linear_cubin(name: &str) -> Result<&'static [u8], MoEError> {
                 "/kernel/shared_expert_phase2.cubin"
             ))
         }
+        SHARED_EXPERT_NVFP4_PHASE1 => {
+            include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/kernel/shared_expert_nvfp4_phase1.cubin"
+            ))
+        }
+        SHARED_EXPERT_NVFP4_PHASE2 => {
+            include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/kernel/shared_expert_nvfp4_phase2.cubin"
+            ))
+        }
         FP8_GEMV => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/fp8_gemv.cubin")),
         FP8_SPLITK_REDUCE => {
             include_bytes!(concat!(env!("OUT_DIR"), "/kernel/fp8_splitk_reduce.cubin"))
@@ -1061,6 +1085,18 @@ fn linear_ptx(name: &str) -> &'static str {
         }
         SHARED_EXPERT_PHASE2 => {
             include_str!(concat!(env!("OUT_DIR"), "/kernel/shared_expert_phase2.ptx"))
+        }
+        SHARED_EXPERT_NVFP4_PHASE1 => {
+            include_str!(concat!(
+                env!("OUT_DIR"),
+                "/kernel/shared_expert_nvfp4_phase1.ptx"
+            ))
+        }
+        SHARED_EXPERT_NVFP4_PHASE2 => {
+            include_str!(concat!(
+                env!("OUT_DIR"),
+                "/kernel/shared_expert_nvfp4_phase2.ptx"
+            ))
         }
         FP8_GEMV => include_str!(concat!(env!("OUT_DIR"), "/kernel/fp8_gemv.ptx")),
         FP8_SPLITK_REDUCE => {
@@ -2165,6 +2201,97 @@ pub fn shared_expert_phase2_args(
 /// The phase-2 grid: one program per output element of out (H programs).
 pub fn shared_expert_phase2_grid(h: usize) -> (u32, u32, u32) {
     (h as u32, 1, 1)
+}
+
+/// Device addresses and shapes for the fused shared-expert phase 1 (NVFP4):
+/// gate_up GEMV + silu*up + se_gate. `x` is `[H]` bf16, `gate_up_packed`
+/// is `[K//8, 2*SI]` i32 (K-major), `gate_up_scale` is `[K//16, 2*SI]` u8,
+/// `gate_up_global` is `[2*SI]` f16, `shared_gate` is `[H]` bf16, `ic2` is
+/// `[SI]` bf16 output, `se_gate` is `[1]` f32 output.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SharedExpertNvfp4Phase1Args {
+    pub x: u64,
+    pub gate_up_packed: u64,
+    pub gate_up_scale: u64,
+    pub gate_up_global: u64,
+    pub shared_gate: u64,
+    pub ic2: u64,
+    pub se_gate: u64,
+    pub h: u32,
+    pub si: u32,
+    pub stride_gu_packed_k: u32,
+    pub stride_gu_scale_k: u32,
+    pub stride_sg: u32,
+}
+
+/// The phase-1 launch argument pack, in the cubin's declared order.
+pub fn shared_expert_nvfp4_phase1_args(
+    abi: &LinearAbi,
+    a: &SharedExpertNvfp4Phase1Args,
+) -> Result<ArgPack, MoEError> {
+    let kernel = abi.kernel(SHARED_EXPERT_NVFP4_PHASE1)?;
+    let mut p = ArgPack::for_linear(kernel);
+    p.ptr(a.x)?;
+    p.ptr(a.gate_up_packed)?;
+    p.ptr(a.gate_up_scale)?;
+    p.ptr(a.gate_up_global)?;
+    p.ptr(a.shared_gate)?;
+    p.ptr(a.ic2)?;
+    p.ptr(a.se_gate)?;
+    p.u32(a.h)?;
+    p.u32(a.si)?;
+    p.u32(a.stride_gu_packed_k)?;
+    p.u32(a.stride_gu_scale_k)?;
+    p.u32(a.stride_sg)?;
+    Ok(p)
+}
+
+/// The phase-1 grid: one program per `BLOCK_N` output elements of ic2.
+pub fn shared_expert_nvfp4_phase1_grid(si: usize) -> (u32, u32, u32) {
+    (si.div_ceil(SHARED_EXPERT_NVFP4_BLOCK_N) as u32, 1, 1)
+}
+
+/// Device addresses and shapes for the fused shared-expert phase 2 (NVFP4):
+/// down GEMV + gating. `ic2` is `[SI]` bf16, `down_packed` is `[K//8, H]` i32
+/// (K-major), `down_scale` is `[K//16, H]` u8, `down_global` is `[H]` f16,
+/// `se_gate` is `[1]` f32, `out` is `[H]` bf16 output.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SharedExpertNvfp4Phase2Args {
+    pub ic2: u64,
+    pub down_packed: u64,
+    pub down_scale: u64,
+    pub down_global: u64,
+    pub se_gate: u64,
+    pub out: u64,
+    pub h: u32,
+    pub si: u32,
+    pub stride_down_packed_k: u32,
+    pub stride_down_scale_k: u32,
+}
+
+/// The phase-2 launch argument pack, in the cubin's declared order.
+pub fn shared_expert_nvfp4_phase2_args(
+    abi: &LinearAbi,
+    a: &SharedExpertNvfp4Phase2Args,
+) -> Result<ArgPack, MoEError> {
+    let kernel = abi.kernel(SHARED_EXPERT_NVFP4_PHASE2)?;
+    let mut p = ArgPack::for_linear(kernel);
+    p.ptr(a.ic2)?;
+    p.ptr(a.down_packed)?;
+    p.ptr(a.down_scale)?;
+    p.ptr(a.down_global)?;
+    p.ptr(a.se_gate)?;
+    p.ptr(a.out)?;
+    p.u32(a.h)?;
+    p.u32(a.si)?;
+    p.u32(a.stride_down_packed_k)?;
+    p.u32(a.stride_down_scale_k)?;
+    Ok(p)
+}
+
+/// The phase-2 grid: one program per `BLOCK_N` output elements of out.
+pub fn shared_expert_nvfp4_phase2_grid(h: usize) -> (u32, u32, u32) {
+    (h.div_ceil(SHARED_EXPERT_NVFP4_BLOCK_N) as u32, 1, 1)
 }
 
 /// Device addresses and shapes for the W8A16 split-K GEMV (M == 1). `a` is

@@ -26,6 +26,7 @@ from . import conv as conv_mod
 from . import fp8_linear as fp8_mod
 from . import gdn as gdn_mod
 from . import linear as linear_mod
+from . import shared_expert_nvfp4 as se_nvfp4_mod
 from . import mrope as mrope_mod
 from . import norm as norm_mod
 from . import offload as off
@@ -800,6 +801,65 @@ def check_mrope_gather(device: torch.device, tol: float) -> int:
     return failures
 
 
+def check_shared_expert_nvfp4(device: torch.device, tol: float) -> int:
+    """NVFP4 fused shared expert: kernel against a torch oracle."""
+    failures = 0
+    for seed in range(3):
+        g = torch.Generator(device="cpu").manual_seed(seed)
+        dev = device
+        H = 64
+        SI = 32
+        # bf16 x and shared_gate
+        x = (torch.rand((H,), generator=g) * 2.0 - 1.0).to(torch.bfloat16).to(dev)
+        shared_gate = (torch.rand((H,), generator=g) * 2.0 - 1.0).to(torch.bfloat16).to(dev)
+        # NVFP4 gate_up: [2*SI, H]
+        gu_packed = torch.randint(0, 256, (2 * SI, H // 2), generator=g, dtype=torch.uint8).to(dev)
+        gu_block = torch.rand((2 * SI, H // 16), generator=g) * 2.0 + 0.25
+        gu_scale = gu_block.to(torch.float8_e4m3fn).to(dev)
+        gu_global = (torch.rand((2 * SI,), generator=g) * 1.5 + 0.5).to(torch.float16).to(dev)
+        # NVFP4 down: [H, SI]
+        dn_packed = torch.randint(0, 256, (H, SI // 2), generator=g, dtype=torch.uint8).to(dev)
+        dn_block = torch.rand((H, SI // 16), generator=g) * 2.0 + 0.25
+        dn_scale = dn_block.to(torch.float8_e4m3fn).to(dev)
+        dn_global = (torch.rand((H,), generator=g) * 1.5 + 0.5).to(torch.float16).to(dev)
+
+        # dequantize
+        gu = nvfp4_dequant(gu_packed.unsqueeze(0), gu_scale.unsqueeze(0), gu_global.unsqueeze(0))[0]
+        dn = nvfp4_dequant(dn_packed.unsqueeze(0), dn_scale.unsqueeze(0), dn_global.unsqueeze(0))[0]
+        W_gate = gu[:SI]
+        W_up = gu[SI:]
+        W_down = dn  # [H, SI]
+
+        xf = x.to(torch.float32)
+        gate = xf @ W_gate.to(torch.float32).T
+        up = xf @ W_up.to(torch.float32).T
+        ic2_ref = (gate / (1.0 + torch.exp(-gate))) * up  # silu*up
+        se_gate_ref = 1.0 / (1.0 + torch.exp(-(xf @ shared_gate.to(torch.float32))))
+        out_ref = (W_down.to(torch.float32) @ ic2_ref) * se_gate_ref
+
+        # K-major banks (the layout the Rust side hands to the kernel):
+        # row-major [N, K//8] i32 -> K-major [K//8, N].
+        gu_packed_km = gu_packed.contiguous().view(torch.int32).T.contiguous()
+        gu_scale_km = gu_scale.T.contiguous()
+        dn_packed_km = dn_packed.contiguous().view(torch.int32).T.contiguous()
+        dn_scale_km = dn_scale.T.contiguous()
+
+        ic2 = torch.empty(SI, dtype=torch.bfloat16, device=dev)
+        se_gate = torch.empty(1, dtype=torch.float32, device=dev)
+        out = torch.empty(H, dtype=torch.bfloat16, device=dev)
+        se_nvfp4_mod.shared_expert_nvfp4_fused(
+            x, gu_packed_km, gu_scale_km, gu_global,
+            dn_packed_km, dn_scale_km, dn_global,
+            shared_gate, ic2, se_gate, out,
+        )
+        rel = (out.to(torch.float32) - out_ref.to(torch.float32)).abs().max() / out_ref.abs().max().clamp(min=1e-6)
+        print(f"shared_expert_nvfp4 seed {seed}: rel {rel:.3e}")
+        if rel.item() > tol:
+            failures += 1
+            print(f"shared_expert_nvfp4 seed {seed}: FAIL", file=sys.stderr)
+    return failures
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--device", default="cpu")
@@ -948,6 +1008,10 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     fp8_failures = check_fp8_linear(torch.device(args.device), args.tol, args.interp_child)
     if fp8_failures:
+        print("FAIL", file=sys.stderr)
+        return 1
+    se_nvfp4_failures = check_shared_expert_nvfp4(torch.device(args.device), args.tol)
+    if se_nvfp4_failures:
         print("FAIL", file=sys.stderr)
         return 1
     print("PASS")

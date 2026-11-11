@@ -79,6 +79,7 @@ fn the_cudarc_forward_matches_the_scalar_oracle() {
         None,
         Some(head_gemv),
         None,
+        None,
         Some(fp8),
         cache,
     )
@@ -224,6 +225,7 @@ fn tower() -> CudarcQwen3_6 {
         reader,
         None,
         Some(head_gemv),
+        None,
         None,
         Some(fp8),
         cache,

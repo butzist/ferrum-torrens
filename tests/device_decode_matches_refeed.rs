@@ -87,6 +87,7 @@ fn model(num_pages: usize, num_slots: usize) -> (CudarcQwen3_6, Arc<DeviceCache>
         None,
         Some(head_gemv),
         None,
+        None,
         Some(fp8),
         cache.clone(),
     )

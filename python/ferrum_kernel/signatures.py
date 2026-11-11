@@ -1216,3 +1216,49 @@ def scale_heads() -> dict:
 
 def scale_heads_constexprs(block: int = SELECT_BLOCK) -> dict:
     return {"BLOCK": block}
+
+
+def shared_expert_nvfp4_phase1() -> dict:
+    return {
+        "x_ptr": "*bf16",
+        "gate_up_packed_ptr": "*i32",
+        "gate_up_scale_ptr": "*fp8e4nv",
+        "gate_up_global_ptr": "*fp16",
+        "shared_gate_ptr": "*bf16",
+        "ic2_ptr": "*bf16",
+        "se_gate_ptr": "*fp32",
+        "H": "i32",
+        "SI": "i32",
+        "stride_gu_packed_k": "i32",
+        "stride_gu_scale_k": "i32",
+        "stride_sg": "i32",
+        "BLOCK_H": "constexpr",
+        "BLOCK_KW": "constexpr",
+    }
+
+
+def shared_expert_nvfp4_phase1_constexprs() -> dict:
+    from .shared_expert_nvfp4 import BLOCK_H, BLOCK_KW, BLOCK_N
+    return {"BLOCK_H": BLOCK_H, "BLOCK_KW": BLOCK_KW, "BLOCK_N": BLOCK_N}
+
+
+def shared_expert_nvfp4_phase2() -> dict:
+    return {
+        "ic2_ptr": "*bf16",
+        "down_packed_ptr": "*i32",
+        "down_scale_ptr": "*fp8e4nv",
+        "down_global_ptr": "*fp16",
+        "se_gate_ptr": "*fp32",
+        "out_ptr": "*bf16",
+        "H": "i32",
+        "SI": "i32",
+        "stride_down_packed_k": "i32",
+        "stride_down_scale_k": "i32",
+        "BLOCK_KW": "constexpr",
+        "BLOCK_N": "constexpr",
+    }
+
+
+def shared_expert_nvfp4_phase2_constexprs() -> dict:
+    from .shared_expert_nvfp4 import BLOCK_KW, BLOCK_N
+    return {"BLOCK_KW": BLOCK_KW, "BLOCK_N": BLOCK_N}

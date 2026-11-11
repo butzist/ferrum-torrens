@@ -5345,3 +5345,62 @@ subsection names are kept verbatim.
     tables pointing at freed slots -- same class of seam, not exercised by
     text-only serving; (ii) re-baseline the decode rate against a like-for-like
     FreeToken run on the corrected trajectory (TODO queued item 8).
+
+166. **The fused NVFP4 shared expert is correct but costs nothing: the step is
+    miss-bound, not shared-expert-bound (2026-11-11).** `shared_expert_nvfp4.py`
+    fuses the NVFP4 shared expert's gate_up GEMV + silu*up + se_gate (phase 1)
+    and its down GEMV + gating (phase 2) into two launches, reading the same
+    K-major banks the dense GEMV reads (`packed [K//8, N]` i32, `scale
+    [K//16, N]` e4m3, `global [N]` f16) rather than widening the weights to
+    bf16. It replaces four launches (two `apply_dense` GEMVs plus the
+    elementwise epilogue) with two and drops the shared expert from 6 MiB to
+    1.7 MiB of weight read per layer.
+    Correctness: `engine_real_generate::one_token_through_the_kernel_matches_the_oracle`
+    answers the oracle token 11751 exactly, `a_warmup_request_does_not_corrupt_the_next_decode`
+    is bit-identical across its warmup, and the triton interpreter oracle agrees
+    on three seeds (rel 5.3e-3 / 7.8e-3 / 6.3e-3).
+    Measured (captured, 50 W cap, clean 442-token prompt, greedy, 48 tokens,
+    three interleaved rounds, one process per arm): NVFP4 fused 34.1 / 35.5 /
+    33.3 (mean 34.30) against bf16 fused 33.7 / 32.6 / 34.7 (mean 33.67). The
+    win sits inside the ~5% single-run spread, so the fused NVFP4 path is kept
+    as the default for its smaller read and lower launch count, not for the
+    rate.
+    The important result is negative: running phase 1 + phase 2 **twice** per
+    layer costs nothing (32.9 / 34.5 with, 33.8 / 33.0 without), so the whole
+    pair is under 0.1 ms/token marginal. The eager substep profile's
+    `moe_shared_fused_nvfp4` 11.0 ms/token over 40 calls is therefore stream
+    wait, not kernel time -- the trap R15 S8 named ("the eager substep profile
+    with per-boundary syncs is not predictive of the captured step"), now
+    measured directly for this stage. Do not chase the shared expert further;
+    R15 S7's roofline analysis was already at the point of diminishing returns
+    and this fused kernel is that analysis's terminal state.
+    Where the time actually is (measured this session, same config):
+    `FT_MISS_TRACE=1` on the clean prompt records 80-180 expert misses per
+    decode step (mean ~120 of 320 fetches, ~37%); at R15 S13's 0.125 ms per miss
+    that is ~15 ms of PCIe copy against a 30 ms step. Pinning the cache to 512
+    slots costs 16.6 ms/token (22.3 against 33.0-35.5 tok/s), and `auto`
+    resolves to exactly the `lru_ensure` `BLOCK_C` ceiling of 2048 slots rather
+    than to VRAM (free 4396 MiB, slot_bytes 1.695 MiB, 512 MiB reserve -> ~2292
+    slots, so the ceiling binds and only ~250 slots of VRAM are unclaimed).
+    Zeroing the shared-expert residual swings the rate 34.9 -> 48.6 tok/s purely
+    by changing which experts the router picks, the same conclusion from the
+    other side.
+    Next lever: hide the copy instead of growing the cache. The wait is charged
+    to the head of the following layer (which is why it lands in the
+    shared-expert span), so the H2D has to be issued on the copy stream far
+    enough ahead that the router and the shared expert run underneath it.
+    Tile autotuning of the new pair is closed as a no-op: a torch-free cold-L2
+    sweep put `BLOCK_N=32 BLOCK_KW=32 WARPS=8` at ~23.6 us for both launches
+    against the committed `BLOCK_N=32 BLOCK_KW=16 WARPS=4`, i.e. the same tens
+    of microseconds that the duplicate-pair experiment already showed to be
+    unmeasurable in the step. Do not re-tune these tiles for rate.
+    Side finding, unrelated to this kernel: `tests/long_prefill_decode.rs` is
+    red on its own built-in fallback prompt. The gate defaulted to "The quick
+    brown fox jumps over the lazy dog. " x 40 and that degenerate trajectory
+    drifts 5.875e-2 of scale at 64 tokens against the gate's 5.0e-2 bound
+    (argmax agrees, so it is accumulation order at the 64-token chunk boundary,
+    not a handoff bug). It reproduces identically at f42d638 in a clean
+    worktree, so it predates this work, and it passes at <= 4.1e-2 on the
+    canonical `bench/prompt-clean.txt` the test header always told you to pass.
+    The fallback is now that same file, so the gate is green without an env var;
+    the threshold was not touched.
