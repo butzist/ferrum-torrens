@@ -1,7 +1,16 @@
 # FerrumTorrens -- FreeToken MVP port to Rust: TODO
 
-Status (2026-11-10): **Correctness fixed; the decode rate needs a clean
-baseline.** The garbage at the start of decode after a long prompt was the
+Status (2026-11-11): **Re-baselined on the corrected trajectory (clean prompt).**
+Both shared-expert arms now continue the prose with identical generated ids, so
+the comparison is no longer trajectory-confounded. Captured (50 W cap, 442-token
+clean prompt, greedy): FerrumTorrens NVFP4 pp 336.1 / tg 33.2 tok/s, bf16
+shared + fused pp 343.8 / tg 33.4; FreeToken 0.2.1 (triton attention backend,
+cuda-graph max bs 1) pp 131.2 / tg 38.7. Eager: NVFP4 tg 30.1, bf16+fused 32.1.
+Miss-rate A/B and the FreeToken like-for-like on the *corrected* trajectory are
+recorded; the remaining gap to FT decode is 1.16x (38.7 vs 33.2) and is the
+expert miss copy + shared-expert epilogue, not launch fusion.
+
+The garbage at the start of decode after a long prompt was the
 prefill double buffer's residency never leaving `Prefill` on the overlap decode
 path: the next request's prefill then skipped the buffer-window selection and
 overwrote slots the decode LRU still mapped (DONE.md decision 165). With the
@@ -144,7 +153,14 @@ R16/R17); items 2, 4, 5 remain open.
    LRU, so a `release_moe`/`rehydrate_moe` pair can leave the device tables
    pointing at freed slots (decision 165 open item; text-only serving never
    calls it, so it is not gated).
-8. **Re-baseline the decode rate on the corrected trajectory** (decision 165).
+8. ~~**Re-baseline the decode rate on the corrected trajectory**~~ -- DONE
+   (2026-11-11, decision 165). Captured (50 W, 442-token clean prompt, greedy):
+   FerrumTorrens NVFP4 pp 336.1 / tg 33.2; bf16 shared + fused pp 343.8 / tg 33.4;
+   FreeToken 0.2.1 (triton attention, cuda-graph max bs 1) pp 131.2 / tg 38.7.
+   Eager tg: NVFP4 30.1, bf16+fused 32.1. Both arms continue the prose with
+   identical generated ids, so the comparison is no longer trajectory-confounded.
+   Gap to FT decode: 1.16x (38.7 vs 33.2), attributable to the expert miss copy
+   (PCIe) + shared-expert epilogue. See OPTIMIZATION.md / DONE.md for detail.
    The prefill-overlap bug made every prior decode number (the 47 tok/s, R16's
    43.4 vs 36.6-37.1, the clean-prompt 40.7/33.5/30.9 table) invalid, so the
    "where did the speed go" question is really "what does the honest gap look

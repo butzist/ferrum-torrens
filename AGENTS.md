@@ -312,6 +312,32 @@ context lean; do the writing in the workers.
   Keep `CARGO_BUILD_JOBS` modest (e.g. 4) so a build cannot spike alongside a
   load. An OOM-killed session loses all uncommitted work in that agent.
 
+## Benchmarking discipline (added 2026-11-11)
+
+- **Clean prompt only.** The canonical benchmark prompt is
+  `bench/prompt-clean.txt` (a ~375-word prose passage about the printing
+  press). The earlier `/tmp/opencode/bench/prompt2.txt` carried a shell artifact
+  (`\\nEOF\\nwc -w ...`) and produced degenerate trajectories on every arm; **never
+  run it again**. Every benchmark, profile, and miss-rate trace uses the clean
+  prompt via `FERRUM_SMOKE_PROMPT="$(cat bench/prompt-clean.txt)"`.
+- **Same inputs and params in both runtimes.** FreeToken and FerrumTorrens must
+  be measured on the *identical* prompt text, greedy decoding
+  (`temperature=0, top_k=1, top_p=1`), the same token count, the same power cap
+  (50 W) and the same cache size. FreeToken's server defaults to temp 1.0 / top_k
+  20, so pass them explicitly on `/v1/completions`. Record the exact env and flags
+  with every number.
+- **Never OOM the host or reset the GPU.** One model-loading process at a time,
+  always under `prlimit --as=68719476736`. Run gated tests one by name with
+  `--test-threads=1`. Check `MemAvailable` in `/proc/meminfo` before loading and
+  stop and report if it is below ~24 GiB. Do not build/test concurrently with a
+  model load. An OOM-killed session loses all uncommitted work.
+- **Roles.** Coding work (edits, tests, kernel changes) is dispatched to the
+  `dev` agent. The orchestrator is the scientist/architect: it proposes
+  improvements, evaluates measurements, and judges keep vs. revert. The user is
+  the tech lead / architect for complex questions and directional decisions.
+- **No fabricated numbers.** "No safe win" is an acceptable and valuable result.
+  Record negative results in `OPTIMIZATION.md`/`DONE.md`.
+
 ## Commits
 
 - Commit after each sprint or feature implementation, when its `TODO.md`
