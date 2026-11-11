@@ -20,6 +20,7 @@ use crate::infrastructure::cuda_gdn::GdnDecode;
 use crate::infrastructure::cuda_linear::{DenseGemv, Fp8Linear};
 use crate::infrastructure::cudarc::{Runtime, Tensor, TensorDType, Unary};
 use crate::infrastructure::decode_buffers::DecodeBuffers;
+use crate::infrastructure::dup::{Dup, Group};
 use crate::infrastructure::ftw::FtwIndex;
 use crate::infrastructure::kvcache_dev::{DeviceCache, KvDType, LinearStateSlabs};
 use crate::infrastructure::profile::{substep_begin, substep_end, substep_report};
@@ -509,6 +510,9 @@ pub struct CudarcQwen3_6 {
     draft_kv: std::sync::Mutex<Option<DraftKv>>,
     /// The draft's expert executor (its own bank space, resident on the device).
     draft_moe: Option<Arc<dyn MoEExecutor>>,
+    /// The stage groups `FERRUM_DUP` asked to relaunch a second time, parsed
+    /// once here (OPTIMIZATION.md R20). Empty is the committed path.
+    dup: Dup,
 }
 
 struct DraftKv {
@@ -585,6 +589,7 @@ impl CudarcQwen3_6 {
             draft: None,
             draft_kv: std::sync::Mutex::new(None),
             draft_moe: None,
+            dup: Dup::from_env(),
         })
     }
 
@@ -644,6 +649,17 @@ impl CudarcQwen3_6 {
     /// The draft head's resident bytes, for the memory arithmetic.
     pub fn draft_bytes(&self) -> usize {
         self.draft.as_ref().map_or(0, |d| d.bytes())
+    }
+
+    /// Relaunch `stage` a second time when `FERRUM_DUP` named its group. The
+    /// duplicate reads the same inputs and writes the same buffers, so the
+    /// forward's numerics are unchanged and the extra launches show up as pure
+    /// marginal step time. Off by default: `has` is a bit test.
+    fn dup_stage<T>(&self, group: Group, stage: impl FnOnce() -> Result<T>) -> Result<()> {
+        if self.dup.has(group) {
+            stage()?;
+        }
+        Ok(())
     }
 
     fn apply_dense(&self, d: &Dense, x: &Tensor) -> Result<Tensor> {
@@ -800,6 +816,9 @@ impl CudarcQwen3_6 {
     ) -> Result<Tensor> {
         let s = substep_begin(&self.rt);
         let (q, k, v, gate) = self.project_attention(layer, x, positions)?;
+        self.dup_stage(Group::AttnProj, || {
+            self.project_attention(layer, x, positions)
+        })?;
         substep_end(&self.rt, "attn_proj", s);
         let t = x.shape()[0];
         let q_dim = self.params.num_q_heads * self.params.head_dim;
@@ -807,6 +826,7 @@ impl CudarcQwen3_6 {
             Access::Stateless => {
                 let s = substep_begin(&self.rt);
                 let attn = q.causal_sdpa(&k, &v, 0)?;
+                self.dup_stage(Group::AttnSdpa, || q.causal_sdpa(&k, &v, 0))?;
                 substep_end(&self.rt, "attn_sdpa", s);
                 attn
             }
@@ -831,6 +851,15 @@ impl CudarcQwen3_6 {
                         .causal_sdpa(&k_all, &v_all, q_offset)?
                         .cast(TensorDType::Bf16)?
                 };
+                self.dup_stage(Group::AttnSdpa, || {
+                    if native {
+                        q.causal_sdpa(&k_all, &v_all, q_offset)
+                    } else {
+                        q.cast(TensorDType::F32)?
+                            .causal_sdpa(&k_all, &v_all, q_offset)?
+                            .cast(TensorDType::Bf16)
+                    }
+                })?;
                 substep_end(&self.rt, "attn_sdpa", s);
                 attn
             }
@@ -854,6 +883,13 @@ impl CudarcQwen3_6 {
                     self.attention
                         .decode(&q, &out, k_ptr, v_ptr, kv_locs, positions, kv_bf16)
                 }?;
+                if self.dup.has(Group::AttnSdpa) {
+                    // SAFETY: as above; the relaunch writes the same bytes.
+                    unsafe {
+                        self.attention
+                            .decode(&q, &out, k_ptr, v_ptr, kv_locs, positions, kv_bf16)
+                    }?;
+                }
                 substep_end(&self.rt, "attn_sdpa", s);
                 out
             }
@@ -865,6 +901,10 @@ impl CudarcQwen3_6 {
         let s = substep_begin(&self.rt);
         let gated = attn.mul(&sigmoid(&gate)?)?;
         let out = self.apply_dense(o, &gated);
+        self.dup_stage(Group::AttnOut, || {
+            let gated = attn.mul(&sigmoid(&gate)?)?;
+            self.apply_dense(o, &gated)
+        })?;
         substep_end(&self.rt, "attn_out", s);
         out
     }
@@ -899,14 +939,21 @@ impl CudarcQwen3_6 {
 
         let s = substep_begin(&self.rt);
         let projected = self.apply_dense(qkvz, x)?;
+        self.dup_stage(Group::GdnProj, || self.apply_dense(qkvz, x))?;
         substep_end(&self.rt, "gdn_qkvz", s);
         let conv_in = projected.narrow(1, 0, conv_dim)?.contiguous()?;
         let z = projected.narrow(1, conv_dim, value_dim)?;
         let s = substep_begin(&self.rt);
+        let ba_w = ba.cast(TensorDType::F32)?;
         let ba = x
             .cast(TensorDType::F32)?
-            .matmul_nt_f32(&ba.cast(TensorDType::F32)?)?
+            .matmul_nt_f32(&ba_w)?
             .cast(TensorDType::Bf16)?;
+        self.dup_stage(Group::GdnProj, || {
+            x.cast(TensorDType::F32)?
+                .matmul_nt_f32(&ba_w)?
+                .cast(TensorDType::Bf16)
+        })?;
         substep_end(&self.rt, "gdn_ba", s);
 
         if let Access::Device { slots, rows, .. } = access {
@@ -966,12 +1013,15 @@ impl CudarcQwen3_6 {
             };
             let s = substep_begin(&self.rt);
             let core_n = rms_norm_last(&core, norm, p.rms_norm_eps)?.reshape(&[t, value_dim])?;
+            self.dup_stage(Group::Norms, || rms_norm_last(&core, norm, p.rms_norm_eps))?;
             substep_end(&self.rt, "gdn_tail_norm", s);
             let s = substep_begin(&self.rt);
             let gated = core_n.mul(&z.silu()?)?;
+            self.dup_stage(Group::GdnProj, || core_n.mul(&z.silu()?))?;
             substep_end(&self.rt, "gdn_tail_gate", s);
             let s = substep_begin(&self.rt);
             let out = self.apply_dense(o, &gated);
+            self.dup_stage(Group::GdnProj, || self.apply_dense(o, &gated))?;
             substep_end(&self.rt, "gdn_tail_proj", s);
             return out;
         }
@@ -1063,12 +1113,15 @@ impl CudarcQwen3_6 {
         substep_end(&self.rt, "gdn_recur", s);
         let s = substep_begin(&self.rt);
         let core_n = rms_norm_last(&core, norm, p.rms_norm_eps)?.reshape(&[t, value_dim])?;
+        self.dup_stage(Group::Norms, || rms_norm_last(&core, norm, p.rms_norm_eps))?;
         substep_end(&self.rt, "gdn_tail_norm", s);
         let s = substep_begin(&self.rt);
         let gated = core_n.mul(&z.silu()?)?;
+        self.dup_stage(Group::GdnProj, || core_n.mul(&z.silu()?))?;
         substep_end(&self.rt, "gdn_tail_gate", s);
         let s = substep_begin(&self.rt);
         let out = self.apply_dense(o, &gated);
+        self.dup_stage(Group::GdnProj, || self.apply_dense(o, &gated))?;
         substep_end(&self.rt, "gdn_tail_proj", s);
         out
     }
@@ -1272,19 +1325,22 @@ impl CudarcQwen3_6 {
         // k + 1 rows rounds differently, and on a checkpoint with high routing
         // entropy that flips an expert and the token with it (decision 151).
         let s = substep_begin(&self.rt);
-        let logits = if per_row_router && t > 1 {
-            let gate = layer.gate.cast(TensorDType::F32)?;
-            let mut rows = Vec::with_capacity(t);
-            for i in 0..t {
-                let row = x_post.narrow(0, i, 1)?.cast(TensorDType::F32)?;
-                rows.push(row.matmul_nt_f32(&gate)?);
-            }
-            Tensor::cat(&rows)?
-        } else {
-            x_post
-                .cast(TensorDType::F32)?
-                .matmul_nt_f32(&layer.gate.cast(TensorDType::F32)?)?
+        let gate_logits = || -> Result<Tensor> {
+            Ok(if per_row_router && t > 1 {
+                let gate = layer.gate.cast(TensorDType::F32)?;
+                let mut rows = Vec::with_capacity(t);
+                for i in 0..t {
+                    let row = x_post.narrow(0, i, 1)?.cast(TensorDType::F32)?;
+                    rows.push(row.matmul_nt_f32(&gate)?);
+                }
+                Tensor::cat(&rows)?
+            } else {
+                x_post
+                    .cast(TensorDType::F32)?
+                    .matmul_nt_f32(&layer.gate.cast(TensorDType::F32)?)?
+            })
         };
+        let logits = gate_logits()?;
         let fused = std::env::var("FERRUM_FUSED_ROUTER").ok().as_deref() != Some("0");
         let (ids, weights) = if fused {
             fused_topk_softmax(&logits, p.top_k)?
@@ -1292,6 +1348,14 @@ impl CudarcQwen3_6 {
             let probs = logits.softmax_last()?;
             topk_renorm(&probs, p.top_k)?
         };
+        if self.dup.has(Group::Router) {
+            let logits = gate_logits()?;
+            if fused {
+                fused_topk_softmax(&logits, p.top_k)?;
+            } else {
+                topk_renorm(&logits.softmax_last()?, p.top_k)?;
+            }
+        }
         substep_end(&self.rt, "moe_gate", s);
 
         // Start the routed step first, so its miss copy can overlap the shared
@@ -1557,6 +1621,18 @@ impl CudarcQwen3_6 {
                         &out,
                     )
                 }?;
+                if self.dup.has(Group::Head) {
+                    // SAFETY: as above; the relaunch writes the same logits.
+                    unsafe {
+                        gemv.gemv(
+                            &x.cast(TensorDType::Bf16)?,
+                            &banks.packed,
+                            &banks.scale,
+                            &banks.global,
+                            &out,
+                        )
+                    }?;
+                }
                 substep_end(&self.rt, "head_gemv", s);
                 let s = substep_begin(&self.rt);
                 let logits = out.to_host_f32();
@@ -1630,7 +1706,20 @@ impl CudarcQwen3_6 {
                 &banks.global,
                 out,
             )
+        }?;
+        if self.dup.has(Group::Head) {
+            // SAFETY: as above; the relaunch writes the same logits.
+            unsafe {
+                gemv.gemv(
+                    &x.cast(TensorDType::Bf16)?,
+                    &banks.packed,
+                    &banks.scale,
+                    &banks.global,
+                    out,
+                )
+            }?;
         }
+        Ok(())
     }
 
     /// The token embeddings of `idx`, from pinned host memory or the device
@@ -1668,9 +1757,18 @@ impl CudarcQwen3_6 {
             let (xsum, h1) = match residual.take() {
                 None => {
                     let h1 = rms_norm(&x, &layer.input_norm, p.rms_norm_eps)?;
+                    self.dup_stage(Group::Norms, || {
+                        rms_norm(&x, &layer.input_norm, p.rms_norm_eps)
+                    })?;
                     (x, h1)
                 }
-                Some(r) => x.add_rms_norm(&r, &layer.input_norm, p.rms_norm_eps)?,
+                Some(r) => {
+                    let out = x.add_rms_norm(&r, &layer.input_norm, p.rms_norm_eps)?;
+                    self.dup_stage(Group::Norms, || {
+                        x.add_rms_norm(&r, &layer.input_norm, p.rms_norm_eps)
+                    })?;
+                    out
+                }
             };
             substep_end(&self.rt, "res_norm", s);
             let mixer_out = if ablated("mixer") {
@@ -1688,6 +1786,9 @@ impl CudarcQwen3_6 {
             };
             let s = substep_begin(&self.rt);
             let (sum2, h2) = mixer_out.add_rms_norm(&xsum, &layer.post_norm, p.rms_norm_eps)?;
+            self.dup_stage(Group::Norms, || {
+                mixer_out.add_rms_norm(&xsum, &layer.post_norm, p.rms_norm_eps)
+            })?;
             substep_end(&self.rt, "post_norm", s);
             x = if ablated("moe") {
                 h2.clone()

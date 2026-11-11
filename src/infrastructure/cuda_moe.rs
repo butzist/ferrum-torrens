@@ -23,6 +23,7 @@ use crate::infrastructure::cuda_driver::{
     StagingKernels,
 };
 use crate::infrastructure::cudarc::{Runtime, Tensor, TensorDType};
+use crate::infrastructure::dup::{Dup, Group};
 use crate::infrastructure::kernel_abi::{
     Abi, CopyArgs, CsrCountArgs, CsrPrefixArgs, CsrScatterArgs, GEMV_DOWN, GEMV_GATE_UP,
     GROUPED_DOWN, GROUPED_GATE_UP, INDEX_COPY, LRU_ENSURE, LruArgs, MOE_CSR_COUNT, MOE_CSR_PREFIX,
@@ -188,6 +189,9 @@ pub struct CudaMoE {
     residency: Residency,
     /// Decode-time copy overlap, present when the device/context allowed it.
     decode_overlap: Option<DecodeOverlap>,
+    /// The stage groups `FERRUM_DUP` asked to relaunch, parsed once here
+    /// (OPTIMIZATION.md R20). Empty is the committed path.
+    dup: Dup,
 }
 
 // SAFETY: the driver handles are immutable after construction, and the tensor
@@ -471,6 +475,7 @@ impl CudaMoE {
             prefill_enabled: false,
             residency: Residency::Decode,
             decode_overlap,
+            dup: Dup::from_env(),
         })
     }
 
@@ -1282,7 +1287,21 @@ impl CudaMoE {
     /// Routes arrive as slot ids with `-1` for "not resident", and the GEMV
     /// handles that branch-free (it reads slot 0 and zeroes the accumulator), so
     /// nothing is compacted on the host and the reduce stays dense over `top_k`.
+    ///
+    /// `FERRUM_DUP=routed` runs them a second time over the same buffers. Each
+    /// one fully overwrites its output from `g`'s inputs, so the routed sum is
+    /// bit-identical and the extra time is the group's marginal cost
+    /// (OPTIMIZATION.md R20). The miss copy is outside this call: a second
+    /// `index_copy` is a no-op hit and would measure nothing.
     pub fn launch(&self, g: &StagedGroup) -> Result<(), MoEError> {
+        self.launch_once(g)?;
+        if self.dup.has(Group::Routed) {
+            self.launch_once(g)?;
+        }
+        Ok(())
+    }
+
+    fn launch_once(&self, g: &StagedGroup) -> Result<(), MoEError> {
         let gu = self
             .gate_up
             .as_ref()

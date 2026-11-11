@@ -81,6 +81,7 @@ flowchart TB
       Abi["kernel_abi\ncubin manifest + arg packing"]
       KvcDev["kvcache_dev\nMHA pool + GDN state slabs"]
       Prof["profile\nFT_PROFILE stage timer (dev)"]
+      Dup["dup\nFERRUM_DUP duplicate hook (dev)"]
       Http["http\naxum routes + SSE"]
       Toker["tokenizers_hf\nHF tokenizer + chat template"]
     end
@@ -148,6 +149,7 @@ stays pure: `Tensor` and CUDA handles never cross it (section 4).
 | KV pool, GDN state slabs, paged GQA attention | Device | `infrastructure/kvcache_dev.rs`, `infrastructure/cuda_attention.rs` |
 | CUDA-graph capture/replay | Device | `infrastructure/decode_graph.rs` + `decode_buffers.rs`; one graph per batch size, opted in with `cuda_graph = true` (decision 134) |
 | Decode stage profile (dev only, `FT_PROFILE=1`) | Device timing events | `infrastructure/profile.rs`; reference probe in `scripts/freetoken_probe/` |
+| Captured-step marginal cost (dev only, `FERRUM_DUP=<group>`) | Duplicate launches inside the graph | `infrastructure/dup.rs` + hooks in `forward_cudarc.rs` / `cuda_moe.rs`; OPTIMIZATION.md R20 |
 
 Crossings per step: token ids H2D, streamed expert rows H2D (misses only), logits
 D2H (for host sampling). The pinned expert banks and the dense weights are set up
@@ -161,6 +163,15 @@ takes the scalar oracle instead and runs every stage on the host
 a default build. `scripts/freetoken_probe/` times the read-only reference the
 same way by monkeypatch (decision 88), which is how the per-stage comparison was
 made.
+
+A captured step has no event attribution (a captured event pair reads back as a
+capture-time host delta), so the captured path is priced by marginal cost
+instead: `FERRUM_DUP=norms,attn_proj,...` relaunches the named stage groups a
+second time with identical inputs and output buffers, which leaves the numerics
+unchanged and turns the step-time delta into that group's cost. The set is parsed
+once at load into `infrastructure/dup.rs`'s `Dup` bitset and the unset case is a
+bit test per stage. `gdn_conv` and `gdn_recur` belong to no group because they
+advance recurrent state.
 
 ---
 
