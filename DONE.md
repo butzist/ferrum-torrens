@@ -5462,3 +5462,45 @@ subsection names are kept verbatim.
     `nix build .#kernels` and re-enter the shell for the deployment artifact.
     Logs: `/tmp/opencode/r23/{step0,r2,r3,c1,c2}.log`, `host_*.txt`, trace
     `trace.37121`.
+
+168. **The captured step owns the blocks it baked, and the idle-release pair
+    rebuilds the device cache: item 7 closes with no fix needed (2026-11-11).**
+    Item 7 carried two suspects from the ~370-token captured
+    `CUDA_ERROR_ILLEGAL_ADDRESS`: (a) a capture bakes the address of every
+    per-step tensor, and cudarc frees those slices when the step's values drop at
+    the end of the recording, so the driver could hand a baked block to a later
+    allocation and a replay would write into somebody else's buffer; and (b)
+    `CachedExperts::release_cache` reset the host plan without resetting the
+    device tables, so a `release_moe`/`rehydrate_moe` pair could leave them
+    pointing at freed slots. Both are now measured, and neither is real.
+    (a) `src/infrastructure/capture_track.rs` hooks `Tensor::new` (the one funnel
+    for fresh device buffers) and records every allocation made while a capture
+    is being recorded; it can then watch later allocations and count any that
+    return a recorded base address. The unit tests pin the record/watch/unwatch
+    semantics. A new gate,
+    `decode_graph_capture::a_captured_step_keeps_the_blocks_it_baked`, reports
+    that one captured decode step bakes **2476 tensor allocations / 98 899 KiB**
+    (so the premise that the step allocates its temporaries is correct), waits
+    for the capture's async frees to land, then replays the recorded allocation
+    sequence three times -- 7428 allocations, 192 MiB held -- and finds **0** of
+    them on a baked address; the replay after the churn is still bit-exact
+    (`max|d| = 0.000e0`). The control that makes the zero meaningful: the same
+    instrument over one ordinary allocate/free round trip sees the pool hand the
+    block back 1/1. Capture-time `cuMemAllocAsync` therefore draws from the
+    graph's own pool, which outlives the recording, so the allocation-free-scratch
+    refactor item 7 proposed is unnecessary.
+    (b) `cuda_moe_matches_reference::a_release_and_rehydrate_round_trip_keeps_the_staged_cache_correct`
+    stages a cache, runs a step, calls `release_cache` + `rehydrate_cache` (the
+    engine's `release_moe`/`rehydrate_moe`), and runs the same step again:
+    `max|after - before| = 0.000e0` and both equal the host plan exactly. The
+    reason is structural: `release_banks` drops `device_staging` (slot tables,
+    usage, step, miss list and the six bank pointers) together with the pinned
+    aliases, and `enable_device_staging` allocates them fresh with `-1` sentinels,
+    so no table can survive a release. The gate also pinned a contract worth
+    knowing: `execute_device` rewrites its `experts` tensor in place (ids to
+    slots), so a caller that repeats a step must re-stage the ids -- the model
+    does this per step, and a fixture that does not reads slots as expert ids.
+    What is still unknown is the *original* crash's cause; it was never
+    reproduced in isolation, and the guards stand unchanged: re-run a
+    long-prompt captured A/B after a kernel-set change (seven 442-token captured
+    runs today, all clean with the fused shared-expert pair as the default).

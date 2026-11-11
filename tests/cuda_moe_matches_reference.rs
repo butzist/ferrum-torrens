@@ -1045,3 +1045,153 @@ fn the_device_handoff_agrees_with_the_host_handoff() {
     );
     println!("PASS");
 }
+
+/// The engine's idle-release pair (`release_moe` / `rehydrate_moe`) must leave a
+/// staged cache that produces the step it did before: `release_cache` frees the
+/// device banks and resets the slot plan, `rehydrate_cache` allocates fresh
+/// tables. If either half kept the old device residency, the next step would read
+/// slot memory that no longer holds the expert it thinks it does, and the output
+/// would differ (or the kernel would fault) -- TODO item 7's second seam.
+///
+/// The step is destructive on its `experts` tensor (the plan rewrites the ids to
+/// slots in place), so every run stages a fresh one; that is what the engine does
+/// per step too. The first run is also checked against the host plan, so a
+/// fixture mistake cannot look like a release bug.
+#[test]
+#[ignore = "needs a CUDA device and the converted checkpoint in .model-cache"]
+#[serial]
+fn a_release_and_rehydrate_round_trip_keeps_the_staged_cache_correct() {
+    use ferrum_torrens::infrastructure::banks::FtwPinnedBanks;
+
+    const L: usize = 0;
+    const EXPERTS: usize = 256;
+    const SLOTS2: usize = 512;
+    const TOKENS2: usize = 8;
+
+    let Some((index, reader)) = open_checkpoint() else {
+        panic!("gate needs the checkpoint in {}", ftw_dir());
+    };
+    let shapes = shapes(&index);
+    let (hidden, inter) = (shapes.hidden, shapes.inter);
+    let source: Arc<dyn ExpertSlabSource> = Arc::new(FtwBanks::new(reader.clone(), index.clone()));
+
+    let x: Vec<f32> = (0..TOKENS2 * hidden)
+        .map(|i| ((i * 2654435761usize % 1009) as f32 / 1009.0) - 0.5)
+        .collect();
+    let routed: Vec<u32> = (0..TOKENS2 * TOP_K)
+        .map(|i| ((i * 7 + 3) % EXPERTS) as u32)
+        .collect();
+    let weights: Vec<f32> = (0..TOKENS2 * TOP_K)
+        .map(|i| 1.0 / TOP_K as f32 + i as f32 * 1e-3)
+        .collect();
+
+    let mut adapter = gate(
+        "driver API + committed cubins",
+        CudaMoE::new_with_stream(
+            Device::Cuda(0),
+            source,
+            shapes,
+            SLOTS2,
+            std::ptr::null_mut(),
+        ),
+    );
+    let rt = adapter.runtime().clone();
+    let driver = adapter.driver();
+    let pinned = gate(
+        "pinned expert banks",
+        FtwPinnedBanks::load(&driver, &reader, &index, shapes, L + 1, EXPERTS),
+    );
+    gate(
+        "enable device staging",
+        adapter.enable_device_staging(Box::new(pinned), L + 1, EXPERTS),
+    );
+    let moe = Arc::new(Mutex::new(adapter));
+    let exec = CachedExperts::with_device_staging(moe.clone(), moe.clone(), L + 1, EXPERTS, SLOTS2);
+
+    let ids: Vec<i32> = routed.iter().map(|&e| e as i32).collect();
+    let xd = gate(
+        "activations on device",
+        rt.from_slice_f32(&x, &[TOKENS2, hidden]),
+    );
+    let wd = gate(
+        "weights on device",
+        rt.from_slice_f32(&weights, &[TOKENS2, TOP_K]),
+    );
+    // One staged step: stage the ids fresh, run, read back. The ids are consumed
+    // by the plan, so a second run needs its own copy.
+    let run = |tag: &str| -> Vec<f32> {
+        let ed = gate(
+            "expert ids on device",
+            rt.from_slice_i32(&ids, &[TOKENS2, TOP_K]),
+        );
+        let mut out = gate(
+            "output buffer",
+            rt.zeros(&[TOKENS2, hidden], TensorDType::F32),
+        );
+        gate(
+            tag,
+            exec.execute_device(
+                &MoEDeviceRequest {
+                    layer: L,
+                    hidden,
+                    inter,
+                    top_k: TOP_K,
+                    x: &xd,
+                    experts: &ed,
+                    weights: &wd,
+                },
+                &mut out,
+            ),
+        );
+        out.to_host_f32().unwrap()
+    };
+
+    let first = run("execute_device (before release)");
+    assert!(
+        first.iter().any(|v| v.abs() > 1e-3),
+        "the first step produced nothing"
+    );
+    assert!(
+        exec.cache_resident(),
+        "the banks are resident before release"
+    );
+
+    let step = ExpertStep {
+        hidden,
+        inter,
+        top_k: TOP_K,
+        x: &x,
+        experts: &routed,
+        weights: &weights,
+    };
+    let mut host_cache = ExpertCache::new(L + 1, EXPERTS, SLOTS2);
+    let mut host_out = vec![0.0f32; TOKENS2 * hidden];
+    gate(
+        "run_experts (host plan)",
+        run_experts(&mut host_cache, &*moe, &*moe, L, &step, &mut host_out),
+    );
+    let to_host = max_abs_diff(&first, &host_out);
+    println!(
+        "staged step vs host plan: {to_host:.3e} of {:.3e}",
+        scale_of(&host_out)
+    );
+    assert_eq!(first, host_out, "the staged step must equal the host plan");
+
+    // Idle release, then rehydrate: the pair the engine runs between requests.
+    gate("release_cache", exec.release_cache());
+    assert!(!exec.cache_resident(), "the banks are gone after release");
+    gate("rehydrate_cache", exec.rehydrate_cache());
+    assert!(exec.cache_resident(), "the banks are back after rehydrate");
+
+    let second = run("execute_device (after rehydrate)");
+    let diff = max_abs_diff(&first, &second);
+    println!(
+        "release/rehydrate round trip: max|after - before| = {diff:.3e} of {:.3e}",
+        scale_of(&first)
+    );
+    assert_eq!(
+        second, first,
+        "a release/rehydrate round trip must reproduce the step exactly"
+    );
+    println!("PASS: the staged cache survives release_moe/rehydrate_moe");
+}

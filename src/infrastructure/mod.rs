@@ -2,6 +2,7 @@
 // CUDA and HTTP types; never imported by the domain core.
 
 pub mod banks;
+pub mod capture_track;
 #[cfg(feature = "cudarc")]
 pub mod cuda_attention;
 #[cfg(feature = "cudarc")]

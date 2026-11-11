@@ -25,7 +25,10 @@ next step's first kernel lands 0.95 ms p50 after the logits D2H). Device samplin
 would recover 0.23 ms (0.8%); the only host design left, a step-spanning
 pipeline, has a 0.95 ms = 3.4% ceiling. **The step is GPU-bound on the copy plus
 serial compute, and every lever there is a measured no-go.** Instrument:
-`FT_PROFILE_HOST=1`.
+`FT_PROFILE_HOST=1`. Queued item 7 is also closed as measured clean (DONE.md
+decision 168): a captured step bakes 2476 tensor allocations, the graph owns
+every block (0 of 7428 churn allocations landed on one, replay bit-exact), and
+the `release_moe`/`rehydrate_moe` round trip rebuilds the device cache exactly.
 
 The garbage at the start of decode after a long prompt was the
 prefill double buffer's residency never leaving `Prefill` on the overlap decode
@@ -148,26 +151,30 @@ R16/R17); item 4 is done (decision 166); items 2 and 5 remain open, and item 9
    is a Rust harness over the committed cubins. Neither is done; the devshell's
    `pythonEnv` torch is CPU-only, so the harness currently runs under the
    FreeToken venv.
-7. **Captured-step buffer stability (mitigated, root cause open).** A captured
-   decode graph bakes every per-step cudarc allocation (router ids/weights,
-   attention/GDN temporaries, the shared-expert GEMV's `a`/`out`), and those
-   slices are freed after capture. It has been dormant, but at ~370-token
-   prompts the NVFP4 captured path intermittently died with
-   `CUDA_ERROR_ILLEGAL_ADDRESS` once the two fused shared-expert cubins were
-   added to *every* `GdnKernels` consumer (more loaded modules shifted the
-   device layout). Mitigation landed: `LINEAR_LOAD_NAMES` excludes the fused
-   pair from the default load set, `SharedExpertFused` loads only its own two
-   (`GdnKernels::load_named`), and the port exists only with
-   `FERRUM_SHARED_BF16=1` (0/5 crashes after; eager was always 0/5, the parent
-   commit 0/7). The real fix is to make the captured step allocation-free with
-   stable scratch buffers (or prove cudarc's capture pool owns the slices for
-   the graph's lifetime). Until then: **a new launcher must not add cubins to
-   the default load set**, and re-run a long-prompt captured A/B after any
-   kernel-set change. The same seam class exists in
-   `CachedExperts::release_cache`: it resets the host plan but not the device
-   LRU, so a `release_moe`/`rehydrate_moe` pair can leave the device tables
-   pointing at freed slots (decision 165 open item; text-only serving never
-   calls it, so it is not gated).
+7. ~~**Captured-step buffer stability**~~ -- CLOSED as measured clean on both
+   seams (2026-11-11, DONE.md decision 168). (a) *Does the graph own the blocks
+   it baked?* `infrastructure/capture_track.rs` records every tensor allocation a
+   capture makes (via `Tensor::new`, the one funnel); a captured decode step bakes
+   **2476 allocations / 98.9 MiB**. The gate
+   `decode_graph_capture::a_captured_step_keeps_the_blocks_it_baked` then churns
+   the allocator over exactly those sizes, in the recorded order, three times
+   (7428 allocations, 192 MiB held): **none** lands on a baked address, and a
+   replay after the churn is bit-exact. A positive control (one ordinary
+   allocate/free round trip) *does* get its block back 1/1, so the zero is the
+   tracker telling the truth, not blindness: capture-time allocations come from
+   the graph's pool and survive cudarc's post-capture frees. The
+   allocation-free-scratch refactor is therefore unnecessary; the ~370-token
+   `CUDA_ERROR_ILLEGAL_ADDRESS` class was not a use-after-free of captured
+   temporaries. (b) *Does `release_moe`/`rehydrate_moe` leave the device tables
+   stale?* No: `release_banks` drops the device staging (tables and banks) and
+   the host plan, and `rehydrate_banks` rebuilds both fresh;
+   `cuda_moe_matches_reference::a_release_and_rehydrate_round_trip_keeps_the_staged_cache_correct`
+   proves the step reproduces exactly (`max|after-before| = 0.000e0`) and equals
+   the host plan. What remains open is only the *actual* cause of the old crash
+   (never reproduced in isolation); the guards stand: re-run a long-prompt
+   captured A/B after any kernel-set change (seven 442-token captured runs clean
+   today), and a new launcher still should not add cubins to the default load
+   set without that A/B.
 8. ~~**Re-baseline the decode rate on the corrected trajectory**~~ -- DONE
    (2026-11-11, decision 165). Captured (50 W, 442-token clean prompt, greedy):
    FerrumTorrens NVFP4 pp 336.1 / tg 33.2; bf16 shared + fused pp 344.8 / tg 34.9;

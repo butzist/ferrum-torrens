@@ -25,9 +25,10 @@ use ferrum_torrens::domain::kvcache::{CachedModel, KvCache, SequenceCache};
 use ferrum_torrens::domain::model::ForwardInput;
 use ferrum_torrens::domain::weights::WeightsReader;
 use ferrum_torrens::infrastructure::banks::{FtwBanks, FtwPinnedBanks};
+use ferrum_torrens::infrastructure::capture_track;
 use ferrum_torrens::infrastructure::cuda_linear::{DenseGemv, Fp8Linear};
 use ferrum_torrens::infrastructure::cuda_moe::CudaMoE;
-use ferrum_torrens::infrastructure::cudarc::Runtime;
+use ferrum_torrens::infrastructure::cudarc::{Runtime, TensorDType};
 use ferrum_torrens::infrastructure::decode_buffers::{DecodeBuffers, DecodeRow};
 use ferrum_torrens::infrastructure::decode_graph::{DecodeGraph, EngineDecodeGraphs};
 use ferrum_torrens::infrastructure::ftw::{FtwIndex, FtwReader};
@@ -394,4 +395,115 @@ fn a_captured_batch_decode_step_replays_equal_to_an_uncaptured_step() {
     check(&got_pad[0], &want_pad, "bs=2 padded row 0");
 
     println!("PASS: batch-2 captured step replays equal to the uncaptured twin");
+}
+
+/// The graph owns the device blocks it baked. A capture bakes every temporary's
+/// address and the slices free at the end of the recording, so the driver's pool
+/// could hand one of those blocks to a later tensor and a replay would write
+/// into it -- TODO item 7's `CUDA_ERROR_ILLEGAL_ADDRESS` class. This churns the
+/// allocator with the recorded step's own sizes, kept alive, and asserts no
+/// watched allocation lands on a baked address; the replay after the churn must
+/// still be bit-exact.
+#[test]
+#[ignore = "needs a CUDA device and the FTW checkpoint"]
+#[serial]
+fn a_captured_step_keeps_the_blocks_it_baked() {
+    let b = build(PROMPT.len() + DECODE_STEPS + 16, 4);
+    let device = Device::Cuda(0);
+    let refbuf = DecodeBuffers::with_runtime(&b.rt, 1, b.vocab, b.window, device);
+
+    let (mut ref_cache, token) = prefill(&b, &PROMPT);
+    stage_rows(&b, std::slice::from_mut(&mut ref_cache), &[token], &refbuf);
+    b.model.forward_decode_into(&refbuf).unwrap();
+    let want = logits_row(&refbuf, 0);
+    b.cache.end(&mut ref_cache);
+
+    let (mut cap_cache, cap_token) = prefill(&b, &PROMPT);
+    assert_eq!(cap_token, token, "prefill must be deterministic");
+    let capbuf = DecodeBuffers::with_runtime(&b.rt, 1, b.vocab, b.window, device);
+    stage_rows(&b, std::slice::from_mut(&mut cap_cache), &[token], &capbuf);
+    let graph =
+        unsafe { DecodeGraph::capture(&b.rt, capbuf, |bufs| b.model.forward_decode_into(bufs)) }
+            .expect("capture the decode step");
+    b.cache.end(&mut cap_cache);
+    // The capture's slices free on the stream as they drop; wait for those frees
+    // to land before the churn, or the pool cannot reuse them yet and the
+    // experiment proves nothing.
+    b.rt.synchronize().expect("sync after capture");
+    let summary = graph.capture_allocations().clone();
+    eprintln!(
+        "captured step baked {} tensor allocations, {} KiB",
+        summary.tensors,
+        summary.bytes >> 10
+    );
+    assert!(summary.tensors > 0, "the step allocates its temporaries");
+    let sizes = capture_track::recorded_sizes();
+    assert_eq!(sizes.len(), summary.tensors);
+
+    // Churn the same sizes in the recorded order, holding a bounded set alive so
+    // the pool has to satisfy later requests elsewhere. Every watched
+    // allocation is checked against the recorded addresses.
+    let mut keep: Vec<ferrum_torrens::infrastructure::cudarc::Tensor> = Vec::new();
+    let mut held = 0usize;
+    capture_track::watch();
+    for _ in 0..3 {
+        for bytes in &sizes {
+            let t = b.rt.zeros(&[(*bytes).max(1)], TensorDType::U8).unwrap();
+            if held + bytes <= 192 << 20 {
+                held += bytes;
+                keep.push(t);
+            }
+        }
+    }
+    let held_kib = held >> 10;
+    let (hits, last) = capture_track::reused();
+    let watched = capture_track::watched();
+    capture_track::unwatch();
+    eprintln!(
+        "churn: {watched} allocations watched, {hits} landed on a baked block (last {last:?}), \
+         {held_kib} KiB held"
+    );
+
+    // Replay from a fresh post-prefill state while the churn is still resident.
+    let (mut rep_cache, rep_token) = prefill(&b, &PROMPT);
+    assert_eq!(rep_token, token);
+    stage_rows(
+        &b,
+        std::slice::from_mut(&mut rep_cache),
+        &[token],
+        graph.buffers(),
+    );
+    graph.replay().expect("replay the graph");
+    b.rt.synchronize().expect("sync after replay");
+    let got = logits_row(graph.buffers(), 0);
+    b.cache.end(&mut rep_cache);
+    let diff = check(&got, &want, "replay after allocator churn");
+    drop(keep);
+
+    assert_eq!(
+        hits, 0,
+        "the driver handed a baked block to another tensor ({last:?}); a replay \
+         would write into somebody else's buffer"
+    );
+
+    // Positive control: the same instrument over one ordinary (uncaptured)
+    // allocate/free round trip must see the pool hand the block back, or the
+    // zero above would only prove the tracker is blind.
+    capture_track::begin_record();
+    drop(b.rt.zeros(&[1 << 20], TensorDType::U8).unwrap());
+    capture_track::end_record();
+    b.rt.synchronize().expect("sync after the control free");
+    capture_track::watch();
+    let control = b.rt.zeros(&[1 << 20], TensorDType::U8).unwrap();
+    let (control_hits, _) = capture_track::reused();
+    capture_track::unwatch();
+    drop(control);
+    eprintln!("control: {control_hits} of 1 ordinary reallocation(s) landed on the freed block");
+    assert!(
+        control_hits > 0,
+        "the tracker must see an ordinary free/realloc round trip"
+    );
+    println!(
+        "PASS: captured step kept its {watched} churn-watched blocks, replay bit-diff {diff:.3e}"
+    );
 }

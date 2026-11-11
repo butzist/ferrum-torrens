@@ -151,6 +151,7 @@ stays pure: `Tensor` and CUDA handles never cross it (section 4).
 | Decode stage profile (dev only, `FT_PROFILE=1`) | Device timing events | `infrastructure/profile.rs`; reference probe in `scripts/freetoken_probe/` |
 | Captured-step marginal cost (dev only, `FERRUM_DUP=<group>`) | Duplicate launches inside the graph | `infrastructure/dup.rs` + hooks in `forward_cudarc.rs` / `cuda_moe.rs`; OPTIMIZATION.md R20 |
 | Host side of one decode step (dev only, `FT_PROFILE_HOST=1`) | Host clocks (`Instant`) | `infrastructure/host_profile.rs` + brackets in `decode_graph.rs`, `cudarc.rs` and `application/generation.rs`; OPTIMIZATION.md R23 |
+| Capture-allocation ownership (dev only) | Host addresses of a capture's tensors | `infrastructure/capture_track.rs`; records what a recording allocates and whether a later allocation lands on it; DONE.md decision 168 |
 
 Crossings per step: token ids H2D, streamed expert rows H2D (misses only), logits
 D2H (for host sampling). The pinned expert banks and the dense weights are set up

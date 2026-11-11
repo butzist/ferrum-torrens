@@ -70,6 +70,7 @@ pub struct DecodeGraph {
     graph: CudaGraph,
     bufs: DecodeBuffers,
     rt: Runtime,
+    allocs: crate::infrastructure::capture_track::Summary,
 }
 
 impl DecodeGraph {
@@ -95,6 +96,10 @@ impl DecodeGraph {
         step(&bufs).map_err(CaptureError::Step)?;
         rt.stream().synchronize().map_err(CaptureError::Driver)?;
 
+        // The recorded step's tensor allocations are what the graph bakes, and
+        // their slices free when they drop after the capture; record them so a
+        // test can prove the driver never hands those blocks to another tensor.
+        crate::infrastructure::capture_track::begin_record();
         rt.stream()
             .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL)
             .map_err(CaptureError::Driver)?;
@@ -102,6 +107,7 @@ impl DecodeGraph {
             // Never leave the stream capturing; the discarded graph, if any,
             // drops at the end of this expression.
             let _ = rt.stream().end_capture(CUgraphInstantiate_flags(0));
+            crate::infrastructure::capture_track::end_record();
             return Err(CaptureError::Step(e));
         }
         let graph = rt
@@ -109,11 +115,13 @@ impl DecodeGraph {
             .end_capture(CUgraphInstantiate_flags(0))
             .map_err(CaptureError::Driver)?
             .ok_or(CaptureError::NoGraph)?;
+        let allocs = crate::infrastructure::capture_track::end_record();
         graph.upload().map_err(CaptureError::Driver)?;
         Ok(Self {
             graph,
             bufs,
             rt: rt.clone(),
+            allocs,
         })
     }
 
@@ -127,6 +135,13 @@ impl DecodeGraph {
     /// step's rows and windows into these between replays.
     pub fn buffers(&self) -> &DecodeBuffers {
         &self.bufs
+    }
+
+    /// What the recorded step allocated, i.e. how many device blocks the graph
+    /// baked the address of. A test uses this to churn the allocator over the
+    /// same sizes; zero reuse means the graph kept its own blocks.
+    pub fn capture_allocations(&self) -> &crate::infrastructure::capture_track::Summary {
+        &self.allocs
     }
 
     /// The runtime whose stream the graph records and replays on.

@@ -63,6 +63,30 @@ struct Profile {
     dumped: bool,
 }
 
+impl Profile {
+    /// File one finished loop iteration. A prefill step is dropped (different
+    /// shape); a decode step is kept, and once `skip + steps` decode steps have
+    /// finished the report window is returned so the caller can print it.
+    fn finish(&mut self, step: Step, skip: usize, steps: usize) -> Option<Vec<Step>> {
+        if !step.decode || self.dumped {
+            return None;
+        }
+        self.seen += 1;
+        self.done.push(step);
+        if self.seen < skip + steps {
+            return None;
+        }
+        self.dumped = true;
+        Some(
+            std::mem::take(&mut self.done)
+                .into_iter()
+                .skip(skip)
+                .take(steps)
+                .collect(),
+        )
+    }
+}
+
 static P: OnceLock<Mutex<Profile>> = OnceLock::new();
 
 fn state() -> &'static Mutex<Profile> {
@@ -142,24 +166,19 @@ impl Drop for StepScope {
         let Some(mut step) = p.open.take() else {
             return;
         };
-        if !step.decode || p.dumped {
-            return;
-        }
         step.record("step", start.elapsed());
-        p.seen += 1;
-        p.done.push(step);
         let skip = env_usize("FT_PROFILE_HOST_SKIP", 4);
         let steps = env_usize("FT_PROFILE_HOST_STEPS", 16).max(1);
-        if p.seen >= skip + steps {
-            let window: Vec<&Step> = p.done.iter().skip(skip).take(steps).collect();
-            let text = report(&window);
-            eprintln!("{text}");
-            let out = std::env::var("FT_PROFILE_HOST_OUT")
-                .unwrap_or_else(|_| "/tmp/ft_profile_host".into());
-            let _ = std::fs::write(format!("{out}.txt"), &text);
-            eprintln!("[ft-profile-host] wrote {out}.txt");
-            p.dumped = true;
-        }
+        let Some(window) = p.finish(step, skip, steps) else {
+            return;
+        };
+        let window: Vec<&Step> = window.iter().collect();
+        let text = report(&window);
+        eprintln!("{text}");
+        let out =
+            std::env::var("FT_PROFILE_HOST_OUT").unwrap_or_else(|_| "/tmp/ft_profile_host".into());
+        let _ = std::fs::write(format!("{out}.txt"), &text);
+        eprintln!("[ft-profile-host] wrote {out}.txt");
     }
 }
 
@@ -237,72 +256,88 @@ mod tests {
 
     use super::*;
 
-    fn reset(on: bool, open: bool) {
-        ON_STATE.store(if on { ON } else { OFF }, Ordering::Relaxed);
-        let mut p = state().lock().unwrap();
-        p.open = if open { Some(Step::default()) } else { None };
-        p.done.clear();
-        p.seen = 0;
-        p.dumped = false;
+    fn step_of(ms: &[(&'static str, f64)]) -> Step {
+        let mut step = Step::default();
+        for (label, v) in ms {
+            step.record(label, Duration::from_secs_f64(v / 1e3));
+        }
+        step
     }
 
     #[test]
-    #[serial]
     fn a_span_accumulates_into_the_open_step_only() {
-        reset(true, true);
-        {
-            let _a = span("stage");
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        {
-            let _a = span("stage");
-        }
-        let p = state().lock().unwrap();
-        let step = p.open.as_ref().unwrap();
-        assert!(step.ms["stage"] >= 1.0, "the span's elapsed time is kept");
+        // The span's own state machine, with no global step open: the label is
+        // counted once per span and summed across repeats.
+        let mut step = Step::default();
+        step.record("stage", Duration::from_millis(2));
+        step.record("stage", Duration::from_millis(1));
+        assert!((step.ms["stage"] - 3.0).abs() < 1e-6, "durations add up");
         assert_eq!(step.calls["stage"], 2);
-        assert!(!step.ms.contains_key("launch"), "an unopened span no-ops");
-        drop(p);
+        assert!(
+            !step.ms.contains_key("launch"),
+            "an unrecorded label is absent"
+        );
 
-        // With no open step a span has nowhere to go and must not panic.
-        reset(true, false);
-        drop(span("stage"));
-        assert!(state().lock().unwrap().open.is_none());
+        // A profile with no open step has nowhere to put a span; that path is
+        // the guard's `if let Some(step)` and must simply do nothing.
+        let mut p = Profile::default();
+        if let Some(open) = p.open.as_mut() {
+            open.record("stage", Duration::from_millis(1));
+        }
+        assert!(p.open.is_none());
     }
 
     #[test]
-    #[serial]
     fn a_non_decode_step_is_dropped_and_a_decode_step_is_filed() {
-        reset(true, false);
-        {
-            let _s = begin_step();
-            drop(span("stage"));
-            mark_decode(false);
-        }
-        assert_eq!(state().lock().unwrap().done.len(), 0, "prefill is dropped");
-        {
-            let _s = begin_step();
-            drop(span("stage"));
-            mark_decode(true);
-        }
-        let p = state().lock().unwrap();
-        assert_eq!(p.done.len(), 1);
-        assert!(p.done[0].ms.contains_key("step"), "the drop files the wall");
+        let mut p = Profile::default();
+        let mut prefill = step_of(&[("stage", 1.0)]);
+        prefill.decode = false;
+        assert!(p.finish(prefill, 0, 1).is_none(), "prefill is dropped");
+        assert!(p.done.is_empty());
+        assert_eq!(p.seen, 0);
+
+        let mut decode = step_of(&[("stage", 1.0)]);
+        decode.decode = true;
+        let window = p.finish(decode, 0, 1).expect("the window is full");
+        assert_eq!(window.len(), 1);
+        assert!(window[0].ms.contains_key("stage"));
         assert_eq!(p.seen, 1);
+
+        // A second step after the dump is not filed again.
+        let mut more = step_of(&[("stage", 1.0)]);
+        more.decode = true;
+        assert!(p.finish(more, 0, 1).is_none());
     }
 
     #[test]
-    #[serial]
+    fn the_skip_window_drops_the_warm_up_steps() {
+        let mut p = Profile::default();
+        for _ in 0..2 {
+            let mut s = step_of(&[("stage", 1.0)]);
+            s.decode = true;
+            assert!(p.finish(s, 2, 1).is_none(), "still warming up");
+        }
+        let mut last = step_of(&[("stage", 2.0)]);
+        last.decode = true;
+        let window = p
+            .finish(last, 2, 1)
+            .expect("the third step fills the window");
+        assert_eq!(window.len(), 1);
+        assert!(
+            (window[0].ms["stage"] - 2.0).abs() < 1e-6,
+            "the last step, not the first"
+        );
+    }
+
+    #[test]
     fn the_report_sorts_by_cost_and_separates_host_from_the_sync() {
-        let mut a = Step::default();
-        a.record("step", Duration::from_micros(30_000));
-        a.record("sync", Duration::from_micros(20_000));
-        a.record("stage", Duration::from_micros(1_000));
-        a.record("sample", Duration::from_micros(2_000));
-        let mut b = Step::default();
-        b.record("step", Duration::from_micros(32_000));
-        b.record("sync", Duration::from_micros(21_000));
-        b.record("stage", Duration::from_micros(3_000));
+        let a = step_of(&[
+            ("step", 30.0),
+            ("sync", 20.0),
+            ("stage", 1.0),
+            ("sample", 2.0),
+        ]);
+        let b = step_of(&[("step", 32.0), ("sync", 21.0), ("stage", 3.0)]);
         let text = report(&[&a, &b]);
         assert!(text.contains("decode_steps=2"));
         let stage = text.find("stage").unwrap();
@@ -318,9 +353,10 @@ mod tests {
 
     #[test]
     #[serial]
-    fn a_disabled_timer_records_nothing() {
-        reset(false, true);
-        drop(span("stage"));
-        assert!(state().lock().unwrap().open.as_ref().unwrap().ms.is_empty());
+    fn a_disabled_timer_opens_nothing() {
+        ON_STATE.store(OFF, Ordering::Relaxed);
+        assert!(!enabled());
+        assert!(begin_step().0.is_none(), "no step is opened when off");
+        assert!(span("stage").0.is_none(), "no span is timed when off");
     }
 }

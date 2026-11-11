@@ -620,15 +620,20 @@ pub struct Tensor {
 }
 
 impl Tensor {
+    /// Every fresh device buffer enters here, so this is also where a capture's
+    /// allocations are recorded: a graph bakes the address of each one and the
+    /// slice is freed when it drops (see `capture_track`).
     fn new(rt: Runtime, buf: Buffer, shape: Vec<usize>) -> Self {
         let strides = contiguous_strides(&shape);
-        Self {
+        let t = Self {
             rt,
             buf,
             shape,
             strides,
             offset: 0,
-        }
+        };
+        crate::infrastructure::capture_track::alloc(t.device_ptr(), t.nbytes());
+        t
     }
 
     pub fn runtime(&self) -> &Runtime {
