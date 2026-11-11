@@ -3246,3 +3246,101 @@ Prefill is unaffected by both levers: the normal prefill path uses
 `cuMemcpyBatchAsync_v2`, not `index_copy_multi`, and pp was 340.8 / 332.0 / 332.4
 tok/s across the arms. Logs: `/tmp/opencode/prio_*`, traces
 `/tmp/opencode/prio/trace_{control,prio,b}.*`.
+
+## R23 -- The host gap: 5 ms/token that no GPU work touches (plan, 2026-11-11)
+
+R22's corrected budget leaves one term that is not GPU work and has never been
+measured: **4.98 ms/step p50 between the head GEMV/logits D2H and the next
+step's first kernel**, 16% of a 32.2 ms step, identical in all three arms of that
+slice (4.98 / 4.94 / 4.59) and still 5.15 ms in the warmest 18.3 ms step. The
+copy (16.3 ms) is at the link rate with ~1.6 ms of headroom and the serial
+compute (11.0 ms) is diffuse (R20), so this is the largest single unattacked
+term. A server pays it per token, so it is a serving cost, not a harness
+artifact -- but the harness's own share has to be separated from the engine's
+before anything is optimized.
+
+### Step 0 -- price the pieces, do not guess
+
+Instrument the host side of one decode step with a host clock (`Instant`), behind
+one env var (`FT_PROFILE_HOST=1`, off by default, no allocation when off), and
+report p50 over the measured steps. The pieces, in the order they run:
+
+1. **`stage_and_launch`** (`decode_graph.rs`): the row/window staging into the
+   fixed buffers -- `from_slice_i32` of the KV window (up to 4096 i32 per step)
+   and the `DecodeRow` fields, i.e. one or more small pageable H2D.
+2. **`cuGraphLaunch`** plus the `service.inner.lock()`.
+3. **the stream synchronize** after the launch (`run_step` does it explicitly).
+4. **the logits readback**: `logits_rows(rows)` then `to_host_f32` of a
+   `[vocab]` row = 1 MB per step. CUPTI already prices the *device* side of this
+   at 74 us (one `memcpy` record), so whatever the host clock shows above that is
+   the host half: a pageable D2H is ~2-3 GB/s, i.e. ~0.4 ms, and the allocation
+   and copy of the `Vec<f32>` adds more.
+5. **sampling** (harness): greedy `argmax` over 248320 floats. Must be measured
+   separately -- it is the harness's, not the engine's.
+6. **tokenizer decode + printing** (harness, dev only): exclude from the engine
+   number, and do not "optimize" it.
+
+Cross-check with the CUPTI trace already in the tree: the gap between the last
+kernel of step N and the first kernel of step N+1 is the whole host gap, so the
+sum of the pieces must reconcile with it. If it does not, the missing piece is
+outside these brackets (engine bookkeeping between `step()` calls, the
+scheduler, or the smoke's own per-token loop).
+
+Also split the engine from the harness: run one arm with sampling replaced by a
+fixed token id (no argmax, no readback beyond what the API requires) and one with
+the full path, so the two shares are known before any fix.
+
+### Step 1 -- fix whichever piece dominates
+
+Ordered by expected size, to be confirmed by step 0:
+
+1. **Keep sampling on the device.** The full-vocab readback exists because the
+   host samples. For greedy (and for the top-k/top-p paths the engine already
+   has device kernels for: `fused_topk_softmax_f32`, `topk_last_f32`,
+   `max_all_f32`, `sum_all_f32`) the host only needs the chosen id (4 bytes) plus
+   the sampler's parameters. Moving the reduce to the device removes the 1 MB
+   pageable D2H from the step. This is the largest candidate if step 0 shows the
+   readback dominating, and it also helps the server's per-token latency.
+2. **Pinned readback.** If the full vector must come back (a caller needs the
+   logits), stage it through a persistent pinned buffer (`cuMemcpyDtoHAsync` into
+   host-pinned memory + one event) instead of a pageable copy that allocates per
+   step. The embedding already uses the same pinned-host pattern.
+3. **Staging without per-step allocations.** The window/rows H2D should write
+   into a persistent pinned staging buffer; a per-step `Vec` + pageable copy pays
+   a driver-side bounce buffer every token.
+4. **The synchronize.** It cannot disappear while the API returns logits, but a
+   server can overlap it with the next request's tokenization; measure whether
+   the harness's own sync (rather than the engine's) is part of the gap.
+5. Only if 1-4 leave most of the gap: a capture that spans the step boundary (the
+   graph launch itself), which is a different design and needs its own slice.
+
+### Acceptance and protocol
+
+- Measure on the clean prompt (`bench/prompt-clean.txt`), captured, 50 W cap,
+  48 tokens, one process per arm, **interleaved 3 rounds minimum**; the control
+  must land in the known 34-36 tok/s band and single runs vary ~5%, so quote
+  per-round numbers and the mean. Never use `/tmp/opencode/bench/prompt2.txt`.
+- Report the host-gap p50 before/after from both the host clock and the CUPTI
+  trace (they must agree), plus the tok/s delta.
+- Gates: `cargo fmt --check`, both clippy passes, `cargo test`, the oracle
+  (`one_token_through_the_kernel_matches_the_oracle` -> " Paris"), and the
+  long-prefill gate. A sampler change additionally needs the greedy-token gates
+  to stay exact (`device_decode_matches_refeed`, `engine_real_generate`).
+- Resource limits as always: one model-loading process at a time under
+  `prlimit --as=68719476736`, `MemAvailable` >= ~23.4 GiB before a load.
+
+### Expected
+
+If the engine's share of the gap is most of it and item 1 or 2 lands, the step
+drops by up to ~4 ms, i.e. 32.2 -> ~28 ms and 34.5 -> ~39-40 tok/s, which is
+FreeToken's 38.7 (R19) without touching the GPU at all. If step 0 instead shows
+the gap is mostly the harness's argmax and printing, the engine has no lever
+here: record that and stop, because the server would not pay the same cost.
+
+### Do not re-chase
+
+Copy/compute interference, copy-stream priority, the copy grid (R22, all
+measured no-wins); the cache policy in any form (R19, bounded at -17.5% by
+Belady); capacity (R18/R19, VRAM-bound); the shared expert (R18); the routed
+GEMV and lm_head (R20, both at the byte roofline); `nsys`/`ncu` (R21: importer
+aborts on this driver, counters are admin-only -- use `scripts/cupti-trace/`).
