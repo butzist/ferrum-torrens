@@ -20,9 +20,11 @@ Instructions for AI coding agents working in this repository.
   blocks, the build process, and a static plus dynamic view of each subsystem,
   with mermaid diagrams.
 - `OPTIMIZATION.md` is the performance plan of record: the measured reference
-  (FreeToken) baseline and the ordered decode-optimization plan (the R-numbered
-  slices and levers). Look measured numbers up here before re-running a probe or
-  re-measuring the reference.
+  (FreeToken) baseline, the current gap decomposition and the ordered
+  optimization plan. Look measured numbers up here before re-running a probe or
+  re-measuring the reference. (Before 2026-11-16 it also carried the R1-R24
+  campaign log; that history is DONE.md decisions 76-169 and git history --
+  see decision 170.)
 - At the start of every session, re-read `TODO.md` in full. It may have been
   updated since your last session. Do not trust stale context.
 

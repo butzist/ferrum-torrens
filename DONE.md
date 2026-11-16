@@ -5504,3 +5504,78 @@ subsection names are kept verbatim.
     reproduced in isolation, and the guards stand unchanged: re-run a
     long-prompt captured A/B after a kernel-set change (seven 442-token captured
     runs today, all clean with the fused shared-expert pair as the default).
+
+169. **R24 kernel-level like-for-like vs FreeToken: ~2x device busy, shared
+    expert and ensure_experts are the largest specific deltas** (2026-11-16,
+    OPTIMIZATION.md R24). The host side is closed (R23), so R24 attributes the
+    remaining ~1.13x decode gap (34.30 vs 38.7 tok/s, clean 442-token prompt,
+    greedy, 50 W cap, captured) by per-kernel device-busy time. The reference
+    server forks workers, so CUPTI preload cannot attach; FreeToken is measured
+    with its own `torch.profiler` window (`FT_PROBE_TORCH=1`,
+    `scripts/freetoken_probe/probe_impl.py`) and compared via
+    `scripts/cupti-trace/compare-decode.py`. Setup: `bench/prompt-clean.txt`
+    (442 tokens), greedy (`temperature=0, top_k=1, top_p=1`), 16-token warmup +
+    48-token measured; FT `freetoken.cli serve --model
+    .model-cache/bench/ftw-ref-14119b8 --moe-backend offload --moe-cache-auto
+    --memory-ratio 0.9 --max-running-requests 1 --max-prefill-length 1024
+    --max-seq-len-override 4096 --kv-reserve-tokens 4096 --text-model-only
+    --cuda-graph-max-bs 1` (model id `ftw-ref-14119b8`, venv
+    `.model-cache/bench/FreeToken/.venv`), RTX 5060 Laptop. FT (torch.profiler,
+    16 decode steps, trace `/tmp/opencode/r24/ft/probe/trace-2189.json`,
+    profile `profile-2189.txt`, measured usage 442+48=490): **22.65 ms/step
+    device busy** (span 23.12) — `fast_index_copy_multi` 12.37, CUTLASS
+    fp8/bf16 GEMM 4.10, `_decode_nvfp4_marlin_kernel` 1.55, sm89 fp8 GEMM 1.36,
+    head `_nvfp4_gemv_kernel` 0.88, `_nvfp4_gemv_splitk` 0.40, GDN
+    `fused_sigmoid_gating_delta_rule_update` 0.32, `_lru_ensure_kernel` 0.19.
+    Ours (CUPTI, 52 steps, recorded in-flight, same clean prompt/greedy): **43.4
+    ms/step device busy** (p50 45.2, span 34.2) — `_index_copy_multi` 14.6,
+    `_shared_expert_nvfp4_phase1` 13.7, `_fp8_gemv_splitk` 5.1, `_nvfp4_gemv`
+    2.3, `_ensure_experts` 1.9, head 1.05, paged attention 0.92,
+    `_shared_expert_nvfp4_phase2` 0.87. Expert-miss copy is comparable (14.6 vs
+    12.37); total device work is ~1.92x ours (overlap differs: FT busy ~ span,
+    ours 43.4 ms busy over 34.2 ms span). Kernel names/structures differ (FT
+    PyTorch+CUTLASS/cuBLASLt/cuBLAS gemvx+Triton vs our AOT cubins), so mapping
+    is not one-to-one, but the largest specific deltas are the NVFP4
+    shared-expert pair (13.7 + 0.87 = 14.57 ms absolute, no equivalently-costed
+    kernel in FT's top table; marginal-cost-free under overlap per R18/R20 yet
+    large in device time, so FT's shared-expert path is far cheaper in absolute
+    work) and `_ensure_experts` (1.9 vs FT `_lru_ensure_kernel` 0.19 ms, ~10x,
+    1.7 ms delta). FP8 projections are comparable in aggregate (5.1 vs 4.10 +
+    1.36), routed GEMV ~18% higher (2.3 vs 1.55 + 0.40). R24 does not isolate a
+    single kernel for the whole gap; next actions are to attribute our
+    shared-expert vs FT's shared-expert path and investigate `_ensure_experts`,
+    then refine GDN/attention mapping if needed, keeping only measured wins
+    (controlled, order-balanced, ~5% variance). Tooling: fixed
+    `scripts/cupti-trace/freetoken-trace.sh` to default to torch-probe mode for
+    forked FT servers (`FERRUM_PROBE=1`, `FERRUM_TRACE=0`; CUPTI preload opt-in
+    via `FERRUM_TRACE=1`) and to pass probe env via `env`.
+
+170. **The 1500-line `OPTIMIZATION.md` is retired; the performance plan of
+   record is its lean replacement.** The old file had become the campaign log
+   (R1-R24, 2026-10-16..11-16) interleaved with the plan: stale-reference
+   headline claims (decision 76's 30.3 tok/s against FreeToken 0.2.1's
+   38.7-47.0), "measured no-win" closures recorded at a noise floor above the
+   lever size, and the current state buried under history. The replacement
+   keeps only: the canonical standing, the R24 gap decomposition, the ordered
+   three-phase plan, the standing measured facts (rooflines, baselines, miss
+   economics), the measurement discipline, and the closed-lever list. The old
+   text is not lost: it is this file's decisions 76-169 plus the retired
+   file's last git revision, and in-repo comments referencing
+   "`OPTIMIZATION.md` R..." resolve there. The external review that motivated
+   the rewrite is `plans/2026-11-16-optimization-campaign-review.md`; its
+   corrections, adopted here and in the replacement: (a) the remaining bs=1 gap
+   is **launch geometry, not fusion** -- FT's small kernels run at the
+   graph-dispatch floor (1-5 us/call) while ours run 10-50 us/call (1-32 CTAs
+   on 26 SMs), which also explains the S8/R9.2 "fusion regresses" results;
+   (b) the A/B noise floor (~+/-5%) exceeds the remaining levers (0.5-2 ms
+   each), so sub-5% claims are decided on CUPTI device-busy, not wall tg;
+   (c) closures made below noise (R8.0b, R8.1, R8.3, S9/S10) are "unresolved",
+   re-opened as geometry items; (d) "hidden under the copy" is span-free but
+   not power-free on a 50 W-capped part. The campaign arc this summarizes:
+   decode tg 0.9 -> ~35 tok/s (copy vectorization, bf16 GEMM, vendored
+   kernels, marlin GEMVs, auto cache, batching, grid-stride copy, fused norms,
+   copy/shared overlap), prefill pp ~34 -> 958 tok/s (chunking, the batched
+   grouped GEMM, the DMA copy, tile tunes) -- prefill and K=4 aggregate ahead
+   of FreeToken 0.2.1, bs=1 decode ~1.2-1.5x behind with the gap attributed to
+   the copy per-miss efficiency (+2.2 ms) and the small-kernel tail (~+7 ms).
+   `TODO.md`'s 550-line status wall was compacted in the same pass.
