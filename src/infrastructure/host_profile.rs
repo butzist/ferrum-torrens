@@ -100,19 +100,66 @@ fn env_usize(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+/// Nanoseconds of CPU time this thread has consumed, or `None` where the clock
+/// is unavailable. A span that reports device-wall and thread-CPU side by side
+/// separates "the driver is working on this thread" from "the thread is parked
+/// waiting for the GPU" -- `cuGraphLaunch`'s 11 ms/step is one or the other, and
+/// they have opposite consequences (a serving cost vs. nothing to win).
+#[cfg(target_os = "linux")]
+fn thread_cpu_ns() -> Option<u64> {
+    #[repr(C)]
+    struct Timespec {
+        tv_sec: i64,
+        tv_nsec: i64,
+    }
+    const CLOCK_THREAD_CPUTIME_ID: i32 = 3;
+    unsafe extern "C" {
+        fn clock_gettime(clockid: i32, tp: *mut Timespec) -> i32;
+    }
+    let mut ts = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a live, correctly typed out-parameter.
+    if unsafe { clock_gettime(CLOCK_THREAD_CPUTIME_ID, &mut ts) } != 0 {
+        return None;
+    }
+    Some(ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn thread_cpu_ns() -> Option<u64> {
+    None
+}
+
+struct Guard {
+    label: &'static str,
+    start: Instant,
+    /// The same span's thread-CPU reading, recorded under its own label.
+    cpu: Option<(&'static str, u64)>,
+}
+
 /// A named host span; records on drop so an early return still lands it.
-pub struct Span(Option<(&'static str, Instant)>);
+pub struct Span(Option<Guard>);
 
 impl Drop for Span {
     fn drop(&mut self) {
-        let Some((label, start)) = self.0 else {
+        let Some(guard) = self.0.take() else {
             return;
         };
-        let d = start.elapsed();
+        let wall = guard.start.elapsed();
+        let cpu = guard
+            .cpu
+            .as_ref()
+            .zip(thread_cpu_ns())
+            .map(|((label, before), now)| (*label, now.saturating_sub(*before)));
         if let Ok(mut p) = state().lock()
             && let Some(step) = p.open.as_mut()
         {
-            step.record(label, d);
+            step.record(guard.label, wall);
+            if let Some((label, ns)) = cpu {
+                step.record(label, Duration::from_nanos(ns));
+            }
         }
     }
 }
@@ -122,7 +169,26 @@ pub fn span(label: &'static str) -> Span {
     if !enabled() {
         return Span(None);
     }
-    Span(Some((label, Instant::now())))
+    Span(Some(Guard {
+        label,
+        start: Instant::now(),
+        cpu: None,
+    }))
+}
+
+/// A span that also records how much CPU the calling thread burned, under
+/// `cpu_label`: equal to the wall time means the driver is working on this
+/// thread, near zero means it is parked waiting on the device.
+pub fn span_cpu(label: &'static str, cpu_label: &'static str) -> Span {
+    if !enabled() {
+        return Span(None);
+    }
+    let start = Instant::now();
+    Span(Some(Guard {
+        label,
+        start,
+        cpu: thread_cpu_ns().map(|ns| (cpu_label, ns)),
+    }))
 }
 
 /// Open one loop iteration. Paired with the guard's drop, which closes it.
@@ -349,6 +415,27 @@ mod tests {
             "host is step - sync, not the sync itself: {text}"
         );
         assert_eq!(percentile(&[1.0, 2.0, 3.0, 4.0], 0.5), 3.0);
+    }
+
+    #[test]
+    fn the_thread_cpu_clock_advances_with_work_and_not_with_sleep() {
+        let t0 = thread_cpu_ns().expect("linux has a per-thread CPU clock");
+        let mut spin = 0u64;
+        for i in 0..2_000_000u64 {
+            spin = spin.wrapping_add(i);
+        }
+        let t1 = thread_cpu_ns().expect("second reading");
+        assert!(t1 > t0, "a busy loop burns CPU time");
+        // A sleep must not consume thread CPU time the way the loop did.
+        let before = thread_cpu_ns().unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        let after = thread_cpu_ns().unwrap();
+        assert!(
+            after - before < 2_000_000,
+            "sleeping is not CPU time ({} ns)",
+            after - before
+        );
+        assert!(spin != 0);
     }
 
     #[test]

@@ -271,7 +271,7 @@ impl<E: DecodeExec> DecodeGraphSet<E> {
             }
         }
         {
-            let _launch = crate::infrastructure::host_profile::span("launch");
+            let _launch = crate::infrastructure::host_profile::span_cpu("launch", "launch_cpu");
             exec.launch()?;
         }
         Ok(bs)
@@ -385,7 +385,9 @@ impl<E: DecodeExec> EngineDecodeGraphs<E> {
             .stage_and_launch(rows, windows)
             .map_err(graph_error)?;
         {
-            let _sync = crate::infrastructure::host_profile::span("sync");
+            // `sync_cpu` is the control for `launch_cpu`: waiting on the graph
+            // is parked time by definition, so it must read near zero.
+            let _sync = crate::infrastructure::host_profile::span_cpu("sync", "sync_cpu");
             if let Some(rt) = &service.rt {
                 rt.synchronize()
                     .map_err(|e| DecodeError::Step(e.to_string()))?;
