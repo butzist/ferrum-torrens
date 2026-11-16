@@ -10,6 +10,7 @@ benchmarks, no multimodal, no runtime cache management, no multi-GPU.
 - Paper: "FreeToken: Efficient Edge-Native MoE Serving with Bandwidth-Adaptive Execution", arXiv:2608.16157. Read section 3 (design) before starting -- it is the only concise system-level documentation.
 - Performance plan and measured reference numbers: `OPTIMIZATION.md`
 - History (decision log 1..169, progress narrative): `DONE.md`
+- Cleanup candidates (proposed removals, not executed): `TODO-cleanup.md`
 
 ## Status (2026-11-16)
 
