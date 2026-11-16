@@ -41,9 +41,13 @@ the Phase 1/2 re-measurement (decision 172) closed the copy as link-bound
 at ~13 GB/s) and re-scoped the tail from "launch geometry" to **node count**:
 2069 kernels/step vs FreeToken's ~800, 1297 of them elementwise glue, and 4.1 ms
 of union idle in ~1.4 us inter-node gaps. The step now accounts as copy 12.6 +
-compute 10.7 + idle 4.1, with our compute at FreeToken parity (10.3). Next: the
-node-count bundle (fuse the GDN/norm/elementwise glue chains), gated on CUPTI
-idle + kernel count. Blockers: none.
+compute 10.7 + idle 4.1, with our compute at FreeToken parity (10.3). The
+node-count bundle has started: two of the 335 `_copy_strided`-per-step kernel
+launches are gone because `is_contiguous` now ignores size-1 dims (decision 173:
+2069 -> 1879 kernels, union idle 4.11 -> 3.84 ms, ids bit-identical, tg flat
+within noise). Next: fuse the elementwise glue that remains (145 `_copy_strided`,
+200 `_cast_bf16_f32`, 190 `_unary`, 100 `_scalar`, 100 `_col_mul`, plus the GDN
+chain), gated on CUPTI idle + kernel count. Blockers: none.
 
 ### Open work
 
