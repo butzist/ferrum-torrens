@@ -665,7 +665,7 @@ impl Tensor {
     }
 
     pub fn is_contiguous(&self) -> bool {
-        self.strides == contiguous_strides(&self.shape)
+        strides_are_row_major(&self.shape, &self.strides)
     }
 
     pub fn device_ptr(&self) -> u64 {
@@ -2066,6 +2066,20 @@ fn contiguous_strides(shape: &[usize]) -> Vec<usize> {
     strides
 }
 
+/// Row-major in memory, ignoring size-1 dims: their stride cannot change
+/// addressing, so `narrow(1, 0, n)` of a `[1, N]` tensor is a contiguous run
+/// and must not be materialized as a copy.
+fn strides_are_row_major(shape: &[usize], strides: &[usize]) -> bool {
+    let mut expected = 1usize;
+    for (&len, &stride) in shape.iter().zip(strides).rev() {
+        if len > 1 && stride != expected {
+            return false;
+        }
+        expected = expected.saturating_mul(len.max(1));
+    }
+    true
+}
+
 /// The committed cubins over a driver, launched from cudarc storage with the
 /// same raw ABI the serving path uses.
 pub struct LinearKernels {
@@ -2767,6 +2781,24 @@ mod tests {
         assert_eq!(contiguous_strides(&[3]), vec![1]);
         assert_eq!(contiguous_strides(&[2, 3]), vec![3, 1]);
         assert_eq!(contiguous_strides(&[2, 3, 4]), vec![12, 4, 1]);
+    }
+
+    #[test]
+    fn row_major_ignores_size_one_dims() {
+        // The decode path narrows a `[1, N]` row into pieces; those are
+        // contiguous runs and must not launch a copy kernel.
+        assert!(strides_are_row_major(&[1, 4], &[4, 1]));
+        assert!(strides_are_row_major(&[1, 4], &[1024, 1]));
+        assert!(strides_are_row_major(&[4, 1], &[1, 1]));
+        assert!(strides_are_row_major(&[2, 3, 1], &[3, 1, 7]));
+        assert!(strides_are_row_major(&[1, 1], &[9, 9]));
+        assert!(strides_are_row_major(&[2, 3], &[3, 1]));
+        // But a real stride gap is still a copy.
+        assert!(!strides_are_row_major(&[1, 4], &[1, 4]));
+        assert!(!strides_are_row_major(&[2, 3], &[3, 2]));
+        assert!(!strides_are_row_major(&[2, 3, 4], &[12, 1, 4]));
+        // A zero-length dim contributes nothing to the run.
+        assert!(strides_are_row_major(&[0, 4], &[4, 1]));
     }
 
     #[test]

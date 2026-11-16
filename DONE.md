@@ -5706,3 +5706,37 @@ subsection names are kept verbatim.
    `/tmp/opencode/r24-copy/` (`copy_bench2.py`, `copy_bench4.py`,
    `starve_bench.py`), shared-expert A/B and traces in
    `/tmp/opencode/r24-shared/`, `scripts/cupti-trace/step-budget.py`.
+
+173. **A row-major view is a view, not a copy: `is_contiguous` ignores size-1
+   dims (-190 nodes/step) (2026-11-16).** First item of the node-count bundle
+   from decision 172. `Tensor::is_contiguous` compared the stride vector against
+   `contiguous_strides(shape)` exactly, so a size-1 dimension's stride -- which
+   cannot affect addressing -- made ordinary decode views look strided:
+   `narrow(1, 0, si)` of a `[1, N]` row has strides `[N, 1]`, not `[si, 1]`, so
+   `contiguous()` materialized it with a `_copy_strided` kernel. The decode
+   forward narrows rows about a dozen times per layer (q/k/v, conv input, the
+   router's `ba`, the routed `gate`/`up` halves, the shared `gate_up`), which is
+   why 335 of the 2069 captured kernels per step were 1.2 us copies of data
+   that was already contiguous. The predicate is now the standard row-major
+   test -- iterate from the last dim, require `stride == expected` only where
+   `len > 1` -- extracted into `strides_are_row_major(shape, strides)` so it is
+   unit-testable without a device (`row_major_ignores_size_one_dims`: the four
+   contiguous cases, three counterexamples, and a zero-length dim). Everything
+   else -- `contiguous_strides`, the `copy_strided` kernel, the ABI, the
+   artifacts -- is untouched; a genuinely strided view still pays the copy.
+   Measured (CUPTI, 10 steps, clean prompt, greedy, captured):
+   `_copy_strided` **335 -> 145 per step** (the rest are genuine strided copies
+   and the prefill-only ones), total kernels **2069 -> 1879**, union idle
+   **4.11 -> 3.84 ms**, sum busy 35.60 -> 35.36. Wall tg is flat within the
+   ~5% noise (37.9/38.3/35.3 narrow vs 37.5/37.6/37.5 control, 3 interleaved
+   rounds), which is what a 1% lever looks like, and the change is kept on the
+   CUPTI decider per the Phase 0 rule. Exactness: both arms generate the
+   identical 47 ids (md5 `790b7e4fc852` over the 48-token window), the same
+   trajectory as the `ensure_experts` A/B, so the forward, the GDN recurrent
+   state path and sampling are unchanged. The one semantic difference is that
+   callers now receive a shared handle where they used to receive a private
+   copy; nothing in the captured decode path mutates a tensor it got from
+   `contiguous()` (the ids prove the state path is intact), but a future
+   in-place consumer of a narrowed row would need its own copy.
+   Gates: `cargo fmt --check`, `cargo clippy --all-targets` (default and
+   `--features cudarc`), `cargo test --lib` 435 passed.
