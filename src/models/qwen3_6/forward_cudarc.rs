@@ -114,7 +114,11 @@ fn rms_norm_last(x: &Tensor, w: &Tensor, eps: f32) -> Result<Tensor> {
         .add_scalar(eps)?
         .sqrt()?
         .reciprocal()?;
-    let w = w.cast(TensorDType::F32)?;
+    let w = if w.dtype() == TensorDType::F32 {
+        w.clone()
+    } else {
+        w.cast(TensorDType::F32)?
+    };
     flat.row_mul(&inv)?
         .col_mul(&w)?
         .cast(TensorDType::Bf16)?
@@ -798,8 +802,8 @@ impl CudarcQwen3_6 {
         let p = &self.params;
         let Mixer::Full {
             qkv,
-            q_norm,
-            k_norm,
+            q_norm_f32,
+            k_norm_f32,
             ..
         } = &layer.mixer
         else {
@@ -818,9 +822,9 @@ impl CudarcQwen3_6 {
         let qg = qg.reshape(&[t, qh, 2, hd])?;
         let q = qg.select(2, 0)?.reshape(&[t, qh * hd])?;
         let gate = qg.select(2, 1)?.reshape(&[t, qh * hd])?;
-        let q = rms_norm_last(&q.reshape(&[t, qh, hd])?, q_norm, p.rms_norm_eps)?
+        let q = rms_norm_last(&q.reshape(&[t, qh, hd])?, q_norm_f32, p.rms_norm_eps)?
             .reshape(&[t, qh * hd])?;
-        let k = rms_norm_last(&k.reshape(&[t, kvh, hd])?, k_norm, p.rms_norm_eps)?;
+        let k = rms_norm_last(&k.reshape(&[t, kvh, hd])?, k_norm_f32, p.rms_norm_eps)?;
         let v = v.reshape(&[t, kvh, hd])?;
 
         if p.rotary_dim == 0 {
@@ -958,11 +962,12 @@ impl CudarcQwen3_6 {
         let Mixer::Linear {
             qkvz,
             o,
-            ba,
+            ba_f32,
             conv,
             a_log,
             dt_bias,
             norm,
+            ..
         } = &layer.mixer
         else {
             return Err(moe_bad("not a linear-attention layer"));
@@ -982,14 +987,13 @@ impl CudarcQwen3_6 {
         let conv_in = projected.narrow(1, 0, conv_dim)?.contiguous()?;
         let z = projected.narrow(1, conv_dim, value_dim)?;
         let s = substep_begin(&self.rt);
-        let ba_w = ba.cast(TensorDType::F32)?;
         let ba = x
             .cast(TensorDType::F32)?
-            .matmul_nt_f32(&ba_w)?
+            .matmul_nt_f32(ba_f32)?
             .cast(TensorDType::Bf16)?;
         self.dup_stage(Group::GdnProj, || {
             x.cast(TensorDType::F32)?
-                .matmul_nt_f32(&ba_w)?
+                .matmul_nt_f32(ba_f32)?
                 .cast(TensorDType::Bf16)
         })?;
         substep_end(&self.rt, "gdn_ba", s);

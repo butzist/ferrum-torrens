@@ -110,6 +110,10 @@ pub enum Mixer {
         o: Box<Dense>,
         q_norm: Tensor,
         k_norm: Tensor,
+        /// The same two norm vectors widened once at load: the decode forward
+        /// normalizes in f32 and used to cast them on every call.
+        q_norm_f32: Tensor,
+        k_norm_f32: Tensor,
     },
     Linear {
         qkvz: Box<Dense>,
@@ -119,6 +123,10 @@ pub enum Mixer {
         a_log: Tensor,
         dt_bias: Tensor,
         norm: Tensor,
+        /// `ba` widened once at load: the router's gate/up projection reads it
+        /// as an f32 GEMM operand, and the decode forward casts it every step
+        /// otherwise (0.5 MiB of writes per layer per step).
+        ba_f32: Tensor,
     },
 }
 
@@ -208,7 +216,16 @@ impl Tower {
                     o,
                     q_norm,
                     k_norm,
-                } => qkv.bytes() + o.bytes() + q_norm.nbytes() + k_norm.nbytes(),
+                    q_norm_f32,
+                    k_norm_f32,
+                } => {
+                    qkv.bytes()
+                        + o.bytes()
+                        + q_norm.nbytes()
+                        + k_norm.nbytes()
+                        + q_norm_f32.nbytes()
+                        + k_norm_f32.nbytes()
+                }
                 Mixer::Linear {
                     qkvz,
                     o,
@@ -217,6 +234,7 @@ impl Tower {
                     a_log,
                     dt_bias,
                     norm,
+                    ba_f32,
                 } => {
                     qkvz.bytes()
                         + o.bytes()
@@ -225,6 +243,7 @@ impl Tower {
                         + a_log.nbytes()
                         + dt_bias.nbytes()
                         + norm.nbytes()
+                        + ba_f32.nbytes()
                 }
             };
         }
@@ -267,6 +286,14 @@ impl Tower {
             lm_head,
         })
     }
+}
+
+/// A bf16 weight widened to f32 once, for a path that reads it as an f32
+/// operand every step (the GDN router and the attention norm weights). The cast
+/// is exact, so the forward's numbers are unchanged.
+fn widen(w: &Tensor) -> Result<Tensor> {
+    w.cast(crate::infrastructure::cudarc::TensorDType::F32)
+        .map_err(|e| LoadError::Device(e.to_string()))
 }
 
 /// The embedding table: pinned host memory by default, so its 970 MiB does not
@@ -314,23 +341,29 @@ fn load_layer(
     let input_norm = ld.norm(&format!("{p}.input_layernorm.weight"), h)?;
     let post_norm = ld.norm(&format!("{p}.post_attention_layernorm.weight"), h)?;
     let mixer = if kind == LayerType::FullAttention {
+        let q_norm = ld.norm(&format!("{p}.self_attn.q_norm.weight"), params.head_dim)?;
+        let k_norm = ld.norm(&format!("{p}.self_attn.k_norm.weight"), params.head_dim)?;
         Mixer::Full {
             qkv: Box::new(ld.dense(&format!("{p}.self_attn.qkv_proj.weight"))?),
             o: Box::new(ld.dense(&format!("{p}.self_attn.o_proj.weight"))?),
-            q_norm: ld.norm(&format!("{p}.self_attn.q_norm.weight"), params.head_dim)?,
-            k_norm: ld.norm(&format!("{p}.self_attn.k_norm.weight"), params.head_dim)?,
+            q_norm_f32: widen(&q_norm)?,
+            k_norm_f32: widen(&k_norm)?,
+            q_norm,
+            k_norm,
         }
     } else {
         let conv_dim = 2 * params.linear_num_key_heads * params.linear_key_head_dim
             + params.linear_num_value_heads * params.linear_value_head_dim;
+        let ba = ld.bf16_shape(
+            &format!("{p}.linear_attn.in_proj_ba.weight"),
+            2 * params.linear_num_value_heads * h,
+            &[2 * params.linear_num_value_heads, h],
+        )?;
         Mixer::Linear {
             qkvz: Box::new(ld.dense(&format!("{p}.linear_attn.in_proj_qkvz.weight"))?),
             o: Box::new(ld.dense(&format!("{p}.linear_attn.out_proj.weight"))?),
-            ba: ld.bf16_shape(
-                &format!("{p}.linear_attn.in_proj_ba.weight"),
-                2 * params.linear_num_value_heads * h,
-                &[2 * params.linear_num_value_heads, h],
-            )?,
+            ba_f32: widen(&ba)?,
+            ba,
             conv: ld.bf16_shape(
                 &format!("{p}.linear_attn.conv1d.weight"),
                 conv_dim * params.linear_conv_kernel_dim,

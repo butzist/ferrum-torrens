@@ -5777,3 +5777,25 @@ subsection names are kept verbatim.
    Gates: `cargo test --lib` 435 passed, `cargo clippy --all-targets
    --features cudarc` clean, the captured decode graph still captures
    (`captured decode graph: true`), pp unchanged within noise.
+
+175. **Weights the decode step reads as f32 are widened once at load (-50
+   nodes/step) (2026-11-16).** Third item of the node-count bundle, the cheap
+   half of decision 172's "constant weight casts". Two per-step casts of
+   constants: `gdn_layer` did `ba.cast(F32)` on the GDN router weight
+   (`[64, 2048]`, i.e. 0.5 MiB written per GDN layer per step, 15 MB/step) and
+   `rms_norm_last` cast the q/k norm vectors on every call. Both are now widened
+   in `load_cudarc.rs` (`Mixer::Full` gains `q_norm_f32`/`k_norm_f32`,
+   `Mixer::Linear` gains `ba_f32`, counted in `resident_bytes`) and the forward
+   reads them (`rms_norm_last` skips the cast when the weight is already f32).
+   The cast is exact, so the math is unchanged: both arms generate the identical
+   47 ids (md5 `790b7e4fc852`).
+   Measured, 3 interleaved rounds both traced: `_cast_bf16_f32` **140 -> 90 per
+   step**, total **1519 -> 1469** nodes. That kernel's device-busy (0.9 us/call)
+   drops by 0.045 ms/step, which is below span noise, and the wall tg is flat
+   (37.6 ctl vs 37.0 widen, overlapping ranges) -- so this is kept for the node
+   and write reduction, not claimed as a wall win. Cost: +15 MB of f32 weights,
+   -7.7 MB of bf16 `ba` kept for the reader, i.e. **+7.7 MB VRAM** out of the
+   8 GiB budget, which is why the remaining VRAM-sensitive work stays in
+   `OPTIMIZATION.md`'s closed list.
+   Gates: `cargo test --lib` 435 passed, `cargo clippy --all-targets
+   --features cudarc` clean, ids identical, captured graph still captures.
