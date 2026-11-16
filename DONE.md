@@ -5741,3 +5741,39 @@ subsection names are kept verbatim.
    in-place consumer of a narrowed row would need its own copy.
    Gates: `cargo fmt --check`, `cargo clippy --all-targets` (default and
    `--features cudarc`), `cargo test --lib` 435 passed.
+
+174. **The GDN output tail is one fused gated-norm row per value head: -360
+   nodes, -1.0 ms span (2026-11-16).** Second item of the node-count bundle
+   (decision 172), and the item S8 had closed as a -2.5% regression.
+   `forward_cudarc.rs::rms_norm_last` composes an RMSNorm out of the tensor API:
+   `cast(f32) -> square -> sum_last -> mul_scalar -> add_scalar -> sqrt ->
+   reciprocal -> row_mul -> col_mul(w) -> cast(bf16)`, and the GDN mixer then
+   did `core_n.mul(&z.silu()?)` on top: about twelve launches per GDN layer, 30
+   layers per step. The `rmsnorm_gated` cubin (`norm.py::_rmsnorm_gated_kernel`,
+   `out = rmsnorm(x, w) * silu(z)` with HIDDEN=128 baked, i.e. exactly the GDN
+   value head dim) was already committed, ABI-tested and **unused** -- it is
+   what S8 built and measured as a regression. It is now wired in through
+   `CudarcQwen3_6::gdn_tail`, gated on `t == 1` (the decode geometry: at prefill
+   `z` is a strided narrow of `projected` and would need a real copy) and on
+   `FERRUM_GDN_TAIL` (default on, `=0` selects the composed path) so one binary
+   can be measured against itself.
+   A/B, same binary, both arms CUPTI-traced, 3 interleaved rounds, clean prompt,
+   greedy, captured: **both arms decode the identical 47 ids**
+   (md5 `790b7e4fc852`), so the fused kernel is bit-identical here and the
+   comparison carries no trajectory confound. Kernels per step **1879 -> 1519**
+   (-360, 12 per GDN layer, as predicted), union idle **3.68 -> 2.95 ms**, span
+   **26.59 -> 25.57 ms**, tg **36.9 -> 38.0 tok/s** (+2.8%, all three fused runs
+   above all three composed runs). The wall win is under the ~5% gate on its
+   own, so it is kept on the CUPTI decider per the Phase 0 rule; the clean sweep
+   and the exact node delta make it a keep rather than a wash.
+   Why S8 saw a regression: it fused the same math *and* hand-picked a fresh
+   tile/launch for it, so a geometry loss could hide a node-count win. This
+   change reuses the committed cubin unchanged, which is why the node delta is
+   the whole story. `rms_norm_last` stays for the q/k norms (hidden 256, not the
+   baked 128) and the final norm, which is the next instance of the same cut.
+   The `Group::Norms` duplicate-launch stage for this tail is now part of
+   `Group::GdnProj` (the fused tail is one kernel; `FERRUM_DUP` semantics shift
+   by that one stage).
+   Gates: `cargo test --lib` 435 passed, `cargo clippy --all-targets
+   --features cudarc` clean, the captured decode graph still captures
+   (`captured decode graph: true`), pp unchanged within noise.

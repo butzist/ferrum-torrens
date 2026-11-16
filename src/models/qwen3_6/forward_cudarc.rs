@@ -266,6 +266,23 @@ fn gdn_chunked_enabled() -> bool {
     gdn_chunked_flag().load(Ordering::Relaxed)
 }
 
+/// The GDN output tail (`rmsnorm(core) * silu(z)`) as the fused gated-norm
+/// cubin instead of the ~12-node elementwise chain. Env-gated (`FERRUM_GDN_TAIL=0`
+/// takes the composed path) so one binary can be measured against itself.
+fn gdn_tail_flag() -> &'static AtomicBool {
+    static FLAG: OnceLock<AtomicBool> = OnceLock::new();
+    FLAG.get_or_init(|| {
+        let on = std::env::var("FERRUM_GDN_TAIL")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        AtomicBool::new(on)
+    })
+}
+
+fn gdn_tail_fused() -> bool {
+    gdn_tail_flag().load(Ordering::Relaxed)
+}
+
 /// Test-only override: force the chunked prefill recurrence on or off. The
 /// differential gate flips this between forwards instead of reloading the model.
 pub fn set_gdn_chunked(enabled: bool) {
@@ -662,6 +679,27 @@ impl CudarcQwen3_6 {
         Ok(())
     }
 
+    /// The GDN mixer's output tail: `rmsnorm(core, norm) * silu(z)` over the
+    /// value heads. `core` is `[t, vb, dv]` and `z` is `[t, vb * dv]`, so the
+    /// tail is one `rmsnorm_gated` row per value head -- the cubin's baked
+    /// HIDDEN is the GDN value head dim, which is why it exists. The composed
+    /// path stays for a geometry the cubin refuses.
+    fn gdn_tail(&self, core: &Tensor, z: &Tensor, norm: &Tensor, t: usize) -> Result<Tensor> {
+        let p = &self.params;
+        let (vb, dv) = (p.linear_num_value_heads, p.linear_value_head_dim);
+        let value_dim = vb * dv;
+        if gdn_tail_fused() && t == 1 && core.numel() == value_dim && z.numel() == value_dim {
+            let rows = vb;
+            let x = core.reshape(&[rows, dv])?;
+            let z_rows = z.reshape(&[rows, dv])?;
+            return x
+                .rms_norm_gated(&z_rows, norm, p.rms_norm_eps)?
+                .reshape(&[t, value_dim]);
+        }
+        let core_n = rms_norm_last(core, norm, p.rms_norm_eps)?.reshape(&[t, value_dim])?;
+        core_n.mul(&z.silu()?)
+    }
+
     fn apply_dense(&self, d: &Dense, x: &Tensor) -> Result<Tensor> {
         // A one-row NVFP4 projection runs the packed-weight gemv: the decode
         // step reads the checkpoint's 4-bit bytes instead of the widened bf16
@@ -1012,12 +1050,8 @@ impl CudarcQwen3_6 {
                 }
             };
             let s = substep_begin(&self.rt);
-            let core_n = rms_norm_last(&core, norm, p.rms_norm_eps)?.reshape(&[t, value_dim])?;
-            self.dup_stage(Group::Norms, || rms_norm_last(&core, norm, p.rms_norm_eps))?;
-            substep_end(&self.rt, "gdn_tail_norm", s);
-            let s = substep_begin(&self.rt);
-            let gated = core_n.mul(&z.silu()?)?;
-            self.dup_stage(Group::GdnProj, || core_n.mul(&z.silu()?))?;
+            let gated = self.gdn_tail(&core, &z, norm, t)?;
+            self.dup_stage(Group::GdnProj, || self.gdn_tail(&core, &z, norm, t))?;
             substep_end(&self.rt, "gdn_tail_gate", s);
             let s = substep_begin(&self.rt);
             let out = self.apply_dense(o, &gated);
@@ -1112,12 +1146,8 @@ impl CudarcQwen3_6 {
         };
         substep_end(&self.rt, "gdn_recur", s);
         let s = substep_begin(&self.rt);
-        let core_n = rms_norm_last(&core, norm, p.rms_norm_eps)?.reshape(&[t, value_dim])?;
-        self.dup_stage(Group::Norms, || rms_norm_last(&core, norm, p.rms_norm_eps))?;
-        substep_end(&self.rt, "gdn_tail_norm", s);
-        let s = substep_begin(&self.rt);
-        let gated = core_n.mul(&z.silu()?)?;
-        self.dup_stage(Group::GdnProj, || core_n.mul(&z.silu()?))?;
+        let gated = self.gdn_tail(&core, &z, norm, t)?;
+        self.dup_stage(Group::GdnProj, || self.gdn_tail(&core, &z, norm, t))?;
         substep_end(&self.rt, "gdn_tail_gate", s);
         let s = substep_begin(&self.rt);
         let out = self.apply_dense(o, &gated);

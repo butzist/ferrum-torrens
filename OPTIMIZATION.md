@@ -68,7 +68,7 @@ above is the lever and this table is not:
 |---|---:|---:|---|
 | `ensure_experts` / `_lru_ensure_kernel` | 0.36 (**landed**; was 1.66 in the A/B arm) | 0.19 | in-register argmin per miss, 2026-11-16 |
 | shared expert (solo) | 0.33 | ~0.4 | 16 CTAs is fine; 12.0 ms busy under the copy is starvation, not cost |
-| norms (~110 nodes) | ~1.2-2 | 0.095 | 1 CTA per row; but the cost is the node count |
+| norms (~110 nodes) | ~1.2-2 | 0.095 | the GDN tail is fused now; q/k and the final norm still compose |
 | paged attention | 0.92 | ~0.2 | re-reads K/V per q head; FT's staged kernel shares tiles |
 | router (gate + topk) | 0.74 | 0.18 | f32 matmul + op chain vs one fused kernel |
 | conv + recurrence | 0.89 | 0.39 | recurrence at parity; the conv is ~10x FT's per call |
@@ -175,8 +175,8 @@ kernel bodies are fine and the **idle between them** is the cost:
 
 | | ours | FreeToken |
 |---|---:|---:|
-| kernels per decode step | **1879** (2069 before the row-major fix) | ~800 |
-| of those, elementwise/glue (<3 us each) | **1107** | -- |
+| kernels per decode step | **1519** (2069 before the two landed cuts) | ~800 |
+| of those, elementwise/glue (<3 us each) | **747** | -- |
 | kernel time in the compute stream | 10.7 ms (excluding the starved shared expert) | 10.3 ms |
 | union GPU idle inside the step | **4.11 ms** | ~0.2 ms (98% busy) |
 | -- of which in <5 us inter-node gaps | 2.85 ms | -- |
@@ -184,15 +184,18 @@ kernel bodies are fine and the **idle between them** is the cost:
 Our non-copy compute is **at parity with FreeToken** (10.7 vs 10.3 ms): the
 heavy GEMVs are ahead (7.45 vs 7.89), the norms/router/attention/conv items in
 the table below are 1-2 us kernels that cost nothing on their own. What we pay
-is ~1.4 us of dead time per node across ~1900 nodes. The fix is **fewer
+is ~1.4 us of dead time per node across ~1500 nodes. The fix is **fewer
 kernels**: materialize nothing that is already a contiguous run (landed: -190
-nodes, decision 173), then fuse the glue chains that remain, not retune tiles:
+nodes, decision 173) and replace a 12-node elementwise chain with the fused
+cubin that already exists (landed: -360 nodes, -1.0 ms span, decision 174),
+then fuse the glue that remains, not retune tiles:
 
 | item | status | measured |
 |---|---|---|
 | `ensure_experts` per-miss argmin | **landed** (decision 171) | 1.66 -> 0.36 ms/step, span -1.8 ms, tg +7.4% |
 | row-major views are views, not copies | **landed** (decision 173) | `is_contiguous` ignores size-1 dims: `_copy_strided` 335 -> 145/step, 2069 -> 1879 nodes, union idle 4.11 -> 3.84 ms, tg flat within noise, ids bit-identical |
-| elementwise glue (145 `_copy_strided`, 200 `_cast_bf16_f32`, 190 `_unary`, 100 `_scalar`, 100 `_col_mul`, 81 `_binary`, 80 `_cast_f32_bf16`, 50 `_sum_last`) | open, biggest | ~1107 nodes/step; fusing the GDN/norm chains is ~1.5-2 ms of gaps |
+| the GDN output tail as one `rmsnorm_gated` row per value head | **landed** (decision 174) | 12 nodes -> 1 per GDN layer: 1879 -> 1519 nodes, union idle 3.68 -> 2.95 ms, span -1.0 ms, tg 36.9 -> 38.0 (+2.8%, clean sweep), ids bit-identical |
+| remaining glue (145 `_copy_strided`, 200 `_cast_bf16_f32`, `_unary`, `_scalar`, `_col_mul`, `_binary`, `_cast_f32_bf16`, `_sum_last`) | open, biggest | ~747 nodes/step; the q/k and final norms still run the composed chain |
 | GDN block (81 `_gather_rows`, 81 `_add_rmsnorm`, 80 `_scatter_rows`, 40 conv, 40 recur) | open | ~540 nodes/step; R9.2's fused norms regressed as a *fused 1-CTA* kernel, revisit as a node-count change |
 | split-K / shared-expert geometry | **closed as no-win** | the phase1 body is 8.1 us/call solo; its 270 us is throttling behind the copy and it costs no span (R18/R22 agree) |
 | decode attention GQA tiles, router fusion, conv geometry, routed-GEMV tile | open, small | each 0.3-0.9 ms of *busy*, and busy is not what we are short of: fold them into the same bundle only if they remove nodes |
@@ -346,9 +349,7 @@ per-layer D2H costs more than it saves).
 
 Compute: GDN block fusion / conv fusion / `ba` cast hoist (S2: the block is
 compute, recur 0.51, conv 0.72) | standalone small-N dense GEMV and simple
-shared-epilogue fusion (S7: <1%) | fused gated-RMSNorm tail (S8: -2.5%
-captured; a geometry defect per the root cause above, not a fusion defect) |
-R9.2 fused q/k + gated norms (-6.4% captured, stash) | decode-kernel driven
+shared-epilogue fusion (S7: <1%) | decode-kernel driven
 prefill attention (decision 117: -3.8%/-19.4% pp; a revisit needs a batched
 K/V-sharing kernel) | W8A8 Triton GEMM (decision 108: +8.1% batched but breaks
 the batched-vs-single exact argmax) | fp8 KV (decision 110: size the KV pool
@@ -367,3 +368,10 @@ previous token).
 `lru_ensure` (R8.0b), the fused router (R8.1/S10), split-K decode attention
 (R8.3/S9). They were measured neutral at ~+/-5% noise, not measured to be zero;
 R24's per-kernel table shows 5-10x per-call gaps on exactly these stages.
+
+**Re-opened closures now settled:** the fused gated-RMSNorm tail (S8, -2.5%
+captured) and R9.2's fused q/k + gated norms (-6.4%) were blamed on fusion.
+S8 is now **landed as a win** (decision 174: the cubin was already committed and
+unused; 12 nodes -> 1 per GDN layer, span -1.0 ms), so the old result measured a
+different thing -- the earlier attempt fused *and* re-tiled. R9.2 stays closed on
+its own measured number.
