@@ -5562,8 +5562,9 @@ subsection names are kept verbatim.
    text is not lost: it is this file's decisions 76-169 plus the retired
    file's last git revision, and in-repo comments referencing
    "`OPTIMIZATION.md` R..." resolve there. The external review that motivated
-   the rewrite is `plans/2026-11-16-optimization-campaign-review.md`; its
-   corrections, adopted here and in the replacement: (a) the remaining bs=1 gap
+   the rewrite is folded into this decision and into the replacement (it is not
+   kept as a separate file); its corrections, adopted here and in the
+   replacement: (a) the remaining bs=1 gap
    is **launch geometry, not fusion** -- FT's small kernels run at the
    graph-dispatch floor (1-5 us/call) while ours run 10-50 us/call (1-32 CTAs
    on 26 SMs), which also explains the S8/R9.2 "fusion regresses" results;

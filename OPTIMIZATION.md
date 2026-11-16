@@ -5,10 +5,10 @@ current gap decomposition, the ordered plan, and the measured reference facts.
 Look here before re-running a probe or re-measuring the reference.
 
 It replaces the R1-R24 campaign file retired 2026-11-16 (DONE.md decision 170;
-the campaign narrative lives in DONE.md decisions 76-169 and in git history;
-the review that motivated the rewrite is
-`plans/2026-11-16-optimization-campaign-review.md`). `TODO.md` holds the open
-items; this file holds the numbers and the plan.
+the campaign narrative lives in DONE.md decisions 76-169 and in git history).
+The external review that motivated the rewrite is folded into the gap
+decomposition below and into decision 170, and is not kept as a separate file.
+`TODO.md` holds the open items; this file holds the numbers and the plan.
 
 Hardware: RTX 5060 Laptop (26 SMs, 8 GiB, sm_120), 50 W power cap unless
 noted. Model: `Qwen3.6-35B-A3B-NVFP4` (40 layers: 30 GDN + 10 full attention,
