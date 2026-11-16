@@ -23,8 +23,9 @@ under `prlimit --as=68719476736`:
 
 | metric | FerrumTorrens | FreeToken 0.2.1 | standing |
 |---|---:|---:|---|
-| bs=1 decode | 37.0-38.3 tok/s (48-token window, n=3 per arm) | 36.3-43.4 tok/s | **~1.0-1.15x behind** |
+| bs=1 decode | **36.6-39.0 tok/s** (mean 37.8; 48-token window, n=8) | 36.3-43.4 tok/s | **~1.0-1.15x behind** |
 | -- step span, same 48-token window | 25.6-27.2 ms (CUPTI) | 22.9-23.4 ms (torch.profiler) | **~1.1x** |
+| prefill pp, clean 442-token prompt | **335.6 tok/s** (334.5-336.7, n=8) | 366.2 at 476-478 tokens | behind at this length |
 | prefill pp, ~517 / ~2057 tokens | 401 / 958 tok/s | 366.2 / 725.0 | **1.10x / 1.32x ahead** |
 | K=4 aggregate / serial window | 26.2 / 16.6 tok/s | 25.17 / 11.70 | **1.04x / 1.42x ahead** |
 
