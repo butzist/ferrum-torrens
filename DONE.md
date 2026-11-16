@@ -5837,3 +5837,33 @@ subsection names are kept verbatim.
    The node-count bundle now stands at **2069 -> 1289 kernels/step and 4.11 ->
    2.65 ms of union idle**, ~1.5 months of "below noise" tail work recovered
    with four cuts that are each bit-identical to the trajectory they replace.
+
+177. **Batched decode is worth 3x aggregate, but only captured: K sweep with the
+   capture arm (2026-11-16).** Phase 3's first measurement. `dispatcher_batching`
+   (the K=4 aggregate-vs-serial gate) hardcoded K=4 and ran eager
+   (`cuda_graph = false`), so it could not answer "does K>4 help". It now takes
+   `FERRUM_BATCH_K` and `FERRUM_BATCH_GRAPH=1`, and the answer is that the graph
+   matters more than K: at K=16 the eager arm gives 54.0 tok/s and the captured
+   arm 99.2, a 1.84x gap, while at K=4 the gap is 6.5%. The captured curve keeps
+   climbing to 16 (57.0 / 83.3 / 99.2 at K=4/8/16) where the eager curve has
+   already flattened (53.5 / 56.4 / 54.0) -- the earlier "batching plateaus at
+   ~55 tok/s" reading was launch overhead from the eager arm, not the batch.
+   K=32 falls off a cliff (64.7 captured, and its own serial arm collapses from
+   32.6 to 16.1), which is the expert-cache working set rather than the batch:
+   larger K multiplies the distinct experts per step after the first tokens
+   diverge, and the copy is ~50% of the step. So the reachable setting on this
+   box is K=8-16, and the default `max_running_requests = 4` leaves ~1.7x of
+   aggregate throughput on the table for this workload.
+   Caveats recorded with the numbers: short prompt (~5 tokens) and 24 decode
+   tokens, in-process dispatcher (no HTTP), one model load per arm, `ignore_eos`,
+   aggregate over the batch window; the clean-prompt K=4 row in
+   `OPTIMIZATION.md`'s standing table uses a different prompt and window, so the
+   absolute numbers are not comparable, only the K and capture deltas are.
+   Not done in this change: raising the default `max_running_requests` (it is a
+   serving-policy decision, and the KV pool auto-sizes from an 8 GiB budget that
+   the expert cache already fills) and a batched-capture *correctness* gate
+   (the sweep checks token counts, not values; the bs=1 oracle gates cover the
+   captured path's numerics but not a K>1 replay).
+   Gates: the test itself asserts both arms produce `K * tokens` and that
+   batched >= serial, at every K run; `cargo test --lib`, fmt and clippy
+   unchanged by the harness edit.

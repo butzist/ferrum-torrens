@@ -18,14 +18,33 @@ use ferrum_torrens::config::Config;
 use ferrum_torrens::domain::sampling::SamplingParams;
 
 const FTW_DIR: &str = ".model-cache/Qwen3.6-35B-A3B-NVFP4.ftw";
-const BATCH: usize = 4;
-const TOKENS: u32 = 24;
+
+/// Requests per arm. `FERRUM_BATCH_K` sweeps it (the plan pushes K past 4).
+fn batch() -> usize {
+    env_usize("FERRUM_BATCH_K", 4)
+}
+
+/// Decode tokens per request.
+fn tokens() -> u32 {
+    env_usize("FERRUM_BATCH_TOKENS", 24) as u32
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
 
 fn config() -> Config {
+    let k = batch();
+    // `FERRUM_BATCH_GRAPH=1` captures the decode step at this batch size; the
+    // harness defaults to eager so the arms differ only in admission.
+    let graph = std::env::var("FERRUM_BATCH_GRAPH").as_deref() == Ok("1");
     format!(
         "[model]\npath = \"{FTW_DIR}\"\ndevice = \"cuda\"\nmax_seq_len = 2048\n\
          max_output_tokens = 64\nmax_prefill_length = 1024\n\
-         max_running_requests = {BATCH}\ncuda_graph = false\n\n\
+         max_running_requests = {k}\ncuda_graph = {graph}\n\n\
          [kv]\nnum_tokens = 2048\ndtype = \"bf16\"\n\n\
          [moe]\ncache_size_slots = \"auto\"\nprefill_overlap = true\n\n\
          [kernel]\ntriton = true\n"
@@ -53,8 +72,8 @@ fn batching_raises_aggregate_decode_throughput() {
     // Serial: one request at a time, each its own forward (batch 1).
     let mut serial_tokens = 0usize;
     let serial = Instant::now();
-    for i in 0..BATCH as u64 {
-        let request = make_request(&engine, 100 + i, prompt.clone(), greedy(TOKENS), i).unwrap();
+    for i in 0..batch() as u64 {
+        let request = make_request(&engine, 100 + i, prompt.clone(), greedy(tokens()), i).unwrap();
         let g = generation::generate(&engine, request).unwrap();
         serial_tokens += g.tokens.len();
     }
@@ -63,10 +82,10 @@ fn batching_raises_aggregate_decode_throughput() {
     // Batched: all K queued on the dispatcher at once; the worker admits them
     // into one scheduler batch and decodes them on one captured step per token.
     let dispatcher = Dispatcher::new(engine.clone());
-    let mut receivers = Vec::with_capacity(BATCH);
+    let mut receivers = Vec::with_capacity(batch());
     let batched = Instant::now();
-    for i in 0..BATCH as u64 {
-        let request = make_request(&engine, 200 + i, prompt.clone(), greedy(TOKENS), i).unwrap();
+    for i in 0..batch() as u64 {
+        let request = make_request(&engine, 200 + i, prompt.clone(), greedy(tokens()), i).unwrap();
         let (reply, rx) = tokio::sync::oneshot::channel();
         assert!(
             dispatcher
@@ -90,7 +109,9 @@ fn batching_raises_aggregate_decode_throughput() {
     let serial_tps = serial_tokens as f64 / serial_elapsed.as_secs_f64();
     let batched_tps = batched_tokens as f64 / batched_elapsed.as_secs_f64();
     eprintln!(
-        "serial:  {serial_tokens} tok in {:.2}s = {serial_tps:.1} tok/s",
+        "K={} tokens={}: serial:  {serial_tokens} tok in {:.2}s = {serial_tps:.1} tok/s",
+        batch(),
+        tokens(),
         serial_elapsed.as_secs_f64()
     );
     eprintln!(
@@ -99,8 +120,8 @@ fn batching_raises_aggregate_decode_throughput() {
         batched_tps / serial_tps
     );
 
-    assert_eq!(serial_tokens, BATCH * TOKENS as usize);
-    assert_eq!(batched_tokens, BATCH * TOKENS as usize);
+    assert_eq!(serial_tokens, batch() * tokens() as usize);
+    assert_eq!(batched_tokens, batch() * tokens() as usize);
     assert!(
         batched_tps > serial_tps,
         "batching must not reduce aggregate decode throughput"

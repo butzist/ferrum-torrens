@@ -55,9 +55,12 @@ headroom. Blockers: none.
 
 ### Open work
 
-1. **The decode plan** -- `OPTIMIZATION.md` Phases 0-2 (copy + tail geometry),
-   then Phase 3's serving push (K > 4 batching, where the engine already
-   leads).
+1. **The decode plan** -- Phases 0-2 are closed (copy link-bound, the tail
+   ground from 2069 to 1289 kernels/step), so Phase 3 is live: the K sweep
+   (decision 177) says captured batching reaches **99.2 tok/s aggregate at
+   K=16** against 54.0 eager and 32.6 serial, with K=32 collapsing on the expert
+   cache. Next: set the serving K from that curve (default is 4), size the KV
+   pool for it, and add a batched-capture correctness gate.
 2. **Spec decode re-measure on the current engine.** The R14b verdict
    (0.62-0.70x) predates the 2048-slot cache, captured verify (decision 159)
    and the multi-row GDN replay fix, so both its inputs are stale. Needs the

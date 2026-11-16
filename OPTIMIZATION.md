@@ -227,6 +227,30 @@ there (K=4: 1.04x aggregate, 1.42x serial). Push K higher and make continuous
 batching the headline metric. Optional, marginal: `BLOCK_C=4096` masked sort to
 reach the ~2292-slot VRAM limit (~0.6 ms).
 
+**K sweep, measured 2026-11-16 (decision 177).** `dispatcher_batching` now
+sweeps K (`FERRUM_BATCH_K`) and the graph arm (`FERRUM_BATCH_GRAPH=1`):
+short prompt, 24 decode tokens, `ignore_eos`, in-process dispatcher, one model
+load per run, aggregate over the whole batch window.
+
+| K | serial arm | batched, eager | batched, captured | capture gain |
+|---:|---:|---:|---:|---:|
+| 4 | 32.4-33.0 | 53.5 | 57.0 | +6.5% |
+| 8 | 35.7-36.6 | 56.4 | 83.3 | +48% |
+| 16 | 30.4-32.6 | 54.0 | **99.2** | +84% |
+| 32 | 15.1-16.1 | 15.5 | 64.7 | +4.2x (both collapse) |
+
+Two findings. (1) **Capturing the batched step is the Phase 3 lever, not K
+itself**: the eager curve plateaus at ~55 tok/s from K=4 to 16 while the
+captured curve keeps climbing to 99. The engine already captures per batch size,
+so this is a config/admission question, not an engine change. (2) **K=16 is the
+measured optimum; K=32 collapses** (99 -> 65) and drags its own serial arm down
+with it (32.6 -> 16.1), i.e. the cliff is expert-cache working set, not the
+batch. The default `max_running_requests = 4` leaves ~1.7x of aggregate
+throughput unused on this workload; the reachable setting is bounded by the KV
+pool (auto-sized from VRAM) and by misses at larger K, not by the batching
+machinery. Absolute numbers here are not comparable with the clean-prompt K=4
+row above (different prompt, window and harness).
+
 ## Standing measured facts (do not re-measure)
 
 ### Rooflines (this box, measured; decision-88 verification)
