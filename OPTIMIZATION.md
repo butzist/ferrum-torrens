@@ -175,8 +175,8 @@ kernel bodies are fine and the **idle between them** is the cost:
 
 | | ours | FreeToken |
 |---|---:|---:|
-| kernels per decode step | **1519** (2069 before the two landed cuts) | ~800 |
-| of those, elementwise/glue (<3 us each) | **747** | -- |
+| kernels per decode step | **1289** (2069 before the four landed cuts) | ~800 |
+| of those, elementwise/glue (<3 us each) | **517** | -- |
 | kernel time in the compute stream | 10.7 ms (excluding the starved shared expert) | 10.3 ms |
 | union GPU idle inside the step | **4.11 ms** | ~0.2 ms (98% busy) |
 | -- of which in <5 us inter-node gaps | 2.85 ms | -- |
@@ -184,11 +184,13 @@ kernel bodies are fine and the **idle between them** is the cost:
 Our non-copy compute is **at parity with FreeToken** (10.7 vs 10.3 ms): the
 heavy GEMVs are ahead (7.45 vs 7.89), the norms/router/attention/conv items in
 the table below are 1-2 us kernels that cost nothing on their own. What we pay
-is ~1.4 us of dead time per node across ~1500 nodes. The fix is **fewer
-kernels**: materialize nothing that is already a contiguous run (landed: -190
-nodes, decision 173) and replace a 12-node elementwise chain with the fused
-cubin that already exists (landed: -360 nodes, -1.0 ms span, decision 174),
-then fuse the glue that remains, not retune tiles:
+is ~1.4 us of dead time per node across ~1300 nodes. The fix is **fewer
+kernels**, and four cuts have landed it: materialize nothing that is already a
+contiguous run (-190 nodes, decision 173), replace a 12-node chain with the
+fused cubin that already exists (-360, decision 174), widen constant weights
+once instead of per step (-50, decision 175), and give the q/k norms their own
+row-per-program cubin (-180, decision 176). Fuse the glue that remains; do not
+retune 1-CTA tiles:
 
 | item | status | measured |
 |---|---|---|
@@ -196,7 +198,7 @@ then fuse the glue that remains, not retune tiles:
 | row-major views are views, not copies | **landed** (decision 173) | `is_contiguous` ignores size-1 dims: `_copy_strided` 335 -> 145/step, 2069 -> 1879 nodes, union idle 4.11 -> 3.84 ms, tg flat within noise, ids bit-identical |
 | the GDN output tail as one `rmsnorm_gated` row per value head | **landed** (decision 174) | 12 nodes -> 1 per GDN layer: 1879 -> 1519 nodes, union idle 3.68 -> 2.95 ms, span -1.0 ms, tg 36.9 -> 38.0 (+2.8%, clean sweep), ids bit-identical |
 | remaining glue (145 `_copy_strided`, 200 `_cast_bf16_f32`, `_unary`, `_scalar`, `_col_mul`, `_binary`, `_cast_f32_bf16`, `_sum_last`) | open, biggest | ~747 nodes/step; the q/k norms are the last composed `rms_norm_last` users |
-| q/k norm fusion (hidden 256) | open, blocked on an artifact | needs a plain-RMSNorm cubin at HIDDEN=256: `add_rmsnorm` bakes 2048 and `rmsnorm_gated` bakes 128, so `rms_norm_last` still composes ~9 nodes per call, 20 calls/step (~180 nodes, ~0.4 ms) |
+| q/k norm fusion (hidden 256) | **landed** (decision 176) | new `rmsnorm` cubin (HIDDEN=BLOCK=256, one row per program): 20 calls/step now one node each, `_unary` 70 -> 10, `_col_mul`/`_scalar`/`_sum_last` to 0, **1469 -> 1289** nodes, union idle 3.43 -> 2.65 ms, span -1.75 ms, tg 36.6 -> 37.5 (+2.5%), ids bit-identical |
 | constant weight casts | **landed** (decision 175) | `ba` `[64, 2048]` and the q/k norm vectors are widened once at load instead of per step: `_cast_bf16_f32` 140 -> 90/step, 1519 -> 1469 nodes, ids bit-identical; the 0.045 ms of device-busy it removes is below span noise, and it costs +7.7 MB of VRAM |
 | GDN block (81 `_gather_rows`, 81 `_add_rmsnorm`, 80 `_scatter_rows`, 40 conv, 40 recur) | open | ~540 nodes/step; R9.2's fused norms regressed as a *fused 1-CTA* kernel, revisit as a node-count change |
 | split-K / shared-expert geometry | **closed as no-win** | the phase1 body is 8.1 us/call solo; its 270 us is throttling behind the copy and it costs no span (R18/R22 agree) |

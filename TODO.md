@@ -42,18 +42,16 @@ at ~13 GB/s) and re-scoped the tail from "launch geometry" to **node count**:
 2069 kernels/step vs FreeToken's ~800, 1297 of them elementwise glue, and 4.1 ms
 of union idle in ~1.4 us inter-node gaps. The step now accounts as copy 12.6 +
 compute 10.7 + idle 4.1, with our compute at FreeToken parity (10.3). The
-node-count bundle has started: `is_contiguous` now ignores size-1 dims so
-row-major views are not materialized (decision 173: 2069 -> 1879 kernels, union
-idle 4.11 -> 3.84 ms), and the GDN output tail is the fused `rmsnorm_gated`
-cubin instead of a 12-node chain (decision 174: 1879 -> 1519 kernels, union idle
-3.68 -> 2.95 ms, span -1.0 ms, tg +2.8%, ids bit-identical). Next: the same cut
-for the q/k norms (the last composed `rms_norm_last` users) and the
-`_cast_bf16_f32`/`_unary`/`_col_mul` glue, gated on CUPTI idle + kernel count.
-Known sizes and the one blocker (both recorded in `OPTIMIZATION.md`): the q/k
-norm needs a plain-RMSNorm cubin at HIDDEN=256 (`add_rmsnorm` bakes 2048,
-`rmsnorm_gated` bakes 128), worth ~180 nodes / ~0.4 ms; hoisting the per-step
-`ba` and norm-weight casts to f32 at load is ~50 nodes / ~0.1 ms with no
-artifact. Blockers: none (the 256-hidden kernel is a normal AOT addition).
+node-count bundle is four cuts in: row-major views are not materialized
+(decision 173), the GDN tail and the q/k norms are fused cubins (decisions 174,
+176), and constant weights are widened once at load (decision 175). Together
+**2069 -> 1289 kernels/step and 4.11 -> 2.65 ms of union idle**, all with
+bit-identical trajectories. Next: the glue that is left (~517 nodes) -- the
+`_copy_strided` de-interleave in the attention projection, `_cast_bf16_f32`, and
+the GDN block's `gather`/`scatter`/conv chain -- each gated on CUPTI idle +
+kernel count. After that the bs=1 ceiling is reached (copy 12.6 + compute 10.7
+vs FreeToken's 12.4 + 10.3) and Phase 3 batching is the only lever with
+headroom. Blockers: none.
 
 ### Open work
 

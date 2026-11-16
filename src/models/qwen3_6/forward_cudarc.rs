@@ -94,7 +94,7 @@ fn argmax(logits: &[f32]) -> usize {
 
 /// add_rmsnorm cubin bakes one hidden width, so a head-sized norm is computed
 /// from the generic elementwise kernels instead.
-fn rms_norm_last(x: &Tensor, w: &Tensor, eps: f32) -> Result<Tensor> {
+fn rms_norm_last_composed(x: &Tensor, w: &Tensor, eps: f32) -> Result<Tensor> {
     let shape = x.shape().to_vec();
     let d = *shape
         .last()
@@ -285,6 +285,22 @@ fn gdn_tail_flag() -> &'static AtomicBool {
 
 fn gdn_tail_fused() -> bool {
     gdn_tail_flag().load(Ordering::Relaxed)
+}
+
+/// The attention q/k norms as the row-per-program `rmsnorm` cubin instead of
+/// the ~10-node composed chain. `FERRUM_NORM_FUSED=0` takes the composed path.
+fn norm_fused_flag() -> &'static AtomicBool {
+    static FLAG: OnceLock<AtomicBool> = OnceLock::new();
+    FLAG.get_or_init(|| {
+        let on = std::env::var("FERRUM_NORM_FUSED")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        AtomicBool::new(on)
+    })
+}
+
+fn norm_fused() -> bool {
+    norm_fused_flag().load(Ordering::Relaxed)
 }
 
 /// Test-only override: force the chunked prefill recurrence on or off. The
@@ -683,6 +699,30 @@ impl CudarcQwen3_6 {
         Ok(())
     }
 
+    /// RMSNorm over the last dim: the committed `rmsnorm` cubin when the row
+    /// width is the head dim it bakes and the weight is already f32 (the loader
+    /// widens the q/k norm vectors once), else the composed elementwise chain.
+    fn rms_norm_last(&self, x: &Tensor, w: &Tensor, eps: f32) -> Result<Tensor> {
+        let Some(&d) = x.shape().last() else {
+            return Err(moe_bad("rms_norm_last on a scalar"));
+        };
+        if d == 0 {
+            return Ok(x.clone());
+        }
+        let fused_ok = norm_fused()
+            && d == self.params.head_dim
+            && x.dtype() == TensorDType::Bf16
+            && w.dtype() == TensorDType::F32;
+        if fused_ok {
+            let rows = x.numel() / d;
+            let shape = x.shape().to_vec();
+            if let Ok(out) = x.contiguous()?.reshape(&[rows, d])?.rms_norm_fused(w, eps) {
+                return out.reshape(&shape);
+            }
+        }
+        rms_norm_last_composed(x, w, eps)
+    }
+
     /// The GDN mixer's output tail: `rmsnorm(core, norm) * silu(z)` over the
     /// value heads. `core` is `[t, vb, dv]` and `z` is `[t, vb * dv]`, so the
     /// tail is one `rmsnorm_gated` row per value head -- the cubin's baked
@@ -700,7 +740,8 @@ impl CudarcQwen3_6 {
                 .rms_norm_gated(&z_rows, norm, p.rms_norm_eps)?
                 .reshape(&[t, value_dim]);
         }
-        let core_n = rms_norm_last(core, norm, p.rms_norm_eps)?.reshape(&[t, value_dim])?;
+        let core_n =
+            rms_norm_last_composed(core, norm, p.rms_norm_eps)?.reshape(&[t, value_dim])?;
         core_n.mul(&z.silu()?)
     }
 
@@ -822,9 +863,10 @@ impl CudarcQwen3_6 {
         let qg = qg.reshape(&[t, qh, 2, hd])?;
         let q = qg.select(2, 0)?.reshape(&[t, qh * hd])?;
         let gate = qg.select(2, 1)?.reshape(&[t, qh * hd])?;
-        let q = rms_norm_last(&q.reshape(&[t, qh, hd])?, q_norm_f32, p.rms_norm_eps)?
+        let q = self
+            .rms_norm_last(&q.reshape(&[t, qh, hd])?, q_norm_f32, p.rms_norm_eps)?
             .reshape(&[t, qh * hd])?;
-        let k = rms_norm_last(&k.reshape(&[t, kvh, hd])?, k_norm_f32, p.rms_norm_eps)?;
+        let k = self.rms_norm_last(&k.reshape(&[t, kvh, hd])?, k_norm_f32, p.rms_norm_eps)?;
         let v = v.reshape(&[t, kvh, hd])?;
 
         if p.rotary_dim == 0 {

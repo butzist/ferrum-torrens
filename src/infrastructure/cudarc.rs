@@ -33,10 +33,11 @@ use crate::infrastructure::kernel_abi::{
     COPY_STRIDED_F32, COPY_STRIDED_I32, COPY_STRIDED_I64, COPY_STRIDED_U8, CUMSUM_DIM0_F32,
     FUSED_TOPK_SOFTMAX_F32, GATHER_ROWS_BF16, GATHER_ROWS_F32, GATHER_ROWS_I32,
     GDN_RATIO_MASKS_F32, INDEX_SELECT_BF16, LinearAbi, MAX_ALL_F32, MROPE_GATHER, MUL_BF16,
-    MUL_F32, MUL_MID_F32, REPEAT_HEADS_BF16, RMSNORM_GATED, ROPE_BF16, RmsnormGatedArgs,
-    SCALAR_BF16, SCALAR_F32, SCALE_HEADS_F32, SCATTER_ROWS_BF16, SCATTER_ROWS_F32,
-    SOFTMAX_LAST_F32, SUM_ALL_F32, SUM_LAST_F32, TOPK_LAST_F32, UNARY_BF16, UNARY_F32,
-    add_rmsnorm_args, add_rmsnorm_grid, rmsnorm_gated_args, rmsnorm_gated_grid,
+    MUL_F32, MUL_MID_F32, REPEAT_HEADS_BF16, RMSNORM, RMSNORM_GATED, ROPE_BF16, RmsnormArgs,
+    RmsnormGatedArgs, SCALAR_BF16, SCALAR_F32, SCALE_HEADS_F32, SCATTER_ROWS_BF16,
+    SCATTER_ROWS_F32, SOFTMAX_LAST_F32, SUM_ALL_F32, SUM_LAST_F32, TOPK_LAST_F32, UNARY_BF16,
+    UNARY_F32, add_rmsnorm_args, add_rmsnorm_grid, rmsnorm_args, rmsnorm_gated_args,
+    rmsnorm_gated_grid, rmsnorm_grid,
 };
 
 fn bad(e: impl std::fmt::Display) -> MoEError {
@@ -1696,6 +1697,45 @@ impl Tensor {
         Ok(out)
     }
 
+    /// Plain RMSNorm over the last dim, one row per program, for the geometry
+    /// the committed cubin bakes (the attention head dim). `w` must be f32.
+    pub fn rms_norm_fused(&self, w: &Tensor, eps: f32) -> Result<Tensor, MoEError> {
+        if self.dim() != 2 || w.dim() != 1 {
+            return Err(bad("rms_norm_fused wants [rows, hidden] and [hidden]"));
+        }
+        if self.dtype() != TensorDType::Bf16 || w.dtype() != TensorDType::F32 {
+            return Err(bad("rms_norm_fused wants a bf16 row and an f32 weight"));
+        }
+        if self.shape[1] != w.shape[0] {
+            return Err(bad(format!(
+                "rms_norm_fused shape mismatch {:?}, {:?}",
+                self.shape, w.shape
+            )));
+        }
+        let x = self.contiguous()?;
+        let w = w.contiguous()?;
+        let (rows, hidden) = (x.shape[0], x.shape[1]);
+        let out = self.rt.zeros(&[rows, hidden], TensorDType::Bf16)?;
+        if rows == 0 || hidden == 0 {
+            return Ok(out);
+        }
+        // SAFETY: `x`, `w` and `out` are live contiguous allocations in this
+        // runtime's context and the launcher checks the baked geometry.
+        unsafe {
+            self.rt.kernels().rmsnorm(
+                self.rt.raw_stream(),
+                x.device_ptr(),
+                w.device_ptr(),
+                out.device_ptr(),
+                eps,
+                rows,
+                hidden,
+                hidden as u32,
+            )
+        }?;
+        Ok(out)
+    }
+
     /// `(x + r, rms_norm(x + r) * w)` with `x`/`r` `[rows, hidden]` bf16 and
     /// `w` `[hidden]` bf16. Both outputs are new bf16 tensors.
     pub fn add_rms_norm(
@@ -2720,6 +2760,52 @@ impl LinearKernels {
         let mut params = pack.kernel_params()?;
         let grid = rmsnorm_gated_grid(rows);
         self.launch(RMSNORM_GATED, grid, &mut params, stream)
+    }
+
+    /// The plain RMSNorm's baked row width, so the forward only fuses a norm
+    /// whose geometry this cubin was built for.
+    pub fn norm_hidden(&self) -> Result<usize, MoEError> {
+        let k = self.abi.kernel(RMSNORM)?;
+        Ok(k.constexpr("HIDDEN")? as usize)
+    }
+
+    /// The plain per-row RMSNorm: `out = rmsnorm(x) * w` over `rows` rows of
+    /// `hidden`. `w` is f32 (the loader widens the norm vectors once).
+    ///
+    /// # Safety
+    /// `x`, `w` and `out` must be live, contiguous device allocations in this
+    /// runtime's context, `x` and `out` `rows * hidden` model-dtype elements and
+    /// `w` `hidden` f32 elements; `stream` must be current-context.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn rmsnorm(
+        &self,
+        stream: CUstream,
+        x: u64,
+        w: u64,
+        out: u64,
+        eps: f32,
+        rows: usize,
+        hidden: usize,
+        stride_x: u32,
+    ) -> Result<(), MoEError> {
+        let kernel = self.abi.kernel(RMSNORM)?;
+        let baked = kernel.constexpr("HIDDEN")? as usize;
+        if hidden != baked {
+            return Err(MoEError::Bad(format!(
+                "rmsnorm was built for hidden {baked}, not {hidden}"
+            )));
+        }
+        let args = RmsnormArgs {
+            x,
+            w,
+            out,
+            eps,
+            stride_x,
+        };
+        let pack = rmsnorm_args(&self.abi, &args)?;
+        let mut params = pack.kernel_params()?;
+        let grid = rmsnorm_grid(rows);
+        self.launch(RMSNORM, grid, &mut params, stream)
     }
 
     pub fn hidden(&self) -> Result<usize, MoEError> {

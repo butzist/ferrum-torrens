@@ -64,7 +64,7 @@ from .elementwise import (
 )
 from .gdn import _gdn_decode_kernel, _gdn_tri_solve_kernel
 from .mrope import _mrope_gather_kernel
-from .norm import _add_rmsnorm_kernel, _rmsnorm_gated_kernel
+from .norm import _add_rmsnorm_kernel, _rmsnorm_gated_kernel, _rmsnorm_kernel
 from .fp8_linear import (
     GEMM_STAGES,
     GEMM_WARPS as FP8_GEMM_WARPS,
@@ -194,6 +194,8 @@ from .signatures import (
     gdn_tri_solve_constexprs,
     add_rmsnorm,
     add_rmsnorm_constexprs,
+    rmsnorm,
+    rmsnorm_constexprs,
     rmsnorm_gated,
     rmsnorm_gated_constexprs,
     gemv,
@@ -487,6 +489,12 @@ LINEAR_KERNELS: dict[str, dict] = {
         "fn": _rmsnorm_gated_kernel,
         "signature": rmsnorm_gated(),
         "constexprs": rmsnorm_gated_constexprs(),
+        "num_warps": 4,
+    },
+    "rmsnorm": {
+        "fn": _rmsnorm_kernel,
+        "signature": rmsnorm(),
+        "constexprs": rmsnorm_constexprs(),
         "num_warps": 4,
     },
     "add_bf16": {

@@ -683,6 +683,24 @@ def add_rmsnorm_constexprs(hidden: int = SERVING_HIDDEN, block: int = NORM_BLOCK
     return {"HIDDEN": hidden, "BLOCK": block}
 
 
+def rmsnorm() -> dict:
+    """Plain per-row RMSNorm over the baked head dim (the attention q/k norms).
+    `w` is f32: the loader widens the norm vectors once rather than per step."""
+    return {
+        "x_ptr": f"*{SERVING_DTYPE}",
+        "w_ptr": "*fp32",
+        "out_ptr": f"*{SERVING_DTYPE}",
+        "eps": "fp32",
+        "stride_x": "i32",
+        "HIDDEN": "constexpr",
+        "BLOCK": "constexpr",
+    }
+
+
+def rmsnorm_constexprs(hidden: int = SERVING_HEAD_DIM, block: int = SERVING_HEAD_DIM) -> dict:
+    return {"HIDDEN": hidden, "BLOCK": block}
+
+
 def rmsnorm_gated() -> dict:
     """Fused gated RMSNorm: out = rmsnorm(x, w) * silu(z)."""
     return {

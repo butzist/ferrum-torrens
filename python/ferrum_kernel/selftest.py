@@ -675,6 +675,32 @@ def check_norm(device: torch.device, tol: float, full: bool) -> int:
     return failures
 
 
+def check_rmsnorm(device: torch.device, tol: float, full: bool) -> int:
+    """Plain RMSNorm against the torch oracle, at the attention head dim."""
+    cases = [("small", {"rows": 2, "hidden": 32})]
+    if full:
+        cases.append(("head-dim", {"rows": 16, "hidden": 256}))
+    failures = 0
+    for label, shape in cases:
+        for seed in range(2):
+            rows, hidden = shape["rows"], shape["hidden"]
+            g = torch.Generator(device=device).manual_seed(seed)
+            x = (torch.randn((rows, hidden), generator=g, dtype=torch.float32) * 0.5).to(device).to(torch.bfloat16)
+            w = (torch.rand((hidden,), generator=g, dtype=torch.float32) * 0.5 + 0.75).to(device)
+            want = norm_mod.rmsnorm_reference(x, w, 1e-6)
+            got = torch.empty((rows, hidden), dtype=torch.bfloat16, device=device)
+            norm_mod.rmsnorm(x, w, got, 1e-6)
+            rel = (
+                (got.to(torch.float32) - want.to(torch.float32)).abs().max().item()
+                / want.to(torch.float32).abs().max().clamp(min=1e-6).item()
+            )
+            print(f"rmsnorm {label} seed {seed}: rel {rel:.3e}")
+            if rel > tol:
+                failures += 1
+                print(f"rmsnorm {label} seed {seed}: FAIL", file=sys.stderr)
+    return failures
+
+
 def check_rmsnorm_gated(device: torch.device, tol: float, full: bool) -> int:
     cases = [("small", {"rows": 2, "hidden": 32})]
     if full:
@@ -987,6 +1013,9 @@ def main(argv: list[str] | None = None) -> int:
         print("FAIL", file=sys.stderr)
         return 1
     norm_failures = check_norm(
+        torch.device(args.device), args.tol, full=args.device != "cpu"
+    )
+    norm_failures += check_rmsnorm(
         torch.device(args.device), args.tol, full=args.device != "cpu"
     )
     if norm_failures:

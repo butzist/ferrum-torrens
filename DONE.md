@@ -5799,3 +5799,41 @@ subsection names are kept verbatim.
    `OPTIMIZATION.md`'s closed list.
    Gates: `cargo test --lib` 435 passed, `cargo clippy --all-targets
    --features cudarc` clean, ids identical, captured graph still captures.
+
+176. **The q/k norms get their own row-per-program cubin: -180 nodes, -0.78 ms
+   of idle (2026-11-16).** Fourth and last sized node-count cut (decision 172's
+   list). The ten full-attention layers normalize q and k with `rms_norm_last`,
+   which composes an RMSNorm out of the tensor API; that was ~9 launches per call
+   and 20 calls per step, and it was the last composer left after decision 174
+   fused the GDN tail. `add_rmsnorm` cannot serve it (HIDDEN=2048 baked) and
+   `rmsnorm_gated` cannot either (128 baked, and it multiplies by `silu(z)`), so
+   this adds a real artifact: `norm.py::_rmsnorm_kernel`, one program per row,
+   HIDDEN=BLOCK=256 (the model's head dim), weight f32 -- which is what the
+   loader already holds since decision 175 widened the norm vectors. Wired
+   through the usual points: `signatures.rmsnorm`, an `aot.py` spec, a
+   `selftest` case against a torch oracle (interp PASS), `RMSNORM` in
+   `kernel_abi` (const, cubin/ptx arms, args, grid, both name arrays),
+   `Kernels::rmsnorm` + `Kernels::norm_hidden`, `Tensor::rms_norm_fused`, and a
+   dispatch in `CudarcQwen3_6::rms_norm_last` that only takes the fused path for
+   the baked width, bf16 rows and an f32 weight, else composes. Gated on
+   `FERRUM_NORM_FUSED` (default on) so one binary A/Bs itself.
+   A/B, same binary, both arms traced, 3 interleaved rounds, clean prompt,
+   greedy, captured: **both arms decode the identical 47 ids**
+   (`790b7e4fc852`), so the fused norm is bit-identical on this trajectory.
+   Kernels per step **1469 -> 1289** (-180, 9 per call as predicted), with the
+   composed chain's kernels going to zero (`_col_mul` 40 -> 0, `_scalar` 40 -> 0,
+   `_sum_last` 20 -> 0, `_unary` 70 -> 10, `_cast_bf16_f32` 90 -> 70,
+   `_cast_f32_bf16` 50 -> 30) against 20 new `_rmsnorm` launches. Union idle
+   **3.43 -> 2.65 ms**, span **27.77 -> 26.02 ms**, tg **36.6 -> 37.5 tok/s**
+   (+2.5%).
+   Artifacts: 68 -> 69 cubins; `rmsnorm_gated`'s bytes moved only in debug line
+   info because the new kernel was inserted above it in `norm.py`, so the AOT
+   set was regenerated wholesale and `aot --check` is clean. Gates: `selftest
+   --interp` PASS, `compile_check` PASS (sm_120), `aot --check` clean,
+   `cargo fmt --check`, `cargo clippy --all-targets` (default and
+   `--features cudarc`), `cargo test --lib` 435 passed, and the gated GPU oracle
+   `engine_real_generate::one_token_prediction_matches_the_oracle` still answers
+   " Paris" (id 11751).
+   The node-count bundle now stands at **2069 -> 1289 kernels/step and 4.11 ->
+   2.65 ms of union idle**, ~1.5 months of "below noise" tail work recovered
+   with four cuts that are each bit-identical to the trajectory they replace.

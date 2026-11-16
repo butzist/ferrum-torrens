@@ -673,6 +673,8 @@ pub const ADD_RMSNORM: &str = "add_rmsnorm";
 
 /// Fused gated RMSNorm: out = rmsnorm(x, w) * silu(z).
 pub const RMSNORM_GATED: &str = "rmsnorm_gated";
+/// Plain per-row RMSNorm over the baked head dim (the attention q/k norms).
+pub const RMSNORM: &str = "rmsnorm";
 
 /// The prefill chunk triangular solve (OPTIMIZATION.md R9.3).
 pub const GDN_TRI_SOLVE: &str = "gdn_tri_solve";
@@ -717,12 +719,13 @@ pub const GDN_RATIO_MASKS_F32: &str = "gdn_ratio_masks_f32";
 pub const MUL_MID_F32: &str = "mul_mid_f32";
 pub const SCALE_HEADS_F32: &str = "scale_heads_f32";
 
-const LINEAR_NAMES: [&str; 52] = [
+const LINEAR_NAMES: [&str; 53] = [
     GDN_DECODE,
     CONV_DECODE,
     CONV_PREFILL,
     ADD_RMSNORM,
     RMSNORM_GATED,
+    RMSNORM,
     GDN_TRI_SOLVE,
     NVFP4_DENSE_GEMV,
     SHARED_EXPERT_PHASE1,
@@ -775,12 +778,13 @@ const LINEAR_NAMES: [&str; 52] = [
 /// The kernels every `GdnKernels` consumer loads by default: [`LINEAR_NAMES`]
 /// minus the fused shared-expert pair, which only its own launcher loads. Every
 /// extra loaded module is device memory and a capture-visible layout change.
-const LINEAR_LOAD_NAMES: [&str; 48] = [
+const LINEAR_LOAD_NAMES: [&str; 49] = [
     GDN_DECODE,
     CONV_DECODE,
     CONV_PREFILL,
     ADD_RMSNORM,
     RMSNORM_GATED,
+    RMSNORM,
     GDN_TRI_SOLVE,
     NVFP4_DENSE_GEMV,
     FP8_GEMV,
@@ -952,6 +956,7 @@ pub fn linear_cubin(name: &str) -> Result<&'static [u8], MoEError> {
         CONV_PREFILL => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/conv_prefill.cubin")),
         ADD_RMSNORM => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/add_rmsnorm.cubin")),
         RMSNORM_GATED => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/rmsnorm_gated.cubin")),
+        RMSNORM => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/rmsnorm.cubin")),
         GDN_TRI_SOLVE => include_bytes!(concat!(env!("OUT_DIR"), "/kernel/gdn_tri_solve.cubin")),
         NVFP4_DENSE_GEMV => {
             include_bytes!(concat!(env!("OUT_DIR"), "/kernel/nvfp4_dense_gemv.cubin"))
@@ -1078,6 +1083,7 @@ fn linear_ptx(name: &str) -> &'static str {
         CONV_PREFILL => include_str!(concat!(env!("OUT_DIR"), "/kernel/conv_prefill.ptx")),
         ADD_RMSNORM => include_str!(concat!(env!("OUT_DIR"), "/kernel/add_rmsnorm.ptx")),
         RMSNORM_GATED => include_str!(concat!(env!("OUT_DIR"), "/kernel/rmsnorm_gated.ptx")),
+        RMSNORM => include_str!(concat!(env!("OUT_DIR"), "/kernel/rmsnorm.ptx")),
         GDN_TRI_SOLVE => include_str!(concat!(env!("OUT_DIR"), "/kernel/gdn_tri_solve.ptx")),
         NVFP4_DENSE_GEMV => include_str!(concat!(env!("OUT_DIR"), "/kernel/nvfp4_dense_gemv.ptx")),
         SHARED_EXPERT_PHASE1 => {
@@ -2018,6 +2024,35 @@ pub fn rmsnorm_gated_args(abi: &LinearAbi, a: &RmsnormGatedArgs) -> Result<ArgPa
 
 /// The fused gated RMSNorm launch grid: one program per row.
 pub fn rmsnorm_gated_grid(rows: usize) -> (u32, u32, u32) {
+    (rows as u32, 1, 1)
+}
+
+/// Device addresses and shapes for one plain RMSNorm launch: `x` is
+/// `[rows, hidden]` model-dtype, `w`/`out` are the f32 weight and the
+/// model-dtype output.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RmsnormArgs {
+    pub x: u64,
+    pub w: u64,
+    pub out: u64,
+    pub eps: f32,
+    pub stride_x: u32,
+}
+
+/// The plain RMSNorm launch argument pack, in the cubin's declared order.
+pub fn rmsnorm_args(abi: &LinearAbi, a: &RmsnormArgs) -> Result<ArgPack, MoEError> {
+    let kernel = abi.kernel(RMSNORM)?;
+    let mut p = ArgPack::for_linear(kernel);
+    p.ptr(a.x)?;
+    p.ptr(a.w)?;
+    p.ptr(a.out)?;
+    p.f32(a.eps)?;
+    p.u32(a.stride_x)?;
+    Ok(p)
+}
+
+/// The plain RMSNorm launch grid: one program per row.
+pub fn rmsnorm_grid(rows: usize) -> (u32, u32, u32) {
     (rows as u32, 1, 1)
 }
 

@@ -109,6 +109,50 @@ def add_rmsnorm_reference(
 
 
 @triton.jit
+def _rmsnorm_kernel(
+    x_ptr,
+    w_ptr,               # [HIDDEN] f32: the caller widens the weight once
+    out_ptr,
+    eps,
+    stride_x,
+    HIDDEN: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Plain RMSNorm, one program per row. The attention q/k norms are the only
+    sites left that composed ten kernels for it (decision 176)."""
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK)
+    mask = cols < HIDDEN
+    x = tl.load(x_ptr + row * stride_x + cols, mask=mask, other=0.0).to(tl.float32)
+    var = tl.sum(x * x, axis=0) / HIDDEN
+    recip = 1.0 / tl.sqrt(var + eps)
+    w = tl.load(w_ptr + cols, mask=mask, other=0.0)
+    tl.store(out_ptr + row * HIDDEN + cols, (x * recip) * w, mask=mask)
+
+
+def rmsnorm(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor, eps: float) -> None:
+    """Launch the plain RMSNorm over `rows` rows: out = rmsnorm(x) * w."""
+    rows, hidden = x.shape
+    _rmsnorm_kernel[(rows,)](
+        x,
+        w,
+        out,
+        eps,
+        x.stride(0),
+        HIDDEN=hidden,
+        BLOCK=triton.next_power_of_2(hidden),
+        num_warps=4,
+    )
+
+
+def rmsnorm_reference(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
+    """Plain-torch oracle for the same math."""
+    xf = x.to(torch.float32)
+    var = xf.pow(2).mean(-1, keepdim=True)
+    return ((xf * torch.rsqrt(var + eps)) * w.to(torch.float32)).to(torch.bfloat16)
+
+
+@triton.jit
 def _rmsnorm_gated_kernel(
     x_ptr,
     z_ptr,
