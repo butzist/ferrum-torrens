@@ -3350,3 +3350,159 @@ launch call, paid while the GPU works.
 
 Logs: `/tmp/opencode/r23/{step0,r2,r3,c1,c2}.log`,
 `/tmp/opencode/r23/host_*.txt`, trace `/tmp/opencode/r23/trace.37121`.
+
+## R24 -- Kernel-level like-for-like vs FreeToken: ~2x device busy, shared expert and ensure_experts dominate the delta (measured 2026-11-16)
+
+R23 closed the host side as a no-win and left one question: does a specific
+compute kernel explain the remaining ~1.13x decode gap to FreeToken (34.30 tok/s
+vs 38.7 on the clean 442-token prompt, greedy, 50 W cap, captured)? Our CUPTI
+preload cannot attach to the reference server (it forks worker processes in
+`server/launch.py`; a CUPTI subscriber inherited across fork hangs the traced
+server), so the reference side is measured with its own `torch.profiler` window
+(`FT_PROBE_TORCH=1`, `scripts/freetoken_probe/probe_impl.py`) and compared via
+`scripts/cupti-trace/compare-decode.py`. Both sides report device-busy time per
+step (sum of record durations, so concurrent streams count separately) and a
+per-kernel table; step wall time is an overlap property, per-kernel cost is not.
+
+### Setup
+
+- Prompt: `bench/prompt-clean.txt` (442 tokens), greedy (`temperature=0,
+  top_k=1, top_p=1`), 16-token warmup + 48-token measured completion.
+- **FreeToken (reference):** `freetoken.cli serve --model
+  .model-cache/bench/ftw-ref-14119b8 --moe-backend offload --moe-cache-auto
+  --memory-ratio 0.9 --max-running-requests 1 --max-prefill-length 1024
+  --max-seq-len-override 4096 --kv-reserve-tokens 4096 --text-model-only
+  --cuda-graph-max-bs 1`, model id `ftw-ref-14119b8`, FreeToken 0.2.1 venv at
+  `.model-cache/bench/FreeToken/.venv`. Torch-profiler window: 16 decode steps
+  (`FT_PROBE_SKIP=24`, `FT_PROBE_TORCH_STEPS=16`). Trace/profile:
+  `/tmp/opencode/r24/ft/probe/trace-2189.json`,
+  `/tmp/opencode/r24/ft/probe/profile-2189.txt`, measured
+  `/tmp/opencode/r24/ft/measured.json` (usage 442+48=490,
+  `"\n\nThe history of the printing press begins in the fifteenth century, when a
+  gold..."`). RTX 5060 Laptop GPU.
+- **FerrumTorrens (ours, recorded in-flight, `TODO.md`):** CUPTI activity trace,
+  52 decode steps on the same clean prompt/greedy conditions. 43.4 ms/step device
+  busy (p50 45.2), 34.2 ms span.
+
+### Totals
+
+| | decode steps | device busy / step | window span / step |
+|---|---:|---:|---:|
+| FreeToken (torch.profiler) | 16 | 22.65 ms (p50 22.65) | 23.12 ms |
+| FerrumTorrens (CUPTI, recorded) | 52 | 43.4 ms (p50 45.2) | 34.2 ms |
+
+We do ~1.92x more device work per step (43.4 vs 22.65 ms) while overlap differs
+(FT busy ~ span, little overlap; ours 43.4 ms busy over 34.2 ms span, ~10 ms of
+copy running under compute per R21/R23). The per-kernel breakdown, not the span,
+is the comparable signal.
+
+### Kernel breakdown (ms/step, top contributors)
+
+**FreeToken (torch.profiler, 16 steps):**
+
+| ms/step | n/step | kernel |
+|---:|---:|---|
+| 12.374 | 40.0 | `fast_index_copy_multi` (expert miss copy) |
+| 4.102 | 39.0 | CUTLASS 3x fp8/bf16 GEMM kernel (SM120 TMA warp-specialized) |
+| 1.550 | 80.0 | `_decode_nvfp4_marlin_kernel` (routed experts) |
+| 1.355 | 40.0 | `sm89_xmma_gemm_e4m3bf16...` (fp8 GEMM) |
+| 0.879 | 1.0 | `_nvfp4_gemv_kernel` (lm head) |
+| 0.395 | 80.0 | `_nvfp4_gemv_splitk_kernel` |
+| 0.322 | 30.0 | `fused_sigmoid_gating_delta_rule_update_kernel` (GDN) |
+| 0.263 | 70.0 | cublas gemvx bf16 |
+| 0.190 | 40.0 | `_lru_ensure_kernel` |
+| 0.148 | 40.0 | cublasLt splitK reduce |
+| 0.104 | 40.0 | cublas gemvx bf16/f32 |
+| 0.095 | 80.0 | `_fused_add_rmsnorm_kernel` |
+| 0.092 | 80.0 | `_static_quant_kernel` |
+| 0.078 | 40.0 | `_router_triton_kernel` |
+| 0.067 | 10.0 | `_decode_grouped_stage1_kernel` (paged attention) |
+
+**FerrumTorrens (CUPTI, recorded):**
+
+| ms/step | kernel |
+|---:|---|
+| 14.6 | `_index_copy_multi` |
+| 13.7 | `_shared_expert_nvfp4_phase1` |
+| 5.1 | `_fp8_gemv_splitk` |
+| 2.3 | `_nvfp4_gemv` (routed) |
+| 1.9 | `_ensure_experts` |
+| 1.05 | head GEMV |
+| 0.92 | paged attention |
+| 0.87 | `_shared_expert_nvfp4_phase2` |
+
+### Read
+
+Kernel names/structure differ (FT: PyTorch + CUTLASS/cuBLASLt/cuBLAS gemvx +
+its Triton kernels; ours: AOT Triton cubins / driver-API kernels), so mapping is
+not one-to-one. The comparable signals are:
+
+- **Expert miss copy is similar:** `_index_copy_multi` 14.6 vs
+  `fast_index_copy_multi` 12.37 ms/step (~+18% ours), consistent with the R19/R22
+  finding that both runtimes pay the PCIe copy.
+- **Shared expert is the largest absolute delta:** our fused NVFP4 shared-expert
+  pair costs 13.7 + 0.87 = **14.57 ms/step**. FT has no equivalently named/costed
+  NVFP4 shared-expert kernel in its top table; its shared-expert/projection work
+  is absorbed into CUTLASS/cublas GEMM paths (e.g. 4.10 + 1.36 ms FP8 GEMMs and
+  gemvx calls). This does **not** contradict R18/R20 ("duplicating the fused pair
+  costs nothing" / shared expert hidden under copy) — marginal cost under overlap
+  can be ~0 while absolute kernel time is large — but it means our NVFP4
+  fused-epilogue shared expert is substantially more expensive in device time than
+  FT's implementation of the same work.
+- **`_ensure_experts` is a clear outlier:** 1.9 ms/step vs FT
+  `_lru_ensure_kernel` 0.19 ms/step (~10x). This is a small absolute delta (1.7
+  ms) but a large relative one and a concrete, name-mappable target.
+- **FP8 projections are comparable in aggregate:** ours `_fp8_gemv_splitk` 5.1 ms
+  vs FT CUTLASS fp8 4.10 + sm89 fp8 GEMM 1.36 = ~5.46 ms (different
+  decomposition/call counts).
+- **Routed expert GEMV:** ours `_nvfp4_gemv` 2.3 vs FT marlin 1.55 + splitk 0.40
+  = 1.95 ms (~+18%).
+- **GDN/attention/norms** are decomposed differently (FT: fused GDN update 0.32,
+  conv1d 0.065, staged paged-attention kernels ~0.14, fused add+rmsnorm 0.095;
+  ours reports paged attention 0.92 as an aggregate) and need a finer mapping
+  before attributing small deltas.
+
+**Conclusion:** R24 does not point to a single compute kernel explaining the
+whole gap; it shows ~2x total device busy (43.4 vs 22.65 ms/step) with the gap
+distributed. The largest specific, actionable-looking deltas are the
+**NVFP4 shared-expert pair (14.6 ms absolute, much larger than FT's equivalent
+path)** and **`_ensure_experts` (1.9 vs 0.19 ms, 10x)**. Copy remains comparable.
+Next: (a) profile/attribute our shared-expert kernels vs FT's shared-expert path
+on a like-for-like basis (and consider whether the NVFP4 fused epilogue is the
+right trade vs FT's approach, despite R18's marginal-cost result under overlap),
+(b) investigate `_ensure_experts` for avoidable work relative to FT's LRU ensure,
+(c) refine GDN/attention mapping if (a)/(b) do not close the gap. Any fix must be
+re-measured with controlled, order-balanced runs (~5% variance) and only kept on
+measured win.
+
+**`_ensure_experts` follow-up (2026-11-16, correctness-validated, perf inconclusive):**
+`python/ferrum_kernel/offload.py::_ensure_experts_kernel` unconditionally built
+packed `(usage,slot)` keys and `tl.sort`ed the full `BLOCK_C=2048` slot vector
+every call (and did not skip victim selection on warm/hit-only steps). Replaced
+with FT-style sequential in-register `argmin` per miss, guarded by
+`if num_missing > 0`, preserving victim/install/rewrite semantics and ascending
+`(usage,slot)` order (same strategy FT `_seq` uses at this cache size). Kernel
+signature/constexprs/ABI unchanged. `kernel-selftest --interp` **PASS** (all 8
+offload lru cases + full suite) and `kernel-compile-check` **PASS**
+(`lru_ensure`: 4183 ptx lines, 195640 cubin bytes, sm_120). Local AOT cubins
+regenerated in `kernel/` (`lru_ensure.cubin/.ptx`, manifest); build consumed via
+`FERRUM_KERNEL_DIR=$PWD` (touch `build.rs` to force rebuild).
+
+Candidate re-measure (clean 442-token `bench/prompt-clean.txt`, greedy, 48
+tokens, `FERRUM_SMOKE_CACHE=auto`, `FERRUM_SMOKE_GRAPH=1`, `FERRUM_SMOKE_REPS=3`,
+`prlimit --as=68719476736`, RTX 5060 Laptop, log
+`/tmp/opencode/r24-remeasure/candidate.log`): tg **36.0 / 35.8 / 34.2 tok/s**
+(mean 35.33), pp **329.3 / 343.2 / 344.9 tok/s**; decoded continuation identical
+across reps and matching the expected prefix. Historical baseline for this shape
+is tg **34.30 tok/s**, pp ~336-344 (3 interleaved rounds). Delta is **+3.0% mean**
+but within the observed ~5% run-to-run variance and **not** an interleaved
+old-vs-new A/B in the same session/thermal state, so **no measured win claimed**.
+A controlled, order-balanced A/B (candidate kernel vs old-kernel build,
+interleaved, same conditions) is required to confirm; the fix targets a 1.7 ms
+device-busy outlier and may yield a small wall-clock gain masked by overlap/noise.
+
+Logs: `/tmp/opencode/r24/ft/` (serve.log, rate.txt, measured.json, warmup.json,
+probe trace/profile/layout 2189), `/tmp/opencode/r24-remeasure/candidate.log`.
+Tooling: `scripts/cupti-trace/compare-decode.py`,
+`scripts/cupti-trace/freetoken-trace.sh` (now defaults to torch-probe mode for
+forked FT server; CUPTI preload opt-in via `FERRUM_TRACE=1`).
