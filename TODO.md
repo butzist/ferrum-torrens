@@ -1090,7 +1090,9 @@ per-kernel table (0.92 ms/step vs FT's ~0.2); R8.4 W8A8 rejected (decision 108,
 breaks the exact argmax); R8.5 fp8 KV rejected (decision 110; size the pool);
 R8.6 like-for-like miss measurement DONE (decision 100); R9.1 fused
 add+RMSNorm DONE (decision 100, captured tg 25.9 -> 27.7); R9.2 fused GDN tail
-rejected (-6.4% captured, stash). The FreeToken prefill/K=4 baselines are
+rejected (-6.4% captured) and its stash was dropped 2026-11-16 (it patched the
+deleted `forward_torch.rs`; the same fusion later landed properly, decisions
+174/176). The FreeToken prefill/K=4 baselines are
 measured: pp 366.2/725.0, K=4 25.17/11.70 (numbers in `OPTIMIZATION.md`
 "Standing measured facts").
 

@@ -3026,11 +3026,12 @@ settled.
        window is quadratic. The Host fallback is libtorch's fused, GQA-aware
        SDPA (flash attention), which is simply the better prefill kernel.
      - **Shipped/closed.** The implementation, the `FERRUM_PF_ATTN` knob and the
-       integrated gate are parked in `git stash` ("R10.3 paged prefill
-       attention: correct (3-chunk gate green) but pp -3.8% ..."), not shipped.
-       A revisit needs a batched prefill attention kernel that shares K/V tiles
-       across queries, not the decode kernel. R10.4 (`norm_in`) remains the open
-       prefill lever.
+       integrated gate were parked in a git stash and that stash was dropped on
+       2026-11-16: it patched `forward_torch.rs`, which `d57bd5d` (the torch-less
+       runtime) deleted, so it is unreplayable by construction and this decision
+       is the record. A revisit needs a batched prefill attention kernel that
+       shares K/V tiles across queries, not the decode kernel. R10.4 (`norm_in`)
+       remains the open prefill lever.
 
 ---
 
@@ -5057,8 +5058,9 @@ subsection names are kept verbatim.
     to free; the captured decode graphs and the expert cache survive an image
     request. `release_moe`/`rehydrate_moe` and the idle unload keep their
     current semantics and remain used by the idle timer's first stage. The
-    parked VMM partial-eviction design (stash@{0}) was measured to break
-    decode-graph capture and stays parked. Host source is the existing pageable
+    parked VMM partial-eviction design was measured to break
+    decode-graph capture and stays parked on `wip/vmm-slot-banks` (the stash
+    that held it was converted to that branch on 2026-11-16). Host source is the existing pageable
     f32 cache; peak RSS is ~18.6 GiB with one load and MemAvailable low-water
     stays above 24 GiB, leaving ~14 GiB of margin against the host budget.
     Measured: tower build 1.31 s (host cache load unchanged), device encode
