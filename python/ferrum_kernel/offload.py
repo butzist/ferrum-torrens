@@ -94,39 +94,41 @@ def _ensure_experts_kernel(
     tl.store(usage_ptr + slot, step, mask=hit)
     # Scatter the distinct misses so `misses[rank]` is the ascending list.
     tl.store(misses_ptr + rank, q - id_base, mask=first_miss)
-    tl.debug_barrier()
 
-    c = tl.arange(0, BLOCK_C)
-    cm = c < num_cached
-    u = tl.load(usage_ptr + c, mask=cm, other=USAGE_MAX)
-    # Pack (usage, slot) into one sortable int64: ascending sort is exactly the
-    # sequence of `pick_victim` argmins, because the packed keys are distinct.
-    # Free slots carry usage 0, so they are the coldest and get reused first;
-    # only this step's hits (u == step) are pinned to KEY_MAX and never evicted.
-    # A bitonic top-k (`tl.topk`) would be cheaper than the full sort but its
-    # result mis-types under the interpreter (triton 3.7.1) on this packed
-    # tensor, and `--interp` is a required gate, so the sort stays.
-    key = tl.where(
-        cm & (u != step),
-        (u.to(tl.int64) << SLOT_BITS) | c.to(tl.int64),
-        KEY_MAX,
-    )
-    cand = tl.sort(key)
-
-    j = tl.arange(0, BLOCK_C)
-    jm = j < num_missing
-    victim = (cand & ((1 << SLOT_BITS) - 1)).to(tl.int32)
-    # `e` and `old` are flat ids: `id_of_slot` is shared across layers, so the
-    # victim may currently hold another layer's expert.
-    e = tl.load(misses_ptr + j, mask=jm, other=0) + id_base
-    old = tl.load(id_of_slot_ptr + victim, mask=jm, other=-1)
-    tl.debug_barrier()
-    tl.store(slot_for_id_ptr + old, -1, mask=jm & (old >= 0))
-    tl.store(id_of_slot_ptr + victim, e, mask=jm)
-    tl.store(slot_for_id_ptr + e, victim, mask=jm)
-    tl.store(usage_ptr + victim, step, mask=jm)
-    tl.store(slots_ptr + j, victim, mask=jm)
-    tl.debug_barrier()
+    # Victims are the `num_missing` least-recently-used evictable slots, in
+    # ascending (usage, slot) order, i.e. the sequence of argmins `pick_victim`
+    # would return. The cache is small enough to hold the full usage vector in
+    # registers (BLOCK_C covers it), so each miss is one in-register argmin and a
+    # scalar update: much cheaper than sorting the whole 2048-entry vector every
+    # call, and a no-op when the cache is warm (num_missing == 0). The sort-free
+    # path mirrors the reference's sequential strategy (R24).
+    if num_missing > 0:
+        # The hit bump above is a scatter store and the load below reloads the
+        # same array: without a CTA-scope fence the reload can observe a pre-bump
+        # value, and a hit whose previous touch was long ago would win argmin and
+        # be evicted out from under the rewrite. Same hazard as the reference.
+        tl.debug_barrier()
+        c = tl.arange(0, BLOCK_C)
+        cm = c < num_cached
+        u = tl.load(usage_ptr + c, mask=cm, other=USAGE_MAX)
+        umax = tl.full([BLOCK_C], USAGE_MAX, u.dtype)
+        # Free slots carry usage 0 and are reused first; this step's hits (and
+        # out-of-range lanes) are pinned so they are never evicted.
+        u = tl.where((u == step) | (~cm), umax, u)
+        for i in tl.range(num_missing):
+            victim = tl.argmin(u, axis=0).to(tl.int32)
+            # Scalar load, not a masked block reduction: victims are distinct, so
+            # no earlier iteration wrote the slot being read.
+            old = tl.load(id_of_slot_ptr + victim)
+            if old >= 0:
+                tl.store(slot_for_id_ptr + old, -1)
+            e = tl.load(misses_ptr + i) + id_base
+            tl.store(id_of_slot_ptr + victim, e)
+            tl.store(slot_for_id_ptr + e, victim)
+            tl.store(usage_ptr + victim, step)
+            tl.store(slots_ptr + i, victim)
+            # Claim the slot in-register so the next argmin picks a new victim.
+            u = tl.where(c == victim, umax, u)
 
     # Rewrites read the final table, so an id evicted again in this same call
     # (only possible below the engine floor) rewrites to -1 like the host plan.

@@ -19,24 +19,27 @@ prompt `bench/prompt-clean.txt`, greedy, 50 W cap, captured):
 
 | metric | FerrumTorrens | FreeToken 0.2.1 | standing |
 |---|---:|---:|---|
-| bs=1 decode | 30.7-36.0 tok/s (34.2 ms span) | 36.3-43.4 (23.1 ms span) | **~1.2-1.5x behind** |
+| bs=1 decode | 35.7-36.5 tok/s (27.5-29.4 ms span) | 36.3-43.4 (22.9-23.4 ms span) | **~1.0-1.2x behind** |
 | prefill pp @517 / @2057 | 401 / 958 tok/s | 366 / 725 | **1.10x / 1.32x ahead** |
 | K=4 aggregate / serial | 26.2 / 16.6 tok/s | 25.2 / 11.7 | **1.04x / 1.42x ahead** |
 
-The bs=1 decode gap decomposes (decision 169) into: miss-copy per-miss
-efficiency (+2.2 ms; 143 vs 127 us/miss, both near the PCIe link limit), heavy
-GEMVs at parity, and a ~6-7 ms small-kernel tail whose systemic cause is
-**launch geometry** (1-32-CTA kernels on 26 SMs vs FreeToken's machine-filling
+The bs=1 decode gap decomposes (decision 169, span accounting corrected in
+decision 171) into: union device busy 23.4 ms ours vs 22.5 ms FreeToken (so the
+work is nearly equal; ours overlaps ~12 ms of expert copy with the compute
+stream), a miss-copy per-miss efficiency delta (+0.0-2.2 ms; 143 vs 127 us/miss,
+both near the PCIe link limit), and the rest as **idle / serialization** inside a
+27.5 ms span (85% busy vs FT's 98%). The per-kernel tail is a **launch-geometry**
+problem on our side (1-32-CTA kernels on 26 SMs vs FreeToken's machine-filling
 vendored kernels), plus ~2 ms of extra graph-node dispatch (1974 vs ~800
 kernels/step). The plan -- Phase 0 measurement, Phase 1 the copy restructure,
 Phase 2 the tail geometry bundle, Phase 3 serving/batching -- is in
 `OPTIMIZATION.md`.
 
-Just completed: R24 (decision 169, kernel-level like-for-like) and the
-`_ensure_experts` argmin rewrite (selftest + compile-check green, uncommitted
-candidate at +3.0% mean tg -- below the ~5% noise floor, so it is confirmed by
-interleaved A/B or CUPTI device-busy before it is claimed). In progress: Phase
-0, the canonical re-baseline. Blockers: none.
+Just completed: Phase 2 item 1, the `_ensure_experts` argmin rewrite (decision
+171): CUPTI A/B with identical token ids moved it 1.66 -> 0.36 ms/step, union
+busy -1.3 ms, span 29.4 -> 27.5 ms, tg 33.6 -> 36.1 (+7.4%). In progress: Phase 0
+(standing re-based above; `scripts/cupti-trace/step-budget.py` added) then Phase
+1, the copy restructure. Blockers: none.
 
 ### Open work
 

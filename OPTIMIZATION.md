@@ -23,8 +23,8 @@ under `prlimit --as=68719476736`:
 
 | metric | FerrumTorrens | FreeToken 0.2.1 | standing |
 |---|---:|---:|---|
-| bs=1 decode | 30.7-36.0 tok/s | 36.3-43.4 tok/s | **~1.2-1.5x behind** |
-| -- same-session span (R24, 48-token window) | 34.2 ms/step | 23.1 ms/step | 1.48x |
+| bs=1 decode | 35.7-36.5 tok/s (mean 36.0) | 36.3-43.4 tok/s | **~1.0-1.2x behind** |
+| -- step span, same 48-token window | 27.2-29.4 ms (CUPTI) | 22.9-23.4 ms (torch.profiler) | **~1.2x** |
 | prefill pp, ~517 / ~2057 tokens | 401 / 958 tok/s | 366.2 / 725.0 | **1.10x / 1.32x ahead** |
 | K=4 aggregate / serial window | 26.2 / 16.6 tok/s | 25.17 / 11.70 | **1.04x / 1.42x ahead** |
 
@@ -33,7 +33,8 @@ Caveats that make any comparison honest:
 - **Decode tg falls as the measured window grows**: the expert-miss rate drifts
   up as the continuation enters new text (R21). Always state the window. At 128
   decoded tokens: ours 30.7-31.6, FT 36.3-38.7 (~1.2x). At 48 tokens both are
-  faster; the R24 spans above are the same-session 48-token numbers.
+  faster; the span row above is the 48-token pair. Report misses/step with every
+  decode number: it moves tg ~15% on its own.
 - **FT's absolute decode number swings 36.3-47.0 tok/s** across prompt, cache
   warmth and power cap (R14b's 47.0 was 40 W; R16's 43.4 was a tainted prompt).
   Never compare against a stale reference: decision 76's 30.3 tok/s (0.2.0-era)
@@ -42,23 +43,26 @@ Caveats that make any comparison honest:
   HTTP per request, so their compute-side prefill (~1086 tok/s marginal) is
   faster than the table suggests and still behind ours at 2057.
 
-## The bs=1 decode gap, decomposed (R24, decision 169)
+## The bs=1 decode gap, decomposed (R24/decision 169, span accounting corrected 2026-11-16)
 
 Per step, device side, same prompt/conditions (FT: torch.profiler, 16 steps;
-ours: CUPTI activity trace, 52 steps):
+ours: CUPTI activity trace, 52 steps). `union` is the GPU-busy time; `sum` counts
+the two streams separately:
 
 | component | FerrumTorrens | FreeToken | delta |
 |---|---:|---:|---:|
-| expert miss copy | 14.6 ms (~102 misses x 143 us) | 12.37 ms (~98 x 127 us) | **+2.2 ms** |
-| heavy GEMVs (FP8 projections, routed, head) | 8.45 ms | 8.3 ms | +0.15 (parity) |
-| small-kernel tail + graph dispatch | ~9-10 ms | ~2.4 ms | **~+7 ms** |
-| step span | 34.2 ms | 23.1 ms | +11.1 ms |
+| expert miss copy (sum; overlaps our compute stream) | 12.4-14.6 ms (~102 misses x 143 us) | 12.37 ms (~98 x 127 us) | +0.0 to +2.2 |
+| heavy GEMVs (FP8 projections, routed, head) | 7.45 ms | 7.89 ms | -0.4 (ahead) |
+| shared-expert pair (starved by the copy; ~1.9 ms unstarved) | 12.5 ms starved | ~0.4 ms | geometry |
+| small kernels (attn, norms, router, conv, elementwise) | 3.1 ms | ~2.4 ms | +0.7 |
+| union device busy | 23.4 ms | 22.5 ms | +0.9 |
+| step span | 27.5-29.4 ms | 22.9-23.4 ms | **+5 +/- 1** |
 
 The tail, stage by stage (ms/step; FT column from its per-kernel table):
 
 | stage | ours | FT | note |
 |---|---:|---:|---|
-| `ensure_experts` / `_lru_ensure_kernel` | 1.9 | 0.19 | full 2048-slot sort per layer vs per-miss argmin |
+| `ensure_experts` / `_lru_ensure_kernel` | 0.36 (**landed**; was 1.66 in the A/B arm) | 0.19 | in-register argmin per miss, 2026-11-16 |
 | shared expert (unstarved) | ~1.9 | 0.40 | 16-32 CTAs, serial K; FT runs split-K |
 | norms (~110 nodes) | ~1.2-2 | 0.095 | 1 CTA per row; FT's fused add_rmsnorm is 1.2 us/call |
 | paged attention | 0.92 | ~0.2 | re-reads K/V per q head; FT's staged kernel shares tiles |
@@ -77,10 +81,18 @@ piece sits below wall-clock A/B noise. This also explains the S8/R9.2 "fusion
 regresses" results: those fused kernels had the same 1-CTA geometry, so fusion
 was blamed for a geometry defect.
 
-Busy-vs-span caution: our 43.4 ms device-busy (vs FT 22.65) is inflated by
-starved-but-hidden work (the shared expert runs 4-16x slower under the copy
-window but does not extend the span; R21/R22). Compare spans between engines;
-use per-kernel busy only for same-kernel before/after.
+Busy-vs-span caution, corrected 2026-11-16: the "43.4 ms device-busy" figure in
+R24 was a **sum across streams**, not work. The union (GPU-busy) time is
+**~23.4 ms/step ours vs 22.5 FT**: the two engines do close to the same amount
+of device work per step, and ours spreads ~12 ms of it (the expert copy) over a
+second stream that overlaps the compute stream. The remaining gap is therefore
+**overlap efficiency and idle, not extra device work**: 23.4 busy inside a 27.5
+ms span (85%) versus FT's 22.5 inside 22.9 (98%). Per-kernel busy is likewise
+inflated by starvation -- the shared expert's phase1 shows 11.6 ms while the
+copy's CTAs occupy the SMs, against ~1.7 ms unstarved -- so compare spans
+between engines and use per-kernel busy only for the same kernel before/after.
+Tooling: `scripts/cupti-trace/step-budget.py` (span, union busy, overlap,
+per-kernel table).
 
 Attribution caveat: FT's `_nvfp4_gemv_splitk_kernel` (80 calls, 0.395 ms) is
 assigned above to the shared expert (40 layers x gate_up + down). If it is
@@ -123,13 +135,17 @@ Each item is a measured per-call gap of 5-10x against the FT kernel in the R24
 table; none clears wall-clock noise alone, so they ship as one bundle measured
 by CUPTI device-busy, then a wall-tg A/B (n>=8):
 
-1. `ensure_experts`: per-miss argmin instead of the full sort. **Implemented**
-   (selftest + compile-check green, uncommitted candidate: +3.0% mean tg, below
-   noise); confirm by interleaved A/B or CUPTI, then commit. 1.9 -> ~0.2 ms.
+1. `ensure_experts`: per-miss argmin instead of the full sort. **Landed
+   2026-11-16 (decision 171).** CUPTI A/B, same build, only the `lru_ensure`
+   cubin differs, identical token ids: **1.66 -> 0.36 ms/step** (42 -> 9.4
+   us/call), union busy -1.3 ms, span 29.4 -> 27.5 ms, tg 33.6 -> 36.1 (+7.4%).
+   This is the Phase 0 rule in action: a lever worth ~5% decided at ~1% noise.
 2. Shared-expert phases: split-K through the existing 1536-CTA
-   `fp8_gemv_splitk` pattern. ~1.9 -> ~0.4 ms busy. Span-hidden under the copy
-   window today, but (a) on a 50 W-capped part busy time is power/clock budget,
-   (b) it is exposed the moment Phase 1 lands.
+   `fp8_gemv_splitk` pattern. ~1.9 -> ~0.4 ms busy (12.5 ms in the starved
+   trace). Span-hidden under the copy window today, but (a) on a 50 W-capped
+   part busy time is power/clock budget, (b) it is exposed the moment Phase 1
+   lands. Split-K also attacks the starvation directly: 16 CTAs contending with
+   the copy's 384 is why one phase costs 11.6 ms.
 3. Norm kernels: grid/warp config audit (`add_rmsnorm` is 1 CTA/row; FT's
    equivalent is 1.2 us/call). ~0.5-1 ms.
 4. Decode attention: GQA-aware K/V tile sharing (the R10.3 lesson applied to
@@ -190,12 +206,16 @@ reduce 0.148 | `_fused_add_rmsnorm_kernel` 0.095 | `_static_quant_kernel`
 `_decode_grouped_stage1_kernel` 0.067 + stage2 (staged split-K paged
 attention; flashinfer under `fi`). Sum ~22.0 of 22.65 ms busy.
 
-### FerrumTorrens decode kernel table (R24, CUPTI, 52 steps, ms/step)
+### FerrumTorrens decode kernel table (CUPTI, ms/step)
 
-`_index_copy_multi` 14.6 | `_shared_expert_nvfp4_phase1` 13.7 (starved;
-unstarved ~1.7) | `_fp8_gemv_splitk` 5.1 | `_nvfp4_gemv` 2.3 (routed) |
-`_ensure_experts` 1.9 | head GEMV 1.05 | paged attention 0.92 |
-`_shared_expert_nvfp4_phase2` 0.87 (unstarved ~0.19). 1974 compute + 101 copy
+R24 (52 steps, pre-`ensure_experts`): `_index_copy_multi` 14.6 |
+`_shared_expert_nvfp4_phase1` 13.7 (starved; unstarved ~1.7) |
+`_fp8_gemv_splitk` 5.1 | `_nvfp4_gemv` 2.3 (routed) | `_ensure_experts` 1.9 |
+head GEMV 1.05 | paged attention 0.92 | `_shared_expert_nvfp4_phase2` 0.87
+(unstarved ~0.19). Post-landing A/B (2026-11-16, 51 steps): copy 12.6,
+phase1 11.6 starved, `_fp8_gemv_splitk` 4.31, `_nvfp4_gemv` 1.81,
+`_ensure_experts` 0.36, head 0.81, attention 0.73; sum 36.1, union 23.4,
+stream 18 (compute) 22.3, stream 13 (copy) 13.5. 1974 compute + 101 copy
 kernels per step vs FT's ~800.
 
 ### FreeToken serving baselines (2026-10-20, `scripts/freetoken_probe/baselines.py`)

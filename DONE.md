@@ -5579,3 +5579,61 @@ subsection names are kept verbatim.
    of FreeToken 0.2.1, bs=1 decode ~1.2-1.5x behind with the gap attributed to
    the copy per-miss efficiency (+2.2 ms) and the small-kernel tail (~+7 ms).
    `TODO.md`'s 550-line status wall was compacted in the same pass.
+
+171. **`ensure_experts` becomes a per-miss in-register argmin: -1.3 ms device
+   busy, -1.8 ms span, +7.4% tg at a matched trajectory (2026-11-16).** The
+   first landed item of the new plan (OPTIMIZATION.md Phase 2 item 1) and the
+   first test of its Phase 0 rule -- decide a ~5% lever on CUPTI device-busy,
+   gate the bundle on wall tg. `python/ferrum_kernel/offload.py` had the LRU
+   admission sort the whole `BLOCK_C=2048` cache every layer: pack
+   `(usage, slot)` into an int64 key, `tl.sort` 2048 keys in one CTA (16 KiB of
+   shared memory), then take the first `num_missing` -- a full sort to answer a
+   top-k question, 40 times a step, on a kernel FreeToken does in 0.19 ms. The
+   rewrite keeps the usage vector in registers and runs `num_missing`
+   in-register `tl.argmin`s, claiming each victim in-register so the next argmin
+   sees it; the whole victim loop is under `if num_missing > 0`, so a warm layer
+   does no work at all. A scalar load reads the victim's previous occupant (the
+   victims are distinct, so no iteration reads a slot an earlier one wrote), and
+   the hit bump keeps its `tl.debug_barrier()` before the reload, because a
+   scatter store followed by a reload of the same array is the same hazard the
+   sort version had. The ABI is unchanged (13 params, same constexprs, grid and
+   warps); only `shared` drops 16384 -> 2048 bytes. Divergence from the
+   reference: same sequential-argmin semantics, but the miss scatter, the hit
+   bump and the barrier stay as they were -- FreeToken's kernel is given the
+   same treatment, so this is a shape change, not a semantics change.
+   Measurement is a same-build A/B with exactly one knob: the store kernel set
+   is no longer a valid old arm (it predates `rmsnorm_gated` and panics at load;
+   `lru_ensure.ptx` had drifted to 14 params), so the old arm was AOT-compiled
+   from the reverted source (`aot --out`, 20 s, CPU-only) into its own tree; the
+   two cubin sets differ only in `lru_ensure` (16 KiB vs 2 KiB shared) and
+   `index_copy.ptx` carries only shifted `.loc` line numbers. Two order-balanced
+   rounds (old, new, new, old), `FERRUM_SMOKE_REPS=1`, clean 442-token prompt,
+   48 tokens, auto cache, captured, one process at a time under `prlimit`; both
+   arms decode the identical 47 ids (md5 of `generated ids` equal), so the miss
+   workload is matched by construction -- the confound decisions 164/165 warn
+   about is absent here. Result, per step over ~51 decode steps:
+
+   | | sort (old) | argmin (new) | delta |
+   |---|---:|---:|---:|
+   | `_ensure_experts` | 1.656 ms (42 us/call) | 0.357 ms (9.4 us/call) | **-1.30 ms** |
+   | union device busy | 24.72 ms | 23.41 ms | -1.31 ms |
+   | step span | 29.36 ms | 27.55 ms | **-1.81 ms** |
+   | tg (2 rounds each) | 33.5, 33.7 (33.6) | 36.5, 35.7 (36.1) | **+7.4%** |
+   | pp | 345.0, 333.9 | 345.1, 345.2 | unchanged |
+
+   The busy drop and the span drop differ by 0.5 ms, so the kernel is on the
+   critical path: it runs on the copy stream ahead of the layer's
+   `_index_copy_multi`, and shortening it shortens the dependency chain, not
+   just the busy total. Gates: `selftest --interp` PASS (the five
+   `offload lru *` oracle cases), `compile_check` PASS for sm_120, `aot --check`
+   clean, `cargo fmt --check`, `cargo clippy --all-targets` (default and
+   `--features cudarc`), `cargo test --lib` 435 passed.
+   Correction recorded in the same change: R24's "43.4 ms device busy vs FT
+   22.65" was a **sum across streams**, and it made the remaining gap look like
+   extra device work. The union is 23.4 ms vs FT's 22.5, i.e. both engines move
+   about the same amount of data per step; ours overlaps ~12 ms of copy with the
+   compute stream and then loses ~4 ms to idle/serialization (85% busy vs 98%).
+   So the plan's remaining levers are the copy's per-miss efficiency, the
+   starved shared-expert geometry and the idle spans -- not a 2x compute
+   deficit. New tool for this: `scripts/cupti-trace/step-budget.py` (span, union
+   busy, overlap, per-kernel table), which is what made the correction visible.
