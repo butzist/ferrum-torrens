@@ -8,6 +8,12 @@
 //
 //   CUPTI_TRACE_OUT=/tmp/trace.csv LD_PRELOAD=/path/libcupti_trace.so <binary>
 //
+// One process only: a CUPTI subscriber and the driver's post-fork state do not
+// survive a `fork()` that then touches CUDA, so do not preload this into a
+// launcher that forks worker processes (the FreeToken reference server does; it
+// hangs at load). Trace such a process with its own profiler instead -- see
+// `scripts/cupti-trace/freetoken-trace.sh --probe`.
+//
 // Columns: kind,start_ns,end_ns,dur_ns,stream,bytes_or_0,name
 #include <cuda.h>
 #include <cupti.h>
