@@ -51,46 +51,66 @@ the two streams separately:
 
 | component | FerrumTorrens | FreeToken | delta |
 |---|---:|---:|---:|
-| expert miss copy (sum; overlaps our compute stream) | 12.4-14.6 ms (~102 misses x 143 us) | 12.37 ms (~98 x 127 us) | +0.0 to +2.2 |
-| heavy GEMVs (FP8 projections, routed, head) | 7.45 ms | 7.89 ms | -0.4 (ahead) |
-| shared-expert pair (starved by the copy; ~1.9 ms unstarved) | 12.5 ms starved | ~0.4 ms | geometry |
-| small kernels (attn, norms, router, conv, elementwise) | 3.1 ms | ~2.4 ms | +0.7 |
-| union device busy | 23.4 ms | 22.5 ms | +0.9 |
+| expert miss copy (serialized with the rest; shared expert hides under it) | 12.4-14.6 ms (~102 misses x 143 us) | 12.37 ms (~98 x 127 us) | 0.0-2.2 |
+| compute excluding the copy and the starved shared expert | 10.7 ms | 10.3 ms | +0.4 (parity) |
+| -- heavy GEMVs (FP8 projections, routed, head) | 7.45 | 7.89 | -0.4 (ahead) |
+| -- everything else (norms, router, attn, conv, glue) | 3.2 | 2.4 | +0.8 |
+| shared-expert pair (starved, and inside the copy window) | 12.0 busy | -- | 0 span |
+| inter-node idle (2069 vs ~800 nodes) | **4.1 ms** | ~0.2 ms | **+3.9** |
 | step span | 27.5-29.4 ms | 22.9-23.4 ms | **+5 +/- 1** |
 
-The tail, stage by stage (ms/step; FT column from its per-kernel table):
+The tail, stage by stage (ms/step; FT column from its per-kernel table). Read
+the "ours" column as device-busy: these are 1-2 us kernels and their *stage*
+cost is a fraction of the dispatch gaps they add, which is why the idle row
+above is the lever and this table is not:
 
 | stage | ours | FT | note |
 |---|---:|---:|---|
 | `ensure_experts` / `_lru_ensure_kernel` | 0.36 (**landed**; was 1.66 in the A/B arm) | 0.19 | in-register argmin per miss, 2026-11-16 |
-| shared expert (unstarved) | ~1.9 | 0.40 | 16-32 CTAs, serial K; FT runs split-K |
-| norms (~110 nodes) | ~1.2-2 | 0.095 | 1 CTA per row; FT's fused add_rmsnorm is 1.2 us/call |
+| shared expert (solo) | 0.33 | ~0.4 | 16 CTAs is fine; 12.0 ms busy under the copy is starvation, not cost |
+| norms (~110 nodes) | ~1.2-2 | 0.095 | 1 CTA per row; but the cost is the node count |
 | paged attention | 0.92 | ~0.2 | re-reads K/V per q head; FT's staged kernel shares tiles |
 | router (gate + topk) | 0.74 | 0.18 | f32 matmul + op chain vs one fused kernel |
 | conv + recurrence | 0.89 | 0.39 | recurrence at parity; the conv is ~10x FT's per call |
 | routed GEMV | 2.3 | 1.55 | both marlin-style; our tile never swept against theirs |
-| graph-node dispatch | ~2 | ~0.8 | 1974+101 vs ~800 kernels/step |
+| graph-node dispatch | **4.1 idle** | ~0.2 | 2069 kernels/step vs ~800 |
 
-**Root cause: launch geometry, not fusion.** FT's small kernels run at the
-graph-dispatch floor (1-5 us/call); ours run 10-50 us/call because they launch
-1-32 CTAs on 26 SMs and walk K serially (confirmed in the tree: `norm.py`
-launches `grid = (rows,)`, `shared_expert_nvfp4.py` phase1 is 16 CTAs, the
-pre-rewrite `ensure_experts` was 1 CTA sorting 2048 slots). The heavy kernels
-got tile tuning (R1/R2/R10.8/R10.9) and match; the tail never did, because each
-piece sits below wall-clock A/B noise. This also explains the S8/R9.2 "fusion
-regresses" results: those fused kernels had the same 1-CTA geometry, so fusion
-was blamed for a geometry defect.
+**Root cause: node count, not launch geometry.** The review's reading was that
+our small kernels are 1-32-CTA launches and FT's fill the machine. The measured
+trace says the opposite in the only currency that matters: our non-copy compute
+is 10.7 ms against FT's 10.3, our heavy kernels are ahead, and 1297 of our 2069
+nodes are elementwise glue that take 1-2 us each. What we pay is ~1.4 us of dead
+time per node: 4.11 ms of union idle, 2.85 ms of it in sub-5-us gaps. FT's ~800
+nodes cost them ~0.2 ms. Fewer, larger kernels is the lever; retuning a 1-CTA
+kernel that costs 1.5 us cannot pay for its own A/B. This also explains the
+S8/R9.2 "fusion regresses" results differently than the review assumed: those
+fusions did cut nodes, but they also moved work into slow kernels, so the two
+effects cancelled.
 
-Busy-vs-span caution, corrected 2026-11-16: the "43.4 ms device-busy" figure in
-R24 was a **sum across streams**, not work. The union (GPU-busy) time is
-**~23.4 ms/step ours vs 22.5 FT**: the two engines do close to the same amount
-of device work per step, and ours spreads ~12 ms of it (the expert copy) over a
-second stream that overlaps the compute stream. The remaining gap is therefore
-**overlap efficiency and idle, not extra device work**: 23.4 busy inside a 27.5
-ms span (85%) versus FT's 22.5 inside 22.9 (98%). Per-kernel busy is likewise
-inflated by starvation -- the shared expert's phase1 shows 11.6 ms while the
-copy's CTAs occupy the SMs, against ~1.7 ms unstarved -- so compare spans
-between engines and use per-kernel busy only for the same kernel before/after.
+Busy-vs-span caution, corrected twice on 2026-11-16: the "43.4 ms device-busy"
+figure in R24 was a **sum across streams**, not work. The union (GPU-busy) time
+is ~23.4 ms/step, within 1 ms of FreeToken's 22.5, and the step decomposes
+cleanly as
+
+    span = copy (12.6) + non-shared compute (10.7) + inter-node idle (4.1)
+
+with the shared expert's 12.0 ms of device-busy **entirely inside the copy
+window**. Both facts are measured, not inferred:
+
+- Solo, `shared_expert_nvfp4_phase1` is **8.1 us/call** (0.33 ms/step for 40
+  launches). Under the copy it stretches to 270-535 us/call -- 30x -- because the
+  copy's 384 CTAs x 4 warps (1536 warps) fill every warp slot on 26 SMs, so the
+  shared expert's 64 warps are throttled to the copy's pace. Bench: 40 phase1
+  launches take 0.48 ms alone, 0.74/1.98/9.63 ms with 1/4/40 copies in flight.
+- That starvation is *span-free*: the copy does not overlap the layer's real
+  compute (sum 36.7 - union 23.4 = 12.4 ms, exactly the shared expert's starved
+  busy), it overlaps the shared expert instead, and the layer waits for the copy
+  anyway. R18 (duplicating the fused pair costs nothing) and R22 (a 384 -> 48 CTA
+  copy grid changes the mechanism and not the step) measured the same thing end
+  to end. It shows up as busy, not as time.
+
+So: compare spans between engines, use per-kernel busy only for the same kernel
+before/after, and never size a lever from a starved kernel's busy time.
 Tooling: `scripts/cupti-trace/step-budget.py` (span, union busy, overlap,
 per-kernel table).
 
@@ -117,46 +137,74 @@ shrinks; verify against the FT source before sizing those two items.
   `scripts/cupti-trace/` (captured-step per-kernel device busy; the only tool
   that sees the captured step), `scripts/freetoken_probe/`.
 
-### Phase 1 -- the miss copy (~1.5-2.2 ms)
+### Phase 1 -- the miss copy (link-bound; <=1 ms left, not 2.2)
 
-`_index_copy_multi_kernel` runs ~143 us/miss (84% of the pinned link) vs FT's
-127 (94%). FT's `fast_index_copy_multi` sustains that with a small fixed grid
-(6 banks x 8 blocks); the R22 attempt at 48 CTAs regressed because the grid was
-shrunk without changing per-CTA work -- our `for row in tl.range(0, n)` loop
-with a store between loads does not keep enough independent loads in flight to
-cover PCIe latency. Restructure toward FT's shape: a flat (bank, row, segment)
-work queue, fixed ~48-96 CTAs, unrolled independent loads. Target ~12.4-13
-ms/step at ~102 misses. Gate: CUPTI copy window + the route-trace simulator +
-the captured A/B.
+**Re-measured 2026-11-16 (decision 172): this phase is nearly closed.** The
+"14.6 vs 12.37 ms" gap in the R24 table was a window with more misses, not a
+kernel defect: at the current miss rate our copy is 12.4-12.6 ms/step, the same
+as FreeToken's. Per miss we are at ~143 us (13.0 GB/s) against their ~127
+(14.0) and a pinned-H2D ceiling of 14.4.
 
-### Phase 2 -- the tail geometry pass (~5-7 ms, one bundle)
+A captured 39-layer microbench (`/tmp` bench, decision 172) swept what the
+review blamed and what this plan proposed:
 
-Each item is a measured per-call gap of 5-10x against the FT kernel in the R24
-table; none clears wall-clock noise alone, so they ship as one bundle measured
-by CUPTI device-busy, then a wall-tg A/B (n>=8):
+| variant | us/miss | GB/s |
+|---|---:|---:|
+| current (4-byte elements, 384 CTAs) | 137.8 | 12.9 |
+| 8-byte elements, same grid | 137.0 | 13.0 |
+| 16-byte accesses (`v4.b32` via arg specialization), per-bank grids | 137.4 | 12.9 |
+| segment 16K/32K/64K/128K/256K per CTA, 4-16 warps | 136-139 | 12.7-13.0 |
+| load `.cg` vs `.cv` vs none, store `.cs` vs default, evict-first | 136-143 | 12.4-13.0 |
 
-1. `ensure_experts`: per-miss argmin instead of the full sort. **Landed
-   2026-11-16 (decision 171).** CUPTI A/B, same build, only the `lru_ensure`
-   cubin differs, identical token ids: **1.66 -> 0.36 ms/step** (42 -> 9.4
-   us/call), union busy -1.3 ms, span 29.4 -> 27.5 ms, tg 33.6 -> 36.1 (+7.4%).
-   This is the Phase 0 rule in action: a lever worth ~5% decided at ~1% noise.
-2. Shared-expert phases: split-K through the existing 1536-CTA
-   `fp8_gemv_splitk` pattern. ~1.9 -> ~0.4 ms busy (12.5 ms in the starved
-   trace). Span-hidden under the copy window today, but (a) on a 50 W-capped
-   part busy time is power/clock budget, (b) it is exposed the moment Phase 1
-   lands. Split-K also attacks the starvation directly: 16 CTAs contending with
-   the copy's 384 is why one phase costs 11.6 ms.
-3. Norm kernels: grid/warp config audit (`add_rmsnorm` is 1 CTA/row; FT's
-   equivalent is 1.2 us/call). ~0.5-1 ms.
-4. Decode attention: GQA-aware K/V tile sharing (the R10.3 lesson applied to
-   the decode kernel). 0.92 -> ~0.3 ms.
-5. Router: finish the fusion (fold the f32 gate matmul into the kernel, or
-   match FT's matmul + fused-kernel split at 0.18 ms). ~0.5 ms.
-6. Routed GEMV tile re-sweep against FT's marlin number (`kernel-autotune`
-   harness exists). 2.3 -> ~1.6-1.9 ms.
-7. Conv decode geometry (24 us/call vs FT's 2.2). ~0.4 ms.
+Everything lands within noise at ~13 GB/s. Request width, cache hints, grid
+shape and per-CTA work are all innocent: the copy is at 90% of the pinned link
+and FreeToken is at 97%. **Do not restructure the kernel for this.** The ~1 ms
+that remains is link efficiency (FT's 16-byte streaming pair, `.wt` stores) and
+is worth one attempt only if bundled with something else.
 
-Expected span after Phases 1-2: ~26-27 ms/step, ~37-38 tok/s: bs=1 parity.
+Consequence for the plan: the copy is ~45% of the step and both engines pay it.
+Anything the copy currently hides is free *in span* (see the shared expert
+below), and the way to stop paying it at all is Phase 3 (batching dedups the
+misses), not a faster copy.
+
+### Phase 2 -- the tail: node count, not launch geometry (~4 ms of idle)
+
+**Re-scoped 2026-11-16 (decision 172).** The R24 stage table and the review read
+the tail as "1-32-CTA kernels, 5-10x FT per call". The captured trace says the
+kernel bodies are fine and the **idle between them** is the cost:
+
+| | ours | FreeToken |
+|---|---:|---:|
+| kernels per decode step | **2069** | ~800 |
+| of those, elementwise/glue (<3 us each) | **1297** | -- |
+| kernel time in the compute stream | 10.7 ms (excluding the starved shared expert) | 10.3 ms |
+| union GPU idle inside the step | **4.11 ms** | ~0.2 ms (98% busy) |
+| -- of which in <5 us inter-node gaps | 2.85 ms | -- |
+
+Our non-copy compute is **at parity with FreeToken** (10.7 vs 10.3 ms): the
+heavy GEMVs are ahead (7.45 vs 7.89), the norms/router/attention/conv items in
+the table below are 1-2 us kernels that cost nothing on their own. What we pay
+is ~1.4 us of dead time per node across ~2000 nodes. The fix is **fewer
+kernels**, i.e. fuse the glue chains, not retune tiles:
+
+| item | status | measured |
+|---|---|---|
+| `ensure_experts` per-miss argmin | **landed** (decision 171) | 1.66 -> 0.36 ms/step, span -1.8 ms, tg +7.4% |
+| elementwise glue (335 `_copy_strided`, 200 `_cast_bf16_f32`, 190 `_unary`, 100 `_scalar`, 100 `_col_mul`, 81 `_binary`, 80 `_cast_f32_bf16`, 50 `_sum_last`) | open, biggest | ~1136 nodes/step; fusing the GDN/norm chains is ~2 ms of gaps |
+| GDN block (81 `_gather_rows`, 81 `_add_rmsnorm`, 80 `_scatter_rows`, 40 conv, 40 recur) | open | ~540 nodes/step; R9.2's fused norms regressed as a *fused 1-CTA* kernel, revisit as a node-count change |
+| split-K / shared-expert geometry | **closed as no-win** | the phase1 body is 8.1 us/call solo; its 270 us is throttling behind the copy and it costs no span (R18/R22 agree) |
+| decode attention GQA tiles, router fusion, conv geometry, routed-GEMV tile | open, small | each 0.3-0.9 ms of *busy*, and busy is not what we are short of: fold them into the same bundle only if they remove nodes |
+
+Expected span after Phase 2: copy 12.6 + compute 10.7 + ~0.5 idle = **~24 ms**,
+i.e. **a tie with FreeToken's 22.9-23.4**, not a win. Getting *ahead* needs one
+of: the copy overlapped with compute instead of serialized behind it (the 12.4
+ms overlap in the trace is the shared expert, not real work, and R22 showed a
+smaller copy grid does not buy it), fewer misses (Phase 3 batching), or compute
+below FT's (they are already ahead of us on nothing but glue). Phase 3 is where
+the durable win is.
+
+Bundling rule stays: these are sub-5% items each, so gate the bundle on CUPTI
+(union idle + kernel count) and a wall-tg A/B (n>=8, matched trajectory).
 
 ### Phase 3 -- the structural truth
 
@@ -217,6 +265,26 @@ phase1 11.6 starved, `_fp8_gemv_splitk` 4.31, `_nvfp4_gemv` 1.81,
 `_ensure_experts` 0.36, head 0.81, attention 0.73; sum 36.1, union 23.4,
 stream 18 (compute) 22.3, stream 13 (copy) 13.5. 1974 compute + 101 copy
 kernels per step vs FT's ~800.
+
+### Toolchain fact: no committed cubin vectorizes (2026-11-16)
+
+Triton's JIT specializes every pointer argument to `tt.divisibility = 16` before
+lowering, and that is what makes a contiguous load lower to `ld.global.v4.b32`.
+The AOT path (`triton.compile(ASTSource(fn, sig, constexprs))`, no `attrs`)
+skips that step, so AxisInfo sees alignment 1 everywhere and the coalescing pass
+picks `sizePerThread = 1`. Measured: **all 68 committed cubins issue scalar
+global accesses only** (0 vectorized loads or stores in the PTX; SASS confirms
+`LDG.E`/`STG.E` 32-bit in `index_copy`). Passing the attrs by hand takes a plain
+copy kernel from 8 x `b32` to 2 x `v4.b32` per thread.
+
+For the staging copy this does not matter (13.0 vs 12.9 GB/s, measured), and a
+base pointer loaded from a device table cannot be hinted anyway (`tl.assume` and
+`tl.multiple_of` are both dropped by the int-to-pointer cast). It is open whether
+the GEMVs, norms or attention would gain: anything reading a *contiguous*
+activation would, and the kernel-argument pointers are all allocator-aligned. A
+first measurement would add `attrs` in `aot._compile_one` for one kernel, compare
+its PTX, and CUPTI the per-kernel time. Do not change the AOT contract globally
+without that check, since a wrong divisibility claim is a misaligned access.
 
 ### FreeToken serving baselines (2026-10-20, `scripts/freetoken_probe/baselines.py`)
 

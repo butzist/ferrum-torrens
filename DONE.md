@@ -5637,3 +5637,72 @@ subsection names are kept verbatim.
    starved shared-expert geometry and the idle spans -- not a 2x compute
    deficit. New tool for this: `scripts/cupti-trace/step-budget.py` (span, union
    busy, overlap, per-kernel table), which is what made the correction visible.
+
+172. **The copy is link-bound and the tail is node count, not launch geometry:
+   both Phase 1 and Phase 2 of the new plan are re-scoped (2026-11-16).** The
+   review and R24's stage table read the remaining ~5 ms of span as (a) a copy
+   at 84% of the PCIe link that a FT-shaped kernel could fix (+2.2 ms) and (b)
+   1-32-CTA tail kernels running 5-10x FT's per call. Both readings are wrong
+   once the numbers are taken with the tools the plan mandates.
+   *The copy.* At the current miss rate the copy is 12.4-12.6 ms/step, the same
+   as FreeToken's 12.37; R24's 14.6 was a colder window, not a kernel defect.
+   A captured 39-layer microbench over a pinned host source (39 per-layer
+   launches, distinct random rows per layer so L2 cannot serve the reads)
+   measured every shape the review proposed: 4-byte elements 137.8 us/miss
+   (12.9 GB/s), 8-byte elements 137.0, 16-byte `v4.b32` accesses through a
+   per-bank grid 137.4, segments of 16K-256K per CTA with 4-16 warps 136-139,
+   and every cache-hint permutation (`.cg`/`.cv`/none on the load, `.cs`/default
+   on the store, evict-first) 136-143. Request width, CTA shape, per-CTA work
+   and cache hints are all innocent: the kernel sits at ~90% of the 14.4 GB/s
+   pinned-H2D ceiling, and FT's 127 us/miss is 97% of it. There is <=1 ms in
+   this lever, not 2.2, and it is link efficiency. What made the review's
+   "small grid regressed" story look right is that the mixture is bandwidth-
+   limited, so any shape lands in the same place (R22 measured the same thing
+   end to end).
+   *The shared expert.* `_shared_expert_nvfp4_phase1` costs **8.1 us/call solo**
+   (0.33 ms/step for 40 launches) and 270-535 us/call inside the step: a 30x
+   throttle, because the copy's 384 CTAs x 4 warps = 1536 warps fill every warp
+   slot on 26 SMs, so the shared expert's 64 warps advance at the copy's pace.
+   Bench: 40 phase1 launches take 0.48 ms alone, 0.74 ms with one copy in
+   flight, 1.98 with four, 9.63 with forty. That is why the trace shows its
+   duration tracking the copy's in lock-step, and why removing it entirely
+   (the `FERRUM_SHARED_SKIP` arm) gave 63.5 tok/s against a 35.1 control: the
+   skip arm's degenerate trajectory routed to a handful of experts, so its copy
+   fell to 2.41 ms/step (span 15.8, union 11.3) and the comparison measures the
+   miss count, not the shared expert. Starvation here is *free in span*: the
+   copy window is what the layer waits for anyway, and R18 (duplicating the
+   fused pair costs nothing) and R22 (a 384 -> 48 CTA copy grid changes the
+   mechanism and not the step) both already said so. Split-K'ing the shared
+   expert would buy busy time nobody is short of; closed as a no-win.
+   *What is left.* The step now accounts exactly as copy 12.6 + compute 10.7 +
+   union idle 4.1 = 27.4 ms, and FT's as 12.4 + 10.3 + 0.2 = 22.9. Our non-copy
+   compute is **at parity** (heavy GEMVs 7.45 vs 7.89, ahead; everything else
+   3.2 vs 2.4) and the 12.0 ms of starved shared expert is the "overlap" that
+   made the union look like parity work. The real delta is **2069 kernels/step
+   against ~800**: 1297 are elementwise glue (`_copy_strided` 335,
+   `_cast_bf16_f32` 200, `_unary` 190, `_scalar` 100, `_col_mul` 100,
+   `_binary` 81, `_cast_f32_bf16` 80, `_sum_last` 50) at 1-2 us each, and the
+   union idle is 4.11 ms of which 2.85 ms sits in sub-5-us inter-node gaps,
+   i.e. ~1.4 us of dead time per node. FT pays ~0.2 ms for its 800. So Phase 2
+   becomes a **node-count** bundle (fuse the GDN/norm/elementwise chains), the
+   tail-per-kernel items stay open only if they remove nodes, and the honest
+   target is ~24 ms/step (a tie with FT 22.9-23.4) with the durable win in Phase
+   3 batching.
+   *Toolchain finding.* No committed cubin vectorizes a global access: 0
+   vectorized loads or stores across the 68 PTX files, and `index_copy`'s SASS
+   is 32 x `LDG.E.STRONG.GPU` + 32 x `STG.E.EF`. The AOT path calls
+   `triton.compile(ASTSource(fn, signature, constexprs))` without `attrs`, so it
+   never applies the JIT's `tt.divisibility = 16` argument specialization and
+   the coalescing pass picks `sizePerThread = 1`; supplying the attrs by hand
+   turns a plain copy into 2 x `ld.global.v4.b32` per thread. Harmless for the
+   copy (measured), open for every kernel that reads a contiguous activation
+   with an aligned kernel-argument pointer. Recorded in OPTIMIZATION.md.
+   Method note: this is the Phase 0 rule paying for itself twice. The copy and
+   the shared expert were both "measured no-win" claims that the plan had
+   re-opened as 1.5-2.2 ms items on R24's *sum-across-streams* busy numbers;
+   measuring the union, the solo kernel cost and the node/gap distribution
+   closed them again with a reason, and moved the size to the one place the
+   trace actually shows it (4.1 ms of idle). Artifacts: kernel microbenches in
+   `/tmp/opencode/r24-copy/` (`copy_bench2.py`, `copy_bench4.py`,
+   `starve_bench.py`), shared-expert A/B and traces in
+   `/tmp/opencode/r24-shared/`, `scripts/cupti-trace/step-budget.py`.

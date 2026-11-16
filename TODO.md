@@ -23,23 +23,27 @@ prompt `bench/prompt-clean.txt`, greedy, 50 W cap, captured):
 | prefill pp @517 / @2057 | 401 / 958 tok/s | 366 / 725 | **1.10x / 1.32x ahead** |
 | K=4 aggregate / serial | 26.2 / 16.6 tok/s | 25.2 / 11.7 | **1.04x / 1.42x ahead** |
 
-The bs=1 decode gap decomposes (decision 169, span accounting corrected in
-decision 171) into: union device busy 23.4 ms ours vs 22.5 ms FreeToken (so the
-work is nearly equal; ours overlaps ~12 ms of expert copy with the compute
-stream), a miss-copy per-miss efficiency delta (+0.0-2.2 ms; 143 vs 127 us/miss,
-both near the PCIe link limit), and the rest as **idle / serialization** inside a
-27.5 ms span (85% busy vs FT's 98%). The per-kernel tail is a **launch-geometry**
-problem on our side (1-32-CTA kernels on 26 SMs vs FreeToken's machine-filling
-vendored kernels), plus ~2 ms of extra graph-node dispatch (1974 vs ~800
-kernels/step). The plan -- Phase 0 measurement, Phase 1 the copy restructure,
-Phase 2 the tail geometry bundle, Phase 3 serving/batching -- is in
-`OPTIMIZATION.md`.
+The bs=1 decode gap is now accounted as **copy 12.6 + compute 10.7 +
+inter-node idle 4.1 ms** (decisions 169/171/172). The copy is link-bound
+(143 vs 127 us/miss, both at 90-97% of the pinned PCIe rate) and the shared
+expert's 12 ms of "busy" is starvation *inside* the copy window, so neither is
+the lever. Our non-copy compute is at FreeToken parity (10.7 vs 10.3 ms, heavy
+GEMVs ahead at 7.45 vs 7.89); the gap is **2069 kernels/step vs ~800**, 1297 of
+ours elementwise glue costing ~1.4 us of dead time per node. The plan -- Phase 0
+measurement, Phase 1 the copy (closed as link-bound), Phase 2 the node-count
+bundle, Phase 3 serving/batching -- is in `OPTIMIZATION.md`.
 
-Just completed: Phase 2 item 1, the `_ensure_experts` argmin rewrite (decision
-171): CUPTI A/B with identical token ids moved it 1.66 -> 0.36 ms/step, union
-busy -1.3 ms, span 29.4 -> 27.5 ms, tg 33.6 -> 36.1 (+7.4%). In progress: Phase 0
-(standing re-based above; `scripts/cupti-trace/step-budget.py` added) then Phase
-1, the copy restructure. Blockers: none.
+Just completed: Phase 2's first item, the `_ensure_experts` argmin rewrite
+(decision 171): CUPTI A/B with identical token ids moved it 1.66 -> 0.36
+ms/step, union busy -1.3 ms, span 29.4 -> 27.5 ms, tg 33.6 -> 36.1 (+7.4%). Then
+the Phase 1/2 re-measurement (decision 172) closed the copy as link-bound
+(<=1 ms left; request width, cache hints and CTA shape all measure within noise
+at ~13 GB/s) and re-scoped the tail from "launch geometry" to **node count**:
+2069 kernels/step vs FreeToken's ~800, 1297 of them elementwise glue, and 4.1 ms
+of union idle in ~1.4 us inter-node gaps. The step now accounts as copy 12.6 +
+compute 10.7 + idle 4.1, with our compute at FreeToken parity (10.3). Next: the
+node-count bundle (fuse the GDN/norm/elementwise glue chains), gated on CUPTI
+idle + kernel count. Blockers: none.
 
 ### Open work
 
